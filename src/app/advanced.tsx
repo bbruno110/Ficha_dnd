@@ -1,11 +1,14 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as DocumentPicker from 'expo-document-picker';
+import { documentDirectory, EncodingType, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
+import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
-const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia', 'Kit', 'Acervo'];
+const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Acervo'];
 
 const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capacete', 'Capa', 'Bota', 'Luva', 'Consumível', 'Ferramenta', 'Mochila/Saco', 'Outro'];
 const EFFECT_CATEGORIES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
@@ -60,6 +63,8 @@ export default function AdvancedCreatorScreen() {
   const [tempSubclassParent, setTempSubclassParent] = useState('');
   const [tempSubclassLevel, setTempSubclassLevel] = useState('3');
   const [dbClasses, setDbClasses] = useState<{name: string}[]>([]);
+  // NOVO: Estado para a quantidade de perícias extras que a subclasse dá
+  const [bonusSkills, setBonusSkills] = useState('0');
 
   // Estados de Magia
   const [spellLevel, setSpellLevel] = useState('Truque');
@@ -87,7 +92,8 @@ export default function AdvancedCreatorScreen() {
   const [spellDescription, setSpellDescription] = useState('');
 
   // Estados de KIT
-  const [kitTargetClass, setKitTargetClass] = useState('');
+  const [kitTargetClasses, setKitTargetClasses] = useState<string[]>([]);
+  const [tempKitClass, setTempKitClass] = useState('');
   const [kitClassSearch, setKitClassSearch] = useState('');
   const [kitItems, setKitItems] = useState<{name: string, qty: number}[]>([]);
   const [dbItemsCatalog, setDbItemsCatalog] = useState<any[]>([]);
@@ -122,7 +128,7 @@ export default function AdvancedCreatorScreen() {
 
   const loadAcervo = async () => {
     try {
-      const tableMap: Record<string, string> = { 'Item': 'items', 'Raça': 'races', 'Classe': 'classes', 'Subclasse': 'subclasses', 'Magia': 'spells', 'Kit': 'starting_kits' };
+      const tableMap: Record<string, string> = { 'Item': 'items', 'Raça': 'races', 'Classe': 'classes', 'Subclasse': 'subclasses', 'Magia/Skill': 'spells', 'Kit': 'starting_kits' };
       let data: any[] = [];
       const fetchTable = async (label: string, tableName: string) => {
         const rows = await db.getAllAsync(`SELECT * FROM ${tableName} WHERE criador IN ('proprio', 'importado')`);
@@ -148,14 +154,92 @@ export default function AdvancedCreatorScreen() {
   };
 
   const toggleSelection = (uniqueId: string) => setSelectedAcervo(prev => prev.includes(uniqueId) ? prev.filter(i => i !== uniqueId) : [...prev, uniqueId]);
-  const handleExport = async () => { /* Mantido */ };
-  const handleImport = async () => { /* Mantido */ };
+  
+  // ================= SISTEMA DE IMPORTAÇÃO E EXPORTAÇÃO =================
+
+  const handleExport = async () => {
+    if (selectedAcervo.length === 0) {
+      Alert.alert("Aviso", "Selecione pelo menos um item da lista para exportar.");
+      return;
+    }
+    
+    try {
+      const itemsToExport = myCreations.filter(item => selectedAcervo.includes(`${item.tableName}-${item.id}`));
+      const jsonData = JSON.stringify(itemsToExport, null, 2);
+      
+      const fileUri = documentDirectory + 'acervo_dnd.json';
+      await writeAsStringAsync(fileUri, jsonData, { encoding: EncodingType.UTF8 });
+      
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(fileUri);
+      } else {
+        Alert.alert("Erro", "O compartilhamento não está disponível neste dispositivo.");
+      }
+    } catch (error) {
+      console.error(error);
+      Alert.alert("Erro", "Falha ao gerar arquivo de exportação.");
+    }
+  };
+
+  const handleImport = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({ 
+        type: ['application/json', '*/*'],
+        copyToCacheDirectory: true
+      });
+      
+      if (result.canceled) return;
+      
+      const fileUri = result.assets[0].uri;
+      
+      const fileContent = await readAsStringAsync(fileUri, { encoding: EncodingType.UTF8 });
+      const importedData = JSON.parse(fileContent);
+      
+      if (!Array.isArray(importedData)) {
+        Alert.alert("Erro", "Formato de arquivo inválido. O arquivo deve ser um JSON válido gerado pelo aplicativo.");
+        return;
+      }
+
+      let importedCount = 0;
+
+      for (const item of importedData) {
+        if (!item.tableName || !item.name) continue; 
+        if (!VALID_TABLES.includes(item.tableName)) continue; 
+        
+        const { tableName, type, id, ...fields } = item;
+        fields.criador = 'importado';
+        
+        // Verifica se a tabela destino possui as mesmas colunas (proteção contra BD antigo)
+        try{
+          const keys = Object.keys(fields);
+          const values = Object.values(fields) as any[];
+          const placeholders = keys.map(() => '?').join(', ');
+          
+          const query = `INSERT INTO ${tableName} (${keys.join(', ')}) VALUES (${placeholders})`;
+          await db.runAsync(query, values);
+          importedCount++;
+        } catch (dbError) {
+          console.warn(`Item duplicado ou coluna ausente: ${item.name}`);
+        }
+      }
+      
+      Alert.alert("Sucesso!", `${importedCount} conteúdos importados para o seu mundo.`);
+      loadAcervo();
+
+    } catch (error) {
+      console.error(error);
+      Alert.alert("Erro", "Falha ao ler ou processar o arquivo.");
+    }
+  };
+
+  // ================= FIM DO SISTEMA =================
 
   const resetForms = () => {
     setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffVal(''); setTempEffType('Cortante'); setTempEffDuration(''); setTempEffTurns(''); setItemDescription('');
     setStats({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' }); setSpeed('9m'); setHitDice('8'); setGold('10'); setSubclassLevel('3'); setIsCaster(false); setSaves([]);
     
-    setSubclassParents([]); setSubclassSearch(''); setTempSubclassLevel('3');
+    // Reseta o estado novo
+    setSubclassParents([]); setSubclassSearch(''); setTempSubclassLevel('3'); setBonusSkills('0');
     if(dbClasses.length > 0) setTempSubclassParent(dbClasses[0].name);
     
     setSpellLevel('Truque'); setSpellClassesReq([]); setSpellClassSearch(''); setTempSpellClassLvl('1');
@@ -164,7 +248,7 @@ export default function AdvancedCreatorScreen() {
     setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRange('18m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
     setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellSaves([]); setSpellDescription(''); 
     
-    setKitTargetClass(''); setKitClassSearch(''); setKitItems([]);
+    setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
   };
 
   const handleTabChange = (tab: string) => { setActiveTab(tab); if (tab !== 'Acervo') resetForms(); };
@@ -183,17 +267,10 @@ export default function AdvancedCreatorScreen() {
     setKitItemModalVisible(false); setKitItemSearch('');
   };
 
-  const updateSpellClassLevel = (className: string, level: string) => {
-    setSpellClassesReq(prev => prev.map(c => c.name === className ? { ...c, minLevel: level.replace(/[^0-9]/g, '') || '1' } : c));
-  };
-  const updateSubclassParentLevel = (className: string, level: string) => {
-    setSubclassParents(prev => prev.map(c => c.name === className ? { ...c, minLevel: level.replace(/[^0-9]/g, '') || '3' } : c));
-  };
-
   const handleSave = async () => {
     if (!name.trim()) { Alert.alert('Erro', 'O nome é obrigatório!'); return; }
     try {
-      if (activeTab === 'Magia') {
+      if (activeTab === 'Magia/Skill') {
         if (spellClassesReq.length === 0) { Alert.alert('Erro', 'Adicione ao menos uma classe na magia.'); return; }
         
         const finalCastTime = `${castTimeValue} ${castTimeType}`.trim();
@@ -256,18 +333,27 @@ export default function AdvancedCreatorScreen() {
         if (subclassParents.length === 0) { Alert.alert('Erro', 'Adicione ao menos uma classe pai para esta subclasse.'); return; }
         const parentNames = subclassParents.map(c => c.name).join(', ');
         const mainLevelReq = parseInt(subclassParents[0].minLevel) || 3;
-        await db.runAsync(`INSERT INTO subclasses (name, class_name, level_required, criador) VALUES (?, ?, ?, 'proprio')`, [name, parentNames, mainLevelReq]);
+        const bnsSkills = parseInt(bonusSkills) || 0;
+        
+        // CORREÇÃO: Insere com o novo campo 'bonus_skills'
+        await db.runAsync(`INSERT INTO subclasses (name, class_name, level_required, bonus_skills, criador) VALUES (?, ?, ?, ?, 'proprio')`, [name, parentNames, mainLevelReq, bnsSkills]);
       }
       else if (activeTab === 'Kit') {
-        if (!kitTargetClass) { Alert.alert('Erro', 'Selecione a classe alvo para este kit.'); return; }
+        if (kitTargetClasses.length === 0) { Alert.alert('Erro', 'Selecione pelo menos uma classe alvo para este kit.'); return; }
         if (kitItems.length === 0) { Alert.alert('Erro', 'Adicione pelo menos um item à mochila do kit.'); return; }
-        await db.runAsync(`INSERT INTO starting_kits (name, target_name, target_type, items, criador) VALUES (?, ?, ?, ?, 'proprio')`, [name, kitTargetClass, 'class', JSON.stringify(kitItems)]);
+        
+        for (const targetClass of kitTargetClasses) {
+          await db.runAsync(
+            `INSERT INTO starting_kits (name, target_name, target_type, items, criador) VALUES (?, ?, ?, ?, 'proprio')`, 
+            [name, targetClass, 'class', JSON.stringify(kitItems)]
+          );
+        }
       }
 
       Alert.alert('Sucesso!', `${activeTab} "${name}" criado com sucesso!`);
       resetForms();
       if (activeTab === 'Classe') setDbClasses(await db.getAllAsync<{name: string}>('SELECT name FROM classes ORDER BY name'));
-    } catch (error: any) { Alert.alert('Erro', 'Ocorreu um problema ao salvar. Já existe um com esse nome?'); }
+    } catch (error: any) { Alert.alert('Erro', 'Ocorreu um problema ao salvar. Já existe um item com esse nome, ou o banco está desatualizado.'); }
   };
 
   const renderItemForm = () => {
@@ -634,26 +720,71 @@ export default function AdvancedCreatorScreen() {
           ))}
         </View>
       )}
+
+      {/* NOVO CAMPO: BÔNUS DE PERÍCIA DA SUBCLASSE */}
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>PERÍCIAS EXTRAS (Opcional)</Text>
+        <TextInput 
+          style={styles.input} 
+          keyboardType="numeric" 
+          value={bonusSkills} 
+          onChangeText={setBonusSkills} 
+          placeholder="Quantas perícias o jogador ganha? (Ex: 0, 1, 3...)" 
+          placeholderTextColor="#666"
+        />
+        <Text style={[styles.label, {color: 'rgba(255,255,255,0.4)', fontSize: 9, marginTop: 5}]}>
+          *A maioria das subclasses (como Campeão ou Assassino) não concede perícias, digite 0. Subclasses como o Colégio do Conhecimento dão 3.
+        </Text>
+      </View>
     </View>
   );
 
   const renderKitForm = () => (
     <View>
-      <Text style={styles.label}>CLASSE ALVO DO KIT</Text>
+      <Text style={styles.label}>CLASSES ALVO DO KIT (Adicione uma ou mais)</Text>
       
       <View style={styles.effectBuilder}>
         <TextInput style={[styles.input, {backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 10, marginBottom: 15}]} placeholder="Buscar classe..." placeholderTextColor="#666" value={kitClassSearch} onChangeText={setKitClassSearch} />
         
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
           <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
             {dbClasses.filter(c => c.name.toLowerCase().includes(kitClassSearch.toLowerCase())).map(c => (
-              <TouchableOpacity key={c.name} style={[styles.limitBtn, kitTargetClass === c.name && styles.limitBtnActive]} onPress={() => setKitTargetClass(c.name)}>
-                <Text style={[styles.limitBtnText, kitTargetClass === c.name && styles.limitBtnTextActive]}>{c.name}</Text>
+              <TouchableOpacity 
+                key={c.name} 
+                style={[styles.limitBtn, tempKitClass === c.name && styles.limitBtnActive]} 
+                onPress={() => setTempKitClass(c.name)}
+              >
+                <Text style={[styles.limitBtnText, tempKitClass === c.name && styles.limitBtnTextActive]}>{c.name}</Text>
               </TouchableOpacity>
             ))}
           </View>
         </ScrollView>
+
+        <TouchableOpacity style={styles.addEffectBtn} onPress={() => {
+          if(!tempKitClass) { Alert.alert('Erro', 'Selecione uma classe na lista acima.'); return; }
+          if(kitTargetClasses.includes(tempKitClass)) { Alert.alert('Aviso', 'Esta classe já foi adicionada.'); return; }
+          
+          setKitTargetClasses([...kitTargetClasses, tempKitClass]);
+          setTempKitClass(''); 
+          setKitClassSearch('');
+        }}>
+          <Text style={styles.addEffectBtnText}>+ ADICIONAR CLASSE AO KIT</Text>
+        </TouchableOpacity>
       </View>
+
+      {/* LISTA DE CLASSES ADICIONADAS */}
+      {kitTargetClasses.length > 0 && (
+        <View style={{marginBottom: 20}}>
+          {kitTargetClasses.map((cls, i) => (
+            <View key={i} style={[styles.effectRow, {backgroundColor: 'rgba(0,0,0,0.3)', borderColor: 'rgba(255,255,255,0.1)'}]}>
+              <Text style={styles.effectText}>{cls}</Text>
+              <TouchableOpacity onPress={() => setKitTargetClasses(kitTargetClasses.filter(c => c !== cls))}>
+                <Ionicons name="trash" size={20} color="#ff6666" />
+              </TouchableOpacity>
+            </View>
+          ))}
+        </View>
+      )}
 
       <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, marginTop: 10}}>
         <Text style={styles.label}>ITENS NA MOCHILA</Text>
@@ -711,7 +842,7 @@ export default function AdvancedCreatorScreen() {
   const renderAcervo = () => (
     <View style={{ flex: 1, minHeight: 400 }}>
       <View style={styles.acervoTabs}>
-        {['Todos', 'Item', 'Raça', 'Classe', 'Subclasse', 'Magia', 'Kit'].map(tab => (
+        {['Todos', 'Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit'].map(tab => (
           <TouchableOpacity key={tab} style={[styles.acervoTabBtn, acervoFilter === tab && styles.acervoTabBtnActive]} onPress={() => setAcervoFilter(tab)}>
             <Text style={[styles.acervoTabBtnText, acervoFilter === tab && styles.acervoTabBtnTextActive]}>{tab}</Text>
           </TouchableOpacity>
@@ -779,14 +910,14 @@ export default function AdvancedCreatorScreen() {
               <View style={styles.cardBlock}>
                 <View style={styles.formGroup}>
                   <Text style={styles.label}>NOME DO(A) {activeTab.toUpperCase()}</Text>
-                  <TextInput style={styles.input} value={name} onChangeText={setName} placeholder={`Ex: ${activeTab === 'Magia' ? 'Bola de Fogo' : 'Necromante'}...`} placeholderTextColor="#666" />
+                  <TextInput style={styles.input} value={name} onChangeText={setName} placeholder={`Ex: ${activeTab === 'Magia/Skill' ? 'Bola de Fogo' : 'Necromante'}...`} placeholderTextColor="#666" />
                 </View>
 
                 {activeTab === 'Item' && renderItemForm()}
                 {activeTab === 'Raça' && renderRaceForm()}
                 {activeTab === 'Classe' && renderClassForm()}
                 {activeTab === 'Subclasse' && renderSubclassForm()}
-                {activeTab === 'Magia' && renderSpellForm()}
+                {activeTab === 'Magia/Skill' && renderSpellForm()}
                 {activeTab === 'Kit' && renderKitForm()}
               </View>
               <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>

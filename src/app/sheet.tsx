@@ -126,9 +126,10 @@ export default function CharacterSheetScreen() {
           const raceData = await db.getFirstAsync<{speed: string}>(`SELECT speed FROM races WHERE name = ?`, [charData.race]);
           if (raceData) setCharRaceSpeed(raceData.speed);
 
-          const mainClassName = charData.class.split(' ')[0]; 
-          const classData = await db.getFirstAsync<{is_caster: number}>(`SELECT is_caster FROM classes WHERE name = ?`, [mainClassName]);
-          if (classData) setCharHasSpells(classData.is_caster === 1);
+          // CORREÇÃO: Puxa todas as classes conjuradoras e verifica se o personagem tem alguma delas
+          const casterClasses = await db.getAllAsync<{name: string}>(`SELECT name FROM classes WHERE is_caster = 1`);
+          const hasSpells = casterClasses.some(c => charData.class.includes(c.name));
+          setCharHasSpells(hasSpells);
 
           if (charData.spells.length > 0) {
             const placeholders = charData.spells.map(() => '?').join(',');
@@ -672,9 +673,6 @@ export default function CharacterSheetScreen() {
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarBack} onPress={() => router.back()}><Text style={styles.topBarBackText}>{"<"}</Text></TouchableOpacity>
         <Text style={styles.topBarTitle}>{character.name}</Text>
-        <TouchableOpacity onPress={() => router.push(`/edit?id=${character.id}`)}>
-            <Ionicons name="pencil" size={20} color="#00bfff" />
-        </TouchableOpacity>
       </View>
 
       <View>
@@ -876,22 +874,6 @@ export default function CharacterSheetScreen() {
                             <Text style={styles.itemSubDetail}>{item.weight}kg {item.properties ? ` • ${item.properties}` : ''}</Text>
                         </TouchableOpacity>
 
-                        <View style={{flexDirection: 'row', gap: 5}}>
-                          {isConsumable && (
-                            <TouchableOpacity style={styles.iconActionBtn} onPress={() => {
-                              setActionQty(1);
-                              setSelectedBagItem({item, index: i});
-                            }}>
-                                <Ionicons name="flask" size={18} color="#00fa9a" />
-                            </TouchableOpacity>
-                          )}
-                          <TouchableOpacity style={[styles.iconActionBtn, {borderColor: 'rgba(255,100,100,0.3)', backgroundColor: 'rgba(255,100,100,0.1)'}]} onPress={() => {
-                            setActionQty(1);
-                            setSelectedBagItem({item, index: i});
-                          }}>
-                              <Ionicons name="paper-plane" size={18} color="#ff6666" />
-                          </TouchableOpacity>
-                        </View>
                     </View>
                   )
               }) : <Text style={styles.emptyText}>Sua mochila está vazia.</Text>}
@@ -902,7 +884,7 @@ export default function CharacterSheetScreen() {
               {renderEquipSlot('helmet', 'Capacete', '🪖')}
               {renderEquipSlot('amulet', 'Colar', '📿')}
               {renderEquipSlot('cloak', 'Capa', '🧥')}
-              {renderEquipSlot('armor', 'Vestimenta', '🛡️')}
+              {renderEquipSlot('armor', 'Armadura', '🛡️')}
               {renderEquipSlot('campClothes', 'Acampamento', '🏕️')}
               {renderEquipSlot('lightSource', 'Fonte de Luz', '🕯️')}
               {renderEquipSlot('gloves', 'Luvas', '🧤')}
@@ -1197,7 +1179,7 @@ export default function CharacterSheetScreen() {
                               <Text style={styles.catalogItemName}>
                                 {item.name} {item.criador === 'proprio' || item.criador === 'importado' ? <Text style={{color: '#00bfff', fontSize: 10}}>[Custom]</Text> : null}
                               </Text>
-                              <Text style={styles.catalogItemSub}>{item.weight}kg {item.damage && item.damage !== '-' && `• ⚔️ ${item.damage}`}</Text>
+                              <Text style={styles.catalogItemSub}>{item.weight}kg - Descrição. {item.descricao}`</Text>
                             </View>
                             <Text style={styles.addIcon}>+</Text>
                         </TouchableOpacity>
@@ -1236,7 +1218,7 @@ export default function CharacterSheetScreen() {
       <Modal visible={levelUpModalVisible} transparent animationType="fade">
         <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
-                <Text style={styles.modalTitle}>🎉 Level Up! Nível {newLevelData}</Text>
+                <Text style={styles.modalTitle}>Nível {newLevelData}</Text>
                 <Text style={{color: 'rgba(255,255,255,0.8)', fontSize: 14, textAlign: 'center', marginBottom: 25, marginTop: 10, lineHeight: 22}}>Você ganhou XP suficiente para subir de nível! Deseja atualizar sua ficha agora?</Text>
                 <View style={{width: '100%', gap: 15}}>
                   <TouchableOpacity style={styles.lvlUpBtnPrimary} onPress={goToEditScreen}><Text style={styles.lvlUpBtnPrimaryText}>Atualizar Ficha</Text></TouchableOpacity>

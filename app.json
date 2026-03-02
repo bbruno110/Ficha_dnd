@@ -2,7 +2,7 @@
   "expo": {
     "name": "Ficha D&D",
     "slug": "ficha-dnd",
-    "version": "1.0.0",
+    "version": "1.0.7",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "fichadnd",
@@ -11,6 +11,7 @@
       "icon": "./assets/expo.icon"
     },
     "android": {
+      "versionCode": 5,
       "adaptiveIcon": {
         "backgroundColor": "#102b56",
         "foregroundImage": "./assets/images/icon.png",

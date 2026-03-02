@@ -5,18 +5,19 @@ import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
-const STEPS = ['Níveis & Vida', 'Atributos', 'Proficiências', 'Resumo & Magias'];
+const STEPS = ['Níveis & Vida', 'Atributos', 'Proficiências', 'Resumo & Habilidades'];
 
 type ClassEntry = { id: string; name: string; subclass: string; level: number };
 
 // Tabela Padrão de Nível de Magia vs Nível de Classe de Conjurador Total (D&D 5e)
 const getHighestSpellLevelAllowed = (casterLevel: number) => {
   if (casterLevel < 1) return -1;
-  return Math.ceil(casterLevel / 2); // Nv 1-2=Nv 1, Nv 3-4=Nv 2, Nv 5-6=Nv 3...
+  return Math.ceil(casterLevel / 2);
 };
 
 const getSpellLevelNumber = (levelStr: string) => {
   if (levelStr.toLowerCase() === 'truque') return 0;
+  if (levelStr === 'Classe' || levelStr === 'Manobra') return -1; // Para sempre aparecerem no filtro de nível
   const match = levelStr.match(/\d+/);
   return match ? parseInt(match[0], 10) : 99;
 };
@@ -48,8 +49,10 @@ export default function EditCharacterScreen() {
   const [extraPoints, setExtraPoints] = useState(0);
   
   const [activeSaves, setActiveSaves] = useState<string[]>([]);
-  // activeSkills agora guarda a ID da Skill. Se aparecer 2x, é Especialidade (Expertise).
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
+  // MEMÓRIA PARA IMPEDIR DUPLA-SELEÇÃO DE PERÍCIA
+  const [originalSkills, setOriginalSkills] = useState<string[]>([]);
+
   const [maxSavesAllowed, setMaxSavesAllowed] = useState(2);
   const [maxSkillsAllowed, setMaxSkillsAllowed] = useState(4);
   const [maxExpertiseAllowed, setMaxExpertiseAllowed] = useState(0);
@@ -92,7 +95,9 @@ export default function EditCharacterScreen() {
         const char = await db.getFirstAsync(`SELECT * FROM characters WHERE id = ?`, [Number(id)]);
         setDbSkills(await db.getAllAsync(`SELECT * FROM skills ORDER BY name ASC`));
         setDbSaves(await db.getAllAsync(`SELECT * FROM saving_throws ORDER BY name ASC`));
+        
         setDbSpells(await db.getAllAsync(`SELECT * FROM spells ORDER BY level, name ASC`));
+        
         setDbSubclasses(await db.getAllAsync(`SELECT * FROM subclasses ORDER BY level_required ASC`));
         setDbClasses(await db.getAllAsync(`SELECT * FROM classes ORDER BY name ASC`));
 
@@ -120,7 +125,11 @@ export default function EditCharacterScreen() {
           const parseArray = (val: string) => { try { const p = JSON.parse(val); return Array.isArray(p) ? p : []; } catch { return []; } };
 
           setActiveSaves(parseArray((char as any).save_values));
-          setActiveSkills(parseArray((char as any).skill_values));
+          
+          const parsedSkillsArray = parseArray((char as any).skill_values);
+          setActiveSkills(parsedSkillsArray);
+          setOriginalSkills(parsedSkillsArray);
+          
           setActiveSpells(parseArray((char as any).spells).map(String));
         }
       } catch (e) { console.error(e); } finally { setLoading(false); }
@@ -153,13 +162,20 @@ export default function EditCharacterScreen() {
       const bardoLevel = classesData.find(c => c.name === 'Bardo')?.level || 0;
       if (bardoLevel >= 10) calcExpertise += 2;
 
-      const hasLoreBard = classesData.some(c => c.name === 'Bardo' && c.subclass === 'Colégio do Conhecimento' && c.level >= 3);
-      if (hasLoreBard) calcSkills += 3;
+      // LÓGICA NOVA E DINÂMICA: Lê as subclasses do banco de dados!
+      classesData.forEach(cData => {
+        if (cData.subclass) {
+          const subObj = dbSubclasses.find(s => s.name === cData.subclass);
+          if (subObj && subObj.bonus_skills) {
+            calcSkills += Number(subObj.bonus_skills);
+          }
+        }
+      });
     }
 
     setMaxSkillsAllowed(calcSkills);
     setMaxExpertiseAllowed(calcExpertise);
-  }, [classesData, character]);
+  }, [classesData, character, dbSubclasses]);
 
   const currentLevelSum = classesData.reduce((acc, c) => acc + c.level, 0);
   const conMod = Math.floor((stats.CON - 10) / 2);
@@ -169,13 +185,23 @@ export default function EditCharacterScreen() {
   let asisGained = 0;
   let totalCasterLevel = 0;
 
+  let activeClassNames = classesData.filter(c => c.level > 0).map(c => c.name);
+  if (classesData.some(c => c.subclass === 'Cavaleiro Arcano' || c.subclass === 'Trapaceiro Arcano')) {
+      if (!activeClassNames.includes('Mago')) activeClassNames.push('Mago');
+  }
+
   classesData.forEach(newClass => {
     const oldClass = originalClassesData.find(c => c.name === newClass.name);
     const oldLevel = oldClass ? oldClass.level : 0;
     const levelsGained = newClass.level - oldLevel;
     
     const dbClassObj = dbClasses.find(c => c.name === newClass.name);
-    if (dbClassObj?.is_caster) totalCasterLevel += newClass.level;
+    
+    if (dbClassObj?.is_caster) {
+        totalCasterLevel += newClass.level;
+    } else if (newClass.subclass === 'Cavaleiro Arcano' || newClass.subclass === 'Trapaceiro Arcano') {
+        totalCasterLevel += Math.ceil(newClass.level / 3);
+    }
 
     if (levelsGained > 0) {
       const hitDie = dbClassObj?.hit_dice || 8;
@@ -202,10 +228,9 @@ export default function EditCharacterScreen() {
   const sabMod = Math.floor((stats.SAB - 10) / 2);
   const carMod = Math.floor((stats.CAR - 10) / 2);
   const bestMagicMod = Math.max(intMod, sabMod, carMod, 0);
-  const maxSpellsAllowed = Math.max(targetLevel + bestMagicMod + 3, activeSpells.length);
   
-  // Nível Máximo de Magia que pode ser escolhida
   const maxSpellLevelAllowedToLearn = totalCasterLevel > 0 ? getHighestSpellLevelAllowed(totalCasterLevel) : 0;
+  const maxSpellsAllowed = totalCasterLevel > 0 ? Math.max(targetLevel + bestMagicMod + 3, activeSpells.length) : 0;
 
   const changeClassLevel = (id: string, delta: number) => {
     setClassesData(prev => prev.map(c => {
@@ -240,40 +265,58 @@ export default function EditCharacterScreen() {
     }
   };
 
-  // LOGICA REVISADA: Proficiência (1 click) -> Especialidade/Expertise (2 clicks) -> Desmarcar (3 clicks)
+  // ======== NOVA LÓGICA DE PERÍCIAS ========
   const toggleSkill = (skillId: string) => {
     const occurrences = activeSkills.filter(i => i === skillId).length;
-    const currentExpertiseCount = activeSkills.length - new Set(activeSkills).size; // Conta quantos itens repetidos existem (Especialidades ativas)
-    const uniqueSkillsCount = new Set(activeSkills).size; // Conta quantas perícias únicas estão marcadas
+    const uniqueSkillsCount = new Set(activeSkills).size; 
+    const currentExpertiseCount = activeSkills.length - uniqueSkillsCount;
+    const isOriginalProficiency = originalSkills.includes(skillId); // Checa a memória
 
     if (occurrences === 0) {
-      // Adiciona Proficiência normal
+      // Adicionar Proficiência nova
       if (uniqueSkillsCount >= maxSkillsAllowed) {
         Alert.alert("Limite Atingido", `Você só pode ter proficiência em ${maxSkillsAllowed} perícias.`); return;
       }
       setActiveSkills(prev => [...prev, skillId]);
     } 
     else if (occurrences === 1) {
-      // Tenta promover para Especialidade (Dobro de Proficiência)
-      if (currentExpertiseCount >= maxExpertiseAllowed) {
-        Alert.alert("Limite Atingido", `Você só possui direito a ${maxExpertiseAllowed} Especialidade(s) com essa classe/nível.`); return;
+      // Já é proficiente. O que fazer no 2º clique?
+      if (isOriginalProficiency && maxExpertiseAllowed > 0 && currentExpertiseCount < maxExpertiseAllowed) {
+        // Se era uma perícia antiga e tem slot de especialidade sobrando, evolui!
+        setActiveSkills(prev => [...prev, skillId]); 
+      } else {
+        // Se for perícia nova DESSA edição, ou já bateu o limite de especialidades, o 2º clique REMOVE ela.
+        setActiveSkills(prev => prev.filter(i => i !== skillId));
       }
-      setActiveSkills(prev => [...prev, skillId]); // Fica duplicado no array (2 ocorrências = Expertise)
     } 
     else {
-      // Remove totalmente (Remove as duas ocorrências)
+      // Tem 2 ocorrências (Especialidade). Clicar remove tudo.
       setActiveSkills(prev => prev.filter(i => i !== skillId));
     }
   };
 
   const toggleSpell = (spellId: string) => {
-    if (activeSpells.includes(spellId)) setActiveSpells(prev => prev.filter(i => i !== spellId));
-    else {
-      if (activeSpells.length >= maxSpellsAllowed) {
-        Alert.alert("Limite Atingido", `Seu intelecto atual permite apenas ${maxSpellsAllowed} magias/truques simultâneos.`); return;
-      }
-      setActiveSpells(prev => [...prev, spellId]);
+    const spell = dbSpells.find(s => s.id.toString() === spellId);
+    if (!spell) return;
+
+    if (spell.level === 'Classe') {
+       Alert.alert("Habilidade Passiva", "Esta habilidade é base da sua classe e não pode ser desmarcada.");
+       return;
     }
+
+    const isSelecting = !activeSpells.includes(spellId);
+    
+    if (isSelecting && totalCasterLevel > 0 && (spell.level === 'Truque' || spell.level.includes('Nível'))) {
+      const spellCount = activeSpells.filter(sId => {
+        const s = dbSpells.find(dbS => dbS.id.toString() === sId);
+        return s && (s.level === 'Truque' || s.level.includes('Nível'));
+      }).length;
+
+      if (spellCount >= maxSpellsAllowed) {
+        Alert.alert("Limite Atingido", `Seu intelecto atual permite apenas ${maxSpellsAllowed} magias simultâneas.`); return;
+      }
+    }
+    setActiveSpells(prev => isSelecting ? [...prev, spellId] : prev.filter(i => i !== spellId));
   };
 
   const goToNextStep = () => {
@@ -299,14 +342,13 @@ export default function EditCharacterScreen() {
         `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=? WHERE id=?`,
         [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
       );
-      router.back();
+      router.push({ pathname: '/sheet' as any, params: { id: character.id } }); // Volta para a ficha e força atualização
     } catch (e) { console.error("Erro ao salvar:", e); }
   };
 
   if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#00bfff" /></View>;
 
   const isLevelUp = character && targetLevel > character.level;
-  const activeClassNames = classesData.filter(c => c.level > 0).map(c => c.name);
 
   // ================= RENDER PASSOS =================
   const renderStep0 = () => (
@@ -436,9 +478,11 @@ export default function EditCharacterScreen() {
           <Text style={styles.sectionTitle}>PERÍCIAS</Text>
           <Text style={styles.counterText}>Prof: {uniqueSkillsCount}/{maxSkillsAllowed} | Esp: {currentExpertiseCount}/{maxExpertiseAllowed}</Text>
         </View>
+        
+        {/* TEXTO DE AJUDA ATUALIZADO PARA EXPLICAR A NOVA REGRA */}
         <Text style={[styles.hpHint, {marginBottom: 15, textAlign: 'left'}]}>
-          Clique 1x para <Text style={{color: '#00bfff'}}>Proficiência (+{profBonus})</Text>.{'\n'}
-          {maxExpertiseAllowed > 0 && `Clique 2x para Especialidade (+${profBonus * 2}).`}
+          1 Toque: <Text style={{color: '#00bfff'}}>Proficiência (+{profBonus})</Text>.{'\n'}
+          {maxExpertiseAllowed > 0 && `2 Toques (apenas em perícias antigas): Especialidade (+${profBonus * 2}).`}
         </Text>
         
         <View style={styles.cardBlock}>
@@ -503,41 +547,53 @@ export default function EditCharacterScreen() {
     );
   }
 
-  const renderStep3 = () => (
-    <View>
-      <Text style={styles.sectionTitle}>RESUMO FINAL DA FICHA</Text>
-      <View style={[styles.cardBlock, { borderColor: '#00fa9a', borderWidth: 1 }]}>
-        <View style={styles.summaryRow}>
-          <Text style={styles.summaryLabel}>Novo Nível:</Text>
-          <Text style={styles.summaryValue}>{targetLevel}</Text>
-        </View>
-        <View style={styles.summaryRow}>
-          <Text style={styles.summaryLabel}>Nova Vida Máx:</Text>
-          <Text style={[styles.summaryValue, {color: '#ff6666'}]}>{character.hp_max + (parseInt(hpIncrease) || 0)} PV</Text>
-        </View>
-        <View style={styles.summaryRow}>
-          <Text style={styles.summaryLabel}>Soma de Atributos:</Text>
-          <Text style={styles.summaryValue}>{currentTotal}</Text>
-        </View>
-      </View>
+  const renderStep3 = () => {
+    const spellCount = activeSpells.filter(sId => {
+      const s = dbSpells.find(dbS => dbS.id.toString() === sId);
+      return s && (s.level === 'Truque' || s.level.includes('Nível'));
+    }).length;
 
-      <Text style={styles.sectionTitle}>GRIMÓRIO DE MAGIAS</Text>
-      <View style={styles.cardBlock}>
-        <View style={styles.spellHeaderRow}>
-          <Text style={{color: '#fff', fontSize: 14}}>
-            Conhecidas: <Text style={{fontWeight: 'bold', color: activeSpells.length >= maxSpellsAllowed ? '#ff6666' : '#00fa9a'}}>{activeSpells.length} / {maxSpellsAllowed}</Text>
-          </Text>
+    return (
+      <View>
+        <Text style={styles.sectionTitle}>RESUMO FINAL DA FICHA</Text>
+        <View style={[styles.cardBlock, { borderColor: '#00fa9a', borderWidth: 1 }]}>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Novo Nível:</Text>
+            <Text style={styles.summaryValue}>{targetLevel}</Text>
+          </View>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Nova Vida Máx:</Text>
+            <Text style={[styles.summaryValue, {color: '#ff6666'}]}>{character.hp_max + (parseInt(hpIncrease) || 0)} PV</Text>
+          </View>
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Soma de Atributos:</Text>
+            <Text style={styles.summaryValue}>{currentTotal}</Text>
+          </View>
         </View>
-        <Text style={[styles.hpHint, {marginBottom: 15, textAlign: 'left'}]}>
-          Magias limitadas a <Text style={{color: '#00fa9a', fontWeight: 'bold'}}>Nível {maxSpellLevelAllowedToLearn}</Text> baseado no nível da sua classe conjuradora.
-        </Text>
-        
-        <TouchableOpacity style={styles.manageSpellsBtn} onPress={() => setSpellsModalVisible(true)}>
-          <Text style={styles.manageSpellsBtnText}>Abrir Catálogo de Magias</Text>
-        </TouchableOpacity>
+
+        <Text style={styles.sectionTitle}>HABILIDADES & MAGIAS</Text>
+        <View style={styles.cardBlock}>
+          {totalCasterLevel > 0 && (
+            <View style={styles.spellHeaderRow}>
+              <Text style={{color: '#fff', fontSize: 14}}>
+                Espaços de Magia: <Text style={{fontWeight: 'bold', color: spellCount >= maxSpellsAllowed ? '#ff6666' : '#00fa9a'}}>{spellCount} / {maxSpellsAllowed}</Text>
+              </Text>
+            </View>
+          )}
+          
+          <Text style={[styles.hpHint, {marginBottom: 15, textAlign: 'left'}]}>
+            {totalCasterLevel > 0 
+              ? `Magias limitadas a Nível ${maxSpellLevelAllowedToLearn}. Você também pode gerenciar Habilidades e Manobras aqui.` 
+              : `Você pode gerenciar as Habilidades passivas e Manobras da sua classe aqui.`}
+          </Text>
+          
+          <TouchableOpacity style={styles.manageSpellsBtn} onPress={() => setSpellsModalVisible(true)}>
+            <Text style={styles.manageSpellsBtnText}>Abrir Catálogo de Classe</Text>
+          </TouchableOpacity>
+        </View>
       </View>
-    </View>
-  );
+    );
+  }
 
   return (
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
@@ -585,7 +641,7 @@ export default function EditCharacterScreen() {
             
             <View style={styles.spellDetailInfoGrid}>
               <View style={styles.spellDetailInfoItem}>
-                <Text style={styles.spellDetailInfoLabel}>CONJURAÇÃO</Text>
+                <Text style={styles.spellDetailInfoLabel}>ATIVAÇÃO</Text>
                 <Text style={styles.spellDetailInfoValue}>{selectedSpellInfo?.casting_time}</Text>
               </View>
               <View style={styles.spellDetailInfoItem}>
@@ -609,38 +665,61 @@ export default function EditCharacterScreen() {
         </Pressable>
       </Modal>
 
-      {/* MODAL LISTA MAGIAS (CORRIGIDO PARA O TECLADO NÃO ESMAGAR) */}
+      {/* MODAL LISTA MAGIAS/HABILIDADES */}
       <Modal visible={spellsModalVisible} transparent animationType="slide">
         <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
           <Pressable style={styles.modalOverlay} onPress={() => setSpellsModalVisible(false)}>
             <Pressable style={[styles.modalContentFullScreen, {height: '80%'}]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Catálogo Mágico</Text>
+                <Text style={styles.modalTitle}>Catálogo de Classe</Text>
                 <TouchableOpacity onPress={() => setSpellsModalVisible(false)}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
               </View>
-              <TextInput style={styles.searchInput} placeholder="Buscar magia..." value={spellSearch} onChangeText={setSpellSearch} placeholderTextColor="#666" />
+              <TextInput style={styles.searchInput} placeholder="Buscar habilidade/magia..." value={spellSearch} onChangeText={setSpellSearch} placeholderTextColor="#666" />
               
               <FlatList
                 style={{ flex: 1, width: '100%' }}
                 showsVerticalScrollIndicator={false}
                 data={dbSpells.filter(s => {
                   const sLvl = getSpellLevelNumber(s.level);
-                  const isAllowedByLevel = sLvl <= maxSpellLevelAllowedToLearn;
+                  
+                  // Se for Classe ou Manobra (sLvl == -1) ele passa direto no filtro de nível
+                  const isAllowedByLevel = sLvl === -1 || (totalCasterLevel > 0 && sLvl <= maxSpellLevelAllowedToLearn);
+                  
                   const isCompatibleClass = activeClassNames.some(c => s.classes.includes(c));
+                  
+                  // Trava de level da habilidade (class_level_required)
+                  let reqPassed = true;
+                  if (s.class_level_required) {
+                    const reqStr = String(s.class_level_required);
+                    const reqs = reqStr.split(',').map(r => r.trim());
+                    
+                    reqs.forEach(req => {
+                      const [cName, cLevel] = req.split(':');
+                      if (cName && cLevel) {
+                        const playerClassData = classesData.find(cd => cd.name === cName);
+                        if (playerClassData && playerClassData.level < parseInt(cLevel)) {
+                          reqPassed = false;
+                        }
+                      }
+                    });
+                  }
+
                   const matchesSearch = s.name.toLowerCase().includes(spellSearch.toLowerCase());
-                  return isAllowedByLevel && isCompatibleClass && matchesSearch;
+                  return isAllowedByLevel && isCompatibleClass && matchesSearch && reqPassed;
                 })}
                 keyExtractor={s => s.id.toString()}
                 renderItem={({ item }) => {
                   const isActive = activeSpells.includes(item.id.toString());
+                  const isPassive = item.level === 'Classe';
+                  
                   return (
-                    <View style={[styles.spellItemRow, isActive && styles.spellItemRowActive]}>
+                    <View style={[styles.spellItemRow, isActive && styles.spellItemRowActive, isPassive && {borderColor: '#00fa9a', borderWidth: isActive ? 0 : 1}]}>
                       <TouchableOpacity style={{ flex: 1 }} onPress={() => toggleSpell(item.id.toString())}>
-                        <Text style={[styles.spellItemName, isActive && {color: '#02112b'}]}>{item.name}</Text>
+                        <Text style={[styles.spellItemName, isActive && {color: '#02112b'}, isPassive && !isActive && {color: '#00fa9a'}]}>{item.name}</Text>
                         <Text style={[styles.spellItemSub, isActive && {color: 'rgba(2,17,43,0.7)'}]}>{item.level}</Text>
                       </TouchableOpacity>
                       <TouchableOpacity style={{paddingHorizontal: 15}} onPress={() => { setSelectedSpellInfo(item); setSpellDetailModalVisible(true); }}>
-                        <Ionicons name="information-circle-outline" size={26} color={isActive ? "#02112b" : "#00bfff"} />
+                        <Ionicons name="information-circle-outline" size={26} color={isActive ? "#02112b" : (isPassive ? "#00fa9a" : "#00bfff")} />
                       </TouchableOpacity>
                       <TouchableOpacity onPress={() => toggleSpell(item.id.toString())}>
                         <Ionicons name={isActive ? "checkmark-circle" : "ellipse-outline"} size={26} color={isActive ? "#02112b" : "rgba(255,255,255,0.3)"} />
@@ -648,7 +727,7 @@ export default function EditCharacterScreen() {
                     </View>
                   )
                 }}
-                ListEmptyComponent={<Text style={styles.emptyText}>Nenhuma magia compatível encontrada para o seu nível.</Text>}
+                ListEmptyComponent={<Text style={styles.emptyText}>Nenhuma habilidade compatível encontrada para o seu nível atual.</Text>}
               />
             </Pressable>
           </Pressable>

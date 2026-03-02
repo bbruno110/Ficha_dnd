@@ -6,7 +6,7 @@ import { initializeDatabase } from '../database/init';
 
 export default function RootLayout() {
   return (
-    <SQLiteProvider databaseName="dnd_sheet.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_base.db" onInit={initializeDatabase}>
       <ThemeProvider value={DarkTheme}>
         <LinearGradient
           colors={['#102b56', '#02112b']} 
@@ -19,7 +19,6 @@ export default function RootLayout() {
               contentStyle: { backgroundColor: 'transparent' },
             }}
           >
-            {/* Telas */}
             <Stack.Screen name="index" options={{ headerShown: false }} />
             <Stack.Screen name="create" options={{ headerShown: false }} />
           </Stack>
