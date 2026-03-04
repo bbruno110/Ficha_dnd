@@ -294,6 +294,42 @@ export default function CreateCharacterScreen() {
         allies: ['Sou bastante respeitado por um pequeno clã de mercenários independentes.', 'Tenho amizade velada com um capitão da guarda local.', 'Tenho um velho companheiro de batalhões sempre disposto a ajudar por uma caneca de cerveja.'],
         features: ['Possuo dezenas de cicatrizes de batalha, cada uma com uma história militar.', 'Tenho memória afiada para terrenos e posições táticas.', 'Nunca esqueço o rosto de quem já lutou ao meu lado - ou contra mim.'],
         extraLanguages: ['Gigante', 'Orc', 'Proficiência com Ferramentas de Ferreiro', 'Proficiência com Ferramentas de Carpinteiro']
+      },
+      {
+        name: "O Estudioso Místico",
+        allowedClasses: ['Mago', 'Bruxo', 'Clérigo', 'Bardo', 'Druida'],
+        traits: ['Fico instantaneamente fascinado com qualquer relíquia ou bugiganga arcana.', 'Tenho uma curiosidade perigosa, grande demais para o meu próprio bem.', 'Sempre tento mediar conflitos usando lógica e razão antes que virem violência desenfreada.'],
+        ideals: ['Conhecimento. A verdade oculta está acima de qualquer poder temporal.', 'Destino. Meu caminho e minhas descobertas já foram traçados por forças maiores.', 'Equilíbrio. A magia da luz e as artes das trevas precisam coexistir para o mundo não ruir.', 'Iluminação. Todos merecem compartilhar o dom da sabedoria.'],
+        bonds: ['Protejo um segredo ancestral que, se revelado, poderia iniciar uma guerra santa.', 'Devo lealdade irrestrita a uma ordem hermética que o povo acha que já não existe mais.', 'Fui salvo de uma maldição por uma entidade misteriosa e sinto que a ela devo a vida.'],
+        flaws: ['Confio rápido demais em promessas intelectuais e charadas.', 'Frequentemente subestimo inimigos braçais que me parecem estúpidos ou fracos.', 'Fico incrivelmente paranoico quando sinto perturbações no tecido mágico local.', 'Posso sacrificar minha própria segurança por um livro raro.'],
+        backstory: ['Eu era um arquivista de biblioteca que percebeu que ler sobre o mundo não era nada comparado a desvendá-lo pessoalmente.', 'Fui treinado arduamente em um mosteiro místico isolado no topo das montanhas.', 'Era aprendiz de um arquimago excêntrico que desapareceu subitamente sem deixar um único rastro físico.', 'Escapei por pouco de um culto sombrio tentando invocar coisas que não deveriam despertar.'],
+        allies: ['Recebo permissões especiais em grandes bibliotecas e academias de magia.', 'Sou observado e ocasionalmente ajudado por um corvo familiar ou criatura feérica.', 'Sou membro de base de uma aliança secreta de arcanistas espalhados pelo continente.', 'Possuo um mestre ancião que envia mensagens mágicas enigmáticas de vez em quando.'],
+        features: ['Possuo uma tatuagem mística ou cicatriz rúnica que formiga perto de magia intensa.', 'Minhas mãos são sempre frias ao toque, independentemente do clima escaldante.', 'Meus olhos mudam levemente de tonalidade quando eu conjuro ou concentro energia.'],
+        extraLanguages: ['Celestial', 'Silvestre', 'Abissal', 'Proficiência com Ferramentas de Caligrafia']
+      },
+      {
+        name: "O Nobre Vaidoso",
+        allowedClasses: ['Bardo', 'Paladino', 'Feiticeiro', 'Guerreiro'],
+        traits: ['Acredito veementemente que o dinheiro e a influência resolvem absolutamente qualquer problema.', 'Sou excessivamente educado, de forma condescendente, até com meus piores inimigos.', 'Adoro monopolizar a conversa com histórias exageradas sobre minhas proezas.', 'Detesto sujeira e reclamo frequentemente da falta de conforto.'],
+        ideals: ['Poder. Eu farei o que for preciso para elevar o prestígio da minha linhagem.', 'Glória. Quero que meu nome seja eternizado em estátuas de mármore e canções épicas.', 'Noblesse Oblige. É meu dever guiar as massas não instruídas, pois sou superior.', 'Tradição. O sangue nobre e as antigas formas de governar existem por um excelente motivo.'],
+        bonds: ['Guardo o anel de sinete da minha casa, a única prova do meu verdadeiro berço.', 'Jurei limpar o nome da minha família após um escândalo político arruinar nosso feudo.', 'Carrego comigo uma joia de valor inestimável que pertenceu à minha falecida mãe.'],
+        flaws: ['No fundo, acredito que sou ontologicamente superior a todos que não têm berço de ouro.', 'Sou obcecado por aparências físicas, vestimentas luxuosas e culinária fina.', 'Tenho um medo paralisante de falhar, passar vergonha ou parecer fraco em público.', 'Suborno as pessoas impulsivamente em vez de lidar com os problemas.'],
+        backstory: ['Nasci cercado de veludo e servos, mas um golpe de estado tirou tudo de mim, forçando-me a aventurar.', 'Descobri recentemente que sou o filho bastardo de um regente importantíssimo.', 'Entediei-me com a política letárgica da corte e fugi em busca de emoções reais no mundo sujo.', 'Fui deserdado por desonrar minha casa paterna e agora busco glória para esfregar na cara deles.'],
+        allies: ['Ainda mantenho o favor de alguns cortesãos leais e servos saudosos do castelo.', 'Tenho amizade com comandantes da guarda real que outrora protegeram minha família.', 'Possuo crédito (e muitas dívidas) nos maiores bancos mercantis da capital central.', 'Sou apadrinhado à distância por um duque de reputação questionável.'],
+        features: ['Tenho uma risada polida e inconfundível, acompanhada de um olhar de cima para baixo.', 'Meu sotaque denuncia imediatamente uma criação requintada e anos de tutores particulares.', 'Caminho com uma postura reta tão artificial que pareço carregar uma tábua nas costas.'],
+        extraLanguages: ['Dracônico', 'Proficiência com Instrumentos de Sopro', 'Élfico (Alta Sociedade)', 'Proficiência com Ferramentas de Joalheiro']
+      },
+      {
+        name: "O Forasteiro Selvagem",
+        allowedClasses: ['Bárbaro', 'Druida', 'Patrulheiro'],
+        traits: ['Sou profundamente supersticioso, interpretando o voo dos pássaros e o uivo dos lobos.', 'Sempre desconfio das invenções da "civilização" e durmo com um olho aberto em cidades.', 'Prefiro ficar em silêncio absoluto observando os arredores antes de abrir a boca.', 'Fico tenso em locais fechados ou multidões esmagadoras.'],
+        ideals: ['Exploração. O mundo natural precisa ter seus cantos respeitados, não pavimentados.', 'Autossuficiência. Eu sou a minha própria arma; só posso depender do meu suor e sangue.', 'Harmonia Primordial. O ciclo de presa e predador é sagrado e não deve ser corrompido.', 'Liberdade. As paredes das cidades são apenas gaiolas enfeitadas com pedras.'],
+        bonds: ['Meu clã foi dizimado por bestas, e jurei caçar até o último responsável na face da terra.', 'Sou o guardião ungido de um bosque ancestral que a civilização tenta invadir.', 'Tenho uma conexão empática inexplicável com um predador que me salvou na juventude.'],
+        flaws: ['Tenho o hábito perturbador de guardar troféus macabros de minhas caçadas.', 'Sou impulsivo para a fúria se insultarem meus costumes ou a natureza ao meu redor.', 'Tenho pavor de magia necromântica e abominações que quebram o ciclo natural da vida.', 'Somo péssimo com etiquetas sociais e falo brutalmente o que me vem à cabeça.'],
+        backstory: ['Sobrevivi sozinho na selva brutal por dez anos após me separar da minha tribo em uma tempestade.', 'Fui criado e moldado pelas feéricas profundas em uma floresta esquecida pelo tempo.', 'Era um rastreador de recompensas nas estepes congeladas do norte, acostumado ao sangue no gelo.', 'Nasci durante uma tempestade mística e meu povo sempre me viu como um avatar da fúria elemental.'],
+        allies: ['Não tenho senhores; minha aliança primária é com a própria terra e as feras locais.', 'Sou respeitado e temido por tribos nômades que conhecem meu nome de caça.', 'Uma cabala de druidas eremitas ocasionalmente me fornece ervas e direção.', 'Tenho passe-livre em territórios controlados por centauros e outros povos silvestres.'],
+        features: ['Tenho um senso de direção magnético; quase nunca me perco sob céu aberto.', 'Consigo imitar perfeitamente o som de alarme de pássaros e ganidos de lobos.', 'Sinto o cheiro metálico de chuva e o ozônio de tempestades horas antes delas caírem.', 'A maioria dos animais domésticos parece se intimidar ou reverenciar minha presença física.'],
+        extraLanguages: ['Silvestre', 'Primordial', 'Proficiência com Instrumentos de Percussão', 'Proficiência em Kit de Herbalismo']
       }
     ];
 
@@ -396,7 +432,7 @@ export default function CreateCharacterScreen() {
     if (dbRaces.length === 0 || dbClasses.length === 0) { showCustomAlert("Aguarde", "Carregando o banco de dados..."); return; }
     isRandomizing.current = true;
     
-    if (Math.random() < 0.0001) {
+    if (Math.random() < 0.12) {
       try {
         const companionsDB = await db.getAllAsync('SELECT * FROM bg3_companions ORDER BY RANDOM() LIMIT 1');
         if (companionsDB.length > 0) {
@@ -411,32 +447,118 @@ export default function CreateCharacterScreen() {
 
           setName(companion.name); setRace(matchedRace.name); setCharClass(matchedClass.name); setAllowedOriginFeature(companion.originSpell || null);
           
+          // CONVERSÃO DE STRING OBRIGATÓRIA PARA O TEXTINPUT NÃO BUBAR!
           setStats({
-            FOR: companion.stats.FOR, DES: companion.stats.DES, CON: companion.stats.CON,
-            INT: companion.stats.INT, SAB: companion.stats.SAB, CAR: companion.stats.CAR,
+            FOR: String(companion.stats.FOR), 
+            DES: String(companion.stats.DES), 
+            CON: String(companion.stats.CON),
+            INT: String(companion.stats.INT), 
+            SAB: String(companion.stats.SAB), 
+            CAR: String(companion.stats.CAR),
           });
+
           const totalCompStats = Object.values(companion.stats).reduce((acc: number, val: any) => acc + parseInt(val as string), 0);
           setMaxStatsSum(totalCompStats > 72 ? totalCompStats : 72);
 
           setPersonalityTraits(companion.personality); setIdeals(companion.ideals); setBonds(companion.bonds);
           setFlaws(companion.flaws); setBackstory(companion.backstory); setAlliesOrganizations(companion.allies);
-          setFeaturesTraits(companion.features); setLanguages("Comum e idiomas raciais associados.");
+          
+          // --- DICIONÁRIO DE LORE DOS COMPANHEIROS BG3 ---
+          const bg3Extras: Record<string, { langs: string, traits: string }> = {
+            'Astarion': {
+              langs: 'Comum, Élfico, Subcomum.\nProficiência: Ferramentas de Ladrão, Kit de Disfarce.',
+              traits: 'Vampiro Gerado: Não envelhece, precisa de sangue para sustento. Resiste ao sol graças ao parasita ilitide. Possui cicatrizes infernais nas costas.'
+            },
+            'Lae\'zel': {
+              langs: 'Comum, Gith.\nProficiência: Navegação Astral.',
+              traits: 'Treinamento Militar da Creche K\'liir: Conhecimento tático sobre devoradores de mentes. Foco militar implacável e parasita adormecido.'
+            },
+            'Gale': {
+              langs: 'Comum, Élfico, Dracônico, Celestial.\nProficiência: Tabuleiros de Xadrez de Lança.',
+              traits: 'Prodígio de Waterdeep: Carrega um fragmento corrompido da Trama Netheresa no peito (Orbe) que exige consumo de magia. Mantém tara, uma tressym, como familiar.'
+            },
+            'Shadowheart': {
+              langs: 'Comum, Élfico.\nProficiência: Kit de Venenos, Ferramentas de Ladrão.',
+              traits: 'Agente de Shar: Memórias seladas voluntariamente para proteger os segredos do claustro. Possui uma marca mágica na mão que ocasionalmente causa intensa dor.'
+            },
+            'Umbralma': {
+              langs: 'Comum, Élfico.\nProficiência: Kit de Venenos, Ferramentas de Ladrão.',
+              traits: 'Agente de Shar: Memórias seladas voluntariamente para proteger os segredos do claustro. Possui uma marca mágica na mão que ocasionalmente causa intensa dor.'
+            },
+            'Karlach': {
+              langs: 'Comum, Infernal.\nProficiência: Veículos terrestres (Máquinas de Avernus).',
+              traits: 'Motor Infernal: O coração foi substituído por um motor de Zariel que queima com o calor do inferno. Impossibilitada de tocar as pessoas sem queimá-las no plano material.'
+            },
+            'Wyll': {
+              langs: 'Comum, Infernal.\nProficiência: Jogos de Cartas e Dados.',
+              traits: 'A Lâmina da Fronteira: Fama como caçador de monstros heroico. Possui um olho de envio de pedra que pertence à sua patrona demônio, Mizora.'
+            },
+            'Halsin': {
+              langs: 'Comum, Élfico, Silvestre, Primordial.\nProficiência: Kit de Herbalismo.',
+              traits: 'Ancião do Bosque: Porte físico colossal de urso. Conhecimento ancestral sobre rituais da natureza e sobre a Maldição das Sombras que aflige as terras de Ketheric.'
+            },
+            'Jaheira': {
+              langs: 'Comum, Élfico, Silvestre.\nProficiência: Kit de Venenos, Ferramentas de Navegação.',
+              traits: 'Alto Harpista: Lidera uma rede de espiões e informantes. Possui conhecimento tático de séculos atrás e guarda em sua casa relíquias de aventuras passadas.'
+            },
+            'Minsc': {
+              langs: 'Comum.\nProficiência: Nenhuma em especial, mas Boo compensa.',
+              traits: 'Herói de Rashemen: Possui uma força de vontade e fúria indomáveis. Sempre acompanhado por Boo, seu fiel Hamster Espacial Gigante em Miniatura, a quem pede conselhos.'
+            }
+          };
+
+          const extras = bg3Extras[companion.short_name] || bg3Extras[companion.name] || {
+            langs: 'Comum e idiomas raciais associados.',
+            traits: 'Sobrevivente do Nautiloide Ilitide. Carrega um parasita no cérebro.'
+          };
+
+          setFeaturesTraits(extras.traits);
+          setLanguages(extras.langs);
           setGp(matchedClass.starting_gold || 100);
 
           await setupCharacterExtras(matchedRace, matchedClass, companion, companion.stats);
         }
-      } catch (error) {}
+      } catch (error) { console.error("Erro ao buscar companheiros de origem:", error); }
     } else {
       const randRace = dbRaces[Math.floor(Math.random() * dbRaces.length)];
       const randClass = dbClasses[Math.floor(Math.random() * dbClasses.length)];
       setRace(randRace.name); setCharClass(randClass.name); setAllowedOriginFeature(null);
 
-      const maleNames = ['Bruno', 'João', 'Pedro', 'Bentinho', 'Wilker'];
-      const femaleNames = ['Karoline', 'Maria', 'Ana', 'Beatriz', 'Mariana'];
+      const maleNames = ['Bruno', 'João', 'Pedro', 'Bentinho', 'Tiago', 'Rafael', 'Kaelen', 'Thorin', 'Silas', 'Bram', 'Dorian', 'Faelan', 'Gael', 'Orion', 'Beren', 'Nícolas', 'Zoltan', 'Vagner', 'Rurik', 'Luiz', 'Gustavo', 'Leonardo', 'Matheus', 'Felipe', 'Wilker', 'Dante', 'Vítor', 'Enzo', 'Ramon', 'Aldric', 'Cedric', 'Theron', 'Kael', 'Edrin', 'Lucan', 'Magnus', 'Hadrian', 'Alaric', 'Tiberius', 'Cassian', 'Rowan', 'Darion', 'Valen', 'Arthos', 'Kieran', 'Ulric', 'Fenris', 'Maelor', 'Talon', 'Aeron', 'Gareth', 'Eamon', 'Soren', 'Draven'];
+      const femaleNames = ['Karoline', 'Maria', 'Ana', 'Beatriz', 'Mariana', 'Amanda', 'Lyra', 'Elara', 'Ilyana', 'Ayla', 'Morgana', 'Bianca', 'Catarine', 'Fernanda', 'Isabela', 'Sofia', 'Camila', 'Larissa', 'Yanaele', 'Evelyn', 'Alícia', 'Lívia', 'Giovanna', 'Carla', 'Júlia', 'Seraphine', 'Nyx', 'Thalia', 'Isolde', 'Rhiannon', 'Selene', 'Freya', 'Arwen', 'Kaelis', 'Vespera', 'Aurora', 'Elysia', 'Maeryn', 'Zara', 'Lyanna', 'Ophelia', 'Kallista', 'Ysolda', 'Miriel', 'Aerin', 'Velanna', 'Lunara', 'Sylphie'];
       const isMale = Math.random() > 0.5;
       const randomFirstName = isMale ? maleNames[Math.floor(Math.random() * maleNames.length)] : femaleNames[Math.floor(Math.random() * femaleNames.length)];
 
-      const validTitles = ['o Aventureiro', 'de Tal', 'o Desconhecido'];
+      const classTitles: Record<string, string[]> = {
+        'Bárbaro': isMale ? ['o Bárbaro', 'o Implacável', 'o Feroz', 'o Quebra-Crânios'] : ['a Bárbara', 'a Implacável', 'a Feroz', 'a Quebra-Crânios'],
+        'Bardo': isMale ? ['o Bardo', 'o Cancioneiro', 'o Galante', 'Voz-de-Ouro'] : ['a Barda', 'a Cancioneira', 'a Galante', 'Voz-de-Ouro'],
+        'Bruxo': isMale ? ['o Bruxo', 'o Amaldiçoado', 'o Ocultista', 'Corta-Sombras'] : ['a Bruxa', 'a Amaldiçoada', 'a Ocultista', 'Corta-Sombras'],
+        'Clérigo': isMale ? ['o Clérigo', 'o Devoto', 'o Curandeiro', 'Luz-Divina', 'Bicuda Santa', 'Bazuca Celestial'] : ['a Clériga', 'a Devota', 'a Curandeira', 'Luz-Divina', 'Bicuda Santa', 'Bazuca Celestial'],
+        'Druida': isMale ? ['o Druida', 'o Selvagem', 'Fala-com-Feras', 'da Floresta'] : ['a Druida', 'a Selvagem', 'Fala-com-Feras', 'da Floresta'],
+        'Feiticeiro': isMale ? ['o Feiticeiro', 'o Nato', 'Sangue-Mágico', 'o Canalizador'] : ['a Feiticeira', 'a Nata', 'Sangue-Mágico', 'a Canalizadora'],
+        'Guerreiro': isMale ? ['o Guerreiro', 'o Veterano', 'Braço-de-Ferro', 'o Colosso'] : ['a Guerreira', 'a Veterana', 'Braço-de-Ferro', 'a Colosso'],
+        'Ladino': isMale ? ['o Ladino', 'Pé-Ligeiro', 'Mão-Leve', 'o Vigarista', 'das Sombras'] : ['a Ladina', 'Pé-Ligeiro', 'Mão-Leve', 'a Vigarista', 'das Sombras'],
+        'Mago': isMale ? ['o Mago', 'o Sábio', 'o Estudioso', 'Tomo-Vivo'] : ['a Maga', 'a Sábia', 'a Estudiosa', 'Tomo-Vivo'],
+        'Monge': isMale ? ['o Monge', 'Punho-de-Aço', 'o Calmo', 'Passo-Leve'] : ['a Monge', 'Punho-de-Aço', 'a Calma', 'Passo-Leve'],
+        'Paladino': isMale ? ['o Paladino', 'o Justo', 'o Cruzado', 'Escudo-Radiante'] : ['a Paladina', 'a Justa', 'a Cruzada', 'Escudo-Radiante'],
+        'Patrulheiro': isMale ? ['o Patrulheiro', 'o Caçador', 'Olho-de-Águia', 'o Errante'] : ['a Patrulheira', 'a Caçadora', 'Olho-de-Águia', 'a Errante'],
+      };
+
+      const genericTitles = isMale 
+        ? [
+            'de Tal', 'Sem-Teto', 'da Taberna', 'o Azarado', 'o Magnífico', 
+            'meio Tan Tan', 'o Errante', 'o Imortal', 'o Inquebrável', 'o Destemido', 
+            'o Caído', 'o Renascido', 'Sangue-de-Ferro', 'Sussurro-da-Noite', 
+            'Punho-Sombrio', 'Lâmina-Veloz', 'de Rívia', 'Universitário', 'Pedra de tropeço', 'Batutinha'
+          ] 
+        : [
+            'de Tal', 'Sem-Teto', 'da Taberna', 'a Azarada', 'a Magnífica', 
+            'meio Tan Tan', 'a Errante', 'a Imortal', 'a Inquebrável', 'a Destemida', 
+            'a Caída', 'a Renascida', 'Sangue-de-Ferro', 'Sussurro-da-Noite', 
+            'Punho-Sombrio', 'Lâmina-Veloz', 'de Rívia', 'Universitária', 'Pedra de tropeço', 'Batutinha'
+          ];
+
+      const validTitles = [...(classTitles[randClass.name] || []), ...genericTitles];
       const randomTitle = validTitles[Math.floor(Math.random() * validTitles.length)];
 
       setName(`${randomFirstName} ${randomTitle}`);
@@ -698,12 +820,19 @@ export default function CreateCharacterScreen() {
           if (lockedFeatures.includes(s.name)) return true;
 
           // Se for Magia: Bloqueia magias que não são de Nível 1 ou Truque (o personagem está no Nível 1)
-          if (sCat === 'Magia' && s.level !== 'Truque' && s.level !== 'Nível 1') return false;
+          if (sCat === 'Magia') {
+             if (s.level === 'Truque' && maxCantrips <= 0) return false;
+             if (s.level === 'Nível 1' && maxSpellsLvl1 <= 0) return false;
+             if (s.level !== 'Truque' && s.level !== 'Nível 1') return false;
+          }
 
           // Se for Habilidade ou Passiva extra (ex: Estilo de Luta): Bloqueia se o pré-requisito for maior que 1.
-          if ((sCat === 'Habilidade' || sCat === 'Passiva') && s.class_level_required) {
-             const reqLvl = parseInt(String(s.class_level_required), 10) || 1;
-             if (reqLvl > 1) return false;
+          if (sCat === 'Habilidade' || sCat === 'Passiva') {
+             if (maxExtraPassives <= 0) return false;
+             if (s.class_level_required) {
+                const reqLvl = parseInt(String(s.class_level_required), 10) || 1;
+                if (reqLvl > 1) return false;
+             }
           }
 
           return true;

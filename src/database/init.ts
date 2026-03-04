@@ -598,6 +598,119 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       ('race', 'Tiefling', 1, 1, 0, 0, 0, 0),
       ('race', 'Githyanki', 1, 1, 0, 0, 0, 0);
     `);
+    // ==========================================
+    // INSERÇÃO DOS PERSONAGENS DE BALDUR'S GATE 3
+    // ==========================================
+    await db.execAsync(`INSERT INTO bg3_companions (name, short_name, race, class_name, origin_spell, skills, stats, personality, ideals, bonds, flaws, backstory, allies, features) VALUES 
+      (
+        'Lae''zel de K''liir', 'Lae''zel', 'Githyanki', 'Guerreiro', 'Mãos Mágicas (Githyanki)', 
+        '["skill_atletismo", "skill_acrobacia", "skill_intimidacao", "skill_sobrevivencia"]', 
+        '{"FOR": 17, "DES": 13, "CON": 15, "INT": 10, "SAB": 12, "CAR": 8}', 
+        'Feroz, impaciente e estritamente focada no dever militar.', 
+        'Dever. Minha vida pertence à Rainha Lich Vlaakith e ao meu povo.', 
+        'A purificação. Devo encontrar a Creche Githyanki para me livrar deste parasita ilitide.', 
+        'Arrogância. Considero as outras raças do Plano Material fracas e inferiores.', 
+        'Treinada no Plano Astral para ser uma guerreira implacável, fui capturada por Devoradores de Mentes. Agora, preciso provar meu valor para minha rainha e evitar a transformação (ceremorfose).', 
+        'Lealdade apenas ao Império Githyanki e a Vlaakith.', 
+        '["Segundo Fôlego", "Estilo de Luta: Combate com Armas Grandes"]'
+      ),
+      (
+        'Karlach Cliffgate', 'Karlach', 'Tiefling', 'Bárbaro', 'Fúria do Motor Infernal', 
+        '["skill_atletismo", "skill_intimidacao", "skill_sobrevivencia", "skill_percepcao"]', 
+        '{"FOR": 17, "DES": 13, "CON": 14, "INT": 8, "SAB": 12, "CAR": 10}', 
+        'Extremamente enérgica, protetora e animada com as coisas simples da vida.', 
+        'Vida. Fiquei no inferno tempo demais, agora quero viver, amar e aproveitar cada segundo.', 
+        'Desejo encontrar o ferreiro mecânico que consertará o motor que substitui meu coração.', 
+        'Coração em chamas. Meu motor infernal queima tão quente que eu não posso tocar as pessoas que amo sem machucá-las.', 
+        'Fui vendida como escrava para o arquidiabo Zariel e forçada a lutar na Guerra Sangrenta em Avernus por uma década. Escapei no nautiloide, mas meu coração mecânico está superaquecendo neste plano.', 
+        'Velhos amigos das docas de Baldur''s Gate e ferreiros mecânicos.', 
+        '["Fúria", "Defesa Sem Armadura"]'
+      ),
+      (
+        'Astarion Ancunín', 'Astarion', 'Alto Elfo', 'Ladino', 'Mordida Vampírica', 
+        '["skill_furtividade", "skill_blefar", "skill_percepcao", "skill_prestidigitacao"]', 
+        '{"FOR": 8, "DES": 17, "CON": 14, "INT": 13, "SAB": 13, "CAR": 10}', 
+        'Elegante, sarcástico e sempre em busca de prazeres pessoais ou sangue fresco.', 
+        'Liberdade. Nunca mais serei escravo ou marionete de ninguém.', 
+        'Minha liberdade recém-descoberta e a sede de vingança contra Cazador, meu antigo mestre.', 
+        'Fome insaciável e extrema dificuldade em confiar nas intenções de qualquer pessoa.', 
+        'Fui um magistrado de Baldur''s Gate, transformado em vampiro gerado há séculos. Agora livre do controle do meu mestre devido ao girino em minha mente, busco poder para nunca mais ser subjugado.', 
+        'Nenhum aliado confiável, apenas "associados" temporários que me sejam úteis.', 
+        '["Ataque Furtivo", "Especialização (Ladino)", "Visão no Escuro"]'
+      ),
+      (
+        'Gale Dekarios', 'Gale', 'Humano', 'Mago', 'Orbe de Netheril', 
+        '["skill_arcanismo", "skill_historia", "skill_investigacao", "skill_intuicao"]', 
+        '{"FOR": 8, "DES": 13, "CON": 15, "INT": 17, "SAB": 10, "CAR": 12}', 
+        'Educado, romântico, excessivamente falante e apaixonado pela Trama.', 
+        'Conhecimento. A magia é a linguagem do universo, e eu serei fluente nela.', 
+        'Meu amor por Mystra, a Deusa da Magia, é a força motriz e a ruína da minha vida.', 
+        'Ambição desmedida. Minha arrogância em buscar o poder me amaldiçoou com uma bomba no peito.', 
+        'Um prodígio mágico de Waterdeep. Em uma tentativa de provar meu amor à Deusa Mystra, absorvi um fragmento de magia Netheresa corrompida, que agora ameaça destruir tudo ao meu redor se não for alimentada com itens mágicos.', 
+        'Tara, minha familiar tressym voadora, e os estudiosos de Waterdeep.', 
+        '[]'
+      ),
+      (
+        'Halsin', 'Halsin', 'Elfo da Floresta', 'Druida', '', 
+        '["skill_natureza", "skill_medicina", "skill_sobrevivencia", "skill_lidar_animais"]', 
+        '{"FOR": 16, "DES": 10, "CON": 16, "INT": 10, "SAB": 16, "CAR": 10}', 
+        'Sereno, sábio e paciente. Prefere a companhia dos ursos à política das cidades.', 
+        'Equilíbrio. A natureza deve ser preservada e curada das corrupções que a ameaçam.', 
+        'O Bosque Esmeralda. Dediquei minha vida a protegê-lo como Primeiro Druida.', 
+        'Muitas vezes assumo fardos pesados demais sozinho, sentindo-me culpado pelos erros do passado.', 
+        'Atuei como o Primeiro Druida do Bosque Esmeralda. Há mais de um século, lutei contra a maldição das sombras de Ketheric Thorm e falhei em impedir que a terra fosse consumida. Hoje busco redenção.', 
+        'Círculo dos Druidas e os espíritos da floresta.', 
+        '["Visão no Escuro"]'
+      ),
+      (
+        'Jaheira', 'Jaheira', 'Meio-Elfo', 'Druida', '', 
+        '["skill_natureza", "skill_percepcao", "skill_intuicao", "skill_sobrevivencia", "skill_intimidacao"]', 
+        '{"FOR": 10, "DES": 16, "CON": 14, "INT": 10, "SAB": 16, "CAR": 12}', 
+        'Pragmática, direta, de humor seco e com pouca paciência para tolos.', 
+        'Responsabilidade. Alguém precisa limpar a bagunça que os "heróis" deixam para trás.', 
+        'Meus Harpistas e a cidade de Baldur''s Gate, que jurei proteger das sombras.', 
+        'Desconfio de todos por natureza, o que me impede de criar laços profundos facilmente.', 
+        'Sou uma lenda viva, ex-companheira de Gorion e heroína da crise da Prole de Bhaal. Lidero os Harpistas para manter o equilíbrio no mundo, operando a partir da Estalagem da Última Luz.', 
+        'A facção dos Harpistas e os heróis do passado.', 
+        '[]'
+      ),
+      (
+        'Minsc (e Boo)', 'Minsc', 'Humano', 'Patrulheiro', '', 
+        '["skill_atletismo", "skill_sobrevivencia", "skill_lidar_animais", "skill_intimidacao"]', 
+        '{"FOR": 20, "DES": 12, "CON": 16, "INT": 8, "SAB": 10, "CAR": 10}', 
+        'Inabalavelmente otimista, heróico, fala com seu hamster de estimação e resolve as coisas na base da força.', 
+        'Justiça! O mal deve ser esmagado pela bota pesada da bondade!', 
+        'Boo, meu hamster espacial gigante em miniatura, e minha bússola moral inseparável.', 
+        'Não entendo metáforas e costumo atacar primeiro quando vejo o que considero "mal".', 
+        'Um herói lendário de Rashemen que viajou por Faerûn há um século. Passei mais de cem anos transformado em estátua de pedra, até ser libertado acidentalmente em uma Baldur''s Gate moderna e confusa.', 
+        'Boo, Jaheira e qualquer um que lute pelo bem.', 
+        '["Inimigo Favorito", "Explorador Nato"]'
+      ),
+      (
+        'Wyll Ravengard', 'Wyll', 'Humano', 'Bruxo', '', 
+        '["skill_persuasao", "skill_intimidacao", "skill_arcanismo", "skill_historia"]', 
+        '{"FOR": 8, "DES": 13, "CON": 14, "INT": 13, "SAB": 10, "CAR": 17}', 
+        'Heroico, fanfarrão, cortês, sempre se apresenta como o "Lâmina da Fronteira".', 
+        'Heroísmo. A lenda de um herói deve sempre proteger o povo e inspirar os fracos.', 
+        'Meu pai, o Grão-Duque Ravengard, que me exilou sem saber a verdade do meu sacrifício.', 
+        'Fiz um pacto com a diaba Mizora e agora minha alma está atrelada à vontade de um demônio.', 
+        'Filho de um nobre poderoso. Quando a cidade esteve sob ameaça de um culto draconiano, fiz um pacto sombrio para salvá-la. Fui deserdado por usar magias profanas. Agora caço monstros como o Lâmina da Fronteira.', 
+        'Os camponeses que salvei, refugiados e os Tieflings.', 
+        '[]'
+      ),
+      (
+        'Umbralma', 'ShadowHeart', 'Meio-Elfo', 'Clérigo', 'Bênção da Divindade Sombria', 
+        '["skill_religiao", "skill_medicina", "skill_furtividade", "skill_blefar"]', 
+        '{"FOR": 10, "DES": 13, "CON": 15, "INT": 10, "SAB": 17, "CAR": 10}', 
+        'Secreta, devota, cautelosa, mas com um coração mole que tenta esconder.', 
+        'Fé. A escuridão abriga segredos e verdades que a luz ofusca.', 
+        'Minha missão. Fui encarregada de recuperar um artefato sagrado vital para minha Deusa.', 
+        'Minha memória foi apagada. Não sei quem sou de verdade, e tenho um pavor irracional de lobos.', 
+        'Sou uma clériga e agente de elite do claustro de Shar em Baldur''s Gate. Minhas memórias foram seladas como parte do meu treinamento para uma missão suicida de roubar o Artefato Prismático.', 
+        'A Igreja de Shar (Nossa Senhora da Perda).', 
+        '[]'
+      )
+    ;`);
 
   } else {
     console.log('Banco de dados já populado. Pulando inserção.');

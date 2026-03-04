@@ -2,7 +2,7 @@
   "expo": {
     "name": "Ficha D&D",
     "slug": "ficha-dnd",
-    "version": "1.1.8",
+    "version": "0.5.10",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "fichadnd",
