@@ -13,7 +13,7 @@ const DEFAULT_SLOTS = {
   mainHand: null, offHand: null, ranged: null, lightSource: null 
 };
 
-const SPELL_LEVELS = ['Todos', 'Truque', 'Nível 1', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6', 'Nível 7', 'Nível 8', 'Nível 9'];
+const SPELL_LEVELS = ['Todos', 'Passiva', 'Truque', 'Nível 1', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6', 'Nível 7', 'Nível 8', 'Nível 9'];
 const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 
 export default function CharacterSheetScreen() {
@@ -129,7 +129,7 @@ export default function CharacterSheetScreen() {
           // CORREÇÃO: Puxa todas as classes conjuradoras e verifica se o personagem tem alguma delas
           const casterClasses = await db.getAllAsync<{name: string}>(`SELECT name FROM classes WHERE is_caster = 1`);
           const hasSpells = casterClasses.some(c => charData.class.includes(c.name));
-          setCharHasSpells(hasSpells);
+          setCharHasSpells(true);
 
           if (charData.spells.length > 0) {
             const placeholders = charData.spells.map(() => '?').join(',');
@@ -495,10 +495,21 @@ export default function CharacterSheetScreen() {
 
   const getFilteredAndSortedSpells = () => {
     let filtered = spellDetails.filter(spell => {
+      // 1. Filtro de Busca por Texto
       if (spellSearch && !spell.name.toLowerCase().includes(spellSearch.toLowerCase())) return false;
-      if (spellLevelFilter !== 'Todos' && spell.level !== spellLevelFilter) return false;
       
-      // Ajuste para ler as novas colunas
+      // 2. Filtro de Nível / Passiva (Ajustado)
+      if (spellLevelFilter !== 'Todos') {
+        if (spellLevelFilter === 'Passiva') {
+          // Se for Passiva, verifica tanto o nível quanto o tempo de conjuração
+          if (spell.level !== 'Passiva' && spell.casting_time !== 'Passiva') return false;
+        } else {
+          // Se não for Passiva, filtra pelo nível exato
+          if (spell.level !== spellLevelFilter) return false;
+        }
+      }
+      
+      // 3. Filtro de Efeitos
       if (spellEffectFilter !== 'Todos') {
         const dmgText = (spell.damage_dice || spell.damage || '').toLowerCase();
         const typeText = (spell.damage_type || '').toLowerCase();
@@ -519,6 +530,7 @@ export default function CharacterSheetScreen() {
 
     return filtered;
   };
+
   const filteredSpellsList = getFilteredAndSortedSpells();
 
   if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#00bfff" /></View>;
@@ -677,10 +689,10 @@ export default function CharacterSheetScreen() {
 
       <View>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabContainer}>
-          {['stats', 'profs', 'inv'].concat(charHasSpells ? ['spells'] : []).map((t) => (
+          {['stats', 'profs', 'inv', 'spells'].map((t) => (
             <TouchableOpacity key={t} style={[styles.tab, activeTab === t && styles.activeTab]} onPress={() => setActiveTab(t as any)}>
               <Text style={[styles.tabText, activeTab === t && styles.activeTabText]}>
-                {t === 'stats' ? 'STATUS' : t === 'profs' ? 'PROFS' : t === 'inv' ? 'MOCHILA' : 'MAGIAS'}
+                {t === 'stats' ? 'STATUS' : t === 'profs' ? 'PROFS' : t === 'inv' ? 'MOCHILA' : 'Habilidades'}
               </Text>
             </TouchableOpacity>
           ))}

@@ -1,3 +1,4 @@
+// ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
@@ -10,28 +11,48 @@ import {
   StyleSheet, Text, TextInput, TouchableOpacity, View
 } from 'react-native';
 
+// IMPORTAÇÃO DO NOVO COMPONENTE
+import SpellSelector, { SpellItem } from '../components/SpellSelector';
+
 // ================= TIPAGENS =================
-type RaceItem = { id: number; name: string; stat_bonuses: string; speed: string; criador?: string };
-type ClassItem = { id: number; name: string; recommended_stats: string; starting_equipment: string; starting_gold: number; hit_dice: number; saves: string; subclass_level: number; is_caster: number; criador?: string };
+type RaceItem = { id: number; name: string; stat_bonuses: string; speed: string; features: string; criador?: string };
+type ClassItem = { id: number; name: string; recommended_stats: string; starting_equipment: string; starting_gold: number; hit_dice: number; saves: string; subclass_level: number; is_caster: number; features: string; criador?: string };
 type SkillItem = { id: string; name: string; stat: string };
-type SpellItem = { 
-  id: number; 
-  name: string; 
-  level: string; 
-  casting_time?: string; 
-  range?: string; 
-  damage?: string; 
-  description?: string;
-  classes?: string;
-};
 type DbItem = { id: number; name: string; weight: number; criador?: string };
 type InventoryItem = { name: string; qty: number; weight: number };
-type StartingKit = { id: number; name: string; target_name: string; items: string; criador?: string };
+type StartingKit = { id: number; name: string; target_name: string; target_type?: string; items: string; criador?: string };
+type SpellProgression = { cantrips_known: number, spells_known: number, slot_1: number };
+
+// Força a categoria para os contadores não quebrarem
+const getCategory = (spell?: SpellItem): string => {
+  if (!spell) return 'Desconhecido';
+  if (spell.category && spell.category !== 'Desconhecido') return spell.category;
+  if (spell.level === 'Truque' || spell.level?.includes('Nível')) return 'Magia';
+  if (spell.casting_time === 'Passiva' || spell.level === 'Passiva') return 'Passiva';
+  return 'Habilidade';
+};
+
+// Lista de magias/features que pertencem EXCLUSIVAMENTE aos personagens de BG3
+const BG3_ORIGIN_FEATURES = [
+  "Mãos Mágicas (Githyanki)", 
+  "Mordida Vampírica", 
+  "Fúria do Motor Infernal", 
+  "Orbe de Netheril", 
+  "Bênção da Divindade Sombria", 
+  "Golpe Destruidor de Almas"
+];
+
+// Lista de Habilidades base das Classes para serem tratadas como Passivas
+const BASE_CLASS_FEATURES = [
+  "Fúria", "Defesa Sem Armadura", "Segundo Fôlego", "Imposição das Mãos", "Sentido Divino", "Inimigo Favorito", "Explorador Nato", "Ataque Extra", "Ação Surto"
+];
 
 export default function CreateCharacterScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const isRandomizing = useRef(false);
+
+  const hasConfirmedRandomize = useRef(false);
 
   // ----- ESTADOS DO BANCO DE DADOS -----
   const [dbRaces, setDbRaces] = useState<RaceItem[]>([]);
@@ -66,11 +87,15 @@ export default function CreateCharacterScreen() {
   const [featuresTraits, setFeaturesTraits] = useState('');
   const [languages, setLanguages] = useState('');
 
+  // ----- ESTADOS DE MAGIAS E HABILIDADES -----
   const [selectedSpells, setSelectedSpells] = useState<string[]>([]);
-  const [spellSearch, setSpellSearch] = useState('');
-  
-  const [selectedSpellDetail, setSelectedSpellDetail] = useState<SpellItem | null>(null);
-  const [spellDetailModalVisible, setSpellDetailModalVisible] = useState(false);
+  const [spellsModalVisible, setSpellsModalVisible] = useState(false);
+  const [maxCantrips, setMaxCantrips] = useState(0);
+  const [maxSpellsLvl1, setMaxSpellsLvl1] = useState(0);
+
+  // Estado para blindar magias de origem e passivas inatas
+  const [allowedOriginFeature, setAllowedOriginFeature] = useState<string | null>(null);
+  const [lockedFeatures, setLockedFeatures] = useState<string[]>([]);
 
   // Estados de Inventário e Kit
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -84,16 +109,10 @@ export default function CreateCharacterScreen() {
   const [modalType, setModalType] = useState<'race' | 'class' | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // ALERTA CUSTOMIZADO
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
 
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string, style?: string}[]) => {
-    setCustomAlert({
-      visible: true,
-      title,
-      message,
-      buttons: buttons || [{ text: 'OK', color: '#00bfff' }]
-    });
+    setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: '#00bfff' }] });
   };
 
   // ================= CÁLCULOS TÉCNICOS =================
@@ -125,14 +144,75 @@ export default function CreateCharacterScreen() {
   if (charClass === 'Ladino') maxSkillsAllowed += 2;
   else if (charClass === 'Bardo' || charClass === 'Patrulheiro') maxSkillsAllowed += 1;
 
-  const MAX_CANTRIPS = 3;
-  const MAX_SPELLS_LVL1 = 4;
+  // CÁLCULO DE PASSIVAS EXTRAS (Ex: Estilo de Luta do Guerreiro)
+  let maxExtraPassives = 0;
+  if (charClass === 'Guerreiro') maxExtraPassives = 1; 
+
+  const isCasterClass = maxCantrips > 0 || maxSpellsLvl1 > 0;
+
+  // ================= FUNÇÕES DE PROGRESSÃO DE MAGIA =================
+  const fetchSpellLimits = async (cName: string, rName: string, currentStats: any = stats) => {
+    if (cName === 'Selecione uma classe') return { cantrips: 0, lvl1: 0 };
+    
+    let calcCantrips = 0;
+    let calcLvl1 = 0;
+
+    let dbCantrips: number | null = null;
+    let dbLvl1: number | null = null;
+    let dbRaceCantrips: number | null = null;
+
+    try {
+      const classProg = await db.getFirstAsync<SpellProgression>(
+        `SELECT * FROM spellcasting_progression WHERE source_type = 'class' AND source_name = ? AND level = 1`, 
+        [cName]
+      );
+
+      if (classProg) {
+        dbCantrips = classProg.cantrips_known || 0;
+        
+        // Magias fixas conhecidas vs Magias preparadas diariamente
+        if (classProg.spells_known > 0) {
+           dbLvl1 = classProg.spells_known;
+        } else {
+           const intMod = Math.floor((parseInt(currentStats.INT) - 10) / 2);
+           const sabMod = Math.floor((parseInt(currentStats.SAB) - 10) / 2);
+           const carMod = Math.floor((parseInt(currentStats.CAR) - 10) / 2);
+
+           if (cName === 'Mago') dbLvl1 = Math.max(1 + intMod, 1);
+           else if (cName === 'Clérigo' || cName === 'Druida') dbLvl1 = Math.max(1 + sabMod, 1);
+           else if (cName === 'Paladino' || cName === 'Patrulheiro') dbLvl1 = 0;
+           else if (classProg.slot_1 > 0) dbLvl1 = classProg.slot_1 + (classProg.cantrips_known > 0 ? 2 : 0);
+           else dbLvl1 = 0;
+        }
+      }
+
+      const raceProg = await db.getFirstAsync<SpellProgression>(
+        `SELECT cantrips_known FROM spellcasting_progression WHERE source_type = 'race' AND source_name = ? AND level = 1`, 
+        [rName]
+      );
+
+      if (raceProg) { dbRaceCantrips = raceProg.cantrips_known || 0; }
+    } catch (e) {}
+
+    // Fallbacks caso banco falhe
+    if (dbCantrips !== null && dbLvl1 !== null) {
+      calcCantrips = dbCantrips;
+      calcLvl1 = dbLvl1;
+    } else {
+      if (['Mago', 'Feiticeiro'].includes(cName)) { calcCantrips = 3; calcLvl1 = 4; }
+      else if (['Bardo', 'Bruxo', 'Clérigo', 'Druida'].includes(cName)) { calcCantrips = 2; calcLvl1 = 3; }
+      else if (['Paladino', 'Patrulheiro'].includes(cName)) { calcCantrips = 0; calcLvl1 = 0; }
+    }
+
+    if (dbRaceCantrips !== null) { calcCantrips += dbRaceCantrips; } 
+    else { if (['Alto Elfo', 'Drow', 'Tiefling', 'Githyanki'].includes(rName)) { calcCantrips += 1; } }
+
+    return { cantrips: calcCantrips, lvl1: calcLvl1 };
+  };
 
   // ================= FUNÇÕES DE APOIO =================
   const openSelectionModal = (type: 'race' | 'class') => { 
-    setModalType(type); 
-    setSearchQuery(''); 
-    setModalVisible(true); 
+    setModalType(type); setSearchQuery(''); setModalVisible(true); 
   };
 
   const getFilteredData = () => {
@@ -141,143 +221,135 @@ export default function CreateCharacterScreen() {
     );
   };
 
-  // ================= GERAÇÕES ALEATÓRIAS =================
   const generateRandomLore = () => {
     const archetypes = [
       {
         name: "O Malandro das Ruas",
+        allowedClasses: ['Ladino', 'Bardo', 'Guerreiro', 'Bruxo', 'Monge'],
         traits: ['Sempre encontro uma forma de rir, mesmo nas piores situações.', 'Sempre desconfio das intenções de estranhos antes de confiar.', 'Gosto de testar os limites das pessoas só para ver como reagem.', 'Tenho dificuldade em levar qualquer autoridade a sério.', 'Falo o que penso, mesmo quando deveria ficar calado.'],
         ideals: ['Liberdade. Correntes são feitas para serem quebradas.', 'Caos. A ordem excessiva sufoca a vida.', 'Comunidade. Devemos cuidar uns dos outros para sobreviver.'],
         bonds: ['Fui expulso da minha vila e um dia voltarei para provar meu valor.', 'Tenho um rival que jurei superar em tudo.', 'Estou em busca de um ente querido que desapareceu há anos.'],
         flaws: ['Tenho um vício em jogos de cartas que sempre me deixa pobre.', 'Impulsivo, ajo antes de pensar se a emoção falar mais alto.', 'Costumo mentir mesmo quando não há necessidade.', 'Não sei lidar bem com autoridade.'],
-        backstory: ['Cresceu nas ruas da capital, aprendendo a sobreviver desde cedo furtando pães e frutas nas feiras.', 'Foi acusado injustamente de um crime e agora vive fugindo.'],
-        allies: ['Tem uma dívida eterna com a Taverneira do "Javali Saltitante".', 'Mantém contato obscuro com o sindicato de contrabandistas do cais.', 'Tem um informante nas masmorras da cidade.', 'Possui um contato no mercado negro.'],
-        features: ['Consegue dormir profundamente em qualquer lugar, mesmo no chão de pedra.', 'Sua sombra parece se mover um segundo atrasada.', 'Tem uma tolerância absurdamente alta para bebidas fortes.'],
-        languages: ['Comum, Goblin e Símbolos Secretos de Ladrões.', 'Comum, Subcomum e Símbolos Secretos de Ladrões.', 'Comum, Orc e Proficiência com Cartas de Baralho.']
+        backstory: ['Cresci nas ruas da capital, aprendendo a sobreviver desde cedo furtando pães e frutas nas feiras.', 'Fui acusado injustamente de um crime e agora vivo fugindo.', 'Trabalhava como capanga de um agiota, até o dia em que decidi roubar dele e fugir.'],
+        allies: ['Tenho uma dívida eterna com a Taverneira do "Javali Saltitante".', 'Mantenho contato obscuro com o sindicato de contrabandistas do cais.', 'Tenho um informante nas masmorras da cidade.', 'Possuo um contato no mercado negro.'],
+        features: ['Consigo dormir profundamente em qualquer lugar, mesmo no chão de pedra.', 'Minha sombra parece se mover um segundo atrasada.', 'Tenho uma tolerância absurdamente alta para bebidas fortes.'],
+        extraLanguages: ['Goblin', 'Subcomum', 'Símbolos Secretos de Ladrões', 'Proficiência com Cartas de Baralho']
       },
       {
         name: "O Devoto Fanático",
+        allowedClasses: ['Clérigo', 'Paladino', 'Monge'],
         traits: ['Tudo o que faço é em nome da minha fé.', 'Vejo sinais divinos em pequenos acontecimentos.', 'Tenho dificuldade em entender quem não segue uma crença.', 'Costumo citar escrituras em momentos inadequados.'],
         ideals: ['Fé. A verdadeira força vem da devoção absoluta.', 'Sacrifício. Grandes recompensas exigem grandes renúncias.', 'Purificação. O mal deve ser erradicado pela raiz.'],
         bonds: ['Protejo um templo que foi quase destruído.', 'Minha vida pertence à divindade que me salvou.', 'Carrego uma relíquia sagrada que não pode cair em mãos erradas.'],
         flaws: ['Sou intolerante com crenças opostas.', 'Posso ir longe demais ao tentar "corrigir" alguém.', 'Confundo minha vontade com a vontade divina.'],
-        backstory: ['Sobreviveu a uma tragédia que acredita ter sido intervenção divina.', 'Foi criado dentro de um templo e nunca conheceu outra vida.', 'Recebeu uma visão profética que mudou seu destino.'],
-        allies: ['É respeitado por membros de sua ordem religiosa.', 'Recebe apoio discreto de um sacerdote influente.', 'Possui contato com um inquisidor da fé.'],
-        features: ['Sua presença intimida hereges.', 'Sua voz ecoa com autoridade quando fala de fé.', 'Possui marcas sagradas discretas pelo corpo.'],
-        languages: ['Comum, Celestial e Proficiência com Kit de Caligrafia.', 'Comum, Infernal e Proficiência com Kit de Investigação.']
+        backstory: ['Sobrevivi a uma tragédia que acredito ter sido intervenção divina.', 'Fui criado dentro de um templo e nunca conheci outra vida.', 'Recebi uma visão profética que mudou meu destino de uma hora para a outra.'],
+        allies: ['Sou respeitado por membros de minha ordem religiosa.', 'Recebo apoio discreto de um sacerdote influente.', 'Possuo contato com um inquisidor da fé.'],
+        features: ['Minha presença intimida hereges e cultistas.', 'Minha voz ecoa com autoridade quando falo de fé.', 'Possuo marcas sagradas discretas pelo corpo.'],
+        extraLanguages: ['Celestial', 'Infernal', 'Proficiência com Kit de Caligrafia', 'Abissal']
       },
       {
-        name: "O Alquimista Obcecado",
-        traits: ['Anoto tudo em cadernos cheios de fórmulas.', 'Vejo potencial explosivo em objetos comuns.', 'Fico empolgado demais ao testar hipóteses.', 'Perco a noção do tempo quando estou pesquisando.'],
-        ideals: ['Descoberta. Sempre há algo novo a ser criado.', 'Transformação. Nada é fixo; tudo pode mudar.', 'Ambição. O impossível é apenas uma questão de tentativa.'],
-        bonds: ['Busco aperfeiçoar a fórmula que matou meu antigo mentor.', 'Protejo um manuscrito raro que contém conhecimento proibido.', 'Prometi curar uma doença incurável.'],
-        flaws: ['Subestimo riscos de experimentos.', 'Tenho dificuldade em aceitar falhas.', 'Às vezes trato pessoas como cobaias involuntárias.'],
-        backstory: ['Aprendiz de um alquimista excêntrico.', 'Expulso de uma academia por práticas perigosas.', 'Descobriu cedo talento para manipular substâncias raras.'],
-        allies: ['Tem contato com um fornecedor de ingredientes exóticos.', 'Recebe cartas ocasionais de um antigo colega de estudos.', 'Conhece um médico disposto a testar novas misturas.'],
-        features: ['Cheira constantemente a reagentes químicos.', 'Tem pequenas queimaduras antigas nas mãos.', 'Carrega frascos escondidos nas roupas.'],
-        languages: ['Comum, Dracônico e Proficiência com Kit de Alquimia.', 'Comum, Élfico e Proficiência com Kit de Herbalismo.']
+        name: "O Alquimista/Estudioso Obcecado",
+        allowedClasses: ['Mago', 'Feiticeiro', 'Ladino', 'Bruxo', 'Artífice'],
+        traits: ['Anoto tudo em cadernos cheios de fórmulas e desenhos.', 'Vejo potencial explosivo em objetos comuns.', 'Fico empolgado demais ao testar hipóteses perigosas.', 'Perco a noção do tempo quando estou pesquisando algo novo.'],
+        ideals: ['Descoberta. Sempre há algo novo a ser criado ou entendido.', 'Transformação. Nada é fixo; tudo pode mudar.', 'Ambição. O impossível é apenas uma questão de tentativa e erro.'],
+        bonds: ['Busco aperfeiçoar a fórmula mágica que matou meu antigo mentor.', 'Protejo um manuscrito raro que contém conhecimento proibido.', 'Prometi achar a cura para uma praga que assola minha região.'],
+        flaws: ['Subestimo riscos de experimentos e feitiços instáveis.', 'Tenho dificuldade extrema em aceitar falhas.', 'Às vezes trato pessoas como cobaias involuntárias.'],
+        backstory: ['Fui aprendiz de um mestre excêntrico, até que o laboratório explodiu e tive que fugir.', 'Acabei expulso de uma academia mágica por práticas perigosas.', 'Descobri cedo meu talento para manipular substâncias raras e energias voláteis.'],
+        allies: ['Tenho contato com um fornecedor de ingredientes exóticos.', 'Recebo cartas criptografadas de um antigo colega de estudos.', 'Conheço um médico disposto a testar novas misturas sem fazer perguntas.'],
+        features: ['Cheiro constantemente a reagentes químicos e pergaminho velho.', 'Tenho pequenas queimaduras antigas nas pontas dos dedos.', 'Carrego frascos escondidos em bolsos secretos nas roupas.'],
+        extraLanguages: ['Dracônico', 'Proficiência com Kit de Alquimia', 'Proficiência com Kit de Herbalismo', 'Primordial']
       },
       {
         name: "O Navegador Errante",
-        traits: ['Sempre conto histórias do mar, mesmo quando ninguém pediu.', 'Confio mais em mapas do que em pessoas.', 'Acredito que o horizonte sempre guarda algo melhor.', 'Tenho dificuldade em ficar muito tempo no mesmo lugar.'],
-        ideals: ['Liberdade. O mar não pertence a ninguém.', 'Descoberta. Sempre há novas rotas a serem traçadas.', 'Camaradagem. Uma tripulação unida sobrevive a qualquer tempestade.'],
-        bonds: ['Procuro um porto lendário que poucos acreditam existir.', 'Minha antiga tripulação foi destruída por piratas.', 'Tenho um mapa incompleto que pode mudar o mundo.'],
-        flaws: ['Sou supersticioso quanto a presságios marítimos.', 'Bebo demais quando estou em terra firme.', 'Não resisto a uma aposta envolvendo navegação.'],
-        backstory: ['Cresceu em um navio mercante.', 'Único sobrevivente de um naufrágio misterioso.', 'Fugiu de casa para viver aventuras no mar.'],
-        allies: ['Tem amizade com um capitão aposentado.', 'É bem-vindo em certos portos costeiros.', 'Mantém contato com cartógrafos independentes.'],
-        features: ['Sente mudanças no vento antes que aconteçam.', 'Excelente equilíbrio mesmo em terreno instável.', 'Reconhece constelações com facilidade.'],
-        languages: ['Comum, Primordial e Proficiência com Ferramentas de Navegação.', 'Comum, Aquan e Proficiência com Instrumentos de Corda.']
+        allowedClasses: ['Bardo', 'Guerreiro', 'Ladino', 'Patrulheiro'],
+        traits: ['Sempre conto histórias do mar, mesmo quando ninguém pediu.', 'Confio mais em mapas antigos do que em pessoas novas.', 'Acredito que o horizonte sempre guarda algo melhor do que o porto seguro.', 'Tenho extrema dificuldade em ficar muito tempo no mesmo lugar.'],
+        ideals: ['Liberdade. O mar e as estradas não pertencem a ninguém.', 'Descoberta. Sempre há novas rotas a serem traçadas.', 'Camaradagem. Uma tripulação unida sobrevive a qualquer tempestade.'],
+        bonds: ['Procuro um porto lendário que poucos acreditam existir.', 'Minha antiga tripulação foi destruída por piratas sanguinolentos.', 'Tenho um mapa incompleto que pode mudar a geografia do mundo conhecido.'],
+        flaws: ['Sou extremamente supersticioso quanto a presságios marítimos e climáticos.', 'Bebo além da conta quando estou muito tempo em terra firme.', 'Não resisto a uma aposta perigosa se envolver navegação ou rotas.'],
+        backstory: ['Cresci esfregando o convés de um navio mercante.', 'Sou o único sobrevivente de um naufrágio provocado por uma fera misteriosa.', 'Fugi de uma família abusiva para viver aventuras no mar sem fim.'],
+        allies: ['Tenho amizade fiel com um capitão aposentado e rabugento.', 'Sou bem-vindo em certos portos costeiros barra-pesada.', 'Mantenho contato com cartógrafos independentes.'],
+        features: ['Sinto mudanças no vento antes mesmo que aconteçam.', 'Tenho um equilíbrio excelente, mesmo em terreno muito instável.', 'Reconheço rotas e constelações com uma batida de olho.'],
+        extraLanguages: ['Primordial', 'Proficiência com Ferramentas de Navegação', 'Aquan', 'Proficiência com Veículos Aquáticos']
       },
       {
         name: "O Assassino Calculista",
-        traits: ['Raramente demonstro emoções.', 'Observo padrões de comportamento antes de agir.', 'Prefiro resolver problemas de forma silenciosa.', 'Nunca faço ameaças vazias.'],
-        ideals: ['Eficiência. O método mais limpo é sempre o melhor.', 'Contrato. Um acordo selado deve ser cumprido.', 'Equilíbrio. Às vezes a morte é necessária.'],
-        bonds: ['Tenho uma dívida com o mestre que me treinou.', 'Busco vingança contra quem traiu minha antiga guilda.', 'Protejo alguém que não sabe o que faço para mantê-lo seguro.'],
-        flaws: ['Tenho dificuldade em confiar em aliados.', 'Subestimo emoções como fator de risco.', 'Vejo pessoas como peças em um tabuleiro.'],
-        backstory: ['Treinado desde jovem por uma guilda clandestina.', 'Foi traído por seu contratante e quase morreu.', 'Antigo espião que decidiu trabalhar por conta própria.'],
-        allies: ['Tem contato com um informante no submundo.', 'Possui acesso a um falsificador talentoso.', 'É conhecido por um pequeno círculo de mercadores corruptos.'],
-        features: ['Passos quase inaudíveis.', 'Nunca esquece a rotina de um alvo.', 'Mantém lâminas escondidas em locais improváveis.'],
-        languages: ['Comum, Subcomum e Símbolos Secretos de Ladrões.', 'Comum, Élfico e Proficiência com Kit de Disfarce.']
+        allowedClasses: ['Ladino', 'Patrulheiro', 'Monge', 'Guerreiro'],
+        traits: ['Raramente demonstro emoções ou levanto a voz.', 'Observo padrões de comportamento antes de agir ou falar com alguém.', 'Prefiro resolver problemas da forma mais rápida e silenciosa possível.', 'Nunca faço ameaças vazias.'],
+        ideals: ['Eficiência. O método mais limpo e letal é sempre o melhor.', 'Contrato. Um acordo selado deve ser cumprido, independente do alvo.', 'Equilíbrio. Às vezes, a morte de um é necessária para a sobrevivência de muitos.'],
+        bonds: ['Tenho uma dívida impagável com o mestre que me ensinou a lutar e desaparecer.', 'Busco vingança implacável contra quem traiu minha antiga guilda.', 'Protejo alguém importante que não faz a menor ideia da minha real profissão.'],
+        flaws: ['Tenho dificuldade gigantesca em confiar em aliados recém-chegados.', 'Subestimo o afeto e a compaixão como um fator de risco.', 'Vejo a maioria das pessoas apenas como peças em um tabuleiro.'],
+        backstory: ['Fui treinado desde jovem por uma guilda clandestina que não tolerava falhas.', 'Fui traído e deixado para morrer por meu antigo contratante.', 'Era um espião a serviço de um lorde corrupto, mas decidi trabalhar por conta própria.'],
+        allies: ['Tenho contato direto com um informante do submundo.', 'Possuo acesso a um falsificador talentosíssimo.', 'Sou conhecido - e temido - por um pequeno círculo de mercadores ilegais.'],
+        features: ['Meus passos são quase inaudíveis, não importa o calçado.', 'Nunca esqueço a rotina de um alvo após observá-lo por um dia.', 'Mantenho lâminas minúsculas escondidas em locais improváveis do corpo.'],
+        extraLanguages: ['Símbolos Secretos de Ladrões', 'Proficiência com Kit de Disfarce', 'Proficiência com Kit de Veneno', 'Subcomum']
       },
       {
         name: "O Combatente Disciplinado",
-        traits: ['Não tenho tempo para brincadeiras, sou focado no objetivo.', 'Não confio em sorte, apenas em preparação.', 'Prefiro observar em silêncio antes de agir.'],
-        ideals: ['Honra. Se eu der minha palavra, eu a cumprirei custe o que custar.', 'Justiça. Os culpados sempre devem pagar.', 'Proteção. Os fracos devem ser defendidos.'],
-        bonds: ['Luto para proteger aqueles que não podem se proteger sozinhos.', 'Minha honra está ligada ao nome da minha família.', 'Devo minha vida a um aventureiro que me salvou da morte certa.'],
-        flaws: ['Guardo rancor por tempo demais.', 'Sou incapaz de recusar um desafio.', 'Tenho um temperamento explosivo que me mete em confusão.', 'Tenho dificuldade em admitir quando estou errado.'],
-        backstory: ['Antigo guarda da cidade que se cansou da corrupção dos nobres, jogou o distintivo fora e pegou a estrada.', 'Serviu no exército durante uma guerra esquecida.', 'Sobrevivente de um ataque de saqueadores; jurou que nunca mais seria fraco diante do perigo.'],
-        allies: ['É respeitado por um pequeno clã de mercenários.', 'Tem amizade com um capitão da guarda.', 'Tem um velho companheiro de guerra sempre disposto a ajudar.'],
-        features: ['Nunca adoece facilmente.', 'Tem memória fotográfica para mapas.', 'Nunca esquece um rosto ou uma voz que tenha ouvido mais de uma vez.'],
-        languages: ['Comum, Gigante e Proficiência com Ferramentas de Pedreiro.', 'Comum, Anão e Proficiência com Ferramentas de Carpinteiro.', 'Comum, Anão e Proficiência com Ferramentas de Ferreiro.']
-      },
-      {
-        name: "O Estudioso Místico",
-        traits: ['Fico fascinado com qualquer pedaço de magia antiga ou bugigangas.', 'Tenho curiosidade demais para meu próprio bem.', 'Sempre tento mediar conflitos antes que virem violência.'],
-        ideals: ['Conhecimento. A verdade está acima de qualquer poder.', 'Destino. Meu caminho já foi traçado pelos deuses.', 'Equilíbrio. Luz e trevas precisam coexistir.', 'Redenção. Todos merecem uma segunda chance.'],
-        bonds: ['Protejo um segredo que poderia iniciar uma guerra.', 'Devo lealdade a uma ordem que já nem existe mais.', 'Fui salvo por uma divindade e sinto que devo algo em troca.'],
-        flaws: ['Confio rápido demais em promessas bonitas.', 'Subestimo inimigos que parecem fracos.', 'Fico paranoico quando sinto que estão me observando.', 'Tenho pavor de criaturas que rastejam ou voam no escuro.'],
-        backstory: ['Um estudioso de biblioteca que percebeu que a vida lendo livros é muito chata em comparação com vivê-la.', 'Treinado arduamente em um mosteiro isolado nas montanhas, desceu ao vale para ver como é o mundo real.', 'Foi aprendiz de um mago excêntrico que desapareceu sem deixar pistas.', 'Escapou de um culto sombrio que ainda pode estar à sua procura.'],
-        allies: ['Recebe favores ocasionais de um sacerdote local.', 'É protegido por uma entidade misteriosa.', 'É membro secreto de uma sociedade arcana.', 'Possui um mentor ancião que envia cartas misteriosas de vez em quando.'],
-        features: ['Possui uma cicatriz no rosto que parece formigar perto de magia.', 'Tem mãos sempre frias, mesmo no calor.', 'Seus olhos mudam levemente de cor quando está irritado.'],
-        languages: ['Comum, Celestial e Proficiência com Kit de Herbalismo.', 'Comum, Abissal e Proficiência com Kit de Veneno.', 'Comum, Élfico.', 'Comum, Infernal e Proficiência com Kit de Disfarce.']
-      },
-      {
-        name: "O Nobre Vaidoso",
-        traits: ['Acredito que o dinheiro resolve qualquer problema.', 'Sou excessivamente educado, até com meus inimigos.', 'Adoro contar histórias exageradas sobre minhas façanhas.'],
-        ideals: ['Poder. Eu farei o que for preciso para me tornar o mais forte.', 'Glória. Quero que meu nome seja lembrado por gerações.', 'Tradição. As antigas formas existem por um motivo.'],
-        bonds: ['Guardo um mapa incompleto para um tesouro lendário.', 'Prometi destruir a criatura que arruinou minha cidade natal.', 'Carrego comigo um medalhão que pertenceu à minha mãe.'],
-        flaws: ['Acho que sou superior a todos que não têm educação ou berço.', 'Sou obcecado por riqueza e conforto.', 'Tenho medo de falhar na frente dos outros.'],
-        backstory: ['Filho de camponeses tranquilos, encontrou um artefato enferrujado no campo que despertou seu desejo por aventura.', 'Descobriu recentemente que tem sangue nobre.'],
-        allies: ['Membro honorário da Guilda dos Aventureiros Locais.', 'Tem amizade com um capitão da guarda.'],
-        features: ['Risada inconfundível e ecoa alto demais.', 'Tem um sotaque marcante de uma região distante.'],
-        languages: ['Comum, Dracônico e Proficiência com Instrumentos de Sopro.', 'Comum, Élfico e Proficiência com Kit de Alquimia.']
-      },
-      {
-        name: "O Forasteiro Selvagem",
-        traits: ['Sou supersticioso e levo presságios muito a sério.', 'Sempre desconfio das intenções de estranhos antes de confiar.', 'Prefiro observar em silêncio antes de agir.'],
-        ideals: ['Exploração. O mundo precisa ter seus cantos descobertos.', 'Autossuficiência. Só posso depender de mim mesmo.', 'Equilíbrio. Luz e trevas precisam coexistir.'],
-        bonds: ['Devo minha vida a um aventureiro que me salvou da morte certa.', 'Luto para proteger aqueles que não podem se proteger sozinhos.'],
-        flaws: ['Sou viciado em viver a vida.', 'Impulsivo, ajo antes de pensar se a emoção falar mais alto.', 'Tenho pavor de criaturas que rastejam ou voam no escuro.'],
-        backstory: ['Sobreviveu sozinho na natureza por anos após se perder.', 'Criado por uma criatura feérica na floresta.', 'Cresceu em um navio mercante e conhece bem os perigos do mar.'],
-        allies: ['Nenhum, prefere trabalhar sozinho e confia apenas na própria sombra.'],
-        features: ['Tem um senso de direção perfeito; sempre sabe onde fica o norte.', 'Consegue imitar perfeitamente o som de pequenos animais e pássaros.', 'Sente cheiro de chuva antes de tempestades.', 'Animais parecem confiar nele com facilidade.'],
-        languages: ['Comum, Silvestre e Proficiência com Instrumentos de Corda.', 'Comum, Primordial e Proficiência com Ferramentas de Navegação.']
+        allowedClasses: ['Guerreiro', 'Paladino', 'Bárbaro', 'Monge'],
+        traits: ['Não tenho tempo para brincadeiras, sou completamente focado no objetivo.', 'Não confio em sorte mágica, apenas no meu treino e preparação física.', 'Prefiro observar o campo de batalha em silêncio antes de desferir o primeiro golpe.'],
+        ideals: ['Honra. Se eu der minha palavra, eu a cumprirei, custe o que custar.', 'Justiça. Os culpados sempre devem pagar na mesma moeda.', 'Proteção. Os fracos e inocentes devem ser defendidos por aqueles que são fortes.'],
+        bonds: ['Luto para proteger aqueles que não conseguem empunhar uma arma.', 'Minha honra está eternamente ligada ao nome manchado da minha família.', 'Devo minha vida a um aventureiro veterano que me salvou da morte certa no passado.'],
+        flaws: ['Guardo rancor por tempo demais, às vezes anos.', 'Sou praticamente incapaz de recusar um desafio direto às minhas habilidades.', 'Tenho um temperamento rígido que muitas vezes aliena meus aliados.', 'Tenho extrema dificuldade em admitir quando meu plano tático está errado.'],
+        backstory: ['Fui um antigo guarda da cidade que se cansou da corrupção dos nobres, jogou o distintivo fora e pegou a estrada.', 'Servi bravamente no exército durante uma guerra violenta que o reino preferiu esquecer.', 'Sou sobrevivente de um ataque de saqueadores; jurei treinar até que nunca mais fosse fraco.'],
+        allies: ['Sou bastante respeitado por um pequeno clã de mercenários independentes.', 'Tenho amizade velada com um capitão da guarda local.', 'Tenho um velho companheiro de batalhões sempre disposto a ajudar por uma caneca de cerveja.'],
+        features: ['Possuo dezenas de cicatrizes de batalha, cada uma com uma história militar.', 'Tenho memória afiada para terrenos e posições táticas.', 'Nunca esqueço o rosto de quem já lutou ao meu lado - ou contra mim.'],
+        extraLanguages: ['Gigante', 'Orc', 'Proficiência com Ferramentas de Ferreiro', 'Proficiência com Ferramentas de Carpinteiro']
       }
     ];
 
-    const chosenArchetype = archetypes[Math.floor(Math.random() * archetypes.length)];
+    let validArchetypes = archetypes;
+    if (charClass && charClass !== 'Selecione uma classe') {
+      validArchetypes = archetypes.filter(a => a.allowedClasses.includes(charClass));
+      if (validArchetypes.length === 0) validArchetypes = archetypes; 
+    }
 
+    const chosenArchetype = validArchetypes[Math.floor(Math.random() * validArchetypes.length)];
     setPersonalityTraits(chosenArchetype.traits[Math.floor(Math.random() * chosenArchetype.traits.length)]);
     setIdeals(chosenArchetype.ideals[Math.floor(Math.random() * chosenArchetype.ideals.length)]);
     setBonds(chosenArchetype.bonds[Math.floor(Math.random() * chosenArchetype.bonds.length)]);
     setFlaws(chosenArchetype.flaws[Math.floor(Math.random() * chosenArchetype.flaws.length)]);
     
     let generatedBackstory = chosenArchetype.backstory[Math.floor(Math.random() * chosenArchetype.backstory.length)];
-    if (charClass && !charClass.includes('Selecione')) {
-        generatedBackstory += ` Acabou se tornando um ${charClass} devido às dificuldades que enfrentou no caminho.`;
+    if (charClass && charClass !== 'Selecione uma classe') {
+        const connectors = [
+          ` O destino e a dureza da vida acabaram forjando minhas habilidades como ${charClass}.`,
+          ` Abraçar o caminho de ${charClass} foi a única maneira que encontrei para sobreviver a esse passado.`,
+          ` Essa história me deixou marcas profundas e despertou minha vocação como ${charClass}.`
+        ];
+        generatedBackstory += connectors[Math.floor(Math.random() * connectors.length)];
     }
     setBackstory(generatedBackstory);
-    
+
     setAlliesOrganizations(chosenArchetype.allies[Math.floor(Math.random() * chosenArchetype.allies.length)]);
     setFeaturesTraits(chosenArchetype.features[Math.floor(Math.random() * chosenArchetype.features.length)]);
-    setLanguages(chosenArchetype.languages[Math.floor(Math.random() * chosenArchetype.languages.length)]);
+    
+    let baseLangs = "Comum";
+    if (race.includes('Elfo')) baseLangs += ", Élfico";
+    else if (race.includes('Anão')) baseLangs += ", Anão";
+    else if (race.includes('Halfling')) baseLangs += ", Halfling";
+    else if (race.includes('Draconato')) baseLangs += ", Dracônico";
+    else if (race.includes('Gnomo')) baseLangs += ", Gnômico";
+    else if (race.includes('Orc')) baseLangs += ", Orc";
+    else if (race.includes('Tiefling')) baseLangs += ", Infernal";
+    else if (race.includes('Githyanki')) baseLangs += ", Gith (Subcomum)";
+    else baseLangs += " e mais um idioma racial à escolha";
+
+    const extraLang = chosenArchetype.extraLanguages[Math.floor(Math.random() * chosenArchetype.extraLanguages.length)];
+    setLanguages(`Idiomas: ${baseLangs}.\nHerança do Passado: ${extraLang}.`);
   };
 
   const handleRandomizeClick = () => {
-    // Verifica se já existe algo preenchido pelo usuário
     const isDirty = name.trim() !== '' || race !== 'Selecione uma raça' || charClass !== 'Selecione uma classe';
-
-    // Se estiver limpo, gera direto sem perguntar
-    if (!isDirty) {
+    
+    if (!isDirty || hasConfirmedRandomize.current) {
       generateRandomCharacter();
       return;
     }
 
-    // Se estiver sujo, pergunta o que o jogador quer fazer baseado no passo atual
     if (step === 3 || step === 4) {
       showCustomAlert(
         "Gerador Inteligente",
-        "Você está na aba de História.\nDeseja gerar APENAS a personalidade e o histórico, mantendo os seus status, raça e classe atuais?",
+        "Você está na aba de História.\nDeseja gerar APENAS a personalidade genérica e o histórico, mantendo os seus status atuais?",
         [
           { text: "Cancelar", color: "#666" },
           { 
@@ -288,7 +360,11 @@ export default function CreateCharacterScreen() {
               setTimeout(() => {
                 showCustomAlert("Atenção", "Isso apagará todas as suas escolhas atuais. Deseja continuar?", [
                   { text: "Não", color: "#666" },
-                  { text: "Sim, gerar do zero", color: "#ff6666", style: "destructive", onPress: generateRandomCharacter }
+                  { text: "Sim, gerar do zero", color: "#ff6666", style: "destructive", onPress: () => {
+                      hasConfirmedRandomize.current = true;
+                      generateRandomCharacter();
+                    } 
+                  }
                 ]);
               }, 400);
             } 
@@ -306,83 +382,107 @@ export default function CreateCharacterScreen() {
         "Isso substituirá as informações que você já preencheu. Deseja continuar?",
         [
           { text: "Cancelar", color: "#666" },
-          { text: "Sim, sortear", color: "#ff6666", style: "destructive", onPress: generateRandomCharacter }
+          { text: "Sim, sortear", color: "#ff6666", style: "destructive", onPress: () => {
+              hasConfirmedRandomize.current = true;
+              generateRandomCharacter();
+            } 
+          }
         ]
       );
     }
   };
 
   const generateRandomCharacter = async () => {
-    if (dbRaces.length === 0 || dbClasses.length === 0) {
-       showCustomAlert("Aguarde", "Carregando o banco de dados...");
-       return;
-    }
-
+    if (dbRaces.length === 0 || dbClasses.length === 0) { showCustomAlert("Aguarde", "Carregando o banco de dados..."); return; }
     isRandomizing.current = true;
     
-    const randRace = dbRaces[Math.floor(Math.random() * dbRaces.length)];
-    const randClass = dbClasses[Math.floor(Math.random() * dbClasses.length)];
-    setRace(randRace.name);
-    setCharClass(randClass.name);
+    if (Math.random() < 0.0001) {
+      try {
+        const companionsDB = await db.getAllAsync('SELECT * FROM bg3_companions ORDER BY RANDOM() LIMIT 1');
+        if (companionsDB.length > 0) {
+          const companion: any = companionsDB[0];
+          companion.skills = JSON.parse(companion.skills);
+          companion.stats = JSON.parse(companion.stats);
+          companion.originSpell = companion.origin_spell;
+          companion.class = companion.class_name;
 
-    const maleNames = ['Bruno', 'João', 'Pedro', 'Carlos', 'Tiago', 'Rafael', 'Kaelen', 'Thorin', 'Silas', 'Bram', 'Dorian', 'Faelan', 'Gael', 'Orion', 'Beren', 'Nícolas', 'Zoltan', 'Vagner', 'Rurik', 'Luiz', 'Gustavo', 'Leonardo', 'Matheus', 'Felipe', 'Wilker', 'Dante', 'Vítor', 'Enzo', 'Ramon'];
-    const femaleNames = ['Karoline', 'Maria', 'Ana', 'Beatriz', 'Mariana', 'Amanda', 'Lyra', 'Elara', 'Ilyana', 'Ayla', 'Morgana', 'Bianca', 'Catarine', 'Fernanda', 'Isabela', 'Sofia', 'Camila', 'Larissa', 'Yanaele', 'Evelyn', 'Alícia', 'Lívia', 'Giovanna', 'Carla', 'Júlia'];
+          const matchedRace = dbRaces.find(r => r.name.toLowerCase().includes(companion.race.toLowerCase())) || dbRaces[0];
+          const matchedClass = dbClasses.find(c => c.name.toLowerCase().includes(companion.class.toLowerCase())) || dbClasses[0];
 
-    const isMale = Math.random() > 0.5;
-    const randomFirstName = isMale 
-      ? maleNames[Math.floor(Math.random() * maleNames.length)] 
-      : femaleNames[Math.floor(Math.random() * femaleNames.length)];
+          setName(companion.name); setRace(matchedRace.name); setCharClass(matchedClass.name); setAllowedOriginFeature(companion.originSpell || null);
+          
+          setStats({
+            FOR: companion.stats.FOR, DES: companion.stats.DES, CON: companion.stats.CON,
+            INT: companion.stats.INT, SAB: companion.stats.SAB, CAR: companion.stats.CAR,
+          });
+          const totalCompStats = Object.values(companion.stats).reduce((acc: number, val: any) => acc + parseInt(val as string), 0);
+          setMaxStatsSum(totalCompStats > 72 ? totalCompStats : 72);
 
-    const classTitles: Record<string, string[]> = {
-      'Bárbaro': isMale ? ['o Bárbaro', 'o Implacável', 'o Feroz', 'o Quebra-Crânios'] : ['a Bárbara', 'a Implacável', 'a Feroz', 'a Quebra-Crânios'],
-      'Bardo': isMale ? ['o Bardo', 'o Cancioneiro', 'o Galante', 'Voz-de-Ouro'] : ['a Barda', 'a Cancioneira', 'a Galante', 'Voz-de-Ouro'],
-      'Bruxo': isMale ? ['o Bruxo', 'o Amaldiçoado', 'o Ocultista', 'Corta-Sombras'] : ['a Bruxa', 'a Amaldiçoada', 'a Ocultista', 'Corta-Sombras'],
-      'Clérigo': isMale ? ['o Clérigo', 'o Devoto', 'o Curandeiro', 'Luz-Divina'] : ['a Clériga', 'a Devota', 'a Curandeira', 'Luz-Divina'],
-      'Druida': isMale ? ['o Druida', 'o Selvagem', 'Fala-com-Feras', 'da Floresta'] : ['a Druida', 'a Selvagem', 'Fala-com-Feras', 'da Floresta'],
-      'Feiticeiro': isMale ? ['o Feiticeiro', 'o Nato', 'Sangue-Mágico', 'o Canalizador'] : ['a Feiticeira', 'a Nata', 'Sangue-Mágico', 'a Canalizadora'],
-      'Guerreiro': isMale ? ['o Guerreiro', 'o Veterano', 'Braço-de-Ferro', 'o Colosso'] : ['a Guerreira', 'a Veterana', 'Braço-de-Ferro', 'a Colosso'],
-      'Ladino': isMale ? ['o Ladino', 'Pé-Ligeiro', 'Mão-Leve', 'o Vigarista', 'das Sombras'] : ['a Ladina', 'Pé-Ligeiro', 'Mão-Leve', 'a Vigarista', 'das Sombras'],
-      'Mago': isMale ? ['o Mago', 'o Sábio', 'o Estudioso', 'Tomo-Vivo'] : ['a Maga', 'a Sábia', 'a Estudiosa', 'Tomo-Vivo'],
-      'Monge': isMale ? ['o Monge', 'Punho-de-Aço', 'o Calmo', 'Passo-Leve'] : ['a Monge', 'Punho-de-Aço', 'a Calma', 'Passo-Leve'],
-      'Paladino': isMale ? ['o Paladino', 'o Justo', 'o Cruzado', 'Escudo-Radiante'] : ['a Paladina', 'a Justa', 'a Cruzada', 'Escudo-Radiante'],
-      'Patrulheiro': isMale ? ['o Patrulheiro', 'o Caçador', 'Olho-de-Águia', 'o Errante'] : ['a Patrulheira', 'a Caçadora', 'Olho-de-Águia', 'a Errante'],
-    };
+          setPersonalityTraits(companion.personality); setIdeals(companion.ideals); setBonds(companion.bonds);
+          setFlaws(companion.flaws); setBackstory(companion.backstory); setAlliesOrganizations(companion.allies);
+          setFeaturesTraits(companion.features); setLanguages("Comum e idiomas raciais associados.");
+          setGp(matchedClass.starting_gold || 100);
 
-    const genericTitles = isMale 
-      ? ['de Tal', 'Sem-Teto', 'da Taberna', 'o Azarado', 'o Magnífico'] 
-      : ['de Tal', 'Sem-Teto', 'da Taberna', 'a Azarada', 'a Magnífica'];
+          await setupCharacterExtras(matchedRace, matchedClass, companion, companion.stats);
+        }
+      } catch (error) {}
+    } else {
+      const randRace = dbRaces[Math.floor(Math.random() * dbRaces.length)];
+      const randClass = dbClasses[Math.floor(Math.random() * dbClasses.length)];
+      setRace(randRace.name); setCharClass(randClass.name); setAllowedOriginFeature(null);
 
-    const validTitles = [...(classTitles[randClass.name] || []), ...genericTitles];
-    const randomTitle = validTitles[Math.floor(Math.random() * validTitles.length)];
+      const maleNames = ['Bruno', 'João', 'Pedro', 'Bentinho', 'Wilker'];
+      const femaleNames = ['Karoline', 'Maria', 'Ana', 'Beatriz', 'Mariana'];
+      const isMale = Math.random() > 0.5;
+      const randomFirstName = isMale ? maleNames[Math.floor(Math.random() * maleNames.length)] : femaleNames[Math.floor(Math.random() * femaleNames.length)];
 
-    setName(`${randomFirstName} ${randomTitle}`);
+      const validTitles = ['o Aventureiro', 'de Tal', 'o Desconhecido'];
+      const randomTitle = validTitles[Math.floor(Math.random() * validTitles.length)];
 
-    const baseStats = JSON.parse(randClass.recommended_stats || '{}');
-    const bonuses = JSON.parse(randRace.stat_bonuses || '{}') as Record<string, number>;
-    const totalBonus = Object.values(bonuses).reduce((acc, val) => acc + (val || 0), 0);
-    setMaxStatsSum(72 + totalBonus);
-    setStats({
-      FOR: String((baseStats.FOR || 10) + (bonuses.FOR || 0)),
-      DES: String((baseStats.DES || 10) + (bonuses.DES || 0)),
-      CON: String((baseStats.CON || 10) + (bonuses.CON || 0)),
-      INT: String((baseStats.INT || 10) + (bonuses.INT || 0)),
-      SAB: String((baseStats.SAB || 10) + (bonuses.SAB || 0)),
-      CAR: String((baseStats.CAR || 10) + (bonuses.CAR || 0)),
-    });
-    setGp(randClass.starting_gold || 0);
+      setName(`${randomFirstName} ${randomTitle}`);
 
-    let calcSkills = 4;
-    if (randRace.name === 'Meio-Elfo') calcSkills += 2;
-    if (randRace.name === 'Elfo' || randRace.name === 'Meio-Orc') calcSkills += 1;
-    if (randClass.name === 'Ladino') calcSkills += 2;
-    else if (randClass.name === 'Bardo' || randClass.name === 'Patrulheiro') calcSkills += 1;
+      const baseStats = JSON.parse(randClass.recommended_stats || '{}');
+      const bonuses = JSON.parse(randRace.stat_bonuses || '{}') as Record<string, number>;
+      const totalBonus = Object.values(bonuses).reduce((acc, val) => acc + (val || 0), 0);
+      setMaxStatsSum(72 + totalBonus);
+      
+      const calculatedStats = {
+        FOR: String((baseStats.FOR || 10) + (bonuses.FOR || 0)), DES: String((baseStats.DES || 10) + (bonuses.DES || 0)), CON: String((baseStats.CON || 10) + (bonuses.CON || 0)),
+        INT: String((baseStats.INT || 10) + (bonuses.INT || 0)), SAB: String((baseStats.SAB || 10) + (bonuses.SAB || 0)), CAR: String((baseStats.CAR || 10) + (bonuses.CAR || 0)),
+      };
+      setStats(calculatedStats);
+      setGp(randClass.starting_gold || 0);
+
+      generateRandomLore();
+      await setupCharacterExtras(randRace, randClass, null, calculatedStats);
+    }
     
-    const classSaves = JSON.parse(randClass.saves || '[]');
-    const shuffledSkills = [...dbSkills].sort(() => 0.5 - Math.random());
-    const randomSkills = shuffledSkills.slice(0, calcSkills).map(s => s.id);
-    setProficiencies([...classSaves, ...randomSkills]);
+    setStep(7); 
+    setTimeout(() => { isRandomizing.current = false; }, 500);
+  };
 
-    const kits = await db.getAllAsync<StartingKit>(`SELECT * FROM starting_kits WHERE target_name = ?`, [randClass.name]);
+  const setupCharacterExtras = async (r: RaceItem, c: ClassItem, companion?: any, generatedStats?: any) => {
+    const classSaves = JSON.parse(c.saves || '[]');
+    let finalSkills: string[] = [];
+
+    if (companion && companion.skills) {
+       finalSkills = companion.skills;
+    } else {
+       let calcSkills = 4;
+       if (r.name === 'Meio-Elfo') calcSkills += 2;
+       if (r.name === 'Elfo' || r.name === 'Meio-Orc') calcSkills += 1;
+       if (c.name === 'Ladino') calcSkills += 2;
+       else if (c.name === 'Bardo' || c.name === 'Patrulheiro') calcSkills += 1;
+       
+       const shuffledSkills = [...dbSkills].sort(() => 0.5 - Math.random());
+       finalSkills = shuffledSkills.slice(0, calcSkills).map(s => s.id);
+    }
+    setProficiencies([...classSaves, ...finalSkills]);
+
+    let kits: StartingKit[] = [];
+    if (companion) { kits = await db.getAllAsync<StartingKit>(`SELECT * FROM starting_kits WHERE name LIKE ?`, [`%${companion.shortName || companion.name}%`]); } 
+    if (!kits || kits.length === 0) { kits = await db.getAllAsync<StartingKit>(`SELECT * FROM starting_kits WHERE target_name = ? AND target_type != 'bg3'`, [c.name]); }
+
     if (kits.length > 0) {
       const randKit = kits[Math.floor(Math.random() * kits.length)];
       setSelectedKitName(randKit.name);
@@ -395,147 +495,48 @@ export default function CreateCharacterScreen() {
         setInventory(builtInventory);
       } catch(e) {}
     } else {
-      setInventory([]);
-      setSelectedKitName('Nenhum kit disponível');
+      setInventory([]); setSelectedKitName('Nenhum kit disponível');
     }
 
-    const spells = await db.getAllAsync<SpellItem>(`SELECT * FROM spells WHERE classes LIKE ? AND level IN ('Truque', 'Nível 1', 'Classe')`, [`%${randClass.name}%`]);
-    const classFeatures = spells.filter(s => s.level === 'Classe').map(s => s.id.toString());
+    let raceFeatures: string[] = [];
+    let classFeaturesListed: string[] = [];
+    try {
+      if (r.features) raceFeatures = JSON.parse(r.features).map((f:any) => typeof f === 'string' ? f : f.name);
+      if (c.features) classFeaturesListed = JSON.parse(c.features).map((f:any) => typeof f === 'string' ? f : f.name);
+    } catch(e) {}
+
+    if (companion && companion.originSpell) { raceFeatures.push(companion.originSpell); }
+    if (r.name === 'Githyanki' && !raceFeatures.includes('Mãos Mágicas (Githyanki)')) { raceFeatures.push('Mãos Mágicas (Githyanki)'); }
+
+    const allLockedFeatures = Array.from(new Set([...raceFeatures, ...classFeaturesListed]));
+    setLockedFeatures(allLockedFeatures);
+
+    const spells = await db.getAllAsync<SpellItem>(`SELECT * FROM spells WHERE classes LIKE ? OR name IN (${allLockedFeatures.length > 0 ? allLockedFeatures.map(() => '?').join(',') : '""'}) ORDER BY level ASC, name ASC`, [`%${c.name}%`, ...allLockedFeatures]);
     
-    if (randClass.is_caster === 1) {
-      const cantrips = spells.filter(s => s.level === 'Truque').sort(() => 0.5 - Math.random()).slice(0, MAX_CANTRIPS).map(s => s.id.toString());
-      const level1 = spells.filter(s => s.level === 'Nível 1').sort(() => 0.5 - Math.random()).slice(0, MAX_SPELLS_LVL1).map(s => s.id.toString());
-      setSelectedSpells([...classFeatures, ...cantrips, ...level1]);
-    } else {
-      setSelectedSpells([...classFeatures]);
-    }
-
-    generateRandomLore();
-
-    setStep(7); 
-
-    setTimeout(() => {
-      isRandomizing.current = false;
-    }, 500);
-  };
-
-  // ================= EFEITOS =================
-  useEffect(() => {
-    async function loadCatalog() {
-      try {
-        setDbRaces(await db.getAllAsync('SELECT * FROM races ORDER BY name'));
-        setDbClasses(await db.getAllAsync('SELECT * FROM classes ORDER BY name'));
-        setDbSavingThrows(await db.getAllAsync('SELECT * FROM saving_throws'));
-        setDbSkills(await db.getAllAsync('SELECT * FROM skills ORDER BY name'));
-        setDbItems(await db.getAllAsync('SELECT * FROM items ORDER BY name'));
-      } catch (error) { console.error("Erro ao carregar catálogos:", error); }
-    }
-    loadCatalog();
-  }, []);
-
-  useEffect(() => {
-    if (isRandomizing.current) return; 
-
-    if (race !== 'Selecione uma raça' && charClass !== 'Selecione uma classe') {
-      const selectedRace = dbRaces.find(r => r.name === race);
-      const selectedClass = dbClasses.find(c => c.name === charClass);
-
-      if (selectedRace && selectedClass) {
-        try {
-          const baseStats = JSON.parse(selectedClass.recommended_stats || '{}');
-          const bonuses = JSON.parse(selectedRace.stat_bonuses || '{}') as Record<string, number>;
-          const totalBonus = Object.values(bonuses).reduce((acc, val) => acc + (val || 0), 0);
-          setMaxStatsSum(72 + totalBonus);
-
-          setStats({
-            FOR: String((baseStats.FOR || 10) + (bonuses.FOR || 0)),
-            DES: String((baseStats.DES || 10) + (bonuses.DES || 0)),
-            CON: String((baseStats.CON || 10) + (bonuses.CON || 0)),
-            INT: String((baseStats.INT || 10) + (bonuses.INT || 0)),
-            SAB: String((baseStats.SAB || 10) + (bonuses.SAB || 0)),
-            CAR: String((baseStats.CAR || 10) + (bonuses.CAR || 0)),
-          });
-          
-          setGp(selectedClass.starting_gold || 0);
-          
-          const classProfs = JSON.parse(selectedClass.saves || '[]');
-          setProficiencies(prev => {
-            const semSavesAntigos = prev.filter(p => !p.startsWith('save_'));
-            return [...semSavesAntigos, ...classProfs];
-          });
-        } catch (error) {}
-      }
-    }
-  }, [race, charClass, dbRaces, dbClasses]);
-
-  useEffect(() => {
-    async function fetchKits() {
-      if (charClass === 'Selecione uma classe') return;
-      try {
-        const kits = await db.getAllAsync<StartingKit>(
-          `SELECT * FROM starting_kits WHERE target_name = ?`, 
-          [charClass]
-        );
-        setDbKits(kits);
-        
-        if (isRandomizing.current) return; 
-
-        if (kits.length > 0) {
-           handleSelectKit(kits[0]);
-        } else {
-           setInventory([]);
-           setSelectedKitName('Nenhum kit disponível');
-        }
-      } catch (error) { console.error(error); }
-    }
-    fetchKits();
-  }, [charClass, dbItems]);
-
-  useEffect(() => {
-    if (dbSavingThrows.length === 0 || dbSkills.length === 0) return;
-    const bnsProf = parseInt(profBonus) || 0;
-    const newSaves: Record<string, string> = {};
-    dbSavingThrows.forEach(save => {
-      const score = parseInt(stats[save.stat as keyof typeof stats]) || 10;
-      let mod = Math.floor((score - 10) / 2);
-      if (proficiencies.includes(save.id)) mod += bnsProf;
-      newSaves[save.id] = mod >= 0 ? `+${mod}` : `${mod}`;
+    const lockedFeatureIds: string[] = [];
+    allLockedFeatures.forEach(featName => {
+       const found = spells.find(s => s.name === featName);
+       if (found) lockedFeatureIds.push(found.id.toString());
     });
-    setSaveValues(newSaves);
 
-    const newSkills: Record<string, string> = {};
-    dbSkills.forEach(skill => {
-      const score = parseInt(stats[skill.stat as keyof typeof stats]) || 10;
-      let mod = Math.floor((score - 10) / 2);
-      if (proficiencies.includes(skill.id)) mod += bnsProf;
-      newSkills[skill.id] = mod >= 0 ? `+${mod}` : `${mod}`;
-    });
-    setSkillValues(newSkills);
-  }, [stats, proficiencies, profBonus, dbSavingThrows, dbSkills]);
+    const limits = await fetchSpellLimits(c.name, r.name, generatedStats || stats);
+    setMaxCantrips(limits.cantrips);
+    setMaxSpellsLvl1(limits.lvl1);
 
-  useEffect(() => {
-    async function loadSpells() {
-      if (charClass === 'Selecione uma classe') return;
-      try {
-        const result = await db.getAllAsync<SpellItem>(
-          `SELECT * FROM spells WHERE classes LIKE ? AND level IN ('Truque', 'Nível 1', 'Classe', 'Manobra') ORDER BY level ASC, name ASC`,
-          [`%${charClass}%`]
-        );
-        
-        setAvailableSpells(result);
-        
-        if (!isRandomizing.current) {
-           const classFeatures = result.filter(s => s.level === 'Classe').map(s => s.id.toString());
-           setSelectedSpells(prev => Array.from(new Set([...prev, ...classFeatures])));
-        }
-        
-      } catch (error) {}
+    let cantrips: string[] = [];
+    let level1: string[] = [];
+    
+    if (limits.cantrips > 0) {
+      cantrips = spells.filter(s => s.level === 'Truque' && getCategory(s) === 'Magia').sort(() => 0.5 - Math.random()).slice(0, limits.cantrips).map(s => s.id.toString());
     }
-    loadSpells();
-  }, [charClass]);
+    if (limits.lvl1 > 0) {
+      level1 = spells.filter(s => s.level === 'Nível 1' && getCategory(s) === 'Magia').sort(() => 0.5 - Math.random()).slice(0, limits.lvl1).map(s => s.id.toString());
+    }
+    
+    setSelectedSpells([...lockedFeatureIds, ...cantrips, ...level1]);
+  }
 
-  // ================= FUNÇÕES DE INTERAÇÃO =================
-  
+  // ================= FUNÇÕES DE INTERAÇÃO DO USUÁRIO =================
   const handleSelectKit = (kit: StartingKit) => {
     try {
       const parsedItems = JSON.parse(kit.items);
@@ -571,22 +572,199 @@ export default function CreateCharacterScreen() {
     setProficiencies(prev => prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]);
   };
 
+  // Effect Initial Load
+  useEffect(() => {
+    async function loadCatalog() {
+      try {
+        setDbRaces(await db.getAllAsync('SELECT * FROM races ORDER BY name'));
+        setDbClasses(await db.getAllAsync('SELECT * FROM classes ORDER BY name'));
+        setDbSavingThrows(await db.getAllAsync('SELECT * FROM saving_throws'));
+        setDbSkills(await db.getAllAsync('SELECT * FROM skills ORDER BY name'));
+        setDbItems(await db.getAllAsync('SELECT * FROM items ORDER BY name'));
+      } catch (error) {}
+    }
+    loadCatalog();
+  }, []);
+
+  // Effect Limites de Magia (Manual Selection)
+  useEffect(() => {
+    if (isRandomizing.current) return;
+    async function updateSpellLimits() {
+      const limits = await fetchSpellLimits(charClass, race, stats);
+      setMaxCantrips(limits.cantrips);
+      setMaxSpellsLvl1(limits.lvl1);
+    }
+    updateSpellLimits();
+  }, [charClass, race, stats]);
+
+  useEffect(() => {
+    if (isRandomizing.current) return; 
+    if (race !== 'Selecione uma raça' && charClass !== 'Selecione uma classe') {
+      const selectedRace = dbRaces.find(r => r.name === race);
+      const selectedClass = dbClasses.find(c => c.name === charClass);
+
+      if (selectedRace && selectedClass) {
+        try {
+          const baseStats = JSON.parse(selectedClass.recommended_stats || '{}');
+          const bonuses = JSON.parse(selectedRace.stat_bonuses || '{}') as Record<string, number>;
+          const totalBonus = Object.values(bonuses).reduce((acc, val) => acc + (val || 0), 0);
+          setMaxStatsSum(72 + totalBonus);
+
+          setStats({
+            FOR: String((baseStats.FOR || 10) + (bonuses.FOR || 0)), DES: String((baseStats.DES || 10) + (bonuses.DES || 0)), CON: String((baseStats.CON || 10) + (bonuses.CON || 0)),
+            INT: String((baseStats.INT || 10) + (bonuses.INT || 0)), SAB: String((baseStats.SAB || 10) + (bonuses.SAB || 0)), CAR: String((baseStats.CAR || 10) + (bonuses.CAR || 0)),
+          });
+          
+          setGp(selectedClass.starting_gold || 0);
+          
+          const classProfs = JSON.parse(selectedClass.saves || '[]');
+          setProficiencies(prev => {
+            const semSavesAntigos = prev.filter(p => !p.startsWith('save_'));
+            return [...semSavesAntigos, ...classProfs];
+          });
+        } catch (error) {}
+      }
+    }
+  }, [race, charClass, dbRaces, dbClasses]);
+
+  useEffect(() => {
+    async function fetchKits() {
+      if (charClass === 'Selecione uma classe') return;
+      try {
+        const kits = await db.getAllAsync<StartingKit>(`SELECT * FROM starting_kits WHERE target_name = ? AND target_type != 'bg3'`, [charClass]);
+        setDbKits(kits);
+        if (isRandomizing.current) return; 
+        if (kits.length > 0) { handleSelectKit(kits[0]); } 
+        else { setInventory([]); setSelectedKitName('Nenhum kit disponível'); }
+      } catch (error) {}
+    }
+    fetchKits();
+  }, [charClass, dbItems]);
+
+  useEffect(() => {
+    if (dbSavingThrows.length === 0 || dbSkills.length === 0) return;
+    const bnsProf = parseInt(profBonus) || 0;
+    const newSaves: Record<string, string> = {};
+    dbSavingThrows.forEach(save => {
+      const score = parseInt(stats[save.stat as keyof typeof stats]) || 10;
+      let mod = Math.floor((score - 10) / 2);
+      if (proficiencies.includes(save.id)) mod += bnsProf;
+      newSaves[save.id] = mod >= 0 ? `+${mod}` : `${mod}`;
+    });
+    setSaveValues(newSaves);
+
+    const newSkills: Record<string, string> = {};
+    dbSkills.forEach(skill => {
+      const score = parseInt(stats[skill.stat as keyof typeof stats]) || 10;
+      let mod = Math.floor((score - 10) / 2);
+      if (proficiencies.includes(skill.id)) mod += bnsProf;
+      newSkills[skill.id] = mod >= 0 ? `+${mod}` : `${mod}`;
+    });
+    setSkillValues(newSkills);
+  }, [stats, proficiencies, profBonus, dbSavingThrows, dbSkills]);
+
+  useEffect(() => {
+     if (isRandomizing.current) return;
+     const currentRace = dbRaces.find(r => r.name === race);
+     const currentClass = dbClasses.find(c => c.name === charClass);
+     
+     let rFeats: string[] = [];
+     let cFeats: string[] = [];
+     
+     try { if (currentRace && currentRace.features) rFeats = JSON.parse(currentRace.features).map((f:any) => typeof f === 'string' ? f : f.name); } catch(e){}
+     try { if (currentClass && currentClass.features) cFeats = JSON.parse(currentClass.features).map((f:any) => typeof f === 'string' ? f : f.name); } catch(e){}
+     
+     if (race === 'Githyanki' && !rFeats.includes('Mãos Mágicas (Githyanki)')) rFeats.push('Mãos Mágicas (Githyanki)');
+     
+     setLockedFeatures(Array.from(new Set([...rFeats, ...cFeats])));
+  }, [race, charClass, dbRaces, dbClasses]);
+
+  useEffect(() => {
+    async function loadSpells() {
+      if (charClass === 'Selecione uma classe') return;
+      try {
+        const result = await db.getAllAsync<SpellItem>(
+          `SELECT * FROM spells WHERE classes LIKE ? OR name IN (${lockedFeatures.length > 0 ? lockedFeatures.map(() => '?').join(',') : '""'}) ORDER BY level ASC, name ASC`,
+          [`%${charClass}%`, ...lockedFeatures]
+        );
+        
+        const safeSpells = result.filter(s => {
+          if (BG3_ORIGIN_FEATURES.includes(s.name) && s.name !== allowedOriginFeature) return false;
+          
+          const sCat = getCategory(s);
+
+          // As inatas e passivas bloqueadas SEMPRE aparecem, independentemente do nível.
+          // Elas precisam aparecer para o jogador ver as skills garantidas dele com o cadeado.
+          if (lockedFeatures.includes(s.name)) return true;
+
+          // Se for Magia: Bloqueia magias que não são de Nível 1 ou Truque (o personagem está no Nível 1)
+          if (sCat === 'Magia' && s.level !== 'Truque' && s.level !== 'Nível 1') return false;
+
+          // Se for Habilidade ou Passiva extra (ex: Estilo de Luta): Bloqueia se o pré-requisito for maior que 1.
+          if ((sCat === 'Habilidade' || sCat === 'Passiva') && s.class_level_required) {
+             const reqLvl = parseInt(String(s.class_level_required), 10) || 1;
+             if (reqLvl > 1) return false;
+          }
+
+          return true;
+        });
+
+        setAvailableSpells(safeSpells);
+        
+        if (!isRandomizing.current) {
+           // Trava automaticamente as passivas obrigatórias da classe atual na array de 'selectedSpells'
+           const classFeatures = safeSpells.filter(s => lockedFeatures.includes(s.name)).map(s => s.id.toString());
+           setSelectedSpells(prev => Array.from(new Set([...prev, ...classFeatures])));
+        }
+      } catch (error) {}
+    }
+    loadSpells();
+  }, [charClass, race, allowedOriginFeature, lockedFeatures, maxCantrips, maxSpellsLvl1, maxExtraPassives]);
+
   const toggleSpell = (id: string) => {
     const spell = availableSpells.find(s => s.id.toString() === id);
     if (!spell) return;
-    
-    if (spell.level === 'Classe') {
-       showCustomAlert("Habilidade da Classe", "Esta habilidade pertence ao Nível 1 da sua classe e não pode ser removida.");
-       return;
+
+    if (lockedFeatures.includes(spell.name)) {
+      showCustomAlert("Bloqueado", "Esta habilidade é inata da sua Raça/Classe e não pode ser removida.");
+      return;
     }
     
+    const sCat = getCategory(spell);
     const isSelecting = !selectedSpells.includes(id);
+    
     if (isSelecting) {
-      const cantripsCount = selectedSpells.filter(sId => availableSpells.find(s => s.id.toString() === sId)?.level === 'Truque').length;
-      const level1Count = selectedSpells.filter(sId => availableSpells.find(s => s.id.toString() === sId)?.level === 'Nível 1').length;
-      
-      if (spell.level === 'Truque' && cantripsCount >= MAX_CANTRIPS) { showCustomAlert("Limite de Truques", `A classe permite no máximo ${MAX_CANTRIPS} Truques no Nível 1.`); return; }
-      if (spell.level === 'Nível 1' && level1Count >= MAX_SPELLS_LVL1) { showCustomAlert("Limite de Magias", `A classe permite no máximo ${MAX_SPELLS_LVL1} magias de Nível 1.`); return; }
+      if (sCat === 'Passiva' || sCat === 'Habilidade') {
+        const passivesCount = selectedSpells.filter(sId => {
+          const sp = availableSpells.find(s => s.id.toString() === sId);
+          return sp && (getCategory(sp) === 'Passiva' || getCategory(sp) === 'Habilidade') && !lockedFeatures.includes(sp.name);
+        }).length;
+        
+        if (passivesCount >= maxExtraPassives) {
+          showCustomAlert("Limite de Passivas", `Sua classe te dá direito a selecionar ${maxExtraPassives} habilidade(s) extra(s) no Nível 1.`);
+          return;
+        }
+      } else if (spell.level === 'Truque') {
+        const cantripsCount = selectedSpells.filter(sId => {
+          const sp = availableSpells.find(s => s.id.toString() === sId);
+          return sp && getCategory(sp) === 'Magia' && sp.level === 'Truque';
+        }).length;
+        
+        if (cantripsCount >= maxCantrips) {
+          showCustomAlert("Limite de Truques", `Você pode escolher no máximo ${maxCantrips} Truques.`);
+          return;
+        }
+      } else if (spell.level === 'Nível 1') {
+        const level1Count = selectedSpells.filter(sId => {
+          const sp = availableSpells.find(s => s.id.toString() === sId);
+          return sp && getCategory(sp) === 'Magia' && sp.level === 'Nível 1';
+        }).length;
+        
+        if (level1Count >= maxSpellsLvl1) {
+          showCustomAlert("Limite de Magias", `Seu atributo permite apenas ${maxSpellsLvl1} magias de Nível 1.`);
+          return;
+        }
+      }
     }
     setSelectedSpells(prev => isSelecting ? [...prev, id] : prev.filter(item => item !== id));
   };
@@ -614,80 +792,21 @@ export default function CreateCharacterScreen() {
           name, race, class, stats, prof_bonus, inspiration, proficiencies, 
           save_values, skill_values, personality_traits, ideals, bonds, flaws, 
           features_traits, backstory, allies_organizations, languages,
-          spells, equipment, gp, sp, cp,
+          spells, spell_slots_used, equipment, gp, sp, cp,
           hp_max, hp_current, level, xp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           name, race, charClass, JSON.stringify(stats), profBonus, inspiration || '0', 
           JSON.stringify(proficiencies), JSON.stringify(activeSavesToSave), JSON.stringify(activeSkillsToSave), 
           personalityTraits, ideals, bonds, flaws, featuresTraits, backstory, alliesOrganizations, languages, 
-          JSON.stringify(selectedSpells), JSON.stringify(cleanInventory), gp, sp, cp, hpMax, hpMax, 1, 0 
+          JSON.stringify(selectedSpells), '{}', JSON.stringify(cleanInventory), gp, sp, cp, hpMax, hpMax, 1, 0 
         ]
       );
       router.back();
-    } catch (error) { console.error("Erro ao inserir:", error); }
+    } catch (error) {}
   };
 
   // ================= RENDERIZAÇÕES =================
-
-  const renderKitModal = () => (
-    <Modal visible={kitModalVisible} animationType="slide" transparent={true}>
-      <Pressable style={styles.modalOverlay} onPress={() => setKitModalVisible(false)}>
-        <View style={[styles.modalContent, {maxHeight: '80%'}]}>
-          <Text style={styles.modalTitle}>Kits da Classe: {charClass}</Text>
-          <FlatList
-            data={dbKits}
-            keyExtractor={item => item.id.toString()}
-            renderItem={({item}) => {
-              const itemsList = JSON.parse(item.items).map((i: any) => `${i.qty}x ${i.name}`).join(', ');
-              return (
-                <TouchableOpacity style={styles.kitCard} onPress={() => handleSelectKit(item)}>
-                  <Text style={styles.kitCardTitle}>{item.name}</Text>
-                  <Text style={styles.kitCardItems}>{itemsList}</Text>
-                  {item.criador !== 'base' && <Text style={styles.customKitBadge}>Customizado</Text>}
-                </TouchableOpacity>
-              )
-            }}
-            ListEmptyComponent={<Text style={styles.emptyText}>Nenhum kit encontrado.</Text>}
-          />
-        </View>
-      </Pressable>
-    </Modal>
-  );
-
-  const renderSpellDetailModal = () => (
-    <Modal visible={spellDetailModalVisible} animationType="fade" transparent={true}>
-      <Pressable style={styles.modalOverlay} onPress={() => setSpellDetailModalVisible(false)}>
-        <View style={styles.spellDetailCard}>
-          <Text style={styles.spellDetailName}>{selectedSpellDetail?.name}</Text>
-          <Text style={styles.spellDetailLevel}>{selectedSpellDetail?.level} • {selectedSpellDetail?.classes}</Text>
-          
-          <View style={styles.spellDetailInfoGrid}>
-            <View style={styles.spellDetailInfoItem}>
-              <Text style={styles.spellDetailInfoLabel}>ATIVAÇÃO</Text>
-              <Text style={styles.spellDetailInfoValue}>{selectedSpellDetail?.casting_time}</Text>
-            </View>
-            <View style={styles.spellDetailInfoItem}>
-              <Text style={styles.spellDetailInfoLabel}>ALCANCE</Text>
-              <Text style={styles.spellDetailInfoValue}>{selectedSpellDetail?.range}</Text>
-            </View>
-          </View>
-
-          <Text style={styles.spellDetailInfoLabel}>DANO / EFEITO</Text>
-          <Text style={[styles.spellDetailInfoValue, {color: '#00fa9a', marginBottom: 15}]}>{selectedSpellDetail?.damage || '-'}</Text>
-
-          <Text style={styles.spellDetailInfoLabel}>DESCRIÇÃO</Text>
-          <ScrollView style={{maxHeight: 200}}>
-            <Text style={styles.spellDetailDescription}>{selectedSpellDetail?.description}</Text>
-          </ScrollView>
-
-          <TouchableOpacity style={styles.modalCloseButton} onPress={() => setSpellDetailModalVisible(false)}>
-            <Text style={styles.modalCloseText}>FECHAR</Text>
-          </TouchableOpacity>
-        </View>
-      </Pressable>
-    </Modal>
-  );
 
   const renderSearchModal = () => (
     <Modal visible={modalVisible} animationType="slide" transparent={true}>
@@ -767,49 +886,70 @@ export default function CreateCharacterScreen() {
   );
 
   const renderStepSpells = () => {
-    const filteredSpells = availableSpells.filter(spell => spell.name.toLowerCase().includes(spellSearch.toLowerCase()));
-    
-    const isCasterClass = selectedClassObj?.is_caster === 1;
-    const cantripsCount = selectedSpells.filter(sId => availableSpells.find(s => s.id.toString() === sId)?.level === 'Truque').length;
-    const level1Count = selectedSpells.filter(sId => availableSpells.find(s => s.id.toString() === sId)?.level === 'Nível 1').length;
-
     return (
       <View style={styles.stepContainer}>
+        <SpellSelector 
+          visible={spellsModalVisible} 
+          onClose={() => setSpellsModalVisible(false)}
+          availableSpells={availableSpells}
+          selectedSpellIds={selectedSpells}
+          lockedFeatureNames={lockedFeatures}
+          onToggleSpell={toggleSpell}
+          counterText={
+            [
+              maxExtraPassives > 0 ? `Habilidades: ${selectedSpells.filter(sId => ['Passiva', 'Habilidade'].includes(getCategory(availableSpells.find(s => s.id.toString() === sId))) && !lockedFeatures.includes(availableSpells.find(s => s.id.toString() === sId)?.name || '')).length}/${maxExtraPassives}` : null,
+              maxCantrips > 0 ? `Truques: ${selectedSpells.filter(sId => getCategory(availableSpells.find(s => s.id.toString() === sId)) === 'Magia' && availableSpells.find(s => s.id.toString() === sId)?.level === 'Truque').length}/${maxCantrips}` : null,
+              maxSpellsLvl1 > 0 ? `Magias: ${selectedSpells.filter(sId => getCategory(availableSpells.find(s => s.id.toString() === sId)) === 'Magia' && availableSpells.find(s => s.id.toString() === sId)?.level === 'Nível 1').length}/${maxSpellsLvl1}` : null
+            ].filter(Boolean).join(' • ')
+          }
+          hintText={isCasterClass 
+            ? `Sua classe permite a escolha de magias ativas e habilidades.` 
+            : `Sua classe permite escolher habilidades e estilos de combate.`}
+        />
+
         <View style={styles.statsHeader}>
           <Text style={styles.listTitle}>MAGIAS & HABILIDADES</Text>
-          {isCasterClass && <Text style={styles.counterText}>T: {cantripsCount}/{MAX_CANTRIPS} • N1: {level1Count}/{MAX_SPELLS_LVL1}</Text>}
         </View>
+        <Text style={styles.hpHint}>Clique no botão abaixo para abrir o catálogo completo da sua classe e gerenciar suas magias e habilidades passivas.</Text>
         
-        {!isCasterClass && <Text style={styles.hpHint}>Sua classe não conjura magias, mas você recebe as habilidades abaixo automaticamente no nível 1.</Text>}
-        
-        <TextInput style={[styles.searchInput, { marginBottom: 20, marginTop: 10 }]} placeholder="Buscar por nome ou nível..." placeholderTextColor="rgba(255,255,255,0.4)" value={spellSearch} onChangeText={setSpellSearch} />
-        
-        <View style={styles.skillsCard}>
-          {filteredSpells.map(s => {
-            const isPassive = s.level === 'Classe';
-            const isSelected = selectedSpells.includes(s.id.toString());
-            
-            return (
-              <View key={s.id} style={styles.skillRow}>
-                <TouchableOpacity style={[styles.radioCircle, isSelected && styles.radioCircleSelected, isPassive && {borderColor: '#00fa9a', backgroundColor: isSelected ? 'rgba(0,250,154,0.2)' : 'transparent'}]} onPress={() => toggleSpell(s.id.toString())}>
-                  {isSelected && <View style={[styles.radioDot, isPassive && {backgroundColor: '#00fa9a'}]} />}
-                </TouchableOpacity>
-                <TouchableOpacity style={{ flex: 1 }} onPress={() => { setSelectedSpellDetail(s); setSpellDetailModalVisible(true); }}>
-                  <Text style={styles.skillName}>{s.name} <Ionicons name="information-circle-outline" size={14} color={isPassive ? "#00fa9a" : "#00bfff"} /></Text>
-                </TouchableOpacity>
-                <Text style={[styles.spellLevelHint, isPassive && {color: '#02112b', backgroundColor: '#00fa9a'}]}>{s.level}</Text>
-              </View>
-            )
-          })}
-          {filteredSpells.length === 0 && <Text style={styles.emptyText}>Nenhuma habilidade listada para esta classe.</Text>}
-        </View>
+        {availableSpells.length > 0 ? (
+          <TouchableOpacity style={styles.manageSpellsBtn} onPress={() => setSpellsModalVisible(true)}>
+            <Text style={styles.manageSpellsBtnText}>Abrir Catálogo de Classe</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={[styles.manageSpellsBtn, {backgroundColor: 'rgba(255,255,255,0.05)'}]}>
+            <Text style={[styles.manageSpellsBtnText, {color: 'rgba(255,255,255,0.4)'}]}>Nenhuma habilidade adicional no Nível 1</Text>
+          </View>
+        )}
       </View>
     );
   };
 
   const renderStepEquipment = () => (
     <View style={styles.stepContainer}>
-      {renderKitModal()}
+      <Modal visible={kitModalVisible} animationType="slide" transparent={true}>
+        <Pressable style={styles.modalOverlay} onPress={() => setKitModalVisible(false)}>
+          <View style={[styles.modalContent, {maxHeight: '80%'}]}>
+            <Text style={styles.modalTitle}>Kits da Classe: {charClass}</Text>
+            <FlatList
+              data={dbKits}
+              keyExtractor={item => item.id.toString()}
+              renderItem={({item}) => {
+                const itemsList = JSON.parse(item.items).map((i: any) => `${i.qty}x ${i.name}`).join(', ');
+                return (
+                  <TouchableOpacity style={styles.kitCard} onPress={() => handleSelectKit(item)}>
+                    <Text style={styles.kitCardTitle}>{item.name}</Text>
+                    <Text style={styles.kitCardItems}>{itemsList}</Text>
+                    {item.target_type === 'bg3' && <Text style={[styles.customKitBadge, {color: '#ffd700', backgroundColor: 'rgba(255,215,0,0.1)'}]}>BG3 Origem</Text>}
+                    {item.criador !== 'base' && item.target_type !== 'bg3' && <Text style={styles.customKitBadge}>Customizado</Text>}
+                  </TouchableOpacity>
+                )
+              }}
+              ListEmptyComponent={<Text style={styles.emptyText}>Nenhum kit encontrado.</Text>}
+            />
+          </View>
+        </Pressable>
+      </Modal>
 
       <View style={styles.kitSelectionHeader}>
         <Text style={styles.label}>KIT INICIAL DE CLASSE</Text>
@@ -870,11 +1010,10 @@ export default function CreateCharacterScreen() {
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
       {renderSearchModal()}
-      {renderSpellDetailModal()}
 
       {/* MODAL DE ALERTA CUSTOMIZADO */}
       <Modal visible={customAlert.visible} transparent animationType="fade">
-        <View style={styles.modalOverlay}>
+        <View style={styles.modalOverlayCenter}>
           <View style={styles.customAlertBox}>
             <Text style={styles.customAlertTitle}>{customAlert.title}</Text>
             <Text style={styles.customAlertMessage}>{customAlert.message}</Text>
@@ -958,8 +1097,9 @@ const styles = StyleSheet.create({
   selectButton: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, paddingHorizontal: 15, paddingVertical: 16 },
   selectButtonText: { fontSize: 16, color: '#ffffff' },
   selectIcon: { color: 'rgba(255, 255, 255, 0.5)', fontSize: 12 },
-  modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0, 0, 0, 0.8)' },
-  modalContent: { backgroundColor: '#102b56', borderRadius: 24, padding: 20, alignItems: 'center', width: '90%' },
+  modalOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0, 0, 0, 0.8)' },
+  modalOverlayCenter: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0, 0, 0, 0.8)', padding: 20 },
+  modalContent: { backgroundColor: '#102b56', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 20, alignItems: 'center', width: '100%', borderWidth: 1, borderColor: '#00bfff' },
   modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#ffffff', marginBottom: 15 },
   searchInput: { width: '100%', backgroundColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, padding: 12, color: '#ffffff', fontSize: 16, marginBottom: 15 },
   modalListItem: { width: '100%', paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.05)' },
@@ -1017,15 +1157,8 @@ const styles = StyleSheet.create({
   hpBox: { flex: 1, backgroundColor: 'rgba(255, 50, 50, 0.05)', paddingVertical: 15, borderRadius: 12, alignItems: 'center' },
   hpValue: { fontSize: 26, fontWeight: 'bold', color: '#ff6666' },
   hpLabel: { fontSize: 10, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.7)' },
-
-  spellDetailCard: { backgroundColor: '#102b56', borderRadius: 24, padding: 25, width: '90%', borderWidth: 1, borderColor: '#00bfff' },
-  spellDetailName: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginBottom: 5 },
-  spellDetailLevel: { color: '#00bfff', fontSize: 12, fontWeight: 'bold', textTransform: 'uppercase', marginBottom: 20 },
-  spellDetailInfoGrid: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20, backgroundColor: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 12 },
-  spellDetailInfoItem: { alignItems: 'center', flex: 1 },
-  spellDetailInfoLabel: { color: 'rgba(255,255,255,0.4)', fontSize: 9, fontWeight: 'bold', letterSpacing: 1, marginBottom: 4 },
-  spellDetailInfoValue: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
-  spellDetailDescription: { color: 'rgba(255,255,255,0.7)', fontSize: 14, lineHeight: 22 },
+  manageSpellsBtn: { backgroundColor: '#00bfff', padding: 18, borderRadius: 15, alignItems: 'center', marginTop: 10 },
+  manageSpellsBtnText: { color: '#02112b', fontWeight: 'bold', fontSize: 14 },
 
   kitSelectionHeader: { marginBottom: 25 },
   kitSelectBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#00bfff' },
