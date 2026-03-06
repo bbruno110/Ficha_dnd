@@ -1,4 +1,5 @@
 // ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
+import DiceRoller3D from '@/components/DiceRoller3D';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
@@ -343,137 +344,142 @@ export default function CharacterSheetScreen() {
     setItemModalVisible(false); setItemSearch('');
   };
 
-  const applyDynamicBonus = (bagIndex: number, attr: string, val: number, isPerm: boolean, itemName: string, qty: number) => {
-    updateBagQty(bagIndex, -qty);
-    let newStats = { ...character.stats };
-    let dbUpdates: any = {};
-    const totalVal = val * qty;
-
-    if (isPerm) {
-      newStats[attr] = String((parseInt(newStats[attr]) || 10) + totalVal);
-      newStats.extra_points = (parseInt(newStats.extra_points) || 0) + totalVal;
-      setTimeout(() => showCustomAlert("Poder Permanente!", `A essência de ${itemName} entra em suas veias.\nSua ${attr} foi alterada em ${totalVal > 0 ? '+'+totalVal : totalVal} para sempre! ✨`), 400);
-    } else {
-      if(!newStats.temp_mods) newStats.temp_mods = {};
-      newStats.temp_mods[attr] = (parseInt(newStats.temp_mods[attr]) || 0) + totalVal;
-      setTimeout(() => showCustomAlert("Buff Ativado", `Você consumiu ${itemName}.\nSeu corpo reage e você recebe ${totalVal > 0 ? '+'+totalVal : totalVal} em ${attr} temporariamente. ⏳`), 400);
-    }
-
-    dbUpdates.stats = newStats;
-    updateDB(dbUpdates);
-  };
-
   const processConsumeItem = (bagIndex: number, item: any, qty: number) => {
     const effect = item.damage && item.damage !== '-' ? item.damage : 'Efeito oculto';
     
-    if (effect.toLowerCase().includes('escolher')) {
-      const match = effect.match(/[+-]?\d+/);
-      const bonusVal = match ? parseInt(match[0]) : 1;
-      const isPerm = effect.toLowerCase().includes('perm');
+    // Parse da tag "Escolher"
+    const hasEscolher = effect.toLowerCase().includes('escolher');
+    let escolherVal = 0;
+    let escolherIsPerm = false;
+    
+    if (hasEscolher) {
+      const escolherMatch = effect.match(/escolher\s*([+-]?\d+)/i);
+      escolherVal = escolherMatch ? parseInt(escolherMatch[1]) : 1;
+      escolherIsPerm = effect.toLowerCase().includes('perm');
+    }
 
+    // Função interna que processa TUDO: O status escolhido (se tiver), as penalidades e curas.
+    const executeConsumption = (chosenAttr?: string) => {
+      updateBagQty(bagIndex, -qty);
+
+      let newStats = { ...character.stats };
+      let msgParts = [];
+      let showHpModal = false;
+      let dbUpdates: any = {};
+
+      // 1. Aplica o Atributo Escolhido (caso exista)
+      if (chosenAttr) {
+        const totalVal = escolherVal * qty;
+        if (escolherIsPerm) {
+          newStats[chosenAttr] = String((parseInt(newStats[chosenAttr]) || 10) + totalVal);
+          newStats.extra_points = (parseInt(newStats.extra_points) || 0) + totalVal;
+          msgParts.push(`✨ Escolha: ${totalVal > 0 ? '+'+totalVal : totalVal} em ${chosenAttr} (Permanente)`);
+        } else {
+          if(!newStats.temp_mods) newStats.temp_mods = {};
+          newStats.temp_mods[chosenAttr] = (parseInt(newStats.temp_mods[chosenAttr]) || 0) + totalVal;
+          msgParts.push(`⏳ Escolha: ${totalVal > 0 ? '+'+totalVal : totalVal} em ${chosenAttr} (Temporário)`);
+        }
+      }
+
+      // 2. Aplica as outras propriedades fixas na string (ex: CAR -2)
+      const statRegex = /(CA|FOR|DES|CON|INT|SAB|CAR)\s*([+-]?\d+)\s*(\(?(Perm|Temp).*)?/gi;
+      const statMatches = [...effect.matchAll(statRegex)];
+
+      if (statMatches.length > 0) {
+        for (const match of statMatches) {
+          const attr = match[1].toUpperCase();
+          const val = parseInt(match[2].replace('+', '')) * qty;
+          const isPerm = match[3] && match[3].toLowerCase().includes('perm');
+          
+          if (isPerm) {
+              if (attr !== 'CA') { 
+                  newStats[attr] = String((parseInt(newStats[attr]) || 10) + val);
+                  newStats.extra_points = (parseInt(newStats.extra_points) || 0) + val;
+              }
+              msgParts.push(`💪 Permanente: ${val > 0 ? '+'+val : val} em ${attr}`);
+          } else {
+              if(!newStats.temp_mods) newStats.temp_mods = {};
+              newStats.temp_mods[attr] = (parseInt(newStats.temp_mods[attr]) || 0) + val;
+              msgParts.push(`⏳ Temporário: ${val > 0 ? '+'+val : val} em ${attr}`);
+          }
+        }
+      }
+
+      // 3. Aplica curas diretas
+      const effectStr = effect.toLowerCase();
+      if (effectStr.includes('cura') || effectStr.includes('hp') || (item.damage_type || '').toLowerCase().includes('cura')) {
+        const temDado = /d\d+/i.test(effect);
+        if (!temDado) {
+          const matchFixo = effect.match(/cura\s*([+-]?\d+)/i) || effect.match(/([+-]?\d+)\s*cura/i);
+          if (matchFixo) {
+            const curaValor = parseInt(matchFixo[1]) * qty;
+            if(!isNaN(curaValor)) {
+               const novoHp = Math.min(character.hp_max, character.hp_current + Math.abs(curaValor));
+               dbUpdates.hp_current = novoHp;
+               msgParts.push(`💖 Recuperou ${Math.abs(curaValor)} Pontos de Vida.`);
+            }
+          } else {
+            const genericNumMatch = effect.match(/\d+/);
+            if (genericNumMatch && !chosenAttr && statMatches.length === 0) {
+               const curaValor = parseInt(genericNumMatch[0]) * qty;
+               const novoHp = Math.min(character.hp_max, character.hp_current + Math.abs(curaValor));
+               dbUpdates.hp_current = novoHp;
+               msgParts.push(`💖 Recuperou ${Math.abs(curaValor)} Pontos de Vida.`);
+            }
+          }
+        } else {
+          showHpModal = true;
+          msgParts.push(`🎲 Requer Rolagem de Cura:\n${qty}x (${effect})`);
+        }
+      }
+
+      if (msgParts.length === 0 && !chosenAttr) msgParts.push(`✨ Efeito da ingestão: ${effect}`);
+
+      dbUpdates.stats = newStats;
+      if (Object.keys(dbUpdates).length > 0) updateDB(dbUpdates);
+
+      setTimeout(() => {
+        showCustomAlert(
+          "Efeito Aplicado!", 
+          msgParts.join('\n\n'), 
+          showHpModal 
+            ? [ { text: 'OK', color: '#fff' }, { text: 'Ir para HP', color: '#00fa9a', onPress: () => setHpModalVisible(true) } ] 
+            : [{ text: 'OK', color: '#00bfff' }]
+        );
+      }, 400);
+    };
+
+    // Caso possua ESCOLHER, mostramos os botões e passamos o status para executeConsumption.
+    if (hasEscolher) {
       const attrButtons: any[] = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].map(attr => ({
         text: attr,
-        color: bonusVal > 0 ? '#00fa9a' : '#ff6666',
-        onPress: () => applyDynamicBonus(bagIndex, attr, bonusVal, isPerm, item.name, qty)
+        color: escolherVal > 0 ? '#00fa9a' : '#ff6666',
+        onPress: () => executeConsumption(attr)
       }));
 
       showCustomAlert(
         `Consumir ${qty}x ${item.name}`,
-        `Você tem certeza que deseja ingerir este item?\n\n(Seus verdadeiros efeitos só serão revelados após o consumo...)`,
+        `Este item afeta um atributo de sua escolha. Os outros efeitos (se houver) também serão ativados.\n\nQual atributo deseja alterar?`,
+        [
+          
+          ...attrButtons
+        ]
+      );
+    } 
+    else {
+      showCustomAlert(
+        `Consumir ${qty}x ${item.name}`,
+        `Você tem certeza que deseja ingerir este item? Seus efeitos serão ativados em seu corpo...`,
         [
           { text: "Recusar", color: "#666" },
           { 
             text: "Beber / Comer", 
             color: "#00fa9a",
-            onPress: () => {
-              setTimeout(() => {
-                showCustomAlert(
-                  `Efeito Revelado!`,
-                  `O efeito mágico toma conta de você!\n\nEle alterará ${isPerm ? 'permanentemente' : 'temporariamente'} um atributo à sua escolha em ${bonusVal > 0 ? '+'+(bonusVal*qty) : (bonusVal*qty)}.\n\nQual atributo ele afetará?`,
-                  attrButtons
-                );
-              }, 400);
-            }
+            onPress: () => executeConsumption()
           }
         ]
       );
-      return; 
     }
-
-    showCustomAlert(
-      `Consumir ${qty}x ${item.name}`,
-      `Você tem certeza que deseja ingerir este item? Seus efeitos serão ativados em seu corpo...`,
-      [
-        { text: "Recusar", color: "#666" },
-        { 
-          text: "Beber / Comer", 
-          color: "#00fa9a",
-          onPress: () => {
-            updateBagQty(bagIndex, -qty);
-
-            let newStats = { ...character.stats };
-            let msgParts = [];
-            let showHpModal = false;
-            let dbUpdates: any = {};
-
-            const statRegex = /(CA|FOR|DES|CON|INT|SAB|CAR)\s*([+-]?\d+)\s*(\(?(Perm|Temp).*)?/gi;
-            const statMatches = [...effect.matchAll(statRegex)];
-            
-            if (statMatches.length > 0) {
-              for (const match of statMatches) {
-                const attr = match[1].toUpperCase();
-                const val = parseInt(match[2].replace('+', '')) * qty;
-                const isPerm = match[3] && match[3].toLowerCase().includes('perm');
-                
-                if (isPerm) {
-                    if (attr !== 'CA') { 
-                        newStats[attr] = String((parseInt(newStats[attr]) || 10) + val);
-                        newStats.extra_points = (parseInt(newStats.extra_points) || 0) + val;
-                    }
-                    msgParts.push(`💪 Permanente: ${val > 0 ? '+'+val : val} em ${attr}`);
-                } else {
-                    if(!newStats.temp_mods) newStats.temp_mods = {};
-                    newStats.temp_mods[attr] = (parseInt(newStats.temp_mods[attr]) || 0) + val;
-                    msgParts.push(`⏳ Temporário: ${val > 0 ? '+'+val : val} em ${attr}`);
-                }
-              }
-              dbUpdates.stats = newStats;
-            }
-
-            const effectStr = effect.toLowerCase();
-            if (effectStr.includes('cura') || effectStr.includes('hp') || (item.damage_type || '').toLowerCase().includes('cura')) {
-              const temDado = /d\d+/i.test(effect);
-              if (!temDado) {
-                const matchFixo = effect.match(/\d+/);
-                if (matchFixo) {
-                  const curaValor = parseInt(matchFixo[0]) * qty;
-                  const novoHp = Math.min(character.hp_max, character.hp_current + curaValor);
-                  dbUpdates.hp_current = novoHp;
-                  msgParts.push(`💖 Recuperou ${curaValor} Pontos de Vida.`);
-                }
-              } else {
-                showHpModal = true;
-                msgParts.push(`🎲 Requer Rolagem de Cura:\n${qty}x (${effect})`);
-              }
-            }
-
-            if (msgParts.length === 0) msgParts.push(`✨ Efeito da ingestão: ${effect}`);
-
-            if (Object.keys(dbUpdates).length > 0) updateDB(dbUpdates);
-
-            setTimeout(() => {
-              showCustomAlert(
-                "Efeito Revelado!", 
-                msgParts.join('\n\n'), 
-                showHpModal 
-                  ? [ { text: 'OK', color: '#fff' }, { text: 'Ir para HP', color: '#00fa9a', onPress: () => setHpModalVisible(true) } ] 
-                  : [{ text: 'OK', color: '#00bfff' }]
-              );
-            }, 400);
-          } 
-        }
-      ]
-    );
   };
 
   const processThrowItem = (bagIndex: number, item: any, qty: number) => {
@@ -1440,6 +1446,34 @@ export default function CharacterSheetScreen() {
         </View>
       </Modal>
 
+      {/* ================= MODAL DE ALERTAS CUSTOMIZADOS (AÇÕES) ================= */}
+      <Modal visible={customAlert.visible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.customAlertBox}>
+            <Text style={styles.customAlertTitle}>{customAlert.title}</Text>
+            <Text style={styles.customAlertMessage}>{customAlert.message}</Text>
+            
+            <View style={styles.customAlertBtnRow}>
+              {customAlert.buttons.map((btn, index) => (
+                <TouchableOpacity 
+                  key={index} 
+                  style={[styles.customAlertBtn, { borderColor: btn.color || '#fff', borderWidth: 1 }]}
+                  onPress={() => {
+                    // Fecha o modal e então executa a ação, se existir
+                    setCustomAlert(prev => ({ ...prev, visible: false }));
+                    if (btn.onPress) btn.onPress();
+                  }}
+                >
+                  <Text style={[styles.customAlertBtnText, { color: btn.color || '#fff' }]}>
+                    {btn.text}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        </View>
+      </Modal>
+        <DiceRoller3D/>
     </LinearGradient>
   );
 }

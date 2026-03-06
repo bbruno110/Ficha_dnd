@@ -75,7 +75,7 @@ export default function HomeScreen() {
       ) : (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyIcon}>🛡️</Text>
-          <Text style={styles.emptyTitle}>Nenhum herói encontrado</Text>
+          <Text style={styles.emptyTitle}>Nenhum tav encontrado</Text>
           <Text style={styles.emptyText}>Sua jornada ainda não começou. Crie seu primeiro personagem para iniciar a aventura!</Text>
         </View>
       )}

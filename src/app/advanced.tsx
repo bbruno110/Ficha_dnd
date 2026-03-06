@@ -360,21 +360,36 @@ export default function AdvancedCreatorScreen() {
         );
       }
       else if (activeTab === 'Item') {
-        let damageParts: string[] = [];
+        let damageValueParts: string[] = [];
+        let damageTypeParts: string[] = [];
         let extraProps: string[] = [];
+
         itemEffects.forEach(eff => {
           let suffix = eff.duration ? (eff.duration === 'Temp' && eff.turns ? ` (Temp: ${eff.turns} turnos)` : ` (${eff.duration})`) : '';
-          if (eff.type === 'Escolher Atributo') damageParts.push(`Escolher ${eff.val}${suffix}`);
-          else if (['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) damageParts.push(`${eff.type} ${eff.val}${suffix}`);
-          else if (eff.type === 'Cura') damageParts.push(`Cura ${eff.val}`);
-          else if (eff.type === 'Outro') damageParts.push(eff.val);
-          else damageParts.push(`${eff.val} ${eff.type}`);
+          
+          // Se for atributo, Cura ou efeito especial de "Outro", o tipo vai no valor da string
+          if (['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Cura'].includes(eff.type)) {
+              if (eff.type === 'Escolher Atributo') damageValueParts.push(`Escolher ${eff.val}${suffix}`);
+              else if (eff.type === 'Cura') damageValueParts.push(`Cura ${eff.val}`);
+              else damageValueParts.push(`${eff.type} ${eff.val}${suffix}`);
+          } 
+          else if (eff.type === 'Outro') {
+              damageValueParts.push(eff.val);
+          }
+          // Se for um tipo de dano (Fogo, Cortante, etc), separamos o dado (1d6) do tipo (Fogo)
+          else {
+              damageValueParts.push(eff.val); 
+              damageTypeParts.push(eff.type);
+          }
         });
-        const finalDamage = damageParts.length > 0 ? damageParts.join(' + ') : '-';
+
+        const finalDamage = damageValueParts.length > 0 ? damageValueParts.join(' + ') : '-';
+        const finalDamageType = damageTypeParts.length > 0 ? damageTypeParts.join(', ') : '-';
         const finalProps = [itemCategory, ...extraProps, ...properties].filter(Boolean).join(', ');
+
         await db.runAsync(
           `INSERT INTO items (name, weight, damage, damage_type, properties, descricao, criador) VALUES (?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, parseFloat(weight) || 0, finalDamage, '-', finalProps, itemDescription]
+          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, finalProps, itemDescription]
         );
       } 
       else if (activeTab === 'Raça') {
@@ -525,7 +540,10 @@ export default function AdvancedCreatorScreen() {
           )}
           
           <TouchableOpacity style={styles.addEffectBtn} onPress={() => {
-            if(!tempEffVal) return;
+            if(!tempEffVal && tempEffType !== 'Outro') {
+                Alert.alert("Aviso", "Insira um valor ou dado para o efeito.");
+                return;
+            }
             setItemEffects([...itemEffects, {val: tempEffVal, type: tempEffType, duration: isAttribute ? tempEffDuration : '', turns: tempEffTurns}]);
             setTempEffVal(''); setTempEffDuration(''); setTempEffTurns('');
           }}>
