@@ -1,18 +1,20 @@
 // ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   FlatList, KeyboardAvoidingView, Modal, Platform,
   Pressable,
   ScrollView,
-  StyleSheet, Text, TextInput, TouchableOpacity, View
+  Text, TextInput, TouchableOpacity, View
 } from 'react-native';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE
-import SpellSelector, { SpellItem } from '../components/SpellSelector';
+import SpellSelector, { SpellItem } from '../components/SpellSelector';
+import { joinLanSessionWithCharacter, notifyMasterJoin } from '@/services/lanSession';
+import { appColors, appGradients, createStyles as styles } from '@/styles/globalStyles';
 
 // ================= TIPAGENS =================
 type RaceItem = { id: number; name: string; stat_bonuses: string; speed: string; features: string; criador?: string };
@@ -49,6 +51,7 @@ const BASE_CLASS_FEATURES = [
 
 export default function CreateCharacterScreen() {
   const router = useRouter();
+  const { sessionId, sessionLevel, joinUrl } = useLocalSearchParams<{ sessionId?: string; sessionLevel?: string; joinUrl?: string }>();
   const db = useSQLiteContext();
   const isRandomizing = useRef(false);
 
@@ -112,7 +115,7 @@ export default function CreateCharacterScreen() {
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
 
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string, style?: string}[]) => {
-    setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: '#00bfff' }] });
+    setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: appColors.primary }] });
   };
 
   // ================= CÁLCULOS TÉCNICOS =================
@@ -916,7 +919,7 @@ export default function CreateCharacterScreen() {
     const activeSkillsToSave = proficiencies.filter(p => p.startsWith('skill_'));
 
     try {
-      await db.runAsync(
+      const result = await db.runAsync(
         `INSERT INTO characters (
           name, race, class, stats, prof_bonus, inspiration, proficiencies, 
           save_values, skill_values, personality_traits, ideals, bonds, flaws, 
@@ -931,7 +934,21 @@ export default function CreateCharacterScreen() {
           JSON.stringify(selectedSpells), '{}', JSON.stringify(cleanInventory), gp, sp, cp, hpMax, hpMax, 1, 0 
         ]
       );
-      router.back();
+      const newCharacterId = Number(result.lastInsertRowId);
+      const targetSessionLevel = Math.max(1, parseInt(String(sessionLevel || '1')) || 1);
+
+      if (sessionId && newCharacterId) {
+        const character = await joinLanSessionWithCharacter(db, String(sessionId), newCharacterId);
+        await notifyMasterJoin(firstParam(joinUrl), String(sessionId), character);
+      }
+
+      if (sessionId && targetSessionLevel > 1 && newCharacterId) {
+        router.replace(`/edit?id=${newCharacterId}&levelUpTo=${targetSessionLevel}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(firstParam(joinUrl) || '')}` as any);
+      } else if (sessionId && newCharacterId) {
+        router.replace(`/sheet?id=${newCharacterId}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(firstParam(joinUrl) || '')}` as any);
+      } else {
+        router.back();
+      }
     } catch (error) {}
   };
 
@@ -1136,7 +1153,7 @@ export default function CreateCharacterScreen() {
   );
 
   return (
-    <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+    <LinearGradient colors={appGradients.main} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
       {renderSearchModal()}
 
@@ -1211,96 +1228,7 @@ export default function CreateCharacterScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  scrollContent: { padding: 20, paddingTop: 60, paddingBottom: 100 },
-  header: { marginBottom: 30, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  headerTitle: { fontSize: 32, fontWeight: 'bold', color: '#ffffff' },
-  headerSubtitle: { fontSize: 16, color: '#00bfff', marginTop: 5, fontWeight: 'bold' },
-  randomDiceBtn: { backgroundColor: 'rgba(255,255,255,0.1)', padding: 12, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)', alignItems: 'center', justifyContent: 'center' },
-  formGroup: { marginBottom: 20 },
-  row: { flexDirection: 'row', justifyContent: 'space-between' },
-  label: { fontSize: 12, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.7)', marginBottom: 8, letterSpacing: 1 },
-  input: { backgroundColor: 'rgba(255, 255, 255, 0.05)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, paddingHorizontal: 15, paddingVertical: 12, fontSize: 16, color: '#ffffff' },
-  textArea: { backgroundColor: 'rgba(255, 255, 255, 0.05)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, paddingHorizontal: 15, paddingVertical: 15, fontSize: 14, color: '#ffffff', minHeight: 100, textAlignVertical: 'top' },
-  selectButton: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, paddingHorizontal: 15, paddingVertical: 16 },
-  selectButtonText: { fontSize: 16, color: '#ffffff' },
-  selectIcon: { color: 'rgba(255, 255, 255, 0.5)', fontSize: 12 },
-  modalOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0, 0, 0, 0.8)' },
-  modalOverlayCenter: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0, 0, 0, 0.8)', padding: 20 },
-  modalContent: { backgroundColor: '#102b56', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 20, alignItems: 'center', width: '100%', borderWidth: 1, borderColor: '#00bfff' },
-  modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#ffffff', marginBottom: 15 },
-  searchInput: { width: '100%', backgroundColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, padding: 12, color: '#ffffff', fontSize: 16, marginBottom: 15 },
-  modalListItem: { width: '100%', paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.05)' },
-  modalListItemText: { fontSize: 16, color: '#ffffff' },
-  emptyText: { color: 'rgba(255, 255, 255, 0.5)', marginTop: 20, textAlign: 'center' },
-  modalCloseButton: { marginTop: 20, paddingVertical: 12, width: '100%', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: 12 },
-  modalCloseText: { color: '#00bfff', fontWeight: 'bold' },
-  statsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
-  sectionTitle: { fontSize: 14, fontWeight: 'bold', color: '#ffffff' },
-  counterText: { fontSize: 12, fontWeight: 'bold', color: '#00bfff', backgroundColor: 'rgba(0, 191, 255, 0.1)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
-  statsSection: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: 'rgba(255, 255, 255, 0.1)' },
-  statsGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 10 },
-  statBox: { width: '30%', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, padding: 10, alignItems: 'center' },
-  statLabel: { fontSize: 14, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.7)', marginBottom: 5 },
-  statInput: { fontSize: 24, fontWeight: 'bold', color: '#ffffff', textAlign: 'center' },
-  stepContainer: { marginTop: 10 },
-  step2Container: { marginTop: 10 },
-  profBonusHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', borderWidth: 1, borderColor: 'rgba(0, 191, 255, 0.3)', borderRadius: 12, padding: 15, marginBottom: 20 },
-  profBonusTitle: { fontSize: 14, fontWeight: 'bold', color: '#ffffff' },
-  profBonusInput: { fontSize: 20, fontWeight: 'bold', color: '#00bfff', backgroundColor: 'rgba(0, 0, 0, 0.2)', paddingHorizontal: 15, paddingVertical: 5, borderRadius: 8 },
-  listTitle: { fontSize: 14, fontWeight: 'bold', color: '#ffffff' },
-  skillsCard: { backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: 16, padding: 15, marginBottom: 20 },
-  skillRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.05)' },
-  radioCircle: { height: 24, width: 24, borderRadius: 12, borderWidth: 2, borderColor: 'rgba(255, 255, 255, 0.3)', alignItems: 'center', justifyContent: 'center', marginRight: 15 },
-  radioCircleSelected: { borderColor: '#00bfff' },
-  radioDot: { height: 12, width: 12, borderRadius: 6, backgroundColor: '#00bfff' },
-  skillInputCalculated: { width: 40, fontSize: 16, fontWeight: 'bold', color: '#00bfff', textAlign: 'center', marginRight: 10 },
-  skillName: { fontSize: 16, color: 'rgba(255, 255, 255, 0.8)' },
-  spellLevelHint: { fontSize: 10, fontWeight: 'bold', color: '#00bfff', backgroundColor: 'rgba(0, 191, 255, 0.1)', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-  statHint: { fontSize: 12, color: 'rgba(255, 255, 255, 0.4)' },
-  footer: { position: 'absolute', bottom: 30, left: 20, right: 20, flexDirection: 'row', gap: 10 },
-  backButton: { flex: 1, backgroundColor: 'transparent', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.3)', borderRadius: 16, paddingVertical: 18, alignItems: 'center' },
-  backButtonText: { fontSize: 14, fontWeight: 'bold', color: '#ffffff' },
-  primaryButton: { flex: 2, backgroundColor: '#00bfff', borderRadius: 16, paddingVertical: 18, alignItems: 'center' },
-  primaryButtonText: { fontSize: 14, fontWeight: 'bold', color: '#02112b' },
-  infoBox: { backgroundColor: 'rgba(0, 191, 255, 0.1)', padding: 15, borderRadius: 12, borderColor: 'rgba(0, 191, 255, 0.3)', borderWidth: 1, marginBottom: 20 },
-  hpHint: { color: 'rgba(255,255,255,0.5)', fontSize: 12, textAlign: 'center', marginTop: 5, marginBottom: 15, lineHeight: 18 },
-  infoText: { color: '#ffffff', fontSize: 14, lineHeight: 20 },
-  qtyControl: { flexDirection: 'row', alignItems: 'center', marginRight: 15, backgroundColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 8 },
-  qtyBtn: { paddingHorizontal: 12, paddingVertical: 6 },
-  qtyBtnText: { color: '#00bfff', fontSize: 18, fontWeight: 'bold' },
-  qtyValue: { color: '#ffffff', fontSize: 16, fontWeight: 'bold', width: 20, textAlign: 'center' },
-  coinsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20, gap: 10 },
-  coinBox: { flex: 1, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 12, padding: 10, alignItems: 'center' },
-  coinLabel: { fontSize: 10, fontWeight: 'bold', marginBottom: 5 },
-  coinInput: { color: '#fff', fontSize: 18, fontWeight: 'bold', textAlign: 'center' },
-  summaryHeader: { alignItems: 'center', marginBottom: 20, backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: 20, borderRadius: 16 },
-  summaryName: { fontSize: 28, fontWeight: 'bold', color: '#fff', marginBottom: 5 },
-  summarySubtitle: { fontSize: 16, color: '#00bfff', fontWeight: 'bold' },
-  summaryGrid: { flexDirection: 'row', justifyContent: 'space-between', gap: 10, marginBottom: 10 },
-  summaryBox: { flex: 1, backgroundColor: 'rgba(0, 191, 255, 0.05)', paddingVertical: 15, borderRadius: 12, alignItems: 'center' },
-  summaryBoxValue: { fontSize: 26, fontWeight: 'bold', color: '#fff' },
-  summaryBoxLabel: { fontSize: 10, fontWeight: 'bold', color: '#00bfff' },
-  hpContainer: { flexDirection: 'row', justifyContent: 'space-between', gap: 10, marginBottom: 20 },
-  hpBox: { flex: 1, backgroundColor: 'rgba(255, 50, 50, 0.05)', paddingVertical: 15, borderRadius: 12, alignItems: 'center' },
-  hpValue: { fontSize: 26, fontWeight: 'bold', color: '#ff6666' },
-  hpLabel: { fontSize: 10, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.7)' },
-  manageSpellsBtn: { backgroundColor: '#00bfff', padding: 18, borderRadius: 15, alignItems: 'center', marginTop: 10 },
-  manageSpellsBtnText: { color: '#02112b', fontWeight: 'bold', fontSize: 14 },
-
-  kitSelectionHeader: { marginBottom: 25 },
-  kitSelectBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#00bfff' },
-  kitSelectBtnText: { color: '#00bfff', fontWeight: 'bold', fontSize: 14 },
-  kitCard: { backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: 15, borderRadius: 12, marginBottom: 10, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)' },
-  kitCardTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 5 },
-  kitCardItems: { color: 'rgba(255, 255, 255, 0.6)', fontSize: 12, lineHeight: 18 },
-  customKitBadge: { position: 'absolute', top: 15, right: 15, color: '#00fa9a', fontSize: 10, fontWeight: 'bold', backgroundColor: 'rgba(0,250,154,0.1)', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 5 },
-
-  customAlertBox: { backgroundColor: '#102b56', width: '90%', borderRadius: 20, padding: 25, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', alignItems: 'center' },
-  customAlertTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },
-  customAlertMessage: { color: 'rgba(255,255,255,0.8)', fontSize: 14, textAlign: 'center', lineHeight: 22, marginBottom: 25 },
-  customAlertBtnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, width: '100%', justifyContent: 'center' },
-  customAlertBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 10, alignItems: 'center', minWidth: '30%', borderWidth: 1 },
-  customAlertBtnText: { fontWeight: 'bold', fontSize: 14 },
-});
+function firstParam(value?: string | string[]) {
+  if (Array.isArray(value)) return value[0];
+  return value;
+}

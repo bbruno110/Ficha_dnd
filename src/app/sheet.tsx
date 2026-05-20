@@ -5,7 +5,24 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
+import {
+  fetchLanSessionEvents,
+  fetchLanSessionPayload,
+  getLocalLanSessionForCharacter,
+  getPublicLanPlayers,
+  makeLanCharacterKey,
+  makeLanEventId,
+  rememberLanSessionEvent,
+  sendLanSessionEvent,
+  type LanSessionEvent,
+  type LanSessionPayload,
+  type LanTradeItem,
+  type LanEffectTarget,
+  type LanEffectUnit,
+  type PublicLanPlayer,
+} from '@/services/lanSession';
 
 const XP_TABLE = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000, 85000, 100000, 120000, 140000, 165000, 195000, 225000, 265000, 305000, 355000];
 
@@ -20,7 +37,7 @@ const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 
 const COIN_RATES = { gp: 100, sp: 10, cp: 1 };
 const COIN_NAMES = { gp: 'Ouro', sp: 'Prata', cp: 'Cobre' };
-const COIN_COLORS = { gp: '#ffd700', sp: '#c0c0c0', cp: '#cd7f32' };
+const COIN_COLORS = { gp: appColors.warning, sp: appColors.silver, cp: appColors.copper };
 
 // Força a categoria correta para o agrupamento
 const getCategory = (spell: any): string => {
@@ -31,9 +48,11 @@ const getCategory = (spell: any): string => {
 };
 
 export default function CharacterSheetScreen() {
-  const { id } = useLocalSearchParams();
+  const { id, sessionId, joinUrl } = useLocalSearchParams<{ id?: string; sessionId?: string; joinUrl?: string }>();
   const router = useRouter();
   const db = useSQLiteContext();
+  const routeSessionId = firstParam(sessionId);
+  const routeJoinUrl = decodeParam(firstParam(joinUrl));
 
   const [activeTab, setActiveTab] = useState<'stats' | 'profs' | 'inv' | 'spells'>('stats');
   const [character, setCharacter] = useState<any>(null);
@@ -72,6 +91,19 @@ export default function CharacterSheetScreen() {
   const [selectedBagItem, setSelectedBagItem] = useState<{item: any, index: number} | null>(null);
   const [actionQty, setActionQty] = useState(1);
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
+  const [lanInfo, setLanInfo] = useState<{ sessionId: string; joinUrl: string } | null>(null);
+  const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
+  const [incomingTrades, setIncomingTrades] = useState<LanSessionEvent[]>([]);
+  const [targetPickerMode, setTargetPickerMode] = useState<'send' | 'trade' | null>(null);
+  const [selectedTradeOffer, setSelectedTradeOffer] = useState<LanSessionEvent | null>(null);
+  const [tradeCounterItem, setTradeCounterItem] = useState<{item: any, index: number} | null>(null);
+  const [tradeCounterQty, setTradeCounterQty] = useState(1);
+  const [spellCastVisible, setSpellCastVisible] = useState(false);
+  const [spellTargetKeys, setSpellTargetKeys] = useState<string[]>([]);
+  const [spellTargetAmounts, setSpellTargetAmounts] = useState<Record<string, string>>({});
+  const [spellRollResult, setSpellRollResult] = useState('');
+  const [spellEffectTarget, setSpellEffectTarget] = useState<LanEffectTarget>('custom');
+  const [spellEffectValue, setSpellEffectValue] = useState('0');
 
   // Sistema de Buffs Temporários
   const [tempBuffModalVisible, setTempBuffModalVisible] = useState(false);
@@ -110,7 +142,7 @@ export default function CharacterSheetScreen() {
   }, [selectedSpell]);
 
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string}[]) => {
-    setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: '#00bfff' }] });
+    setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: appColors.primary }] });
   };
 
   useFocusEffect(
@@ -179,8 +211,202 @@ export default function CharacterSheetScreen() {
     }, [id])
   );
 
+  const getSelfLanKey = (sessionValue?: string) => {
+    if (!character || !sessionValue) return '';
+    return makeLanCharacterKey(sessionValue, character);
+  };
+
+  const makeTradeItem = (item: any, qty: number): LanTradeItem => ({
+    name: String(item.name || 'Item'),
+    qty: Math.max(1, Math.min(Number(item.qty) || 1, qty)),
+    weight: Number(item.weight) || 0,
+    damage: item.damage,
+    damage_type: item.damage_type,
+    properties: item.properties,
+  });
+
+  const updateCharacterEquipmentOnly = async (equipment: any) => {
+    if (!character) return false;
+    try {
+      await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [JSON.stringify(equipment), character.id]);
+      setCharacter((prev: any) => ({ ...prev, equipment }));
+      return true;
+    } catch (error) {
+      console.error(error);
+      return false;
+    }
+  };
+
+  const addTradeItemToBag = async (tradeItem?: LanTradeItem) => {
+    if (!character || !tradeItem) return false;
+    const nextBag = [...character.equipment.bag];
+    const existingIndex = nextBag.findIndex((item: any) => item.name === tradeItem.name);
+    if (existingIndex >= 0) {
+      nextBag[existingIndex].qty = (Number(nextBag[existingIndex].qty) || 0) + tradeItem.qty;
+    } else {
+      nextBag.push({ ...tradeItem });
+    }
+    return updateCharacterEquipmentOnly({ ...character.equipment, bag: nextBag });
+  };
+
+  const removeTradeItemFromBagByIndex = async (index: number, qty: number) => {
+    if (!character) return false;
+    const nextBag = [...character.equipment.bag];
+    const item = nextBag[index];
+    if (!item || (Number(item.qty) || 0) < qty) return false;
+    nextBag[index] = { ...item, qty: (Number(item.qty) || 0) - qty };
+    const cleanBag = nextBag.filter((entry: any) => (Number(entry.qty) || 0) > 0);
+    return updateCharacterEquipmentOnly({ ...character.equipment, bag: cleanBag });
+  };
+
+  const removeTradeItemFromBagByName = async (tradeItem?: LanTradeItem) => {
+    if (!character || !tradeItem) return false;
+    const index = character.equipment.bag.findIndex((item: any) => item.name === tradeItem.name);
+    if (index < 0) return false;
+    return removeTradeItemFromBagByIndex(index, tradeItem.qty);
+  };
+
+  const applySpellHpToSelf = async (amount: number) => {
+    if (!character) return;
+    const nextHp = Math.max(0, Math.min(character.hp_max, Number(character.hp_current || 0) + amount));
+    await db.runAsync(`UPDATE characters SET hp_current = ? WHERE id = ?`, [nextHp, character.id]);
+    setCharacter((prev: any) => ({ ...prev, hp_current: nextHp }));
+    notifyOwnLanStatus(nextHp, character.hp_max);
+  };
+
+  const applySpellEffectToSelf = async (event: LanSessionEvent) => {
+    if (!character || !event.spellEffect) return;
+    const target = event.spellEffect.target || 'custom';
+    const value = Number(event.spellEffect.value || 0);
+
+    if (target === 'custom' || value === 0) {
+      showCustomAlert('Efeito recebido', `${event.fromName} aplicou ${event.spellEffect.spellName}.`);
+      return;
+    }
+
+    const newStats = { ...character.stats, temp_mods: { ...(character.stats.temp_mods || {}) } };
+    newStats.temp_mods[target] = (parseInt(newStats.temp_mods[target]) || 0) + value;
+    await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [JSON.stringify(newStats), character.id]);
+    setCharacter((prev: any) => ({ ...prev, stats: newStats }));
+    showCustomAlert('Efeito recebido', `${event.fromName} aplicou ${event.spellEffect.spellName}: ${target} ${value > 0 ? '+' : ''}${value}.`);
+  };
+
+  const handleLanEvents = async (events: LanSessionEvent[], sessionValue: string) => {
+    if (!character) return;
+    const selfKey = getSelfLanKey(sessionValue);
+    const isForMe = (event: LanSessionEvent) => event.toKey === selfKey || event.toName === character.name;
+    const responses = new Set(events.filter((event) => ['trade_accept', 'trade_decline'].includes(event.type)).map((event) => event.tradeId));
+    const pendingOffers = events.filter((event) => event.type === 'trade_offer' && isForMe(event) && !responses.has(event.id));
+
+    setIncomingTrades(pendingOffers);
+
+    for (const event of events) {
+      if (event.type === 'public_status' && event.publicState) {
+        setLanPlayers((current) => current.map((player) => (
+          player.key === event.fromKey || player.characterName === event.fromName
+            ? { ...player, hpCurrent: event.publicState!.hpCurrent, hpMax: event.publicState!.hpMax, level: event.publicState!.level }
+            : player
+        )));
+        continue;
+      }
+
+      if (!isForMe(event)) continue;
+
+      if (event.type === 'send_item') {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) {
+          await addTradeItemToBag(event.item);
+          showCustomAlert('Item recebido', `${event.fromName} enviou ${event.item?.qty || 1}x ${event.item?.name || 'item'}.`);
+        }
+      }
+
+      if (event.type === 'trade_accept') {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) {
+          const removed = await removeTradeItemFromBagByName(event.offeredItem);
+          if (removed) await addTradeItemToBag(event.requestedItem);
+          showCustomAlert('Troca aceita', `${event.fromName} aceitou a troca.`);
+        }
+      }
+
+      if (event.type === 'trade_decline') {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) showCustomAlert('Troca recusada', `${event.fromName} recusou a troca.`);
+      }
+
+      if (event.type === 'spell_hp' && event.spellEffect) {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) {
+          await applySpellHpToSelf(Number(event.spellEffect.amount || 0));
+          const modeText = event.spellEffect.mode === 'heal' ? 'curou' : 'causou dano em';
+          showCustomAlert('Magia recebida', `${event.fromName} usou ${event.spellEffect.spellName} e ${modeText} ${Math.abs(Number(event.spellEffect.amount || 0))} PV.`);
+        }
+      }
+
+      if (event.type === 'spell_effect' && event.spellEffect) {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) await applySpellEffectToSelf(event);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!character) return;
+    let active = true;
+
+    const refreshLan = async () => {
+      const storedInfo = routeSessionId
+        ? { sessionId: routeSessionId, joinUrl: routeJoinUrl || '' }
+        : await getLocalLanSessionForCharacter(db, Number(character.id));
+
+      if (!storedInfo?.sessionId) return;
+
+      const nextInfo = {
+        sessionId: storedInfo.sessionId,
+        joinUrl: decodeParam(storedInfo.joinUrl || ''),
+      };
+      if (active) setLanInfo(nextInfo);
+
+      let nextPayload: LanSessionPayload | null = null;
+      if (nextInfo.joinUrl) {
+        try {
+          nextPayload = await fetchLanSessionPayload(nextInfo.joinUrl);
+        } catch {
+          nextPayload = null;
+        }
+      } else if ((storedInfo as any).payloadJson) {
+        try {
+          nextPayload = JSON.parse((storedInfo as any).payloadJson);
+        } catch {
+          nextPayload = null;
+        }
+      }
+
+      if (nextPayload && active) {
+        const selfKey = makeLanCharacterKey(nextInfo.sessionId, character);
+        setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+      }
+
+      if (nextInfo.joinUrl) {
+        try {
+          const events = await fetchLanSessionEvents(nextInfo.joinUrl);
+          if (active) await handleLanEvents(events.filter((event) => event.sessionId === nextInfo.sessionId), nextInfo.sessionId);
+        } catch {
+          // A mesa pode estar pausada/offline; a ficha continua utilizavel localmente.
+        }
+      }
+    };
+
+    refreshLan();
+    const timer = setInterval(refreshLan, 3500);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [character, routeSessionId, routeJoinUrl]);
+
   // Se estiver carregando ou sem personagem, encerra o render aqui
-  if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#00bfff" /></View>;
+  if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color={appColors.primary} /></View>;
   if (!character) return <View style={styles.loadingContainer}><Text style={styles.errorText}>Erro ao carregar o personagem.</Text></View>;
 
   // ==============================================================================
@@ -228,7 +454,7 @@ export default function CharacterSheetScreen() {
   const caEquip = parseInt(character.stats.equip_mods?.CA) || 0;
   const armorClassTotal = baseCa + (addDes ? desMod : 0) + caTemp + caEquip;
   const caSumBuffs = caTemp + caEquip;
-  const caColor = caSumBuffs > 0 ? '#00fa9a' : (caSumBuffs < 0 ? '#ff6666' : '#fff');
+  const caColor = caSumBuffs > 0 ? appColors.success : (caSumBuffs < 0 ? appColors.danger : appColors.textPrimary);
 
   let expectedLevel = 1;
   for (let i = XP_TABLE.length - 1; i >= 0; i--) { 
@@ -284,6 +510,7 @@ export default function CharacterSheetScreen() {
     let newDbCurrent = newDisplayCurrent - hpBonusFromCon;
     
     updateDB({ hp_current: newDbCurrent });
+    notifyOwnLanStatus(newDbCurrent, character.hp_max);
     setHpModalVisible(false); 
     setInputValue('');
   };
@@ -342,6 +569,255 @@ export default function CharacterSheetScreen() {
     else newBag.push({ name: item.name, qty: 1, weight: item.weight, damage: item.damage, damage_type: item.damage_type, properties: item.properties });
     updateDB({ equipment: { ...character.equipment, bag: newBag } });
     setItemModalVisible(false); setItemSearch('');
+  };
+
+  const handleSendItemToPlayer = async (target: PublicLanPlayer) => {
+    if (!selectedBagItem || !lanInfo || !character) return;
+    const tradeItem = makeTradeItem(selectedBagItem.item, actionQty);
+    const removed = await removeTradeItemFromBagByIndex(selectedBagItem.index, tradeItem.qty);
+    if (!removed) {
+      showCustomAlert('Envio cancelado', 'Voce nao tem quantidade suficiente deste item.');
+      return;
+    }
+
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'send_item',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: target.key,
+        toName: target.characterName,
+        item: tradeItem,
+        createdAt: new Date().toISOString(),
+      });
+      showCustomAlert('Item enviado', `${tradeItem.qty}x ${tradeItem.name} foi enviado para ${target.characterName}.`);
+    } catch {
+      await addTradeItemToBag(tradeItem);
+      showCustomAlert('Envio falhou', 'Nao consegui avisar a sessao LAN. O item voltou para sua mochila.');
+    } finally {
+      setTargetPickerMode(null);
+      setSelectedBagItem(null);
+    }
+  };
+
+  const handleOfferTradeToPlayer = async (target: PublicLanPlayer) => {
+    if (!selectedBagItem || !lanInfo || !character) return;
+    const offeredItem = makeTradeItem(selectedBagItem.item, actionQty);
+
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'trade_offer',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: target.key,
+        toName: target.characterName,
+        offeredItem,
+        createdAt: new Date().toISOString(),
+      });
+      showCustomAlert('Troca enviada', `${target.characterName} recebeu sua proposta de troca.`);
+    } catch {
+      showCustomAlert('Troca falhou', 'Nao consegui enviar a proposta para a sessao LAN.');
+    } finally {
+      setTargetPickerMode(null);
+      setSelectedBagItem(null);
+    }
+  };
+
+  const handleAcceptTrade = async () => {
+    if (!selectedTradeOffer || !tradeCounterItem || !lanInfo || !character) return;
+    const requestedItem = makeTradeItem(tradeCounterItem.item, tradeCounterQty);
+    const removed = await removeTradeItemFromBagByIndex(tradeCounterItem.index, requestedItem.qty);
+    if (!removed) {
+      showCustomAlert('Troca cancelada', 'Voce nao tem quantidade suficiente do item escolhido.');
+      return;
+    }
+
+    await addTradeItemToBag(selectedTradeOffer.offeredItem);
+
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'trade_accept',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: selectedTradeOffer.fromKey,
+        toName: selectedTradeOffer.fromName,
+        tradeId: selectedTradeOffer.id,
+        offeredItem: selectedTradeOffer.offeredItem,
+        requestedItem,
+        createdAt: new Date().toISOString(),
+      });
+      setIncomingTrades((current) => current.filter((event) => event.id !== selectedTradeOffer.id));
+      setSelectedTradeOffer(null);
+      setTradeCounterItem(null);
+      showCustomAlert('Troca aceita', 'A troca foi confirmada.');
+    } catch {
+      await addTradeItemToBag(requestedItem);
+      await removeTradeItemFromBagByName(selectedTradeOffer.offeredItem);
+      showCustomAlert('Troca falhou', 'Nao consegui confirmar a troca na sessao LAN.');
+    }
+  };
+
+  const handleDeclineTrade = async (event: LanSessionEvent) => {
+    if (!lanInfo || !character) return;
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'trade_decline',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: event.fromKey,
+        toName: event.fromName,
+        tradeId: event.id,
+        offeredItem: event.offeredItem,
+        createdAt: new Date().toISOString(),
+      });
+      setIncomingTrades((current) => current.filter((entry) => entry.id !== event.id));
+      if (selectedTradeOffer?.id === event.id) setSelectedTradeOffer(null);
+    } catch {
+      showCustomAlert('Resposta falhou', 'Nao consegui recusar a troca na sessao LAN.');
+    }
+  };
+
+  const notifyOwnLanStatus = async (hpCurrent: number, hpMax: number) => {
+    if (!lanInfo?.joinUrl || !character) return;
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'public_status',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: 'session',
+        toName: 'session',
+        publicState: {
+          hpCurrent,
+          hpMax,
+          level: character.level,
+        },
+        createdAt: new Date().toISOString(),
+      });
+    } catch {
+      // A mudanca local de HP continua valida mesmo se a mesa estiver temporariamente offline.
+    }
+  };
+
+  const getSpellCastMode = (spell: any): 'heal' | 'damage' | 'effect' => {
+    const text = `${spell.damage_dice || ''} ${spell.damage || ''} ${spell.damage_type || ''} ${spell.description || ''}`.toLowerCase();
+    if (text.includes('cura') || text.includes('curar') || text.includes('recupera')) return 'heal';
+    if ((spell.damage_dice && spell.damage_dice !== '-') || (spell.damage && spell.damage !== '-')) return 'damage';
+    return 'effect';
+  };
+
+  const getSpellDiceText = (spell: any) => {
+    const raw = String(spell.damage_dice || spell.damage || '');
+    if (!raw || raw === '-') return '';
+    return raw.replace(/cura/gi, '').trim();
+  };
+
+  const startSpellCast = (spell: any) => {
+    const selfKey = lanInfo ? getSelfLanKey(lanInfo.sessionId) : '';
+    const defaultKeys = selfKey ? [selfKey] : [];
+    setSpellTargetKeys(defaultKeys);
+    setSpellTargetAmounts(defaultKeys.reduce((acc, key) => ({ ...acc, [key]: '' }), {}));
+    setSpellRollResult('');
+    setSpellEffectTarget('custom');
+    setSpellEffectValue('0');
+    setSpellCastVisible(true);
+  };
+
+  const toggleSpellTarget = (key: string) => {
+    setSpellTargetKeys((current) => {
+      const next = current.includes(key) ? current.filter((entry) => entry !== key) : [...current, key];
+      setSpellTargetAmounts((amounts) => {
+        const copy = { ...amounts };
+        if (!copy[key]) copy[key] = '';
+        return copy;
+      });
+      return next;
+    });
+  };
+
+  const rollSpellForTargets = () => {
+    if (!selectedSpell) return;
+    const result = rollDiceExpression(getSpellDiceText(selectedSpell));
+    if (!result) {
+      showCustomAlert('Rolagem indisponivel', 'Nao encontrei uma formula de dado nesta magia. Informe o valor manualmente.');
+      return;
+    }
+
+    setSpellRollResult(`${result.total} (${result.breakdown})`);
+    setSpellTargetAmounts((current) => {
+      const next = { ...current };
+      for (const key of spellTargetKeys) next[key] = String(result.total);
+      return next;
+    });
+  };
+
+  const sendSpellEventToTarget = async (target: PublicLanPlayer, amount: number) => {
+    if (!lanInfo || !character || !selectedSpell) return;
+    const mode = getSpellCastMode(selectedSpell);
+    const event: LanSessionEvent = {
+      id: makeLanEventId(),
+      sessionId: lanInfo.sessionId,
+      type: mode === 'effect' ? 'spell_effect' : 'spell_hp',
+      fromKey: getSelfLanKey(lanInfo.sessionId),
+      fromName: character.name,
+      toKey: target.key,
+      toName: target.characterName,
+      spellEffect: mode === 'effect'
+        ? {
+          spellName: selectedSpell.name,
+          mode,
+          target: spellEffectTarget,
+          value: parseInt(spellEffectValue) || 0,
+          durationText: selectedSpell.duration || 'Instantanea',
+          ...parseSpellDuration(selectedSpell.duration),
+          description: selectedSpell.description,
+        }
+        : {
+          spellName: selectedSpell.name,
+          mode,
+          amount: mode === 'heal' ? Math.abs(amount) : -Math.abs(amount),
+          description: selectedSpell.description,
+        },
+      createdAt: new Date().toISOString(),
+    };
+
+    if (target.isSelf) {
+      await rememberLanSessionEvent(db, event);
+      if (event.type === 'spell_hp') await applySpellHpToSelf(Number(event.spellEffect?.amount || 0));
+      else await applySpellEffectToSelf(event);
+    }
+
+    await sendLanSessionEvent(lanInfo.joinUrl, event);
+  };
+
+  const applySpellCast = async () => {
+    if (!selectedSpell || !lanInfo) return;
+    const targets = lanPlayers.filter((player) => spellTargetKeys.includes(player.key));
+    if (targets.length === 0) {
+      showCustomAlert('Sem alvo', 'Escolha pelo menos um personagem da party.');
+      return;
+    }
+
+    try {
+      for (const target of targets) {
+        const value = parseInt(spellTargetAmounts[target.key]) || 0;
+        if (getSpellCastMode(selectedSpell) !== 'effect' && value <= 0) continue;
+        await sendSpellEventToTarget(target, value);
+      }
+      setSpellCastVisible(false);
+      showCustomAlert('Magia aplicada', `${selectedSpell.name} foi enviada para ${targets.length} alvo(s).`);
+    } catch {
+      showCustomAlert('Magia falhou', 'Nao consegui sincronizar a magia na sessao LAN.');
+    }
   };
 
   const processConsumeItem = (bagIndex: number, item: any, qty: number) => {
@@ -702,6 +1178,49 @@ export default function CharacterSheetScreen() {
   // 3. COMPONENTES DE RENDERIZAÇÃO
   // ==============================================================================
 
+  const renderLanPartyCard = () => {
+    if (!lanInfo && lanPlayers.length === 0) return null;
+    const otherPlayers = lanPlayers.filter((player) => !player.isSelf);
+
+    return (
+      <View style={styles.sessionPartyBox}>
+        <View style={styles.sessionPartyHeader}>
+          <View>
+            <Text style={styles.sessionPartyTitle}>SESSAO LAN</Text>
+            <Text style={styles.sessionPartyHint}>Jogadores veem apenas vida e nivel do grupo.</Text>
+          </View>
+          {incomingTrades.length > 0 && (
+            <TouchableOpacity style={styles.pendingTradeButton} onPress={() => setSelectedTradeOffer(incomingTrades[0])}>
+              <Text style={styles.pendingTradeText}>{incomingTrades.length} TROCA</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {lanPlayers.length === 0 ? (
+          <Text style={styles.emptyText}>Aguardando sincronizacao da mesa.</Text>
+        ) : lanPlayers.map((player) => {
+          const hpPercent = player.hpMax > 0 ? Math.max(0, Math.min(100, (player.hpCurrent / player.hpMax) * 100)) : 0;
+          return (
+            <View key={player.key} style={styles.sessionPlayerRow}>
+              <View>
+                <Text style={styles.sessionPlayerName}>{player.characterName}{player.isSelf ? ' (voce)' : ''}</Text>
+                <Text style={styles.sessionPlayerMeta}>Nivel {player.level}{player.playerName ? ` - ${player.playerName}` : ''}</Text>
+              </View>
+              <View style={styles.sessionHpBox}>
+                <Text style={styles.sessionHpText}>{player.hpCurrent}/{player.hpMax}</Text>
+                <View style={styles.sessionHpTrack}>
+                  <View style={[styles.sessionHpFill, { width: `${hpPercent}%` }]} />
+                </View>
+              </View>
+            </View>
+          );
+        })}
+
+        {otherPlayers.length === 0 && <Text style={styles.sessionPartyHint}>Quando outro jogador entrar, ele aparece aqui para envio ou troca.</Text>}
+      </View>
+    );
+  };
+
   const renderAttackCard = (item: any, slotKey: string, title: string) => {
     if (!item) {
       if (slotKey !== 'mainHand') return null;
@@ -781,7 +1300,7 @@ export default function CharacterSheetScreen() {
   // ==============================================================================
 
   return (
-    <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+    <LinearGradient colors={appGradients.main} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
 
       <View style={styles.topBar}>
@@ -802,6 +1321,7 @@ export default function CharacterSheetScreen() {
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContent}>
+        {renderLanPartyCard()}
         
         {/* ABA STATUS */}
         {activeTab === 'stats' && (
@@ -824,8 +1344,8 @@ export default function CharacterSheetScreen() {
               </View>
             </View>
 
-            <TouchableOpacity style={[styles.combatBoxHp, hpBonusFromCon !== 0 && {borderColor: hpBonusFromCon > 0 ? '#00fa9a' : '#ff6666', borderWidth: 1}]} onPress={() => setHpModalVisible(true)}>
-              <Text style={styles.hpValue}>{displayHpCurrent} <Text style={styles.hpMax}>/ {displayHpMax}</Text></Text>
+            <TouchableOpacity style={[styles.hpBarStyle, hpBonusFromCon !== 0 && {borderColor: hpBonusFromCon > 0 ? '#00fa9a' : '#ff6666', borderWidth: 1}]} onPress={() => setHpModalVisible(true)}>
+              <Text style={styles.hpTextStyle}>{displayHpCurrent} <Text style={styles.hpMaxTextStyle}>/ {displayHpMax}</Text></Text>
               <Text style={styles.combatLabel}>PONTOS DE VIDA {hpBonusFromCon !== 0 && `(CON ${hpBonusFromCon > 0 ? '+' : ''}${hpBonusFromCon})`}</Text>
             </TouchableOpacity>
 
@@ -934,7 +1454,7 @@ export default function CharacterSheetScreen() {
             <View style={styles.weightCard}>
                 <Text style={styles.combatLabel}>PESO DA CARGA (Itens + Moedas)</Text>
                 <Text style={[styles.weightVal, totalWeight > carryCap && {color: '#ff6666'}]}>{totalWeight.toFixed(1)} / {carryCap.toFixed(1)} kg</Text>
-                <View style={styles.weightBar}><View style={[styles.weightFill, {width: `${Math.min((totalWeight/carryCap)*100, 100)}%`, backgroundColor: totalWeight > carryCap ? '#ff6666' : '#00bfff'}]} /></View>
+                <View style={styles.weightBarStyle}><View style={[styles.weightFillStyle, {width: `${Math.min((totalWeight/carryCap)*100, 100)}%`, backgroundColor: totalWeight > carryCap ? '#ff6666' : '#00bfff'}]} /></View>
             </View>
 
             <Text style={styles.sectionTitle}>AÇÕES DE ATAQUE</Text>
@@ -1165,6 +1685,13 @@ export default function CharacterSheetScreen() {
                     <Text style={styles.spellDetailDescription}>{selectedSpell.description}</Text>
                   </ScrollView>
 
+                  {lanInfo?.joinUrl && lanPlayers.length > 0 && (
+                    <TouchableOpacity style={[styles.tradeActionButton, {marginTop: 14}]} onPress={() => startSpellCast(selectedSpell)}>
+                      <Ionicons name="sparkles" size={18} color="#00bfff" />
+                      <Text style={styles.tradeActionButtonText}>Usar na sessao</Text>
+                    </TouchableOpacity>
+                  )}
+
                   <TouchableOpacity style={styles.modalCloseButton} onPress={() => setSelectedSpell(null)}>
                     <Text style={styles.modalCloseText}>FECHAR DETALHES</Text>
                   </TouchableOpacity>
@@ -1176,6 +1703,109 @@ export default function CharacterSheetScreen() {
       </Modal>
 
       {/* Modal de Câmbio de Moedas */}
+      <Modal visible={spellCastVisible && !!selectedSpell} transparent animationType="fade">
+        <Pressable style={styles.modalOverlay} onPress={() => setSpellCastVisible(false)}>
+          <View style={styles.spellCastPanel}>
+            {selectedSpell && (
+              <>
+                <View style={styles.spellCastHeader}>
+                  <View>
+                    <Text style={styles.spellCastTitle}>{selectedSpell.name}</Text>
+                    <Text style={styles.spellCastMeta}>
+                      {getSpellCastMode(selectedSpell) === 'heal' ? 'Cura' : getSpellCastMode(selectedSpell) === 'damage' ? 'Dano' : 'Efeito'} - {selectedSpell.duration || 'Instantanea'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity style={styles.modalCloseButton} onPress={() => setSpellCastVisible(false)}>
+                    <Ionicons name="close" size={20} color="#fff" />
+                  </TouchableOpacity>
+                </View>
+
+                {getSpellCastMode(selectedSpell) !== 'effect' ? (
+                  <>
+                    <View style={styles.modalRowButtons}>
+                      <TouchableOpacity style={styles.tradeActionButton} onPress={rollSpellForTargets}>
+                        <Ionicons name="dice" size={18} color="#00bfff" />
+                        <Text style={styles.tradeActionButtonText}>Rolar virtual</Text>
+                      </TouchableOpacity>
+                      <View style={styles.tradeActionButton}>
+                        <Ionicons name="create" size={18} color="#00bfff" />
+                        <Text style={styles.tradeActionButtonText}>Valor fisico</Text>
+                      </View>
+                    </View>
+
+                    <View style={styles.spellResultBox}>
+                      <Text style={styles.spellResultText}>
+                        {spellRollResult || `Formula: ${getSpellDiceText(selectedSpell) || 'valor manual'}`}
+                      </Text>
+                    </View>
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.sessionPartyHint}>Para efeitos como enfeiticar, armadura ou buffs, escolha o alvo e opcionalmente um atributo/valor para registrar.</Text>
+                    <View style={styles.spellEffectRow}>
+                      {(['custom', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'] as LanEffectTarget[]).map((target) => (
+                        <TouchableOpacity
+                          key={target}
+                          style={[styles.filterPill, spellEffectTarget === target && styles.filterPillActive]}
+                          onPress={() => setSpellEffectTarget(target)}
+                        >
+                          <Text style={[styles.filterPillText, spellEffectTarget === target && styles.filterPillTextActive]}>{target}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                    <TextInput
+                      style={styles.modalInput}
+                      value={spellEffectValue}
+                      onChangeText={setSpellEffectValue}
+                      keyboardType="numeric"
+                      placeholder="Valor opcional. Ex: +2"
+                      placeholderTextColor="#666"
+                    />
+                  </>
+                )}
+
+                <FlatList
+                  data={lanPlayers}
+                  keyExtractor={(player) => player.key}
+                  style={styles.tradeList}
+                  renderItem={({ item }) => {
+                    const active = spellTargetKeys.includes(item.key);
+                    return (
+                      <TouchableOpacity
+                        style={[styles.spellTargetRow, active && styles.spellTargetRowActive]}
+                        onPress={() => toggleSpellTarget(item.key)}
+                      >
+                        <View style={[styles.spellTargetCheck, active && styles.spellTargetCheckActive]}>
+                          {active && <Ionicons name="checkmark" size={15} color="#02112b" />}
+                        </View>
+                        <View style={{flex: 1}}>
+                          <Text style={styles.sessionPlayerName}>{item.characterName}{item.isSelf ? ' (voce)' : ''}</Text>
+                          <Text style={styles.sessionPlayerMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}</Text>
+                        </View>
+                        {getSpellCastMode(selectedSpell) !== 'effect' && (
+                          <TextInput
+                            style={styles.spellAmountInput}
+                            value={spellTargetAmounts[item.key] || ''}
+                            onChangeText={(value) => setSpellTargetAmounts((current) => ({ ...current, [item.key]: value }))}
+                            keyboardType="numeric"
+                            placeholder="0"
+                            placeholderTextColor="#666"
+                          />
+                        )}
+                      </TouchableOpacity>
+                    );
+                  }}
+                />
+
+                <TouchableOpacity style={styles.lvlUpBtnPrimary} onPress={applySpellCast}>
+                  <Text style={styles.lvlUpBtnPrimaryText}>Aplicar magia</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+        </Pressable>
+      </Modal>
+
       <Modal visible={convertModalVisible} transparent animationType="fade">
         <Pressable style={styles.modalOverlay} onPress={() => setConvertModalVisible(false)}>
           <Pressable style={styles.modalContent} onPress={e => e.stopPropagation()}>
@@ -1292,7 +1922,7 @@ export default function CharacterSheetScreen() {
                 {/* LORE DO ITEM */}
                 {itemLore ? (
                   <Text style={{color: 'rgba(255,255,255,0.7)', textAlign: 'center', marginBottom: 15, fontSize: 13, fontStyle: 'italic', paddingHorizontal: 10}}>
-                    "{itemLore}"
+                    {`"${itemLore}"`}
                   </Text>
                 ) : (
                   <Text style={{color: 'rgba(255,255,255,0.3)', textAlign: 'center', marginBottom: 15, fontSize: 12, fontStyle: 'italic'}}>
@@ -1342,12 +1972,130 @@ export default function CharacterSheetScreen() {
                     <Text style={styles.actionBtnThrowText}>Arremessar</Text>
                   </TouchableOpacity>
 
+                  {lanInfo?.joinUrl && lanPlayers.some(player => !player.isSelf) && (
+                    <>
+                      <TouchableOpacity style={styles.tradeActionButton} onPress={() => setTargetPickerMode('send')}>
+                        <Ionicons name="send" size={18} color="#00bfff" />
+                        <Text style={styles.tradeActionButtonText}>Enviar para</Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity style={styles.tradeActionButton} onPress={() => setTargetPickerMode('trade')}>
+                        <Ionicons name="swap-horizontal" size={18} color="#00bfff" />
+                        <Text style={styles.tradeActionButtonText}>Propor troca</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+
                   <TouchableOpacity style={styles.actionBtnCancel} onPress={() => setSelectedBagItem(null)}>
                     <Text style={styles.actionBtnCancelText}>Voltar</Text>
                   </TouchableOpacity>
                 </View>
               </>
             )})()}
+          </View>
+        </Pressable>
+      </Modal>
+
+      <Modal visible={!!targetPickerMode && !!selectedBagItem} transparent animationType="fade">
+        <Pressable style={styles.modalOverlay} onPress={() => setTargetPickerMode(null)}>
+          <View style={styles.tradePanel}>
+            <Text style={styles.modalTitle}>{targetPickerMode === 'send' ? 'Enviar para' : 'Propor troca'}</Text>
+            <Text style={styles.sessionPartyHint}>
+              {selectedBagItem ? `${actionQty}x ${selectedBagItem.item.name}` : ''} - escolha um jogador ativo.
+            </Text>
+
+            <FlatList
+              data={lanPlayers.filter(player => !player.isSelf)}
+              keyExtractor={(player) => player.key}
+              style={styles.tradeList}
+              ListEmptyComponent={<Text style={styles.emptyText}>Nenhum outro jogador ativo na sessao.</Text>}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.tradeItemChoice}
+                  onPress={() => targetPickerMode === 'send' ? handleSendItemToPlayer(item) : handleOfferTradeToPlayer(item)}
+                >
+                  <Text style={styles.tradeSlotName}>{item.characterName}</Text>
+                  <Text style={styles.tradeSlotMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}</Text>
+                </TouchableOpacity>
+              )}
+            />
+
+            <TouchableOpacity style={styles.actionBtnCancel} onPress={() => setTargetPickerMode(null)}>
+              <Text style={styles.actionBtnCancelText}>Cancelar</Text>
+            </TouchableOpacity>
+          </View>
+        </Pressable>
+      </Modal>
+
+      <Modal visible={!!selectedTradeOffer} transparent animationType="fade">
+        <Pressable style={styles.modalOverlay} onPress={() => setSelectedTradeOffer(null)}>
+          <View style={styles.tradePanel}>
+            {selectedTradeOffer && (
+              <>
+                <Text style={styles.modalTitle}>Troca com {selectedTradeOffer.fromName}</Text>
+                <Text style={styles.sessionPartyHint}>Escolha um item da sua mochila para colocar na troca.</Text>
+
+                <View style={styles.tradeBoard}>
+                  <View style={styles.tradeColumn}>
+                    <Text style={styles.tradeColumnTitle}>Ele oferece</Text>
+                    <View style={[styles.tradeSlot, styles.tradeSlotActive]}>
+                      <Text style={styles.tradeSlotName}>{selectedTradeOffer.offeredItem?.name || 'Item'}</Text>
+                      <Text style={styles.tradeSlotMeta}>Qtd. {selectedTradeOffer.offeredItem?.qty || 1}</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.tradeArrowBox}>
+                    <Ionicons name="swap-horizontal" size={22} color="#00bfff" />
+                  </View>
+
+                  <View style={styles.tradeColumn}>
+                    <Text style={styles.tradeColumnTitle}>Sua oferta</Text>
+                    <View style={[styles.tradeSlot, tradeCounterItem && styles.tradeSlotActive]}>
+                      <Text style={styles.tradeSlotName}>{tradeCounterItem?.item?.name || 'Selecione abaixo'}</Text>
+                      <Text style={styles.tradeSlotMeta}>Qtd. {tradeCounterItem ? tradeCounterQty : '-'}</Text>
+                    </View>
+                    {tradeCounterItem && (
+                      <View style={styles.actionQtyRow}>
+                        <TouchableOpacity onPress={() => setTradeCounterQty(Math.max(1, tradeCounterQty - 1))} style={styles.actionQtyBtn}><Text style={styles.actionQtyBtnText}>-</Text></TouchableOpacity>
+                        <Text style={styles.actionQtyVal}>{tradeCounterQty}</Text>
+                        <TouchableOpacity onPress={() => setTradeCounterQty(Math.min(tradeCounterItem.item.qty, tradeCounterQty + 1))} style={styles.actionQtyBtn}><Text style={styles.actionQtyBtnText}>+</Text></TouchableOpacity>
+                      </View>
+                    )}
+                  </View>
+                </View>
+
+                <FlatList
+                  data={character?.equipment?.bag || []}
+                  keyExtractor={(_, index) => index.toString()}
+                  style={styles.tradeList}
+                  ListEmptyComponent={<Text style={styles.emptyText}>Sua mochila esta vazia.</Text>}
+                  renderItem={({ item, index }) => {
+                    const active = tradeCounterItem?.index === index;
+                    return (
+                      <TouchableOpacity
+                        style={[styles.tradeItemChoice, active && styles.tradeItemChoiceActive]}
+                        onPress={() => {
+                          setTradeCounterItem({ item, index });
+                          setTradeCounterQty(1);
+                        }}
+                      >
+                        <Text style={styles.tradeSlotName}>{item.name}</Text>
+                        <Text style={styles.tradeSlotMeta}>Qtd. {item.qty} - {item.weight || 0}kg</Text>
+                      </TouchableOpacity>
+                    );
+                  }}
+                />
+
+                <View style={styles.modalRowButtons}>
+                  <TouchableOpacity style={styles.modalBtn} onPress={() => handleDeclineTrade(selectedTradeOffer)}>
+                    <Text style={{color:'#ff6666', fontWeight:'bold'}}>Recusar</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.modalBtn, {opacity: tradeCounterItem ? 1 : 0.5}]} disabled={!tradeCounterItem} onPress={handleAcceptTrade}>
+                    <Text style={{color:'#00fa9a', fontWeight:'bold'}}>Aceitar</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
           </View>
         </Pressable>
       </Modal>
@@ -1478,178 +2226,56 @@ export default function CharacterSheetScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#02112b' },
-  errorText: { color: '#ff6666', fontWeight: 'bold' },
-  topBar: { paddingTop: 60, paddingBottom: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.2)', position: 'relative' },
-  topBarBack: { position: 'absolute', left: 20, bottom: 12, padding: 5, zIndex: 10 },
-  topBarBackText: { color: '#00bfff', fontSize: 16, fontWeight: 'bold' },
-  topBarTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  
-  tabContainer: { paddingHorizontal: 20, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
-  tab: { paddingVertical: 12, paddingHorizontal: 15, alignItems: 'center', marginRight: 10 },
-  activeTab: { borderBottomWidth: 2, borderBottomColor: '#00bfff' },
-  tabText: { color: 'rgba(255,255,255,0.4)', fontWeight: 'bold', fontSize: 12, letterSpacing: 1 },
-  activeTabText: { color: '#00bfff' },
-  
-  scrollContent: { padding: 20 },
-  
-  headerBlock: { alignItems: 'center', marginBottom: 20 },
-  charClassRace: { fontSize: 14, color: '#00bfff' },
-  levelXpRow: { flexDirection: 'row', gap: 10, marginTop: 10, alignItems: 'center' },
-  badge: { backgroundColor: 'rgba(0,191,255,0.1)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 },
-  badgeText: { color: '#00bfff', fontSize: 11, fontWeight: 'bold' },
-  
-  levelUpIconBtn: { paddingHorizontal: 5, justifyContent: 'center', alignItems: 'center' },
+function firstParam(value?: string | string[]) {
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
 
-  combatBoxHp: { backgroundColor: 'rgba(255,50,50,0.1)', padding: 20, borderRadius: 20, alignItems: 'center', marginBottom: 15 },
-  hpValue: { fontSize: 36, fontWeight: 'bold', color: '#ff6666' },
-  hpMax: { fontSize: 20, color: 'rgba(255,102,102,0.4)' },
-  combatLabel: { fontSize: 9, color: 'rgba(255,255,255,0.5)', marginTop: 5, letterSpacing: 1, fontWeight: 'bold' },
-  combatStatsRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
-  combatStatSmall: { flex: 1, backgroundColor: 'rgba(255,255,255,0.05)', padding: 15, borderRadius: 15, alignItems: 'center' },
-  combatStatValue: { fontSize: 18, color: '#fff', fontWeight: 'bold' },
-  
-  sectionTitle: { color: '#00bfff', fontWeight: 'bold', marginTop: 10, marginBottom: 10, fontSize: 12 },
-  attributesGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
-  attrBox: { width: '31%', backgroundColor: 'rgba(255,255,255,0.05)', padding: 15, borderRadius: 15, alignItems: 'center', marginBottom: 15 },
-  attrLabel: { fontSize: 9, color: 'rgba(255,255,255,0.5)', marginBottom: 5 },
-  attrValue: { fontSize: 20, color: '#fff', fontWeight: 'bold' },
-  modBadge: { backgroundColor: '#00bfff', paddingHorizontal: 8, borderRadius: 6, marginTop: 5 },
-  modText: { fontSize: 12, fontWeight: 'bold', color: '#02112b' },
-  
-  cardBlock: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 20, padding: 15, marginTop: 5, marginBottom: 15 },
-  detailSection: { marginBottom: 15 },
-  detailLabel: { fontSize: 10, color: 'rgba(0,191,255,0.5)', fontWeight: 'bold', marginBottom: 5 },
-  detailText: { color: '#fff', fontSize: 14, lineHeight: 20 },
+function decodeParam(value?: string) {
+  if (!value) return '';
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
 
-  profRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
-  profStatBadge: { backgroundColor: 'rgba(255,255,255,0.1)', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 5, marginRight: 10, width: 35, alignItems: 'center' },
-  profIconActive: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#00bfff', marginRight: 10 },
-  profName: { color: '#fff', fontSize: 13 },
-  profValue: { color: '#fff', fontWeight: 'bold', fontSize: 14 },
+function parseSpellDuration(duration?: string): { durationRemaining: number; durationUnit: LanEffectUnit } {
+  const raw = String(duration || '').toLowerCase();
+  const value = Math.max(1, parseInt(raw.match(/\d+/)?.[0] || '1'));
 
-  weightCard: { backgroundColor: 'rgba(255,255,255,0.05)', padding: 10, borderRadius: 15, marginBottom: 15, alignItems: 'center' },
-  weightVal: { fontSize: 18, color: '#fff', fontWeight: 'bold', marginTop: 5 },
-  weightBar: { width: '100%', height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2, marginTop: 5 },
-  weightFill: { height: '100%', borderRadius: 2 },
-  atkCard: { backgroundColor: 'rgba(0,191,255,0.1)', padding: 15, borderRadius: 16, alignItems: 'center', marginBottom: 10 },
-  atkRow: { flexDirection: 'row', marginTop: 10, gap: 40 },
-  atkSubBox: { alignItems: 'center' },
-  atkVal: { fontSize: 20, color: '#fff', fontWeight: 'bold' },
-  atkLab: { fontSize: 8, color: '#00bfff', fontWeight: 'bold', marginTop: 3 },
-  
-  equipGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 10, marginBottom: 20 },
-  equipSlotBox: { width: '48%', backgroundColor: 'rgba(0,0,0,0.3)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', borderRadius: 12, padding: 15, alignItems: 'center', justifyContent: 'center', height: 95 },
-  equipSlotBoxFilled: { borderColor: '#00bfff', backgroundColor: 'rgba(0,191,255,0.05)' },
-  equipSlotLabel: { fontSize: 8, color: 'rgba(255,255,255,0.5)', position: 'absolute', top: 8, left: 8, fontWeight: 'bold' },
-  equipSlotEmptyIcon: { fontSize: 30, opacity: 0.2 },
-  equipSlotItemName: { color: '#fff', fontWeight: 'bold', textAlign: 'center', fontSize: 13, marginTop: 5 },
-  equipSlotItemDamage: { color: '#00fa9a', fontSize: 10, marginTop: 5, fontWeight: 'bold' },
+  if (raw.includes('turno')) return { durationRemaining: value, durationUnit: 'turn' };
+  if (raw.includes('hora')) return { durationRemaining: value, durationUnit: 'hour' };
+  if (raw.includes('min')) return { durationRemaining: value, durationUnit: 'minute' };
+  return { durationRemaining: 1, durationUnit: 'rest' };
+}
 
-  coinManager: { flexDirection: 'row', gap: 8, marginBottom: 10 },
-  coinControl: { flex: 1, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 12, padding: 8, alignItems: 'center' },
-  coinDisplay: { alignItems: 'center', marginVertical: 5 },
-  coinLabel: { fontSize: 10, fontWeight: 'bold' },
-  coinValText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  coinBtn: { width: '100%', paddingVertical: 5, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 8 },
-  qtyBtnText: { color: '#00bfff', fontSize: 20, fontWeight: 'bold' },
-  headerSpaceBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  addBtn: { backgroundColor: '#00bfff', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
-  addBtnText: { color: '#02112b', fontWeight: 'bold', fontSize: 11 },
-  itemRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
-  qtyContainer: { flexDirection: 'row', alignItems: 'center', gap: 8, marginRight: 15 },
-  itemQty: { color: '#fff', fontWeight: 'bold', width: 15, textAlign: 'center', fontSize: 14 },
-  smallQtyBtn: { width: 28, height: 28, backgroundColor: 'rgba(0,191,255,0.1)', borderRadius: 6, justifyContent: 'center', alignItems: 'center' },
-  smallQtyBtnText: { color: '#00bfff', fontSize: 16, fontWeight: 'bold' },
-  itemName: { color: '#fff', fontSize: 15, fontWeight: '500' },
-  itemSubDetail: { color: 'rgba(255,255,255,0.4)', fontSize: 10, marginTop: 2 },
-  emptyText: { color: 'rgba(255,255,255,0.3)', textAlign: 'center', marginVertical: 20, fontSize: 12 },
+function rollDiceExpression(expression: string) {
+  const tokens = expression.match(/[+-]?\s*(?:\d*)d\d+|[+-]?\s*\d+/gi);
+  if (!tokens?.length) return null;
 
-  // BOTÕES DA MOCHILA E AÇÕES
-  iconActionBtn: { padding: 8, borderRadius: 8, backgroundColor: 'rgba(0,250,154,0.1)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.3)', justifyContent: 'center', alignItems: 'center' },
+  let total = 0;
+  const parts: string[] = [];
 
-  itemStatsBox: { backgroundColor: 'rgba(0,0,0,0.3)', padding: 10, borderRadius: 8, marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)', alignItems: 'center' },
-  itemStatText: { color: '#00fa9a', fontSize: 13, marginBottom: 5, fontWeight: 'bold' },
+  for (const token of tokens) {
+    const clean = token.replace(/\s/g, '');
+    const sign = clean.startsWith('-') ? -1 : 1;
+    const unsigned = clean.replace(/^[+-]/, '');
 
-  spellFilterSection: { backgroundColor: 'rgba(255,255,255,0.05)', padding: 15, borderRadius: 20, marginBottom: 15 },
-  spellSearchRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 15 },
-  spellSearchInputBox: { flex: 1, flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.3)', borderRadius: 12, paddingHorizontal: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
-  spellSearchInput: { flex: 1, color: '#fff', paddingVertical: 10, marginLeft: 10, fontSize: 14 },
-  spellSortBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,191,255,0.1)', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', gap: 5 },
-  spellSortText: { color: '#00bfff', fontWeight: 'bold', fontSize: 12 },
-  filterLabel: { fontSize: 10, color: '#00bfff', fontWeight: 'bold', marginBottom: 8, letterSpacing: 1 },
-  filterPill: { paddingVertical: 6, paddingHorizontal: 15, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.3)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
-  filterPillActive: { backgroundColor: 'rgba(0,191,255,0.2)', borderColor: '#00bfff' },
-  filterPillText: { color: 'rgba(255,255,255,0.5)', fontSize: 11, fontWeight: 'bold' },
-  filterPillTextActive: { color: '#00bfff' },
+    if (unsigned.toLowerCase().includes('d')) {
+      const [countRaw, sidesRaw] = unsigned.toLowerCase().split('d');
+      const count = Math.max(1, parseInt(countRaw || '1') || 1);
+      const sides = Math.max(1, parseInt(sidesRaw) || 1);
+      const rolls = Array.from({ length: count }, () => Math.floor(Math.random() * sides) + 1);
+      const subtotal = rolls.reduce((sum, roll) => sum + roll, 0) * sign;
+      total += subtotal;
+      parts.push(`${sign < 0 ? '-' : ''}${count}d${sides}[${rolls.join(',')}]`);
+    } else {
+      const value = (parseInt(unsigned) || 0) * sign;
+      total += value;
+      parts.push(`${value >= 0 ? '+' : ''}${value}`);
+    }
+  }
 
-  // NOVOS ESTILOS COMPACTOS PARA MAGIAS E MODAL
-  spellGroupHeader: { color: 'rgba(255,255,255,0.6)', fontWeight: 'bold', fontSize: 14, letterSpacing: 1 },
-  spellCardCompact: { flexDirection: 'row', backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 16, padding: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', alignItems: 'center', flex: 1 },
-  spellIconBox: { width: 45, height: 45, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.3)', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
-  spellNameCompact: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  spellSubCompact: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 4 },
-  
-  spellDetailCard: { backgroundColor: '#102b56', borderRadius: 24, padding: 25, width: '90%', borderWidth: 1, borderColor: '#00bfff', alignSelf: 'center', marginTop: 'auto', marginBottom: 'auto' },
-  spellDetailHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 15 },
-  spellDetailIcon: { width: 50, height: 50, borderRadius: 15, backgroundColor: '#00bfff', justifyContent: 'center', alignItems: 'center' },
-  spellDetailName: { color: '#fff', fontSize: 20, fontWeight: 'bold', marginBottom: 2 },
-  spellDetailLevel: { color: '#00bfff', fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase' },
-  divider: { height: 1, backgroundColor: 'rgba(255,255,255,0.1)', marginBottom: 15 },
-  spellDetailInfoGrid: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15, backgroundColor: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 12 },
-  spellDetailInfoItem: { alignItems: 'center', flex: 1 },
-  spellDetailInfoLabel: { color: 'rgba(255,255,255,0.4)', fontSize: 9, fontWeight: 'bold', letterSpacing: 1, marginBottom: 4 },
-  spellDetailInfoValue: { color: '#fff', fontSize: 13, fontWeight: 'bold', textAlign: 'center' },
-  spellDetailDescription: { color: 'rgba(255,255,255,0.8)', fontSize: 14, lineHeight: 22 },
-
-  // NOVOS ESTILOS PARA CÂMBIO DE MOEDAS
-  exchangeBox: { flexDirection: 'row', backgroundColor: 'rgba(0,0,0,0.3)', padding: 15, borderRadius: 16, alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' },
-  exchangeSide: { alignItems: 'center', flex: 1 },
-  exchangeLabel: { fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 'bold', marginBottom: 8, letterSpacing: 1 },
-  exchangeCoins: { flexDirection: 'row', gap: 5 },
-  coinMiniBtn: { width: 34, height: 34, borderRadius: 17, borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.02)' },
-
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  modalContent: { backgroundColor: '#102b56', width: '100%', borderRadius: 25, padding: 20, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
-  modalTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', textAlign: 'center', marginBottom: 5 },
-  modalInput: { backgroundColor: 'rgba(255,255,255,0.1)', padding: 15, borderRadius: 15, color: '#fff', fontSize: 16, marginBottom: 15 },
-  modalInputLarge: { backgroundColor: 'rgba(255,255,255,0.1)', padding: 15, borderRadius: 15, color: '#fff', fontSize: 24, textAlign: 'center', marginBottom: 15, fontWeight: 'bold' },
-  modalRowButtons: { flexDirection: 'row', gap: 10 },
-  modalBtn: { flex: 1, padding: 15, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 15 },
-  
-  lvlUpBtnPrimary: { backgroundColor: '#00bfff', paddingVertical: 14, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  lvlUpBtnPrimaryText: { color: '#000000', fontWeight: 'bold', fontSize: 16 }, 
-  lvlUpBtnSecondary: { backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
-  lvlUpBtnSecondaryText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
-
-  catalogItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
-  catalogItemName: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  catalogItemSub: { color: 'rgba(0,191,255,0.5)', fontSize: 12, marginTop: 2 },
-  addIcon: { color: '#00bfff', fontSize: 24, fontWeight: 'bold' },
-  unequipBtn: { backgroundColor: 'rgba(255,50,50,0.1)', padding: 10, borderRadius: 10, alignItems: 'center', marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,50,50,0.3)' },
-  unequipBtnText: { color: '#ff6666', fontWeight: 'bold', fontSize: 12 },
-
-  actionModalBox: { backgroundColor: '#02112b', width: '85%', borderRadius: 25, padding: 25, borderWidth: 1, borderColor: '#00bfff' },
-  actionQtyRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, marginVertical: 10 },
-  actionQtyBtn: { backgroundColor: 'rgba(255,255,255,0.1)', width: 45, height: 45, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  actionQtyBtnText: { color: '#00bfff', fontSize: 26, fontWeight: 'bold' },
-  actionQtyVal: { color: '#fff', fontSize: 28, fontWeight: 'bold', width: 50, textAlign: 'center' },
-  
-  actionBtnConsume: { flexDirection: 'row', backgroundColor: 'rgba(0,250,154,0.1)', paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(0,250,154,0.3)', gap: 10 },
-  actionBtnConsumeText: { color: '#00fa9a', fontWeight: 'bold', fontSize: 16 },
-  actionBtnThrow: { flexDirection: 'row', backgroundColor: 'rgba(255,100,100,0.1)', paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,100,100,0.3)', gap: 10 },
-  actionBtnThrowText: { color: '#ff6666', fontWeight: 'bold', fontSize: 16 },
-  actionBtnCancel: { paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  actionBtnCancelText: { color: 'rgba(255,255,255,0.5)', fontWeight: 'bold', fontSize: 14 },
-
-  customAlertBox: { backgroundColor: '#102b56', width: '90%', borderRadius: 20, padding: 25, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', alignItems: 'center' },
-  customAlertTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },
-  customAlertMessage: { color: 'rgba(255,255,255,0.8)', fontSize: 14, textAlign: 'center', lineHeight: 22, marginBottom: 25 },
-  customAlertBtnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, width: '100%', justifyContent: 'center' },
-  customAlertBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 10, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', minWidth: '30%' },
-  customAlertBtnText: { fontWeight: 'bold', fontSize: 14 },
-  modalCloseButton: { marginTop: 20, paddingVertical: 15, width: '100%', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: 12 },
-  modalCloseText: { color: '#00bfff', fontWeight: 'bold' }
-});
+  return { total: Math.max(0, total), breakdown: parts.join(' ') };
+}

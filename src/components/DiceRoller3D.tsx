@@ -3,7 +3,8 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber/native';
 import * as CANNON from 'cannon-es';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, Dimensions, PanResponder, Pressable, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
-import * as THREE from 'three';
+import * as THREE from 'three';
+import { appColors, diceRollerStyles as styles } from '@/styles/globalStyles';
 
 type MaterialIconName = React.ComponentProps<typeof MaterialCommunityIcons>['name'];
 
@@ -20,13 +21,13 @@ const FAB_SIZE = 60;
 const SNAP_MARGIN = 20;
 
 const DICE_TYPES: DieType[] = [
-  { id: 'd4', max: 4, label: 'D4', icon: 'dice-d4-outline', color: '#ff9f43' },
-  { id: 'd6', max: 6, label: 'D6', icon: 'dice-d6-outline', color: '#ff4757' },
-  { id: 'd8', max: 8, label: 'D8', icon: 'dice-d8-outline', color: '#2ed573' },
-  { id: 'd10', max: 10, label: 'D10', icon: 'dice-d10-outline', color: '#1dd1a1' },
-  { id: 'd12', max: 12, label: 'D12', icon: 'dice-d12-outline', color: '#9b59b6' },
-  { id: 'd20', max: 20, label: 'D20', icon: 'dice-d20-outline', color: '#1e90ff' },
-  { id: 'd100', max: 100, label: 'D100', icon: 'dice-multiple-outline', color: '#576574' },
+  { id: 'd4', max: 4, label: 'D4', icon: 'dice-d4-outline', color: appColors.dieD4 },
+  { id: 'd6', max: 6, label: 'D6', icon: 'dice-d6-outline', color: appColors.dieD6 },
+  { id: 'd8', max: 8, label: 'D8', icon: 'dice-d8-outline', color: appColors.dieD8 },
+  { id: 'd10', max: 10, label: 'D10', icon: 'dice-d10-outline', color: appColors.dieD10 },
+  { id: 'd12', max: 12, label: 'D12', icon: 'dice-d12-outline', color: appColors.dieD12 },
+  { id: 'd20', max: 20, label: 'D20', icon: 'dice-d20-outline', color: appColors.dieD20 },
+  { id: 'd100', max: 100, label: 'D100', icon: 'dice-multiple-outline', color: appColors.dieD100 },
 ];
 
 function SingleDie({ die, world, diceMat, skipAnim, count, onResult }: { die: DieType, world: CANNON.World, diceMat: CANNON.Material, skipAnim: boolean, count: number, onResult: (val: string, position: {x: number, y: number}, fontSize: number) => void }) {
@@ -223,7 +224,7 @@ function SingleDie({ die, world, diceMat, skipAnim, count, onResult }: { die: Di
         <meshStandardMaterial color={die.color} roughness={0.3} metalness={0.2} flatShading />
       </mesh>
       <lineSegments ref={edgesRef} geometry={edgesGeom as any}>
-        <lineBasicMaterial color="#02112b" linewidth={2} />
+        <lineBasicMaterial color={appColors.primaryDark} linewidth={2} />
       </lineSegments>
     </>
   );
@@ -463,7 +464,7 @@ export default function DiceRoller3D() {
                 ]} 
                 onPress={() => rollDice(die)}
               >
-                <MaterialCommunityIcons name={die.icon} size={24} color="#fff" />
+                <MaterialCommunityIcons name={die.icon} size={24} color={appColors.textPrimary} />
                 <Text style={[styles.subButtonText, menuSide === 'right' ? { right: 55 } : { left: 55 }]}>{die.label}</Text>
               </TouchableOpacity>
             ))}
@@ -478,32 +479,9 @@ export default function DiceRoller3D() {
             }
             setIsOpen(!isOpen)
         }}>
-          <MaterialCommunityIcons name={isOpen ? "close" : "dice-multiple"} size={30} color="#fff" />
+          <MaterialCommunityIcons name={isOpen ? "close" : "dice-multiple"} size={30} color={appColors.textPrimary} />
         </TouchableOpacity>
       </Animated.View>
     </>
   );
 }
-
-const styles = StyleSheet.create({
-  canvasContainer: { ...StyleSheet.absoluteFillObject, zIndex: 9999, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center' },
-  resultOverlay: { position: 'absolute', alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.9)', paddingHorizontal: 50, paddingVertical: 20, borderRadius: 25, borderWidth: 2, borderColor: '#00bfff', alignItems: 'center', elevation: 10 },
-  totalText: { color: '#00fa9a', fontSize: 64, fontWeight: 'bold', textShadowColor: 'rgba(0, 250, 154, 0.5)', textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 10 },
-  
-  highLowContainer: { flexDirection: 'row', gap: 15, marginTop: 10, marginBottom: 5 },
-  highLowBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, borderWidth: 1, alignItems: 'center', minWidth: 60 },
-  highLowLabel: { fontSize: 9, fontWeight: 'bold', letterSpacing: 1, marginBottom: 2 },
-  highLowValue: { fontSize: 20, fontWeight: 'bold' },
-
-  tapToCloseText: { color: 'rgba(255,255,255,0.4)', fontSize: 12, marginTop: 15, textTransform: 'uppercase' },
-  draggableContainer: { position: 'absolute', top: 0, left: 0, width: FAB_SIZE, height: FAB_SIZE, zIndex: 10000 },
-  fab: { width: FAB_SIZE, height: FAB_SIZE, borderRadius: 30, backgroundColor: '#00bfff', justifyContent: 'center', alignItems: 'center', elevation: 8, borderWidth: 2, borderColor: '#102b56' },
-  menuContainer: { position: 'absolute', width: 250 },
-  qtySelector: { position: 'absolute', flexDirection: 'row', backgroundColor: 'rgba(16,43,86,0.9)', padding: 8, borderRadius: 30, gap: 5, borderWidth: 1, borderColor: '#00bfff' },
-  qtyBtn: { width: 35, height: 35, borderRadius: 17.5, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.1)' },
-  qtyBtnActive: { backgroundColor: '#00bfff' },
-  qtyBtnText: { color: '#fff', fontWeight: 'bold' },
-  qtyBtnTextActive: { color: '#102b56' },
-  subButton: { position: 'absolute', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center', elevation: 4, borderWidth: 2, borderColor: '#102b56' },
-  subButtonText: { position: 'absolute', color: '#fff', backgroundColor: 'rgba(0,0,0,0.8)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 4, fontWeight: 'bold', fontSize: 12 },
-});

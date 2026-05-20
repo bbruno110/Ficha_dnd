@@ -3,20 +3,21 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Stack } from 'expo-router';
 import { SQLiteProvider } from 'expo-sqlite';
 import { initializeDatabase } from '../database/init';
+import { appColors, appGradients, layoutStyles as styles } from '@/styles/globalStyles';
 
 export default function RootLayout() {
   return (
     <SQLiteProvider databaseName="dnd_dados33333.db" onInit={initializeDatabase}>
       <ThemeProvider value={DarkTheme}>
         <LinearGradient
-          colors={['#102b56', '#02112b']} 
-          style={{ flex: 1 }}
+          colors={appGradients.main}
+          style={styles.root}
         >
           <Stack
             screenOptions={{
               headerTransparent: true,
-              headerTintColor: '#fff',
-              contentStyle: { backgroundColor: 'transparent' },
+              headerTintColor: appColors.textPrimary,
+              contentStyle: styles.transparentContent,
             }}
           >
             <Stack.Screen name="index" options={{ headerShown: false }} />

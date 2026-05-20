@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import React, { useMemo, useState } from 'react';
-import { FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { appColors, spellSelectorStyles as styles } from '@/styles/globalStyles';
 
 export type SpellItem = { 
   id: number; 
@@ -85,14 +86,14 @@ export default function SpellSelector({ visible, onClose, availableSpells, selec
                 <Text style={styles.modalTitle}>Catálogo de Habilidades</Text>
                 {counterText && <Text style={styles.counterText}>{counterText}</Text>}
               </View>
-              <TouchableOpacity style={styles.closeBtn} onPress={onClose}><Ionicons name="close" size={24} color="#fff" /></TouchableOpacity>
+              <TouchableOpacity style={styles.closeBtn} onPress={onClose}><Ionicons name="close" size={24} color={appColors.textPrimary} /></TouchableOpacity>
             </View>
             
             {hintText && <Text style={styles.hpHint}>{hintText}</Text>}
 
             {/* Barra de Busca */}
             <View style={styles.searchBox}>
-              <Ionicons name="search" size={18} color="rgba(255,255,255,0.4)" style={{marginRight: 10}}/>
+              <Ionicons name="search" size={18} color={appColors.textSoft} style={styles.searchIcon} />
               <TextInput style={styles.searchInput} placeholder="Buscar por nome..." value={search} onChangeText={setSearch} placeholderTextColor="rgba(255,255,255,0.4)" />
             </View>
 
@@ -190,9 +191,9 @@ export default function SpellSelector({ visible, onClose, availableSpells, selec
                       
                       <View style={{alignItems: 'center', gap: 10}}>
                         {isLocked ? (
-                           <Ionicons name="lock-closed" size={28} color={isActive ? "#02112b" : "#00fa9a"} />
+                           <Ionicons name="lock-closed" size={28} color={isActive ? appColors.primaryDark : appColors.success} />
                         ) : (
-                           <Ionicons name={isActive ? "checkmark-circle" : "add-circle-outline"} size={32} color={isActive ? "#02112b" : "#00bfff"} />
+                           <Ionicons name={isActive ? "checkmark-circle" : "add-circle-outline"} size={32} color={isActive ? appColors.primaryDark : appColors.primary} />
                         )}
                       </View>
                     </View>
@@ -202,7 +203,7 @@ export default function SpellSelector({ visible, onClose, availableSpells, selec
                         {item.damage && item.damage !== '-' ? `Efeito: ${item.damage} ${item.damage_type !== 'Nenhum' ? `(${item.damage_type})` : ''}` : 'Efeito: Suporte/Utilitário'}
                       </Text>
                       <TouchableOpacity style={styles.infoBtn} onPress={() => setDetailSpell(item)}>
-                        <Ionicons name="information-circle-outline" size={24} color={isActive ? "#02112b" : "#fff"} />
+                        <Ionicons name="information-circle-outline" size={24} color={isActive ? appColors.primaryDark : appColors.textPrimary} />
                       </TouchableOpacity>
                     </View>
                   </TouchableOpacity>
@@ -267,54 +268,3 @@ export default function SpellSelector({ visible, onClose, availableSpells, selec
     </Modal>
   );
 }
-
-const styles = StyleSheet.create({
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'flex-end' },
-  modalOverlayCenter: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  modalContentFullScreen: { backgroundColor: '#02112b', borderTopLeftRadius: 30, borderTopRightRadius: 30, padding: 15, height: '90%', marginBottom: 10, borderBottomLeftRadius: 30, borderBottomRightRadius: 30, borderWidth: 1, borderColor: '#00bfff' },
-  
-  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10 },
-  modalTitle: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
-  counterText: { color: '#00fa9a', fontSize: 13, fontWeight: 'bold', marginTop: 4 },
-  closeBtn: { padding: 5, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 10 },
-  hpHint: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginBottom: 15 },
-
-  searchBox: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 12, paddingHorizontal: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', marginBottom: 15 },
-  searchInput: { flex: 1, color: '#fff', paddingVertical: 12, fontSize: 15 },
-
-  filterTitle: { color: '#00bfff', fontSize: 10, fontWeight: 'bold', textTransform: 'uppercase', marginBottom: 5, marginLeft: 2 },
-  filterPill: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
-  filterPillActive: { backgroundColor: 'rgba(0,191,255,0.2)', borderColor: '#00bfff' },
-  filterPillText: { color: 'rgba(255,255,255,0.5)', fontSize: 11, fontWeight: 'bold' },
-  filterPillTextActive: { color: '#00bfff' },
-
-  spellCard: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 16, padding: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', marginBottom: 12 },
-  spellCardActive: { backgroundColor: '#00bfff', borderColor: '#00bfff' },
-  spellCardLocked: { borderColor: '#00fa9a', backgroundColor: 'rgba(0,250,154,0.05)' },
-  
-  spellCardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  spellCardTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  
-  tag: { backgroundColor: 'rgba(0,0,0,0.4)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
-  tagText: { color: '#00bfff', fontSize: 9, fontWeight: 'bold' },
-  tagDark: { backgroundColor: 'rgba(0,0,0,0.2)' },
-  tagTextDark: { color: '#02112b' },
-
-  spellCardFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 15, paddingTop: 12, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.1)' },
-  spellCardEffect: { color: '#00fa9a', fontSize: 12, fontWeight: 'bold', flex: 1 },
-  infoBtn: { padding: 4 },
-
-  emptyText: { color: 'rgba(255,255,255,0.3)', textAlign: 'center', marginTop: 40, fontSize: 14 },
-
-  spellDetailCard: { backgroundColor: '#102b56', borderRadius: 24, padding: 25, width: '100%', borderWidth: 1, borderColor: '#00bfff' },
-  spellDetailName: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginBottom: 5 },
-  spellDetailLevel: { color: '#00bfff', fontSize: 12, fontWeight: 'bold', textTransform: 'uppercase', marginBottom: 15 },
-  divider: { height: 1, backgroundColor: 'rgba(255,255,255,0.1)', marginBottom: 15 },
-  spellDetailInfoGrid: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 12 },
-  spellDetailInfoItem: { alignItems: 'center', flex: 1 },
-  spellDetailInfoLabel: { color: 'rgba(255,255,255,0.4)', fontSize: 9, fontWeight: 'bold', letterSpacing: 1, marginBottom: 4 },
-  spellDetailInfoValue: { color: '#fff', fontSize: 13, fontWeight: 'bold', textAlign: 'center' },
-  spellDetailDescription: { color: 'rgba(255,255,255,0.8)', fontSize: 14, lineHeight: 22 },
-  modalCloseButton: { marginTop: 20, paddingVertical: 15, width: '100%', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: 12 },
-  modalCloseText: { color: '#00bfff', fontWeight: 'bold' }
-});

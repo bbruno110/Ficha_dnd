@@ -150,7 +150,57 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       criador TEXT DEFAULT 'base',
       UNIQUE(source_type, source_name, level)
     );
+
+    CREATE TABLE IF NOT EXISTS lan_sessions (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      master_name TEXT,
+      level INTEGER NOT NULL,
+      allow_existing INTEGER NOT NULL DEFAULT 1,
+      invite_code TEXT NOT NULL,
+      join_url TEXT,
+      payload_json TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      current_turn INTEGER NOT NULL DEFAULT 1,
+      elapsed_minutes INTEGER NOT NULL DEFAULT 0,
+      selected_catalog_json TEXT DEFAULT '{}',
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_session_players (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      remote_key TEXT,
+      player_name TEXT,
+      character_id INTEGER,
+      character_snapshot TEXT,
+      hp_current INTEGER DEFAULT 0,
+      hp_max INTEGER DEFAULT 0,
+      xp INTEGER DEFAULT 0,
+      gp INTEGER DEFAULT 0,
+      sp INTEGER DEFAULT 0,
+      cp INTEGER DEFAULT 0,
+      stats_json TEXT DEFAULT '{}',
+      equipment_json TEXT DEFAULT '{}',
+      effects_json TEXT DEFAULT '[]',
+      notes TEXT,
+      joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, character_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_session_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
+
+  await migrateLanTables(db);
 
   const checkDb = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM items');
   
@@ -714,5 +764,47 @@ export async function initializeDatabase(db: SQLiteDatabase) {
 
   } else {
     console.log('Banco de dados já populado. Pulando inserção.');
+  }
+}
+
+async function migrateLanTables(db: SQLiteDatabase) {
+  const columns: [string, string, string][] = [
+    ['lan_sessions', 'status', "TEXT NOT NULL DEFAULT 'active'"],
+    ['lan_sessions', 'current_turn', 'INTEGER NOT NULL DEFAULT 1'],
+    ['lan_sessions', 'elapsed_minutes', 'INTEGER NOT NULL DEFAULT 0'],
+    ['lan_sessions', 'selected_catalog_json', "TEXT DEFAULT '{}'"],
+    ['lan_sessions', 'updated_at', 'DATETIME'],
+    ['lan_session_players', 'remote_key', 'TEXT'],
+    ['lan_session_players', 'hp_current', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'hp_max', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'xp', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'gp', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'sp', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'cp', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'stats_json', "TEXT DEFAULT '{}'"],
+    ['lan_session_players', 'equipment_json', "TEXT DEFAULT '{}'"],
+    ['lan_session_players', 'effects_json', "TEXT DEFAULT '[]'"],
+    ['lan_session_players', 'notes', 'TEXT'],
+    ['lan_session_players', 'last_seen_at', 'DATETIME'],
+  ];
+
+  for (const [table, column, definition] of columns) {
+    try {
+      await db.execAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+    } catch {
+      // Coluna ja existe em bancos criados por versoes anteriores.
+    }
+  }
+
+  try {
+    await db.execAsync(`UPDATE lan_sessions SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP);`);
+  } catch {
+    // Bancos muito antigos podem ainda estar criando a tabela na primeira abertura.
+  }
+
+  try {
+    await db.execAsync(`UPDATE lan_session_players SET last_seen_at = COALESCE(last_seen_at, joined_at, CURRENT_TIMESTAMP);`);
+  } catch {
+    // Bancos muito antigos podem ainda estar criando a tabela na primeira abertura.
   }
 }

@@ -7,7 +7,8 @@ import { Stack, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
-import { Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { appGradients, advancedStyles as styles } from '@/styles/globalStyles';
 
 // ================= TIPAGENS =================
 type SpellClassReq = { name: string; minLevel: string }; 
@@ -475,7 +476,7 @@ export default function AdvancedCreatorScreen() {
                   </TouchableOpacity>
                 )
               }}
-              ListEmptyComponent={<Text style={styles.emptyText}>Nenhuma passiva encontrada. Crie uma na aba Magia/Skill marcando o nível ou tempo como "Passiva".</Text>}
+              ListEmptyComponent={<Text style={styles.emptyText}>Nenhuma passiva encontrada. Crie uma na aba Magia/Skill marcando o nível ou tempo como &quot;Passiva&quot;.</Text>}
             />
             <TouchableOpacity style={styles.modalCloseButton} onPress={() => setFeatureModalVisible(false)}>
               <Text style={styles.modalCloseText}>FECHAR</Text>
@@ -1133,7 +1134,7 @@ export default function AdvancedCreatorScreen() {
   );
 
   return (
-    <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+    <LinearGradient colors={appGradients.main} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
       <View style={styles.topBar}>
         <TouchableOpacity onPress={() => router.back()}><Ionicons name="arrow-back" size={28} color="#fff" /></TouchableOpacity>
@@ -1212,73 +1213,3 @@ export default function AdvancedCreatorScreen() {
     </LinearGradient>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  topBar: { paddingTop: 50, paddingBottom: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, backgroundColor: 'rgba(0,0,0,0.3)' },
-  topBarTitle: { color: '#00fa9a', fontSize: 16, fontWeight: 'bold' },
-  tabsContainer: { paddingVertical: 15, paddingHorizontal: 15, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
-  tabBtn: { paddingVertical: 8, paddingHorizontal: 20, borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.05)' },
-  tabBtnActive: { backgroundColor: '#00bfff' },
-  tabBtnText: { color: 'rgba(255,255,255,0.5)', fontWeight: 'bold' },
-  tabBtnTextActive: { color: '#02112b' },
-  scrollContent: { padding: 20 },
-  cardBlock: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 20, padding: 20, marginBottom: 20 },
-  formGroup: { marginBottom: 20 },
-  row: { flexDirection: 'row', justifyContent: 'space-between' },
-  label: { fontSize: 11, fontWeight: 'bold', color: '#00bfff', marginBottom: 8, letterSpacing: 1 },
-  input: { backgroundColor: 'rgba(0, 0, 0, 0.3)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, paddingHorizontal: 15, paddingVertical: 12, fontSize: 16, color: '#ffffff' },
-  sectionTitle: { fontSize: 12, fontWeight: 'bold', color: '#fff', marginBottom: 15, marginTop: 10 },
-  statsGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 10 },
-  statBox: { width: '30%', backgroundColor: 'rgba(0, 0, 0, 0.3)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 12, padding: 10, alignItems: 'center' },
-  statLabel: { fontSize: 14, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.5)', marginBottom: 5 },
-  statInput: { fontSize: 24, fontWeight: 'bold', color: '#ffffff', textAlign: 'center' },
-  toggleGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  toggleBtn: { paddingVertical: 10, paddingHorizontal: 15, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.3)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
-  toggleBtnActive: { backgroundColor: 'rgba(0,191,255,0.2)', borderColor: '#00bfff' },
-  toggleBtnText: { color: 'rgba(255,255,255,0.6)', fontSize: 13, fontWeight: 'bold', textAlign: 'center' },
-  toggleBtnTextActive: { color: '#00bfff' },
-  limitBtn: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
-  limitBtnActive: { backgroundColor: 'rgba(0,250,154,0.1)', borderColor: '#00fa9a' },
-  limitBtnText: { color: 'rgba(255,255,255,0.5)', fontSize: 11, fontWeight: 'bold', textAlign: 'center' },
-  limitBtnTextActive: { color: '#00fa9a' },
-  effectBuilder: { backgroundColor: 'rgba(0,0,0,0.2)', padding: 15, borderRadius: 12, marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' },
-  addEffectBtn: { backgroundColor: 'rgba(0, 191, 255, 0.1)', borderWidth: 1, borderColor: '#00bfff', padding: 12, borderRadius: 8, alignItems: 'center' },
-  addEffectBtnText: { color: '#00bfff', fontWeight: 'bold', fontSize: 12 },
-  effectRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', padding: 15, borderRadius: 12, marginBottom: 8, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
-  effectText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
-  saveBtn: { backgroundColor: '#00fa9a', padding: 18, borderRadius: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
-  saveBtnText: { color: '#02112b', fontSize: 16, fontWeight: 'bold', letterSpacing: 1 },
-  acervoTabs: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 15, justifyContent: 'center' },
-  acervoTabBtn: { paddingVertical: 8, paddingHorizontal: 12, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 8 },
-  acervoTabBtnActive: { backgroundColor: 'rgba(0,250,154,0.2)', borderWidth: 1, borderColor: '#00fa9a' },
-  acervoTabBtnText: { color: 'rgba(255,255,255,0.5)', fontSize: 12, fontWeight: 'bold' },
-  acervoTabBtnTextActive: { color: '#00fa9a' },
-  acervoActions: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20, gap: 10 },
-  acervoActionBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, backgroundColor: 'rgba(0,191,255,0.1)', paddingVertical: 12, borderRadius: 10, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
-  acervoActionText: { fontSize: 12, fontWeight: 'bold' },
-  acervoItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', padding: 15, borderRadius: 12, marginBottom: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
-  acervoItemActive: { borderColor: '#00fa9a', backgroundColor: 'rgba(0,250,154,0.05)' },
-  acervoItemTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  acervoItemSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 4, textTransform: 'uppercase', fontWeight: 'bold' },
-  acervoDeleteBtn: { padding: 10, backgroundColor: 'rgba(255,100,100,0.1)', borderRadius: 8, marginLeft: 10 },
-  checkbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: 'rgba(255,255,255,0.3)', marginRight: 15, alignItems: 'center', justifyContent: 'center' },
-  checkboxActive: { backgroundColor: '#00fa9a', borderColor: '#00fa9a' },
-  emptyText: { color: 'rgba(255,255,255,0.4)', textAlign: 'center', marginTop: 40, fontSize: 14 },
-  modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0, 0, 0, 0.8)' },
-  modalContent: { backgroundColor: '#102b56', borderRadius: 24, padding: 20, alignItems: 'center', width: '90%' },
-  modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#ffffff', marginBottom: 15 },
-  searchInput: { backgroundColor: 'rgba(0,0,0,0.3)', color: '#fff', padding: 15, borderRadius: 12, marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', width: '100%' },
-  modalCloseButton: { marginTop: 20, paddingVertical: 15, width: '100%', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: 12 },
-  modalCloseText: { color: '#00bfff', fontWeight: 'bold' },
-  catalogItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
-  catalogItemName: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  catalogItemSub: { color: 'rgba(0,191,255,0.5)', fontSize: 12, marginTop: 2 },
-  radioCircle: { width: 36, height: 36, borderRadius: 18, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)', alignItems: 'center', justifyContent: 'center' },
-  radioCircleSelected: { backgroundColor: 'rgba(0,191,255,0.2)', borderColor: '#00bfff' },
-  featureBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,250,154,0.1)', borderWidth: 1, borderColor: '#00fa9a', borderRadius: 8, paddingLeft: 10, paddingRight: 5, paddingVertical: 4 },
-  featureBadgeText: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold', marginRight: 5 },
-  featureBadgeInput: { backgroundColor: 'rgba(0,0,0,0.3)', color: '#fff', fontSize: 11, width: 35, height: 35, textAlign: 'center', borderRadius: 4, marginRight: 5 },
-  hpHint: { color: 'rgba(255,255,255,0.5)', fontSize: 12, textAlign: 'center', marginTop: 15, lineHeight: 18 },
-  counterText: { fontSize: 12, fontWeight: 'bold', color: '#00bfff', backgroundColor: 'rgba(0, 191, 255, 0.1)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 }
-});

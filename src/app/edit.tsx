@@ -4,10 +4,12 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
-import SpellSelector from '../components/SpellSelector';
+import SpellSelector from '../components/SpellSelector';
+import { joinLanSessionWithCharacter, notifyMasterJoin } from '@/services/lanSession';
+import { appColors, appGradients, editStyles as styles } from '@/styles/globalStyles';
 
 // ADICIONADO O NOVO PASSO DE RESUMO FINAL
 const STEPS = ['Níveis & Vida', 'Atributos', 'Proficiências', 'Magias & Hab.', 'Resumo Final'];
@@ -53,7 +55,7 @@ const BASE_CLASS_FEATURES = [
 ];
 
 export default function EditCharacterScreen() {
-  const { id, levelUpTo } = useLocalSearchParams();
+  const { id, levelUpTo, sessionId, joinUrl } = useLocalSearchParams<{ id?: string; levelUpTo?: string; sessionId?: string; joinUrl?: string }>();
   const router = useRouter();
   const db = useSQLiteContext();
 
@@ -508,9 +510,16 @@ export default function EditCharacterScreen() {
         `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=? WHERE id=?`,
         [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
       );
-      
+
+      if (sessionId) {
+        const joinedCharacter = await joinLanSessionWithCharacter(db, String(sessionId), character.id);
+        await notifyMasterJoin(firstParam(joinUrl), String(sessionId), joinedCharacter);
+      }
+
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!
-      if (router.canGoBack()) {
+      if (sessionId) {
+        router.replace(`/sheet?id=${character.id}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(firstParam(joinUrl) || '')}` as any);
+      } else if (router.canGoBack()) {
         router.back();
       } else {
         router.replace('/'); // Fallback de segurança
@@ -519,7 +528,7 @@ export default function EditCharacterScreen() {
     } catch (e) { console.error("Erro ao salvar:", e); }
   };
 
-  if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#00bfff" /></View>;
+  if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color={appColors.primary} /></View>;
 
   const isLevelUp = character && targetLevel > character.level;
 
@@ -854,7 +863,7 @@ export default function EditCharacterScreen() {
   }
 
   return (
-    <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+    <LinearGradient colors={appGradients.main} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
       
       <View style={styles.topBar}>
@@ -973,90 +982,7 @@ export default function EditCharacterScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#02112b' },
-  topBar: { paddingTop: 50, paddingBottom: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, backgroundColor: 'rgba(0,0,0,0.3)' },
-  topBarTitle: { color: '#ffd700', fontSize: 16, fontWeight: 'bold' },
-  stepIndicatorText: { color: '#fff', fontSize: 12 },
-  progressBarContainer: { flexDirection: 'row', height: 4, backgroundColor: 'rgba(0,0,0,0.5)' },
-  progressSegment: { flex: 1, backgroundColor: 'transparent' },
-  progressSegmentActive: { backgroundColor: '#00bfff' },
-  scrollContent: { padding: 20 },
-  sectionTitle: { color: '#00bfff', fontWeight: 'bold', marginBottom: 15, fontSize: 12, textTransform: 'uppercase' },
-  cardBlock: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 20, padding: 20, marginBottom: 20 },
-  
-  classManagerBox: { marginBottom: 20, backgroundColor: 'rgba(0,0,0,0.2)', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' },
-  classHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  classTitleName: { color: '#fff', fontSize: 18, fontWeight: 'bold', flex: 1, marginLeft: 10 },
-  qtyControl: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 8 },
-  qtyBtn: { paddingHorizontal: 12, paddingVertical: 5 },
-  qtyBtnText: { color: '#00bfff', fontSize: 20, fontWeight: 'bold' },
-  qtyValue: { color: '#fff', fontSize: 16, fontWeight: 'bold', width: 25, textAlign: 'center' },
-
-  subclassGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 15, justifyContent: 'center' },
-  subclassBtn: { backgroundColor: 'rgba(255,255,255,0.05)', padding: 10, borderRadius: 12, borderWidth: 1, borderColor: '#444' },
-  subclassBtnActive: { borderColor: '#00bfff', backgroundColor: 'rgba(0,191,255,0.1)' },
-  subclassBtnText: { color: '#fff', fontSize: 11 },
-  subclassBtnTextActive: { color: '#00bfff', fontWeight: 'bold' },
-  
-  multiclassBtn: { padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#00bfff', borderStyle: 'dashed', alignItems: 'center' },
-  multiclassBtnText: { color: '#00bfff', fontSize: 13, fontWeight: 'bold' },
-
-  hpRow: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 20 },
-  hpInfoBox: { alignItems: 'center' },
-  hpInputBox: { alignItems: 'center' },
-  hpLabel: { color: '#aaa', fontSize: 10, marginBottom: 5 },
-  hpValue: { color: '#fff', fontSize: 32, fontWeight: 'bold' },
-  hpInput: { backgroundColor: '#000', color: '#00fa9a', fontSize: 28, width: 80, textAlign: 'center', borderRadius: 12, padding: 5, borderWidth: 1, borderColor: 'rgba(0,250,154,0.3)' },
-  hpPlusIcon: { color: '#00fa9a', fontSize: 24 },
-  hpHint: { color: 'rgba(255,255,255,0.5)', fontSize: 12, textAlign: 'center', marginTop: 15, lineHeight: 18 },
-  recommendedBtn: { marginTop: 15, padding: 12, backgroundColor: 'rgba(0, 250, 154, 0.1)', borderRadius: 10, alignItems: 'center', borderWidth: 1, borderColor: '#00fa9a' },
-  recommendedBtnText: { color: '#00fa9a', fontSize: 12, fontWeight: 'bold' },
-  
-  warningBox: { backgroundColor: 'rgba(0,191,255,0.1)', padding: 15, borderRadius: 12, flexDirection: 'row', alignItems: 'center', gap: 15, marginBottom: 15, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
-  warningText: { color: '#00bfff', flex: 1, fontSize: 12, lineHeight: 18 },
-
-  counterText: { fontSize: 12, fontWeight: 'bold', color: '#00bfff', backgroundColor: 'rgba(0, 191, 255, 0.1)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-  
-  statsGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
-  statEditorBox: { width: '48%', backgroundColor: 'rgba(0,0,0,0.3)', padding: 15, borderRadius: 15, alignItems: 'center', marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' },
-  statLabel: { color: '#00bfff', fontSize: 12, fontWeight: 'bold', marginBottom: 10 },
-  statControlRow: { flexDirection: 'row', alignItems: 'center', gap: 15, marginVertical: 5 },
-  statBtn: { padding: 5, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 8, width: 35, alignItems: 'center' },
-  statBtnText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
-  statValText: { color: '#fff', fontSize: 22, fontWeight: 'bold', width: 35, textAlign: 'center' },
-  statModLabel: { color: 'rgba(255,255,255,0.4)', fontSize: 10, fontWeight: 'bold', marginTop: 5 },
-  
-  toggleGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  toggleBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.3)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
-  toggleBtnActive: { backgroundColor: '#00bfff', borderColor: '#00bfff' },
-  toggleBtnText: { color: 'rgba(255,255,255,0.6)', fontSize: 12, fontWeight: 'bold' },
-  toggleBtnTextActive: { color: '#02112b' },
-
-  summaryRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-  summaryLabel: { color: 'rgba(255,255,255,0.6)', fontSize: 14, fontWeight: 'bold' },
-  summaryValue: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-
-  spellHeaderRow: { marginBottom: 5, backgroundColor: 'rgba(0,0,0,0.2)', padding: 10, borderRadius: 8, alignItems: 'center' },
-  manageSpellsBtn: { backgroundColor: '#00bfff', padding: 18, borderRadius: 15, alignItems: 'center', marginTop: 10 },
-  manageSpellsBtnText: { color: '#02112b', fontWeight: 'bold', fontSize: 14 },
-  
-  summarySpellItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', paddingHorizontal: 15, paddingVertical: 10, borderRadius: 8, marginBottom: 5 },
-
-  bottomNav: { flexDirection: 'row', padding: 20, gap: 10, backgroundColor: '#02112b', borderTopWidth: 1, borderTopColor: '#333' },
-  navBtn: { flex: 1, padding: 16, borderRadius: 12, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)' },
-  navBtnPrimary: { backgroundColor: '#00bfff' },
-  navBtnFinish: { backgroundColor: '#00fa9a' },
-  navBtnText: { color: '#fff', fontWeight: 'bold' },
-  navBtnPrimaryText: { color: '#02112b', fontWeight: 'bold' },
-  navBtnFinishText: { color: '#02112b', fontWeight: 'bold', fontSize: 16 },
-
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'flex-end' },
-  modalContentFullScreen: { backgroundColor: '#102b56', borderTopLeftRadius: 30, borderTopRightRadius: 30, padding: 20, maxHeight: '90%', borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
-  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
-  modalTitle: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
-
-  spellItemRow: { flexDirection: 'row', alignItems: 'center', padding: 5, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 12, marginBottom: 8, justifyContent: 'space-between' },
-  spellItemName: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-});
+function firstParam(value?: string | string[]) {
+  if (Array.isArray(value)) return value[0];
+  return value;
+}

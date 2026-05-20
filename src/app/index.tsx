@@ -4,8 +4,9 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useState } from 'react';
-import { Alert, FlatList, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
-import CharacterCard, { Character } from '../components/CharacterCard';
+import { Alert, FlatList, Text, TouchableOpacity, View } from 'react-native';
+import CharacterCard, { Character } from '../components/CharacterCard';
+import { appColors, appGradients, homeStyles as styles } from '@/styles/globalStyles';
 
 export default function HomeScreen() {
   const router = useRouter();
@@ -52,7 +53,7 @@ export default function HomeScreen() {
   };
 
   return (
-    <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+    <LinearGradient colors={appGradients.main} style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Meus Personagens</Text>
       </View>
@@ -82,8 +83,13 @@ export default function HomeScreen() {
 
       <View style={styles.footer}>
         <TouchableOpacity style={styles.advancedButton} activeOpacity={0.8} onPress={() => router.push('/advanced')}>
-          <Ionicons name="construct-outline" size={20} color="#00bfff" style={{ marginRight: 10 }} />
+          <Ionicons name="construct-outline" size={20} color={appColors.primary} style={styles.buttonIconGap} />
           <Text style={styles.advancedButtonText}>FERRAMENTAS DO MESTRE</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => router.push('/lan-session' as any)}>
+          <Ionicons name="wifi-outline" size={20} color={appColors.success} style={styles.buttonIconGap} />
+          <Text style={styles.lanButtonText}>SESSAO LAN</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => router.push('/create')}>
@@ -98,38 +104,3 @@ export default function HomeScreen() {
     </LinearGradient>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  header: { paddingTop: 60, paddingHorizontal: 20, paddingBottom: 20 },
-  headerTitle: { fontSize: 28, fontWeight: 'bold', color: '#ffffff', letterSpacing: 1 },
-  
-  listContent: { paddingHorizontal: 20, paddingBottom: 180 },
-  
-  emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 40, marginTop: -50 },
-  emptyIcon: { fontSize: 60, marginBottom: 20, opacity: 0.8 },
-  emptyTitle: { fontSize: 20, fontWeight: 'bold', color: '#ffffff', marginBottom: 10 },
-  emptyText: { fontSize: 14, color: 'rgba(255, 255, 255, 0.6)', textAlign: 'center', lineHeight: 22 },
-  
-  footer: { position: 'absolute', bottom: 20, left: 20, right: 20 },
-  
-  advancedButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
-  advancedButtonText: { fontSize: 14, fontWeight: 'bold', color: '#00bfff', letterSpacing: 1 },
-  
-  createButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#102b56', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 16, shadowColor: '#00bfff', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 5, elevation: 5 },
-  createButtonIcon: { fontSize: 24, color: '#00bfff', marginRight: 10, fontWeight: '300' },
-  createButtonText: { fontSize: 16, fontWeight: 'bold', color: '#ffffff', letterSpacing: 1 },
-
-  versionContainer: {
-    marginTop: 15,
-    alignItems: 'center',
-    opacity: 0.4,
-  },
-  versionText: {
-    color: '#ffffff',
-    fontSize: 10,
-    fontWeight: 'bold',
-    letterSpacing: 2,
-    textTransform: 'uppercase'
-  }
-});
