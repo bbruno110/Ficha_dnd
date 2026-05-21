@@ -13,6 +13,9 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       damage_type TEXT,
       properties TEXT,
       descricao TEXT,
+      effect_json TEXT DEFAULT '[]',
+      duration_value INTEGER,
+      duration_unit TEXT,
       criador TEXT DEFAULT 'base'
     );
     
@@ -77,6 +80,9 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       damage_type TEXT,
       saving_throw TEXT,
       description TEXT,
+      effect_json TEXT DEFAULT '[]',
+      duration_value INTEGER,
+      duration_unit TEXT,
       class_level_required INTEGER DEFAULT 1,
       criador TEXT DEFAULT 'base'
     );
@@ -178,6 +184,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       character_snapshot TEXT,
       hp_current INTEGER DEFAULT 0,
       hp_max INTEGER DEFAULT 0,
+      temp_hp INTEGER DEFAULT 0,
       xp INTEGER DEFAULT 0,
       gp INTEGER DEFAULT 0,
       sp INTEGER DEFAULT 0,
@@ -777,6 +784,7 @@ async function migrateLanTables(db: SQLiteDatabase) {
     ['lan_session_players', 'remote_key', 'TEXT'],
     ['lan_session_players', 'hp_current', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'hp_max', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'temp_hp', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'xp', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'gp', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'sp', 'INTEGER DEFAULT 0'],
@@ -786,6 +794,12 @@ async function migrateLanTables(db: SQLiteDatabase) {
     ['lan_session_players', 'effects_json', "TEXT DEFAULT '[]'"],
     ['lan_session_players', 'notes', 'TEXT'],
     ['lan_session_players', 'last_seen_at', 'DATETIME'],
+    ['items', 'effect_json', "TEXT DEFAULT '[]'"],
+    ['items', 'duration_value', 'INTEGER'],
+    ['items', 'duration_unit', 'TEXT'],
+    ['spells', 'effect_json', "TEXT DEFAULT '[]'"],
+    ['spells', 'duration_value', 'INTEGER'],
+    ['spells', 'duration_unit', 'TEXT'],
   ];
 
   for (const [table, column, definition] of columns) {

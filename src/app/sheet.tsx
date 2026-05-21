@@ -1,5 +1,5 @@
 // ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
-import DiceRoller3D from '@/components/DiceRoller3D';
+import DiceRoller3D, { type DiceRollRequest } from '@/components/DiceRoller3D';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
 import {
+  applyLanSessionStateToCharacter,
   fetchLanSessionEvents,
   fetchLanSessionPayload,
   getLocalLanSessionForCharacter,
@@ -115,6 +116,7 @@ export default function CharacterSheetScreen() {
   const [spellLevelFilter, setSpellLevelFilter] = useState('Todos');
   const [spellEffectFilter, setSpellEffectFilter] = useState('Todos');
   const [spellSortOrder, setSpellSortOrder] = useState<'A-Z' | 'Z-A'>('A-Z');
+  const [diceRollRequest, setDiceRollRequest] = useState<DiceRollRequest | undefined>();
   
   // Estado para o Detalhe da Magia e Animação
   const [selectedSpell, setSelectedSpell] = useState<any>(null);
@@ -284,11 +286,33 @@ export default function CharacterSheetScreen() {
       return;
     }
 
+    if (target === 'PV_TEMP') {
+      showCustomAlert('PV temporario', `${event.fromName} aplicou ${event.spellEffect.spellName}: +${Math.max(0, value)} PV temporarios registrados na mesa.`);
+      return;
+    }
+
     const newStats = { ...character.stats, temp_mods: { ...(character.stats.temp_mods || {}) } };
     newStats.temp_mods[target] = (parseInt(newStats.temp_mods[target]) || 0) + value;
     await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [JSON.stringify(newStats), character.id]);
     setCharacter((prev: any) => ({ ...prev, stats: newStats }));
     showCustomAlert('Efeito recebido', `${event.fromName} aplicou ${event.spellEffect.spellName}: ${target} ${value > 0 ? '+' : ''}${value}.`);
+  };
+
+  const applyExpiredEffectToSelf = async (event: LanSessionEvent) => {
+    if (!character || !event.expiredEffect) return;
+    const effect = event.expiredEffect;
+    const target = effect.target;
+
+    if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target)) {
+      const newStats = { ...character.stats, temp_mods: { ...(character.stats.temp_mods || {}) } };
+      const nextValue = (parseInt(newStats.temp_mods[target]) || 0) - Number(effect.value || 0);
+      if (nextValue === 0) delete newStats.temp_mods[target];
+      else newStats.temp_mods[target] = nextValue;
+      await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [JSON.stringify(newStats), character.id]);
+      setCharacter((prev: any) => ({ ...prev, stats: newStats }));
+    }
+
+    showCustomAlert('Efeito encerrado', event.message || `${effect.name} acabou.`);
   };
 
   const handleLanEvents = async (events: LanSessionEvent[], sessionValue: string) => {
@@ -304,7 +328,7 @@ export default function CharacterSheetScreen() {
       if (event.type === 'public_status' && event.publicState) {
         setLanPlayers((current) => current.map((player) => (
           player.key === event.fromKey || player.characterName === event.fromName
-            ? { ...player, hpCurrent: event.publicState!.hpCurrent, hpMax: event.publicState!.hpMax, level: event.publicState!.level }
+            ? { ...player, hpCurrent: event.publicState!.hpCurrent, hpMax: event.publicState!.hpMax, tempHp: event.publicState!.tempHp || player.tempHp, level: event.publicState!.level }
             : player
         )));
         continue;
@@ -347,6 +371,11 @@ export default function CharacterSheetScreen() {
         const fresh = await rememberLanSessionEvent(db, event);
         if (fresh) await applySpellEffectToSelf(event);
       }
+
+      if (event.type === 'effect_expired' && event.expiredEffect) {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) await applyExpiredEffectToSelf(event);
+      }
     }
   };
 
@@ -384,12 +413,32 @@ export default function CharacterSheetScreen() {
 
       if (nextPayload && active) {
         const selfKey = makeLanCharacterKey(nextInfo.sessionId, character);
+        const changedBySession = await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id));
+        if (changedBySession) {
+          const updated = await db.getFirstAsync<Record<string, unknown>>(`SELECT hp_current, hp_max, xp, gp, sp, cp, stats, equipment FROM characters WHERE id = ?`, [Number(character.id)]);
+          if (updated && active) {
+            setCharacter((prev: any) => ({
+              ...prev,
+              hp_current: updated.hp_current,
+              hp_max: updated.hp_max,
+              xp: updated.xp,
+              gp: updated.gp,
+              sp: updated.sp,
+              cp: updated.cp,
+              stats: JSON.parse(String(updated.stats || '{}')),
+              equipment: JSON.parse(String(updated.equipment || '{}')),
+            }));
+          }
+        }
         setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+        if (nextPayload.events?.length) {
+          await handleLanEvents(nextPayload.events.filter((event) => event.sessionId === nextInfo.sessionId), nextInfo.sessionId);
+        }
       }
 
       if (nextInfo.joinUrl) {
         try {
-          const events = await fetchLanSessionEvents(nextInfo.joinUrl);
+          const events = await fetchLanSessionEvents(nextInfo.joinUrl, nextInfo.sessionId);
           if (active) await handleLanEvents(events.filter((event) => event.sessionId === nextInfo.sessionId), nextInfo.sessionId);
         } catch {
           // A mesa pode estar pausada/offline; a ficha continua utilizavel localmente.
@@ -710,6 +759,7 @@ export default function CharacterSheetScreen() {
 
   const getSpellCastMode = (spell: any): 'heal' | 'damage' | 'effect' => {
     const text = `${spell.damage_dice || ''} ${spell.damage || ''} ${spell.damage_type || ''} ${spell.description || ''}`.toLowerCase();
+    if ((text.includes('tempor') || text.includes('temp')) && (text.includes('pv') || text.includes('hp') || text.includes('vida'))) return 'effect';
     if (text.includes('cura') || text.includes('curar') || text.includes('recupera')) return 'heal';
     if ((spell.damage_dice && spell.damage_dice !== '-') || (spell.damage && spell.damage !== '-')) return 'damage';
     return 'effect';
@@ -746,6 +796,10 @@ export default function CharacterSheetScreen() {
 
   const rollSpellForTargets = () => {
     if (!selectedSpell) return;
+    const diceParts = getDiceParts(getSpellDiceText(selectedSpell));
+    if (diceParts[0]) {
+      setDiceRollRequest({ ...diceParts[0], nonce: Date.now() });
+    }
     const result = rollDiceExpression(getSpellDiceText(selectedSpell));
     if (!result) {
       showCustomAlert('Rolagem indisponivel', 'Nao encontrei uma formula de dado nesta magia. Informe o valor manualmente.');
@@ -793,7 +847,6 @@ export default function CharacterSheetScreen() {
     if (target.isSelf) {
       await rememberLanSessionEvent(db, event);
       if (event.type === 'spell_hp') await applySpellHpToSelf(Number(event.spellEffect?.amount || 0));
-      else await applySpellEffectToSelf(event);
     }
 
     await sendLanSessionEvent(lanInfo.joinUrl, event);
@@ -1207,7 +1260,7 @@ export default function CharacterSheetScreen() {
                 <Text style={styles.sessionPlayerMeta}>Nivel {player.level}{player.playerName ? ` - ${player.playerName}` : ''}</Text>
               </View>
               <View style={styles.sessionHpBox}>
-                <Text style={styles.sessionHpText}>{player.hpCurrent}/{player.hpMax}</Text>
+                <Text style={styles.sessionHpText}>{player.hpCurrent}/{player.hpMax}{player.tempHp > 0 ? ` +${player.tempHp}` : ''}</Text>
                 <View style={styles.sessionHpTrack}>
                   <View style={[styles.sessionHpFill, { width: `${hpPercent}%` }]} />
                 </View>
@@ -1743,7 +1796,7 @@ export default function CharacterSheetScreen() {
                   <>
                     <Text style={styles.sessionPartyHint}>Para efeitos como enfeiticar, armadura ou buffs, escolha o alvo e opcionalmente um atributo/valor para registrar.</Text>
                     <View style={styles.spellEffectRow}>
-                      {(['custom', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'] as LanEffectTarget[]).map((target) => (
+                      {(['custom', 'PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'] as LanEffectTarget[]).map((target) => (
                         <TouchableOpacity
                           key={target}
                           style={[styles.filterPill, spellEffectTarget === target && styles.filterPillActive]}
@@ -1780,7 +1833,9 @@ export default function CharacterSheetScreen() {
                         </View>
                         <View style={{flex: 1}}>
                           <Text style={styles.sessionPlayerName}>{item.characterName}{item.isSelf ? ' (voce)' : ''}</Text>
-                          <Text style={styles.sessionPlayerMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}</Text>
+                          <Text style={styles.sessionPlayerMeta}>
+                            Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}{item.tempHp > 0 ? ` (+${item.tempHp} temp.)` : ''}
+                          </Text>
                         </View>
                         {getSpellCastMode(selectedSpell) !== 'effect' && (
                           <TextInput
@@ -1796,6 +1851,21 @@ export default function CharacterSheetScreen() {
                     );
                   }}
                 />
+
+                {lanPlayers.some((player) => player.isSelf) && (
+                  <TouchableOpacity
+                    style={styles.tradeActionButton}
+                    onPress={() => {
+                      const self = lanPlayers.find((player) => player.isSelf);
+                      if (!self) return;
+                      setSpellTargetKeys([self.key]);
+                      setSpellTargetAmounts({ [self.key]: spellTargetAmounts[self.key] || '' });
+                    }}
+                  >
+                    <Ionicons name="person" size={18} color="#00bfff" />
+                    <Text style={styles.tradeActionButtonText}>Usar em mim</Text>
+                  </TouchableOpacity>
+                )}
 
                 <TouchableOpacity style={styles.lvlUpBtnPrimary} onPress={applySpellCast}>
                   <Text style={styles.lvlUpBtnPrimaryText}>Aplicar magia</Text>
@@ -2015,7 +2085,7 @@ export default function CharacterSheetScreen() {
                   onPress={() => targetPickerMode === 'send' ? handleSendItemToPlayer(item) : handleOfferTradeToPlayer(item)}
                 >
                   <Text style={styles.tradeSlotName}>{item.characterName}</Text>
-                  <Text style={styles.tradeSlotMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}</Text>
+                  <Text style={styles.tradeSlotMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}{item.tempHp > 0 ? ` +${item.tempHp}` : ''}</Text>
                 </TouchableOpacity>
               )}
             />
@@ -2221,7 +2291,7 @@ export default function CharacterSheetScreen() {
           </View>
         </View>
       </Modal>
-        <DiceRoller3D/>
+        <DiceRoller3D rollRequest={diceRollRequest}/>
     </LinearGradient>
   );
 }
@@ -2244,7 +2314,7 @@ function parseSpellDuration(duration?: string): { durationRemaining: number; dur
   const raw = String(duration || '').toLowerCase();
   const value = Math.max(1, parseInt(raw.match(/\d+/)?.[0] || '1'));
 
-  if (raw.includes('turno')) return { durationRemaining: value, durationUnit: 'turn' };
+  if (raw.includes('turno') || raw.includes('rodada')) return { durationRemaining: value, durationUnit: 'turn' };
   if (raw.includes('hora')) return { durationRemaining: value, durationUnit: 'hour' };
   if (raw.includes('min')) return { durationRemaining: value, durationUnit: 'minute' };
   return { durationRemaining: 1, durationUnit: 'rest' };
@@ -2278,4 +2348,15 @@ function rollDiceExpression(expression: string) {
   }
 
   return { total: Math.max(0, total), breakdown: parts.join(' ') };
+}
+
+function getDiceParts(expression: string) {
+  const tokens = expression.match(/(?:\d*)d\d+/gi) || [];
+  return tokens.map((token) => {
+    const [countRaw, sidesRaw] = token.toLowerCase().split('d');
+    return {
+      count: Math.max(1, parseInt(countRaw || '1') || 1),
+      sides: Math.max(1, parseInt(sidesRaw) || 1),
+    };
+  }).filter((entry) => [4, 6, 8, 10, 12, 20, 100].includes(entry.sides));
 }

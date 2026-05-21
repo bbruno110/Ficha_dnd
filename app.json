@@ -36,6 +36,12 @@
             "imageWidth": 76
           }
         }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permita que o Ficha D&D use a camera para escanear QR codes de sessoes LAN."
+        }
       ]
     ],
     "experiments": {

@@ -1,7 +1,9 @@
+import Constants from 'expo-constants';
 import { NativeModules, Platform } from 'react-native';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 const SESSION_PORT = 43115;
+const RELAY_PORT = 43116;
 
 const CUSTOM_TABLES = [
   'items',
@@ -30,7 +32,8 @@ export type CatalogSelection = Partial<Record<SelectableCustomTable, number[]>>;
 export type LanSessionStatus = 'active' | 'paused';
 export type LanEffectUnit = 'turn' | 'minute' | 'hour' | 'rest';
 export type LanAdvanceUnit = 'turn' | 'minute' | 'hour' | 'shortRest' | 'longRest';
-export type LanEffectTarget = 'FOR' | 'DES' | 'CON' | 'INT' | 'SAB' | 'CAR' | 'CA' | 'HP' | 'custom';
+export type LanEffectTarget = 'FOR' | 'DES' | 'CON' | 'INT' | 'SAB' | 'CAR' | 'CA' | 'HP' | 'PV_TEMP' | 'custom';
+export type LanEffectKind = 'stat' | 'hp' | 'temp_hp' | 'status' | 'custom';
 
 export type LanSessionRules = {
   id: string;
@@ -48,6 +51,9 @@ export type LanSessionEffect = {
   value: number;
   remaining: number;
   unit: LanEffectUnit;
+  kind?: LanEffectKind;
+  durationText?: string;
+  status?: string;
   source?: string;
 };
 
@@ -64,6 +70,7 @@ export type LanSessionPlayerState = {
   race: string;
   hpCurrent: number;
   hpMax: number;
+  tempHp: number;
   xp: number;
   gp: number;
   sp: number;
@@ -71,6 +78,8 @@ export type LanSessionPlayerState = {
   stats: Record<string, unknown>;
   equipment: Record<string, unknown>;
   effects: LanSessionEffect[];
+  pendingCharacter?: Record<string, unknown> | null;
+  pendingDiff?: string[];
 };
 
 export type LanSessionState = {
@@ -88,6 +97,7 @@ export type LanSessionPayload = {
   catalog: Record<CustomTable, Record<string, unknown>[]>;
   selectedCatalog?: CatalogSelection;
   state?: LanSessionState;
+  events?: LanSessionEvent[];
 };
 
 export type CatalogOption = {
@@ -121,7 +131,7 @@ export type LanTradeItem = {
 };
 
 export type LanSpellEventMode = 'heal' | 'damage' | 'effect';
-export type LanSessionEventType = 'send_item' | 'trade_offer' | 'trade_accept' | 'trade_decline' | 'public_status' | 'spell_hp' | 'spell_effect';
+export type LanSessionEventType = 'send_item' | 'trade_offer' | 'trade_accept' | 'trade_decline' | 'public_status' | 'spell_hp' | 'spell_effect' | 'player_joined' | 'effect_expired' | 'player_kicked' | 'character_update_review';
 
 export type LanSessionEvent = {
   id: string;
@@ -137,6 +147,7 @@ export type LanSessionEvent = {
   publicState?: {
     hpCurrent: number;
     hpMax: number;
+    tempHp?: number;
     level: number;
   };
   spellEffect?: {
@@ -150,6 +161,7 @@ export type LanSessionEvent = {
     durationUnit?: LanEffectUnit;
     description?: string;
   };
+  expiredEffect?: LanSessionEffect;
   tradeId?: string;
   message?: string;
   createdAt: string;
@@ -162,6 +174,7 @@ export type PublicLanPlayer = {
   level: number;
   hpCurrent: number;
   hpMax: number;
+  tempHp: number;
   isSelf: boolean;
 };
 
@@ -176,11 +189,11 @@ type LanNativeModule = {
 const lanNative = NativeModules.LanSessionModule as LanNativeModule | undefined;
 
 const TABLE_COLUMNS: Record<CustomTable, string[]> = {
-  items: ['name', 'weight', 'damage', 'damage_type', 'properties', 'descricao', 'criador'],
+  items: ['name', 'weight', 'damage', 'damage_type', 'properties', 'descricao', 'effect_json', 'duration_value', 'duration_unit', 'criador'],
   races: ['name', 'stat_bonuses', 'speed', 'features', 'criador'],
   classes: ['name', 'recommended_stats', 'starting_equipment', 'starting_gold', 'hit_dice', 'saves', 'subclass_level', 'is_caster', 'features', 'criador'],
   subclasses: ['name', 'class_name', 'level_required', 'bonus_skills', 'features', 'criador'],
-  spells: ['name', 'level', 'category', 'classes', 'casting_time', 'range', 'components', 'duration', 'damage_dice', 'damage_type', 'saving_throw', 'description', 'class_level_required', 'criador'],
+  spells: ['name', 'level', 'category', 'classes', 'casting_time', 'range', 'components', 'duration', 'damage_dice', 'damage_type', 'saving_throw', 'description', 'effect_json', 'duration_value', 'duration_unit', 'class_level_required', 'criador'],
   starting_kits: ['name', 'target_name', 'target_type', 'items', 'criador'],
   spellcasting_progression: ['source_type', 'source_name', 'level', 'cantrips_known', 'spells_known', 'slot_1', 'slot_2', 'slot_3', 'slot_4', 'slot_5', 'slot_6', 'slot_7', 'slot_8', 'slot_9', 'criador'],
 };
@@ -216,6 +229,10 @@ export function makeCatalogKey(table: SelectableCustomTable, id: number) {
 
 export function emptyCatalogSelection(): CatalogSelection {
   return {};
+}
+
+export async function prepareLanSessionStorage(db: SQLiteDatabase) {
+  await ensureLanSchema(db);
 }
 
 export function selectionFromKeys(keys: string[]): CatalogSelection {
@@ -306,6 +323,7 @@ export async function buildLanSessionPayload(
       elapsedMinutes: 0,
       players: [],
     },
+    events: [],
   };
 }
 
@@ -378,15 +396,50 @@ export async function startLanServer(payload: LanSessionPayload) {
 
   if (Platform.OS === 'android' && lanNative?.startSession) {
     const result = await lanNative.startSession(payloadJson, SESSION_PORT);
-    return result.url || result.urls?.[0] || '';
+    const nativeUrl = result.url || result.urls?.find((url) => !/localhost|127\.0\.0\.1/i.test(url)) || result.urls?.[0] || '';
+    if (nativeUrl && !/localhost|127\.0\.0\.1/i.test(nativeUrl)) return nativeUrl;
+  }
+
+  const relayUrl = getRelayBaseUrl();
+  if (relayUrl) {
+    try {
+      const response = await fetch(`${relayUrl}/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payloadJson,
+      });
+      if (response.ok) {
+        const result = await response.json();
+        return result.url || `${relayUrl}/session/${encodeURIComponent(payload.session.id)}`;
+      }
+    } catch {
+      return '';
+    }
   }
 
   return '';
 }
 
-export async function getMasterJoinedPlayers() {
-  if (Platform.OS !== 'android' || !lanNative?.getJoinedPlayers) return [];
-  const rows = await lanNative.getJoinedPlayers();
+export async function getMasterJoinedPlayers(joinUrl?: string) {
+  const rows: string[] = [];
+  if (Platform.OS === 'android' && lanNative?.getJoinedPlayers) {
+    rows.push(...await lanNative.getJoinedPlayers());
+  }
+
+  if (joinUrl) {
+    try {
+      const baseUrl = getSessionBaseUrl(joinUrl);
+      const sessionId = getSessionIdFromJoinUrl(joinUrl);
+      const response = await fetch(`${baseUrl}/joined?sessionId=${encodeURIComponent(sessionId)}`);
+      if (response.ok) {
+        const relayRows = await response.json();
+        if (Array.isArray(relayRows)) rows.push(...relayRows.map((row) => JSON.stringify(row)));
+      }
+    } catch {
+      // O relay pode estar offline; a mesa continua usando o que ja esta salvo.
+    }
+  }
+
   return rows.map((row) => {
     try {
       return JSON.parse(row);
@@ -396,9 +449,22 @@ export async function getMasterJoinedPlayers() {
   });
 }
 
-export async function getNativeSessionEvents() {
-  if (Platform.OS !== 'android' || !lanNative?.getSessionEvents) return [];
-  const rows = await lanNative.getSessionEvents();
+export async function getNativeSessionEvents(joinUrl?: string) {
+  const rows: unknown[] = [];
+  if (Platform.OS === 'android' && lanNative?.getSessionEvents) {
+    rows.push(...await lanNative.getSessionEvents());
+  }
+
+  if (joinUrl) {
+    try {
+      const sessionId = getSessionIdFromJoinUrl(joinUrl);
+      const relayEvents = await fetchLanSessionEvents(joinUrl, sessionId);
+      rows.push(...relayEvents);
+    } catch {
+      // O relay pode estar offline; eventos locais continuam preservados.
+    }
+  }
+
   return rows.map(parseLanSessionEvent).filter(Boolean) as LanSessionEvent[];
 }
 
@@ -413,10 +479,11 @@ export async function fetchLanSessionPayload(url: string): Promise<LanSessionPay
   return response.json();
 }
 
-export async function fetchLanSessionEvents(joinUrl: string): Promise<LanSessionEvent[]> {
+export async function fetchLanSessionEvents(joinUrl: string, sessionId?: string): Promise<LanSessionEvent[]> {
   if (!joinUrl) return [];
-  const baseUrl = joinUrl.replace(/\/session.*$/, '');
-  const response = await fetch(`${baseUrl}/events`);
+  const baseUrl = getSessionBaseUrl(joinUrl);
+  const query = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
+  const response = await fetch(`${baseUrl}/events${query}`);
   if (!response.ok) return [];
   const rows = await response.json();
   if (!Array.isArray(rows)) return [];
@@ -425,7 +492,7 @@ export async function fetchLanSessionEvents(joinUrl: string): Promise<LanSession
 
 export async function sendLanSessionEvent(joinUrl: string | undefined, event: LanSessionEvent) {
   if (!joinUrl) throw new Error('Sessao LAN sem URL ativa.');
-  const baseUrl = joinUrl.replace(/\/session.*$/, '');
+  const baseUrl = getSessionBaseUrl(joinUrl);
   const response = await fetch(`${baseUrl}/event`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -458,6 +525,22 @@ export async function rememberLanSessionEvent(db: SQLiteDatabase, event: LanSess
   return true;
 }
 
+export async function getLanSessionEvents(db: SQLiteDatabase, sessionId: string, limit = 30): Promise<LanSessionEvent[]> {
+  await ensureLanSchema(db);
+  const rows = await db.getAllAsync<{ payload_json: string }>(
+    `SELECT payload_json
+     FROM lan_session_events
+     WHERE session_id = ?
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [sessionId, limit]
+  );
+
+  return rows
+    .map((row) => parseLanSessionEvent(row.payload_json))
+    .filter(Boolean) as LanSessionEvent[];
+}
+
 export async function getLocalLanSessionForCharacter(db: SQLiteDatabase, characterId: number) {
   await ensureLanSchema(db);
   return db.getFirstAsync<{
@@ -475,6 +558,53 @@ export async function getLocalLanSessionForCharacter(db: SQLiteDatabase, charact
   );
 }
 
+export async function getBoundLanCharacter(db: SQLiteDatabase, sessionId: string) {
+  await ensureLanSchema(db);
+  return db.getFirstAsync<{
+    characterId: number;
+    sessionId: string;
+    sessionName: string;
+    joinUrl?: string;
+    payloadJson?: string;
+  }>(
+    `SELECT p.character_id as characterId, s.id as sessionId, s.name as sessionName,
+            s.join_url as joinUrl, s.payload_json as payloadJson
+     FROM lan_session_players p
+     JOIN lan_sessions s ON s.id = p.session_id
+     WHERE p.session_id = ? AND p.character_id IS NOT NULL
+     ORDER BY p.last_seen_at DESC
+     LIMIT 1`,
+    [sessionId]
+  );
+}
+
+export async function getCharacterLanBinding(db: SQLiteDatabase, characterId: number) {
+  await ensureLanSchema(db);
+  return db.getFirstAsync<{
+    characterId: number;
+    sessionId: string;
+    sessionName: string;
+    joinUrl?: string;
+  }>(
+    `SELECT p.character_id as characterId, s.id as sessionId, s.name as sessionName, s.join_url as joinUrl
+     FROM lan_session_players p
+     JOIN lan_sessions s ON s.id = p.session_id
+     WHERE p.character_id = ?
+     ORDER BY p.last_seen_at DESC
+     LIMIT 1`,
+    [characterId]
+  );
+}
+
+export async function unlinkCharacterFromLanSession(db: SQLiteDatabase, characterId: number, sessionId?: string) {
+  await ensureLanSchema(db);
+  if (sessionId) {
+    await db.runAsync(`DELETE FROM lan_session_players WHERE character_id = ? AND session_id = ?`, [characterId, sessionId]);
+  } else {
+    await db.runAsync(`DELETE FROM lan_session_players WHERE character_id = ?`, [characterId]);
+  }
+}
+
 export function getPublicLanPlayers(payload: LanSessionPayload, selfKey?: string): PublicLanPlayer[] {
   return (payload.state?.players || []).map((player) => {
     const key = player.remoteKey || `${payload.session.id}:${player.sourceCharacterId || player.characterId || player.characterName}:${player.characterName}`;
@@ -485,6 +615,7 @@ export function getPublicLanPlayers(payload: LanSessionPayload, selfKey?: string
       level: player.level,
       hpCurrent: player.hpCurrent,
       hpMax: player.hpMax,
+      tempHp: player.tempHp || 0,
       isSelf: Boolean(selfKey && key === selfKey),
     };
   });
@@ -538,6 +669,7 @@ export async function refreshLanSessionPayload(db: SQLiteDatabase, sessionId: st
   };
   payload.selectedCatalog = normalizeCatalogSelection(row.selected_catalog_json ? parseJsonValue(row.selected_catalog_json, {}) : payload.selectedCatalog);
   payload.state = await getLanSessionState(db, sessionId);
+  payload.events = await getLanSessionEvents(db, sessionId, 50);
 
   await db.runAsync(
     `UPDATE lan_sessions SET payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -554,6 +686,12 @@ export async function syncLanSessionPayload(db: SQLiteDatabase, sessionId: strin
   if (Platform.OS === 'android' && lanNative?.updatePayload) {
     await lanNative.updatePayload(JSON.stringify(payload));
   }
+
+  const row = await db.getFirstAsync<{ joinUrl?: string }>(
+    `SELECT join_url as joinUrl FROM lan_sessions WHERE id = ?`,
+    [sessionId]
+  );
+  await updateRelayPayload(row?.joinUrl, payload);
 
   return payload;
 }
@@ -608,17 +746,18 @@ export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId:
   await db.runAsync(
     `INSERT OR REPLACE INTO lan_session_players (
       session_id, remote_key, player_name, character_id, character_snapshot,
-      hp_current, hp_max, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
+      hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
     [
       sessionId,
-      `local:${characterId}`,
+      makeLanCharacterKey(sessionId, { ...character, id: characterId }),
       playerName || normalized.characterName,
       characterId,
       JSON.stringify(character || {}),
       normalized.hpCurrent,
       normalized.hpMax,
+      0,
       normalized.xp,
       normalized.gp,
       normalized.sp,
@@ -633,12 +772,12 @@ export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId:
   return character;
 }
 
-export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: string, character: Record<string, unknown> | null, playerName = '') {
-  if (!joinUrl || !character) return;
-  const baseUrl = joinUrl.replace(/\/session.*$/, '');
+export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: string, character: Record<string, unknown> | null, playerName = '', options?: { reviewSnapshot?: boolean }) {
+  if (!joinUrl || !character) return false;
+  const baseUrl = getSessionBaseUrl(joinUrl);
 
   try {
-    await fetch(`${baseUrl}/join`, {
+    const response = await fetch(`${baseUrl}/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -646,10 +785,13 @@ export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: s
         playerName: playerName || character.name,
         remoteKey: makeLanCharacterKey(sessionId, character),
         character,
+        reviewSnapshot: Boolean(options?.reviewSnapshot),
       }),
     });
+    return response.ok;
   } catch {
     // A ficha local ja entrou na sessao; a notificacao LAN e apenas para o mestre ver a lista ao vivo.
+    return false;
   }
 }
 
@@ -662,27 +804,51 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
   const normalized = normalizeCharacterState(character);
   const remoteKey = String(entry.remoteKey || `${sessionId}:${entry.playerName || normalized.playerName}:${normalized.sourceCharacterId || normalized.characterName}`);
   const playerName = String(entry.playerName || normalized.playerName || normalized.characterName);
-  const existing = await db.getFirstAsync<{ id: number }>(
-    `SELECT id FROM lan_session_players WHERE session_id = ? AND remote_key = ?`,
+  const existing = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_session_players WHERE session_id = ? AND remote_key = ?`,
     [sessionId, remoteKey]
   );
 
   if (existing) {
+    const pendingDiff = entry.reviewSnapshot ? describeCharacterDiff(existing, normalized) : [];
+    if (pendingDiff.length > 0) {
+      await db.runAsync(
+        `UPDATE lan_session_players
+         SET player_name = ?, pending_character_snapshot = ?, notes = ?, last_seen_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [playerName, JSON.stringify(character), JSON.stringify(pendingDiff), Number(existing.id)]
+      );
+      await rememberLanSessionEvent(db, {
+        id: makeLanEventId(),
+        sessionId,
+        type: 'character_update_review',
+        fromKey: remoteKey,
+        fromName: playerName,
+        toKey: 'master',
+        toName: 'Mestre',
+        message: `${normalized.characterName} voltou com alteracoes pendentes: ${pendingDiff.join('; ')}.`,
+        createdAt: new Date().toISOString(),
+      });
+      await syncLanSessionPayload(db, sessionId);
+      return Number(existing.id);
+    }
+
     await db.runAsync(
       `UPDATE lan_session_players
-       SET player_name = ?, character_snapshot = ?, last_seen_at = CURRENT_TIMESTAMP
+       SET player_name = ?, character_snapshot = ?, pending_character_snapshot = NULL, notes = NULL, last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [playerName, JSON.stringify(character), existing.id]
+      [playerName, JSON.stringify(character), Number(existing.id)]
     );
-    return existing.id;
+    await syncLanSessionPayload(db, sessionId);
+    return Number(existing.id);
   }
 
   const result = await db.runAsync(
     `INSERT INTO lan_session_players (
       session_id, remote_key, player_name, character_id, character_snapshot,
-      hp_current, hp_max, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
+      hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
     )
-    VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
+    VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
     [
       sessionId,
       remoteKey,
@@ -690,6 +856,7 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
       JSON.stringify(character),
       normalized.hpCurrent,
       normalized.hpMax,
+      0,
       normalized.xp,
       normalized.gp,
       normalized.sp,
@@ -699,6 +866,17 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
     ]
   );
 
+  await rememberLanSessionEvent(db, {
+    id: makeLanEventId(),
+    sessionId,
+    type: 'player_joined',
+    fromKey: remoteKey,
+    fromName: playerName,
+    toKey: 'master',
+    toName: 'Mestre',
+    message: `${normalized.characterName} entrou na sessao.`,
+    createdAt: new Date().toISOString(),
+  });
   await syncLanSessionPayload(db, sessionId);
   return Number(result.lastInsertRowId);
 }
@@ -706,12 +884,13 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
 export async function updateLanPlayerNumbers(
   db: SQLiteDatabase,
   playerId: number,
-  patch: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'xp' | 'gp' | 'sp' | 'cp'>>
+  patch: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>
 ) {
   await ensureLanSchema(db);
   const allowed = {
     hpCurrent: 'hp_current',
     hpMax: 'hp_max',
+    tempHp: 'temp_hp',
     xp: 'xp',
     gp: 'gp',
     sp: 'sp',
@@ -742,6 +921,89 @@ export async function updateLanPlayerNumbers(
   }
 }
 
+export async function kickLanSessionPlayer(db: SQLiteDatabase, playerId: number) {
+  await ensureLanSchema(db);
+  const player = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_session_players WHERE id = ?`,
+    [playerId]
+  );
+  if (!player) return;
+
+  const sessionId = String(player.session_id || '');
+  const snapshot = parseJsonValue<Record<string, unknown>>(player.character_snapshot, {});
+  const normalized = normalizeCharacterState(snapshot);
+  const playerKey = String(player.remote_key || `${sessionId}:${player.character_id || normalized.characterName}:${normalized.characterName}`);
+
+  await db.runAsync(`DELETE FROM lan_session_players WHERE id = ?`, [playerId]);
+  await rememberLanSessionEvent(db, {
+    id: makeLanEventId(),
+    sessionId,
+    type: 'player_kicked',
+    fromKey: 'master',
+    fromName: 'Mestre',
+    toKey: playerKey,
+    toName: normalized.characterName,
+    message: `${normalized.characterName} foi removido da sessao pelo mestre.`,
+    createdAt: new Date().toISOString(),
+  });
+  await syncLanSessionPayload(db, sessionId);
+}
+
+export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerId: number, accepted: boolean) {
+  await ensureLanSchema(db);
+  const player = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_session_players WHERE id = ?`,
+    [playerId]
+  );
+  if (!player) return;
+
+  const sessionId = String(player.session_id || '');
+  const pending = parseJsonValue<Record<string, unknown> | null>(player.pending_character_snapshot, null);
+
+  if (accepted && pending) {
+    const normalized = normalizeCharacterState(pending);
+    await db.runAsync(
+      `UPDATE lan_session_players
+       SET character_snapshot = ?, pending_character_snapshot = NULL, notes = NULL,
+           hp_current = ?, hp_max = ?, xp = ?, gp = ?, sp = ?, cp = ?,
+           stats_json = ?, equipment_json = ?, last_seen_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        JSON.stringify(pending),
+        normalized.hpCurrent,
+        normalized.hpMax,
+        normalized.xp,
+        normalized.gp,
+        normalized.sp,
+        normalized.cp,
+        JSON.stringify(normalized.stats),
+        JSON.stringify(normalized.equipment),
+        playerId,
+      ]
+    );
+  } else {
+    await db.runAsync(
+      `UPDATE lan_session_players
+       SET pending_character_snapshot = NULL, notes = NULL, last_seen_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [playerId]
+    );
+  }
+
+  await rememberLanSessionEvent(db, {
+    id: makeLanEventId(),
+    sessionId,
+    type: 'character_update_review',
+    fromKey: 'master',
+    fromName: 'Mestre',
+    toKey: String(player.remote_key || ''),
+    toName: normalizeCharacterState(parseJsonValue<Record<string, unknown>>(player.character_snapshot, {})).characterName,
+    message: accepted ? 'Mestre aceitou a ficha atualizada.' : 'Mestre recusou a ficha atualizada; estado da sessao mantido.',
+    createdAt: new Date().toISOString(),
+  });
+  await syncLanSessionPayload(db, sessionId);
+}
+
 export async function addLanPlayerEffect(
   db: SQLiteDatabase,
   playerId: number,
@@ -749,22 +1011,30 @@ export async function addLanPlayerEffect(
 ) {
   await ensureLanSchema(db);
   const player = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT session_id, effects_json FROM lan_session_players WHERE id = ?`,
+    `SELECT session_id, temp_hp, effects_json FROM lan_session_players WHERE id = ?`,
     [playerId]
   );
   if (!player) return;
 
   const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []);
-  effects.push({
+  const normalizedEffect: LanSessionEffect = {
     ...effect,
     id: `effect_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    kind: effect.kind || inferEffectKind(effect.target),
     remaining: Math.max(1, Math.floor(effect.remaining || 1)),
     value: Math.floor(effect.value || 0),
+  };
+  effects.push({
+    ...normalizedEffect,
   });
 
+  const nextTempHp = normalizedEffect.target === 'PV_TEMP'
+    ? Math.max(0, toNumber(player.temp_hp) + Math.max(0, normalizedEffect.value))
+    : toNumber(player.temp_hp);
+
   await db.runAsync(
-    `UPDATE lan_session_players SET effects_json = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [JSON.stringify(effects), playerId]
+    `UPDATE lan_session_players SET effects_json = ?, temp_hp = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [JSON.stringify(effects), nextTempHp, playerId]
   );
   await syncLanSessionPayload(db, String(player.session_id));
 }
@@ -772,15 +1042,20 @@ export async function addLanPlayerEffect(
 export async function removeLanPlayerEffect(db: SQLiteDatabase, playerId: number, effectId: string) {
   await ensureLanSchema(db);
   const player = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT session_id, effects_json FROM lan_session_players WHERE id = ?`,
+    `SELECT session_id, temp_hp, effects_json FROM lan_session_players WHERE id = ?`,
     [playerId]
   );
   if (!player) return;
 
-  const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []).filter((effect) => effect.id !== effectId);
+  const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []);
+  const removed = effects.find((effect) => effect.id === effectId);
+  const nextEffects = effects.filter((effect) => effect.id !== effectId);
+  const nextTempHp = removed?.target === 'PV_TEMP'
+    ? Math.max(0, toNumber((player as any).temp_hp) - Math.max(0, toNumber(removed.value)))
+    : toNumber((player as any).temp_hp);
   await db.runAsync(
-    `UPDATE lan_session_players SET effects_json = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [JSON.stringify(effects), playerId]
+    `UPDATE lan_session_players SET effects_json = ?, temp_hp = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [JSON.stringify(nextEffects), nextTempHp, playerId]
   );
   await syncLanSessionPayload(db, String(player.session_id));
 }
@@ -802,24 +1077,49 @@ export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: strin
   );
 
   const players = await db.getAllAsync<Record<string, unknown>>(
-    `SELECT id, character_id, hp_max, effects_json FROM lan_session_players WHERE session_id = ?`,
+    `SELECT id, remote_key, player_name, character_id, character_snapshot, hp_max, temp_hp, effects_json
+     FROM lan_session_players
+     WHERE session_id = ?`,
     [sessionId]
   );
 
   for (const player of players) {
     const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []);
-    const nextEffects = tickEffects(effects, unit);
+    const { active, expired } = tickEffects(effects, unit);
     const nextHp = unit === 'longRest' ? toNumber(player.hp_max) : undefined;
+    const expiredTempHp = expired
+      .filter((effect) => effect.target === 'PV_TEMP')
+      .reduce((sum, effect) => sum + Math.max(0, toNumber(effect.value)), 0);
+    const nextTempHp = Math.max(0, toNumber(player.temp_hp) - expiredTempHp);
 
     await db.runAsync(
       `UPDATE lan_session_players
-       SET effects_json = ?, hp_current = COALESCE(?, hp_current), last_seen_at = CURRENT_TIMESTAMP
+       SET effects_json = ?, hp_current = COALESCE(?, hp_current), temp_hp = ?, last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [JSON.stringify(nextEffects), nextHp ?? null, toNumber(player.id)]
+      [JSON.stringify(active), nextHp ?? null, nextTempHp, toNumber(player.id)]
     );
 
     if (nextHp !== undefined && player.character_id) {
       await db.runAsync(`UPDATE characters SET hp_current = ? WHERE id = ?`, [nextHp, Number(player.character_id)]);
+    }
+
+    const normalized = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(player.character_snapshot, {}));
+    const characterName = normalized.characterName;
+    const playerKey = String(player.remote_key || `${sessionId}:${player.character_id || characterName}:${characterName}`);
+
+    for (const effect of expired) {
+      await rememberLanSessionEvent(db, {
+        id: makeLanEventId(),
+        sessionId,
+        type: 'effect_expired',
+        fromKey: 'session',
+        fromName: 'Sessao',
+        toKey: playerKey,
+        toName: characterName,
+        expiredEffect: effect,
+        message: `${characterName}: ${effect.name} acabou.`,
+        createdAt: new Date().toISOString(),
+      });
     }
   }
 
@@ -887,7 +1187,16 @@ export function formatElapsedTime(totalMinutes: number) {
 export function summarizeEffect(effect: LanSessionEffect) {
   const sign = effect.value > 0 ? '+' : '';
   const unitLabel = effect.unit === 'turn' ? 'turnos' : effect.unit === 'minute' ? 'min' : effect.unit === 'hour' ? 'h' : 'descanso';
-  return `${effect.name}: ${effect.target} ${sign}${effect.value} (${effect.remaining} ${unitLabel})`;
+  const targetLabel = effect.target === 'PV_TEMP' ? 'PV temp.' : effect.target;
+  const valueText = effect.target === 'custom' || effect.value === 0 ? '' : ` ${targetLabel} ${sign}${effect.value}`;
+  return `${effect.name}:${valueText} (${effect.remaining} ${unitLabel})`;
+}
+
+function inferEffectKind(target: LanEffectTarget): LanEffectKind {
+  if (target === 'PV_TEMP') return 'temp_hp';
+  if (target === 'HP') return 'hp';
+  if (target === 'custom') return 'custom';
+  return 'stat';
 }
 
 async function appendRelatedSpellProgressions(db: SQLiteDatabase, catalog: LanSessionPayload['catalog']) {
@@ -948,6 +1257,8 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
     const normalized = normalizeCharacterState(snapshot);
     const stats = parseJsonValue<Record<string, unknown>>(row.stats_json, normalized.stats);
     const equipment = parseJsonValue<Record<string, unknown>>(row.equipment_json, normalized.equipment);
+    const pendingCharacter = parseJsonValue<Record<string, unknown> | null>(row.pending_character_snapshot, null);
+    const pendingDiff = parseJsonValue<string[]>(row.notes, []);
 
     return {
       id: toNumber(row.id),
@@ -962,6 +1273,7 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
       race: normalized.race,
       hpCurrent: toNumber(row.hp_current, normalized.hpCurrent),
       hpMax: toNumber(row.hp_max, normalized.hpMax),
+      tempHp: toNumber(row.temp_hp),
       xp: toNumber(row.xp, normalized.xp),
       gp: toNumber(row.gp, normalized.gp),
       sp: toNumber(row.sp, normalized.sp),
@@ -969,6 +1281,8 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
       stats,
       equipment,
       effects: parseJsonValue<LanSessionEffect[]>(row.effects_json, []),
+      pendingCharacter,
+      pendingDiff: Array.isArray(pendingDiff) ? pendingDiff : [],
     };
   });
 }
@@ -1002,6 +1316,7 @@ async function ensureLanSchema(db: SQLiteDatabase) {
       character_snapshot TEXT,
       hp_current INTEGER DEFAULT 0,
       hp_max INTEGER DEFAULT 0,
+      temp_hp INTEGER DEFAULT 0,
       xp INTEGER DEFAULT 0,
       gp INTEGER DEFAULT 0,
       sp INTEGER DEFAULT 0,
@@ -1009,6 +1324,7 @@ async function ensureLanSchema(db: SQLiteDatabase) {
       stats_json TEXT DEFAULT '{}',
       equipment_json TEXT DEFAULT '{}',
       effects_json TEXT DEFAULT '[]',
+      pending_character_snapshot TEXT,
       notes TEXT,
       joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -1033,6 +1349,7 @@ async function ensureLanSchema(db: SQLiteDatabase) {
     ['lan_session_players', 'remote_key', 'TEXT'],
     ['lan_session_players', 'hp_current', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'hp_max', 'INTEGER DEFAULT 0'],
+    ['lan_session_players', 'temp_hp', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'xp', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'gp', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'sp', 'INTEGER DEFAULT 0'],
@@ -1040,8 +1357,15 @@ async function ensureLanSchema(db: SQLiteDatabase) {
     ['lan_session_players', 'stats_json', "TEXT DEFAULT '{}'"],
     ['lan_session_players', 'equipment_json', "TEXT DEFAULT '{}'"],
     ['lan_session_players', 'effects_json', "TEXT DEFAULT '[]'"],
+    ['lan_session_players', 'pending_character_snapshot', 'TEXT'],
     ['lan_session_players', 'notes', 'TEXT'],
     ['lan_session_players', 'last_seen_at', 'DATETIME'],
+    ['items', 'effect_json', "TEXT DEFAULT '[]'"],
+    ['items', 'duration_value', 'INTEGER'],
+    ['items', 'duration_unit', 'TEXT'],
+    ['spells', 'effect_json', "TEXT DEFAULT '[]'"],
+    ['spells', 'duration_value', 'INTEGER'],
+    ['spells', 'duration_unit', 'TEXT'],
   ];
 
   for (const [table, column, definition] of columns) {
@@ -1086,6 +1410,33 @@ function normalizeCharacterState(character: Record<string, unknown>) {
   };
 }
 
+function describeCharacterDiff(current: Record<string, unknown>, incoming: ReturnType<typeof normalizeCharacterState>) {
+  const diffs: string[] = [];
+  const currentSnapshot = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(current.character_snapshot, {}));
+  const currentValues = {
+    hpCurrent: toNumber(current.hp_current, currentSnapshot.hpCurrent),
+    hpMax: toNumber(current.hp_max, currentSnapshot.hpMax),
+    xp: toNumber(current.xp, currentSnapshot.xp),
+    gp: toNumber(current.gp, currentSnapshot.gp),
+    sp: toNumber(current.sp, currentSnapshot.sp),
+    cp: toNumber(current.cp, currentSnapshot.cp),
+    stats: parseJsonValue<Record<string, unknown>>(current.stats_json, currentSnapshot.stats),
+    equipment: parseJsonValue<Record<string, unknown>>(current.equipment_json, currentSnapshot.equipment),
+  };
+
+  if (incoming.hpCurrent !== currentValues.hpCurrent || incoming.hpMax !== currentValues.hpMax) {
+    diffs.push(`HP ${currentValues.hpCurrent}/${currentValues.hpMax} -> ${incoming.hpCurrent}/${incoming.hpMax}`);
+  }
+  if (incoming.xp !== currentValues.xp) diffs.push(`XP ${currentValues.xp} -> ${incoming.xp}`);
+  if (incoming.gp !== currentValues.gp || incoming.sp !== currentValues.sp || incoming.cp !== currentValues.cp) {
+    diffs.push(`Moedas ${currentValues.gp} PO, ${currentValues.sp} PP, ${currentValues.cp} PC -> ${incoming.gp} PO, ${incoming.sp} PP, ${incoming.cp} PC`);
+  }
+  if (JSON.stringify(incoming.stats) !== JSON.stringify(currentValues.stats)) diffs.push('Atributos alterados');
+  if (JSON.stringify(incoming.equipment) !== JSON.stringify(currentValues.equipment)) diffs.push('Inventario alterado');
+
+  return diffs;
+}
+
 function normalizeEquipment(value: unknown): Record<string, unknown> {
   const equipment = parseJsonValue<any>(value, {});
   if (Array.isArray(equipment)) return { bag: equipment, slots: {} };
@@ -1114,7 +1465,7 @@ function applyEffectsToStats(stats: Record<string, unknown>, effects: LanSession
 async function updateLocalCharacterNumbers(
   db: SQLiteDatabase,
   characterId: number,
-  patch: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'xp' | 'gp' | 'sp' | 'cp'>>
+  patch: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>
 ) {
   const columnMap = {
     hpCurrent: 'hp_current',
@@ -1124,7 +1475,7 @@ async function updateLocalCharacterNumbers(
     sp: 'sp',
     cp: 'cp',
   } as const;
-  const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
+  const entries = Object.entries(patch).filter(([key, value]) => key in columnMap && value !== undefined);
   if (entries.length === 0) return;
 
   const setSql = entries.map(([key]) => `${columnMap[key as keyof typeof columnMap]} = ?`).join(', ');
@@ -1133,8 +1484,7 @@ async function updateLocalCharacterNumbers(
 }
 
 function tickEffects(effects: LanSessionEffect[], unit: LanAdvanceUnit) {
-  return effects
-    .map((effect) => {
+  const next = effects.map((effect) => {
       let delta = 0;
       if (effect.unit === 'turn' && unit === 'turn') delta = 1;
       if (effect.unit === 'minute') {
@@ -1148,8 +1498,12 @@ function tickEffects(effects: LanSessionEffect[], unit: LanAdvanceUnit) {
       }
       if (effect.unit === 'rest' && (unit === 'shortRest' || unit === 'longRest')) delta = effect.remaining;
       return { ...effect, remaining: Math.max(0, effect.remaining - delta) };
-    })
-    .filter((effect) => effect.remaining > 0);
+    });
+
+  return {
+    active: next.filter((effect) => effect.remaining > 0),
+    expired: next.filter((effect) => effect.remaining <= 0),
+  };
 }
 
 function describeCatalogOption(tableName: SelectableCustomTable, row: Record<string, unknown>) {
@@ -1223,6 +1577,48 @@ function parseLanSessionEvent(value: unknown) {
   if (!event || typeof event !== 'object') return null;
   if (!event.id || !event.sessionId || !event.type) return null;
   return event;
+}
+
+function getRelayBaseUrl() {
+  const envUrl = String((globalThis as any).process?.env?.EXPO_PUBLIC_LAN_RELAY_URL || '').trim();
+  if (envUrl) return trimTrailingSlash(envUrl);
+
+  const constants = Constants as any;
+  const hostUri = String(
+    constants.expoConfig?.hostUri ||
+    constants.manifest?.debuggerHost ||
+    constants.manifest2?.extra?.expoClient?.hostUri ||
+    ''
+  );
+  const host = hostUri.split(':')[0];
+  if (!host || host === 'localhost' || host === '127.0.0.1') return '';
+  return `http://${host}:${RELAY_PORT}`;
+}
+
+function getSessionBaseUrl(joinUrl: string) {
+  return trimTrailingSlash(joinUrl).replace(/\/session(?:\/[^/?#]+)?(?:[?#].*)?$/, '');
+}
+
+function getSessionIdFromJoinUrl(joinUrl: string) {
+  const match = joinUrl.match(/\/session\/([^/?#]+)/);
+  return match ? decodeURIComponent(match[1]) : '';
+}
+
+async function updateRelayPayload(joinUrl: string | undefined, payload: LanSessionPayload) {
+  if (!joinUrl || !getSessionIdFromJoinUrl(joinUrl)) return;
+  try {
+    await fetch(joinUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    // Se o relay caiu, o estado local continua salvo e sera reenviado ao retomar a mesa.
+  }
+}
+
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/+$/, '');
 }
 
 function toNumber(value: unknown, fallback = 0) {

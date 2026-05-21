@@ -13,10 +13,11 @@ type Props = {
 
 export default function QrCodeView({ value, size = 260 }: Props) {
   const matrix = useMemo(() => buildQrMatrix(value), [value]);
-  const cellSize = size / matrix.length;
+  const cellSize = Math.max(1, Math.floor(size / matrix.length));
+  const qrSize = cellSize * matrix.length;
 
   return (
-    <View style={[styles.qrBox, { width: size, height: size }]}>
+    <View style={[styles.qrBox, { width: qrSize, height: qrSize }]}>
       {matrix.map((row, rowIndex) => (
         <View key={rowIndex} style={styles.qrRow}>
           {row.map((isDark, columnIndex) => (
@@ -41,7 +42,7 @@ function buildQrMatrix(value: string) {
   qr.make();
 
   const count = qr.getModuleCount();
-  const quietZone = 2;
+  const quietZone = 4;
   const matrix: boolean[][] = [];
 
   for (let row = -quietZone; row < count + quietZone; row++) {

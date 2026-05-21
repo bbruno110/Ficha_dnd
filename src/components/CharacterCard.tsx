@@ -8,6 +8,8 @@ export type Character = {
   level: number;
   class: string;
   race: string;
+  sessionId?: string | null;
+  sessionName?: string | null;
 };
 
 type Props = {
@@ -15,9 +17,10 @@ type Props = {
   onPress: () => void;
   onDelete: (id: number) => void;
   onEdit: (id: number) => void;
+  onUnlinkSession?: (id: number) => void;
 };
 
-export default function CharacterCard({ character, onPress, onDelete, onEdit }: Props) {
+export default function CharacterCard({ character, onPress, onDelete, onEdit, onUnlinkSession }: Props) {
   // Estados que controlam o nosso Menu Customizado
   const [modalVisible, setModalVisible] = useState(false);
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
@@ -66,7 +69,10 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit }: 
         
         <View style={styles.cardInfo}>
           <Text style={styles.characterName} numberOfLines={1}>{character.name}</Text>
-          <Text style={styles.characterDetails}>{character.race} • {character.class}</Text>
+          <Text style={styles.characterDetails}>{character.race} - {character.class}</Text>
+          {character.sessionName && (
+            <Text style={styles.sessionDetails} numberOfLines={1}>{character.name} - sessao {character.sessionName}</Text>
+          )}
         </View>
 
         <View style={styles.levelBadge}>
@@ -90,6 +96,12 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit }: 
                 <TouchableOpacity style={styles.optionButton} onPress={handleEdit}>
                   <Text style={styles.optionText}>✏️ Editar Ficha</Text>
                 </TouchableOpacity>
+
+                {character.sessionName && onUnlinkSession && (
+                  <TouchableOpacity style={styles.optionButton} onPress={() => { handleClose(); onUnlinkSession(character.id); }}>
+                    <Text style={styles.optionText}>Desvincular da Sessao</Text>
+                  </TouchableOpacity>
+                )}
                 
                 <TouchableOpacity style={[styles.optionButton, styles.optionButtonNoBorder]} onPress={handleDeleteClick}>
                   <Text style={styles.deleteText}>🗑️ Excluir Personagem</Text>

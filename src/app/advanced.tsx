@@ -17,7 +17,7 @@ type SpellItem = { id: number; name: string; level: string; category?: string; c
 
 const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Acervo'];
 const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capacete', 'Capa', 'Bota', 'Luva', 'Consumível', 'Ferramenta', 'Mochila/Saco', 'Outro'];
-const EFFECT_CATEGORIES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
+const EFFECT_CATEGORIES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
 const ITEM_PROPS = ['Acuidade', 'Leve', 'Pesada', 'Duas mãos', 'Versátil', 'Arremesso', 'Munição', 'Alcance', 'Recarga', 'Especial', 'Foco Arcano', 'Foco Divino', 'Foco Druídico', 'Consumível', 'Mágico'];
 
 const SPELL_RANGES = ['Pessoal', 'Toque', '9m', '18m', '36m', 'Cubo', 'Cone'];
@@ -338,6 +338,15 @@ export default function AdvancedCreatorScreen() {
       if (activeTab === 'Magia/Skill') {
         let finalCastTime = castTimeType === 'Passiva' ? 'Passiva' : `${castTimeValue} ${castTimeType}`.trim();
         const finalDuration = spellDurationValue ? `${spellDurationValue} ${spellDurationType}` : spellDurationType;
+        const spellDurationMeta = parseDurationMetadata(finalDuration);
+        const spellEffectJson = JSON.stringify(spellEffectsList.map((eff) => ({
+          kind: eff.type === 'Cura' ? 'heal' : eff.type === 'Outro' ? 'custom' : 'damage',
+          dice: eff.dice || '',
+          type: eff.type || 'Outro',
+          durationText: finalDuration,
+          durationValue: spellDurationMeta.value,
+          durationUnit: spellDurationMeta.unit,
+        })));
         
         let damageParts: string[] = [];
         let typeParts: string[] = [];
@@ -356,20 +365,22 @@ export default function AdvancedCreatorScreen() {
 
         // SALVA EXATAMENTE A CATEGORIA ESCOLHIDA NA TELA
         await db.runAsync(
-          `INSERT INTO spells (name, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type, saving_throw, description, class_level_required, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, spellLevel, spellCategory, justClassNames, finalCastTime, spellRange, spellComponents.join(', '), finalDuration, finalDamageDice, finalDamageType, finalSaves, spellDescription, classReqString]
+          `INSERT INTO spells (name, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type, saving_throw, description, effect_json, duration_value, duration_unit, class_level_required, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
+          [name, spellLevel, spellCategory, justClassNames, finalCastTime, spellRange, spellComponents.join(', '), finalDuration, finalDamageDice, finalDamageType, finalSaves, spellDescription, spellEffectJson, spellDurationMeta.value, spellDurationMeta.unit, classReqString]
         );
       }
       else if (activeTab === 'Item') {
         let damageValueParts: string[] = [];
         let damageTypeParts: string[] = [];
         let extraProps: string[] = [];
+        const itemEffectJson = itemEffects.map((eff) => toStructuredItemEffect(eff));
+        const itemDurationMeta = itemEffectJson.find((eff) => eff.durationValue && eff.durationUnit);
 
         itemEffects.forEach(eff => {
           let suffix = eff.duration ? (eff.duration === 'Temp' && eff.turns ? ` (Temp: ${eff.turns} turnos)` : ` (${eff.duration})`) : '';
           
           // Se for atributo, Cura ou efeito especial de "Outro", o tipo vai no valor da string
-          if (['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Cura'].includes(eff.type)) {
+          if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Cura'].includes(eff.type)) {
               if (eff.type === 'Escolher Atributo') damageValueParts.push(`Escolher ${eff.val}${suffix}`);
               else if (eff.type === 'Cura') damageValueParts.push(`Cura ${eff.val}`);
               else damageValueParts.push(`${eff.type} ${eff.val}${suffix}`);
@@ -389,8 +400,8 @@ export default function AdvancedCreatorScreen() {
         const finalProps = [itemCategory, ...extraProps, ...properties].filter(Boolean).join(', ');
 
         await db.runAsync(
-          `INSERT INTO items (name, weight, damage, damage_type, properties, descricao, criador) VALUES (?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, finalProps, itemDescription]
+          `INSERT INTO items (name, weight, damage, damage_type, properties, descricao, effect_json, duration_value, duration_unit, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
+          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, finalProps, itemDescription, JSON.stringify(itemEffectJson), itemDurationMeta?.durationValue || null, itemDurationMeta?.durationUnit || null]
         );
       } 
       else if (activeTab === 'Raça') {
@@ -488,7 +499,7 @@ export default function AdvancedCreatorScreen() {
   );
 
   const renderItemForm = () => {
-    const isAttribute = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo'].includes(tempEffType);
+    const isAttribute = ['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo'].includes(tempEffType);
 
     return (
       <View>
@@ -560,7 +571,7 @@ export default function AdvancedCreatorScreen() {
               if (eff.type === 'Cura') displayText = `Cura ${eff.val}`;
               else if (eff.type === 'Outro') displayText = eff.val;
               else if (eff.type === 'Escolher Atributo') displayText = `Escolher ${eff.val}${suffix}`;
-              else if (['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) displayText = `${eff.type} ${eff.val}${suffix}`;
+              else if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) displayText = `${eff.type} ${eff.val}${suffix}`;
               else displayText = `${eff.val} ${eff.type}`;
 
               return (
@@ -1212,4 +1223,38 @@ export default function AdvancedCreatorScreen() {
       </KeyboardAvoidingView>
     </LinearGradient>
   );
+}
+
+function parseDurationMetadata(duration: string) {
+  const raw = String(duration || '').toLowerCase();
+  if (!raw || raw.includes('instant') || raw.includes('permanente')) {
+    return { value: null as number | null, unit: null as string | null };
+  }
+
+  const value = Math.max(1, parseInt(raw.match(/\d+/)?.[0] || '1') || 1);
+  if (raw.includes('rodada') || raw.includes('turno')) return { value, unit: 'turn' };
+  if (raw.includes('min')) return { value, unit: 'minute' };
+  if (raw.includes('hora')) return { value, unit: 'hour' };
+  if (raw.includes('dia')) return { value: value * 24, unit: 'hour' };
+  if (raw.includes('concentra')) return { value: 1, unit: 'rest' };
+  return { value: 1, unit: 'rest' };
+}
+
+function toStructuredItemEffect(effect: any) {
+  const durationValue = effect.duration === 'Temp' && effect.turns ? Math.max(1, parseInt(effect.turns) || 1) : null;
+  const isStat = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(effect.type);
+  const isTempHp = effect.type === 'PV_TEMP';
+
+  return {
+    kind: isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : 'custom',
+    target: isTempHp ? 'PV_TEMP' : isStat ? effect.type : undefined,
+    value: parseInt(String(effect.val).replace('+', '')) || 0,
+    dice: /d\d+/i.test(String(effect.val)) ? String(effect.val) : '',
+    type: effect.type,
+    durationText: effect.duration === 'Temp'
+      ? durationValue ? `${durationValue} turno(s)` : 'Temporario'
+      : effect.duration === 'Perm' ? 'Permanente' : '',
+    durationValue,
+    durationUnit: durationValue ? 'turn' : null,
+  };
 }

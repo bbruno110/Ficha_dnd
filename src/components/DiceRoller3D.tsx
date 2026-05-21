@@ -295,7 +295,13 @@ function DiceContainer({ die, count, skipAnim, onFinish }: { die: DieType, count
   );
 }
 
-export default function DiceRoller3D() {
+export type DiceRollRequest = {
+  sides: number;
+  count: number;
+  nonce: number;
+};
+
+export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRequest }) {
   const [isOpen, setIsOpen] = useState(false);
   const [diceCount, setDiceCount] = useState(1);
   const [activeDie, setActiveDie] = useState<DieType | null>(null);
@@ -307,6 +313,14 @@ export default function DiceRoller3D() {
   const pan = useRef(new Animated.ValueXY({ x: width - FAB_SIZE - SNAP_MARGIN, y: height - FAB_SIZE - SNAP_MARGIN - 50 })).current;
   const [menuSide, setMenuSide] = useState<'left' | 'right'>('right');
   const [menuVertical, setMenuVertical] = useState<'top' | 'bottom'>('bottom');
+
+  useEffect(() => {
+    if (!rollRequest) return;
+    const die = DICE_TYPES.find((entry) => entry.max === rollRequest.sides);
+    if (!die) return;
+    setDiceCount(Math.max(1, Math.min(6, rollRequest.count || 1)));
+    rollDice(die);
+  }, [rollRequest?.nonce]);
 
   const panResponder = useRef(PanResponder.create({
     onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 10 || Math.abs(g.dy) > 10,

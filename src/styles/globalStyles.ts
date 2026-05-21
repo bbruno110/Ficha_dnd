@@ -121,8 +121,6 @@ export const qrCodeStyles = StyleSheet.create({
   qrBox: {
     alignSelf: 'center',
     backgroundColor: appColors.textPrimary,
-    padding: 8,
-    borderRadius: 8,
     overflow: 'hidden',
   },
   qrRow: {
@@ -660,6 +658,8 @@ export const lanSessionStyles = StyleSheet.create({
   ruleDescription: { color: 'rgba(255,255,255,0.55)', fontSize: 12, lineHeight: 18 },
   primaryButton: { backgroundColor: appColors.primary, borderRadius: 14, alignItems: 'center', paddingVertical: 15, marginTop: 8 },
   primaryButtonText: { color: appColors.primaryDark, fontSize: 14, fontWeight: 'bold' },
+  joinSessionButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: appColors.successSoft, borderWidth: 1, borderColor: 'rgba(0,250,154,0.35)', borderRadius: 14, paddingVertical: 14, marginTop: 10 },
+  joinSessionButtonText: { color: appColors.success, fontSize: 13, fontWeight: 'bold' },
   secondaryButton: { backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', borderRadius: 14, alignItems: 'center', paddingVertical: 14, marginTop: 16 },
   secondaryButtonText: { color: appColors.danger, fontSize: 13, fontWeight: 'bold' },
   hint: { color: 'rgba(255,255,255,0.62)', fontSize: 13, lineHeight: 20, textAlign: 'center', marginBottom: 16 },
@@ -680,6 +680,8 @@ export const lanSessionStyles = StyleSheet.create({
   statusPillPaused: { borderColor: 'rgba(255,215,0,0.45)', backgroundColor: appColors.warningSoft },
   statusPillText: { color: appColors.primary, fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase' },
   statusPillTextPaused: { color: appColors.warning },
+  sessionEventRow: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: 10, padding: 10, marginBottom: 8 },
+  sessionEventText: { color: appColors.textPrimary, fontSize: 12, lineHeight: 18, flex: 1 },
   smallButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', borderRadius: 10, paddingHorizontal: 11, paddingVertical: 9 },
   smallButtonActive: { backgroundColor: appColors.primarySoft, borderColor: appColors.primary },
   smallButtonDanger: { backgroundColor: appColors.dangerSoft, borderColor: 'rgba(255,102,102,0.35)' },
@@ -706,6 +708,9 @@ export const lanSessionStyles = StyleSheet.create({
   qrHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 10 },
   qrHeaderTextBox: { flex: 1 },
   qrIconBox: { width: 38, height: 38, borderRadius: 19, backgroundColor: appColors.primarySoft, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)', alignItems: 'center', justifyContent: 'center', marginTop: 1 },
+  scannerBox: { height: 280, borderRadius: 14, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)', backgroundColor: appColors.backgroundDeep },
+  scannerCamera: { flex: 1 },
+  scannerFrame: { position: 'absolute', left: '14%', right: '14%', top: '18%', bottom: '18%', borderWidth: 2, borderColor: appColors.primary, borderRadius: 12 },
   modalOverlay: { flex: 1, backgroundColor: appColors.overlayStrong, justifyContent: 'flex-end' },
   modalPanel: { maxHeight: '88%', backgroundColor: appColors.backgroundDeep, borderTopLeftRadius: 18, borderTopRightRadius: 18, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)', padding: 18 },
   modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 },
@@ -830,6 +835,12 @@ export const characterCardStyles = StyleSheet.create({
   characterDetails: {
     fontSize: 14,
     color: 'rgba(255, 255, 255, 0.6)',
+  },
+  sessionDetails: {
+    fontSize: 12,
+    color: '#00fa9a',
+    marginTop: 4,
+    fontWeight: '600',
   },
   levelBadge: {
     backgroundColor: 'rgba(0, 191, 255, 0.15)',

@@ -6,6 +6,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useState } from 'react';
 import { Alert, FlatList, Text, TouchableOpacity, View } from 'react-native';
 import CharacterCard, { Character } from '../components/CharacterCard';
+import { prepareLanSessionStorage, unlinkCharacterFromLanSession } from '@/services/lanSession';
 import { appColors, appGradients, homeStyles as styles } from '@/styles/globalStyles';
 
 export default function HomeScreen() {
@@ -17,8 +18,15 @@ export default function HomeScreen() {
 
   const loadCharacters = async () => {
     try {
+      await prepareLanSessionStorage(db);
       const result = await db.getAllAsync<Character>(
-        `SELECT id, name, level, class, race FROM characters ORDER BY created_at DESC`
+        `SELECT c.id, c.name, c.level, c.class, c.race,
+                s.id as sessionId, s.name as sessionName
+         FROM characters c
+         LEFT JOIN lan_session_players p ON p.character_id = c.id
+         LEFT JOIN lan_sessions s ON s.id = p.session_id
+         GROUP BY c.id
+         ORDER BY c.created_at DESC`
       );
       setCharactersList(result);
     } catch (error) {
@@ -48,6 +56,15 @@ export default function HomeScreen() {
     });
   };
 
+  const handleUnlinkSession = async (id: number) => {
+    try {
+      await unlinkCharacterFromLanSession(db, id);
+      await loadCharacters();
+    } catch (error) {
+      Alert.alert("Erro", "Nao foi possivel desvincular este personagem da sessao.");
+    }
+  };
+
   const handleOpenSheet = (character: Character) => {
     router.push(`/sheet?id=${character.id}`);
   };
@@ -68,6 +85,7 @@ export default function HomeScreen() {
               onPress={() => handleOpenSheet(item)}
               onDelete={handleDeleteCharacter}
               onEdit={handleEditCharacter}
+              onUnlinkSession={handleUnlinkSession}
             />
           )}
           contentContainerStyle={styles.listContent}
