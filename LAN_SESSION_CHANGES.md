@@ -1,40 +1,44 @@
 # Sessao LAN - melhorias aplicadas
 
+## Atualizacao SQL/LAN v2
+
+- Foi adicionado `src/database/migration_dnd_v2.ts` com migracao idempotente para bancos ja instalados.
+- `initializeDatabase(db)` agora liga `PRAGMA foreign_keys = ON` e executa `migrateDatabaseV2(db)` depois da criacao/seed base.
+- A migracao cria e atualiza `lan_effect_catalog`, incluindo status, cores, icones, regras (`rules_json`), testes de remocao e prioridade visual.
+- Foram adicionadas as tabelas `lan_session_pending_requests` e `lan_session_trades` para pedidos ao mestre e trocas entre jogadores.
+- `lan_sessions` recebeu metadados de transporte e autoridade: `transport_mode`, `host_ip`, `host_port`, `protocol_version`, `current_seq` e `is_master`.
+- `lan_session_events` recebeu `seq`, `from_key`, `to_key`, `client_msg_id` e `processed`; eventos salvos localmente agora recebem `seq` incremental.
+- `lan_session_players` recebeu `character_name`, `is_active`, `is_connected`, `last_ack_seq`, `revision_seq` e `kicked_at`.
+- `characters`, `races`, `classes` e `subclasses` receberam campos para `effect_json`/efeitos ativos quando aplicavel.
+- Magias e itens base ganham exemplos de `effect_json` estruturado apenas quando o campo ainda esta vazio, sem sobrescrever conteudo customizado.
+
 ## Entrada de jogadores
 
 - A tela `Sessao LAN` agora tem a acao de jogador `ENTRAR EM SESSAO EXISTENTE`.
 - A tela de entrada do jogador possui scanner de QR com `expo-camera`.
-- Ao escolher/criar uma ficha, o jogador tenta avisar o mestre via `POST /join` usando a URL LAN do QR.
+- Ao escolher/criar uma ficha, o jogador avisa o mestre pelo socket TCP persistente da URL LAN do QR.
 - Quando a entrada chega ao mestre, o jogador e salvo em `lan_session_players`, o payload da mesa e sincronizado e um evento `player_joined` e registrado.
 - O mestre agora consulta jogadores e eventos pelo `joinUrl` ativo, entao jogadores aparecem no painel sem depender do fallback local.
 
-## Relay LAN para Expo
+## Multiplayer local por socket TCP
 
-Foi criado um relay local em Node para ambientes onde o modulo nativo `LanSessionModule` nao existe. Ele funciona como o ponto LAN da mesa:
-
-```bash
-npm run lan-relay
-```
-
-Depois, em outro terminal:
-
-```bash
-npx expo start
-```
-
-Com o relay ligado, o QR passa a carregar uma URL real da rede:
+As sessoes novas usam transporte TCP local, com o app do mestre como host da mesa:
 
 ```text
-http://192.168.x.x:43116/session/lan_...
+tcp://192.168.x.x:43115/lan_...
 ```
 
-Se o IP automatico do Expo nao bater com o IP da sua rede, inicie o app com:
+O protocolo envia quadros JSON por linha (`\n`) em uma conexao persistente:
 
-```bash
-EXPO_PUBLIC_LAN_RELAY_URL=http://SEU_IP_NA_REDE:43116 npx expo start
-```
+- `hello`: jogador solicita o snapshot atual da mesa.
+- `session_snapshot`: mestre envia catalogo, jogadores, estado e historico recente.
+- `join`: jogador envia ficha para aparecer no painel do mestre.
+- `event`: jogador/mestre envia evento de sessao, magia, recurso, efeito ou inventario.
+- `payload_update`: mestre publica o novo estado da mesa para os clientes conectados.
 
-O fallback com dados embutidos no QR continua existindo, mas ele e apenas copia local. Para o jogador aparecer no mestre, use o relay ou um build nativo com servidor LAN real.
+O transporte HTTP/relay deixou de ser usado ao iniciar uma sessao nova. O codigo antigo permanece apenas como compatibilidade para links `http://...` ja salvos.
+
+Importante: socket TCP depende do modulo nativo `react-native-tcp-socket`. Use um dev build/native build (`npx expo run:android` ou EAS Development Build). O Expo Go nao embute esse modulo e, nesse ambiente, a tela mostra o alerta de socket indisponivel em vez de ficar presa em `INICIANDO...`.
 
 ## Banco de dados
 
@@ -66,7 +70,7 @@ As migracoes tambem foram adicionadas para bancos ja existentes.
 - A pendencia mostra diferencas como HP, XP, moedas, atributos e inventario.
 - `Aceitar ficha` atualiza o estado da sessao com a ficha local do jogador.
 - `Manter sessao` descarta a alteracao local e preserva o estado anterior da mesa.
-- O payload da sessao e reenviado ao relay sempre que o mestre aceita, recusa, aplica efeitos, muda HP/moedas ou avanca o tempo.
+- O payload da sessao e republicado pelo socket TCP sempre que o mestre aceita, recusa, aplica efeitos, muda HP/moedas ou avanca o tempo.
 - Alteracoes feitas pelo mestre durante a sessao ativa nao geram pendencia de revisao.
 
 ## Painel do mestre
@@ -105,6 +109,6 @@ As migracoes tambem foram adicionadas para bancos ja existentes.
 3. O QR deve exibir uma URL LAN ativa.
 4. O jogador abre `Sessao LAN` e toca em `ENTRAR EM SESSAO EXISTENTE`.
 5. O jogador escaneia o QR, escolhe/cria a ficha e entra.
-6. A ficha aparece no painel do mestre quando o `POST /join` chega ao servidor LAN.
+6. A ficha aparece no painel do mestre quando o quadro TCP `join` chega ao host LAN.
 7. O mestre aplica efeitos ou recebe efeitos enviados por jogadores.
 8. Ao avancar o tempo da sessao, efeitos expirados aparecem no historico.

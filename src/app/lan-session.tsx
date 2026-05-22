@@ -295,8 +295,8 @@ export default function LanSessionScreen() {
       await loadSavedSessions();
       if (!nextJoinUrl) {
         Alert.alert(
-          'Servidor LAN indisponível',
-          'A sessão foi criada, mas este build não iniciou a URL LAN. Jogadores podem abrir o QR como cópia local, porém não vão aparecer no painel do mestre automaticamente.'
+          'Socket TCP indisponível',
+          'A sessão foi criada localmente, mas este build não conseguiu abrir o servidor TCP. Gere/rode um dev build nativo; o Expo Go não suporta socket TCP local.'
         );
       }
     } catch (error) {
@@ -325,8 +325,8 @@ export default function LanSessionScreen() {
       await loadSavedSessions();
       if (!nextJoinUrl) {
         Alert.alert(
-          'Servidor LAN indisponível',
-          'A mesa foi retomada, mas este build não iniciou a URL LAN. Sem essa URL, o jogador não consegue notificar o mestre automaticamente.'
+          'Socket TCP indisponível',
+          'A mesa foi retomada, mas este build não conseguiu abrir o servidor TCP. Sem a URL tcp://, jogadores não conectam em tempo real.'
         );
       }
     } catch (error) {
@@ -976,7 +976,7 @@ export default function LanSessionScreen() {
 
         {!joinUrl && (
           <Text style={styles.warningText}>
-            Relay LAN indisponível neste ambiente. Inicie npm run lan-relay no PC para gerar uma URL real da rede e receber jogadores no painel do mestre.
+            Socket TCP indisponível neste ambiente. Use um dev build/native build; o Expo Go não consegue hospedar TCP local.
           </Text>
         )}
 

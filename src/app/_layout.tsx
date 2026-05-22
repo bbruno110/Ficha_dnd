@@ -1,13 +1,13 @@
+import { appColors, appGradients, layoutStyles as styles } from '@/styles/globalStyles';
 import { DarkTheme, ThemeProvider } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack } from 'expo-router';
 import { SQLiteProvider } from 'expo-sqlite';
 import { initializeDatabase } from '../database/init';
-import { appColors, appGradients, layoutStyles as styles } from '@/styles/globalStyles';
 
 export default function RootLayout() {
   return (
-    <SQLiteProvider databaseName="dnd_dados33333.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_dados12155.db" onInit={initializeDatabase}>
       <ThemeProvider value={DarkTheme}>
         <LinearGradient
           colors={appGradients.main}

@@ -1,7 +1,10 @@
 import { SQLiteDatabase } from 'expo-sqlite';
 
+import { migrateDatabaseV2 } from './migration_dnd_v2';
+
 export async function initializeDatabase(db: SQLiteDatabase) {
   await db.execAsync(`PRAGMA journal_mode = WAL;`);
+  await db.execAsync(`PRAGMA foreign_keys = ON;`);
 
   // 1. CRIAÇÃO DE TABELAS
   await db.execAsync(`
@@ -772,6 +775,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   } else {
     console.log('Banco de dados já populado. Pulando inserção.');
   }
+  await migrateDatabaseV2(db);
 }
 
 async function migrateLanTables(db: SQLiteDatabase) {

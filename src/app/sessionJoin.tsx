@@ -258,7 +258,7 @@ export default function SessionJoinScreen() {
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Entrada manual</Text>
             <Text style={styles.hint}>Se o QR nao abriu automaticamente, cole a URL LAN mostrada pelo mestre.</Text>
-            <TextInput style={styles.input} value={manualUrl} onChangeText={setManualUrl} placeholder="http://192.168.0.10:43115/session" placeholderTextColor={appColors.placeholderLight} autoCapitalize="none" />
+            <TextInput style={styles.input} value={manualUrl} onChangeText={setManualUrl} placeholder="tcp://192.168.0.10:43115/lan_..." placeholderTextColor={appColors.placeholderLight} autoCapitalize="none" />
             <TouchableOpacity style={styles.primaryButton} onPress={() => loadSession(manualUrl.trim())}>
               <Text style={styles.primaryButtonText}>ENTRAR</Text>
             </TouchableOpacity>
@@ -286,7 +286,7 @@ function parseJoinQrCode(value: string) {
     if (url || data) return { url, data };
   }
 
-  if (/^https?:\/\//i.test(raw)) return { url: raw, data: undefined };
+  if (/^(https?|tcp):\/\//i.test(raw)) return { url: raw, data: undefined };
 
   try {
     const payload = JSON.parse(raw);
