@@ -13,6 +13,7 @@ import {
   importLanCatalog,
   joinLanSessionWithCharacter,
   notifyMasterJoin,
+  resolveLanSessionUrlByInviteCode,
   saveLanSession,
   unlinkCharacterFromLanSession,
   type LanSessionPayload,
@@ -45,35 +46,65 @@ export default function SessionJoinScreen() {
   useEffect(() => {
     const url = firstParam(params.url);
     const data = firstParam(params.data);
+    const code = firstParam(params.code);
 
-    if (url || data) {
-      loadSession(url, data);
+    if (url || data || code) {
+      loadSession(url || code, data);
     }
-  }, [params.url, params.data]);
+  }, [params.url, params.data, params.code]);
 
   const loadSession = async (url?: string, data?: string) => {
     if (!url && !data) {
-      Alert.alert('Sessao LAN', 'Informe uma URL ou escaneie o QR da sessao.');
+      Alert.alert('Sessao LAN', 'Informe o codigo da mesa, uma URL LAN ou escaneie o QR da sessao.');
       return;
     }
 
     setLoading(true);
     try {
-      const nextPayload = data ? JSON.parse(data) as LanSessionPayload : await fetchLanSessionPayload(url || '');
+      const rawInput = (url || '').trim();
+      const parsedInput = rawInput && !data ? parseJoinQrCode(rawInput) : null;
+
+      let resolvedUrl = parsedInput?.url ?? rawInput;
+      const resolvedData = parsedInput?.data ?? data;
+      const inviteCode = (parsedInput?.code || (!/^(https?|tcp):\/\//i.test(rawInput) ? rawInput : '')).trim();
+
+      if (resolvedUrl && !resolvedData && !/^(https?|tcp):\/\//i.test(resolvedUrl)) {
+        resolvedUrl = await resolveLanSessionUrlByInviteCode(inviteCode || resolvedUrl);
+        if (!resolvedUrl) {
+          throw new Error('Codigo da mesa nao encontrado na rede local.');
+        }
+      }
+
+      let nextPayload: LanSessionPayload;
+      try {
+        nextPayload = resolvedData ? JSON.parse(resolvedData) as LanSessionPayload : await fetchLanSessionPayload(resolvedUrl);
+      } catch (error) {
+        if (!resolvedData && inviteCode) {
+          const codeResolvedUrl = await resolveLanSessionUrlByInviteCode(inviteCode);
+          if (codeResolvedUrl && codeResolvedUrl !== resolvedUrl) {
+            resolvedUrl = codeResolvedUrl;
+            nextPayload = await fetchLanSessionPayload(resolvedUrl);
+          } else {
+            throw error;
+          }
+        } else {
+          throw error;
+        }
+      }
       await importLanCatalog(db, nextPayload);
-      await saveLanSession(db, nextPayload, url);
+      await saveLanSession(db, nextPayload, resolvedUrl);
 
       setPayload(nextPayload);
-      setJoinUrl(url || '');
+      setJoinUrl(resolvedUrl || '');
       setImported(true);
 
       const bound = await getBoundLanCharacter(db, nextPayload.session.id);
       if (bound && isBoundCharacterStillInSession(nextPayload, bound.characterId)) {
         const currentCharacter = await db.getFirstAsync<Record<string, unknown>>(`SELECT * FROM characters WHERE id = ?`, [bound.characterId]);
-        await notifyMasterJoin(url || bound.joinUrl, nextPayload.session.id, currentCharacter, '', {
+        await notifyMasterJoin(resolvedUrl || bound.joinUrl, nextPayload.session.id, currentCharacter, '', {
           reviewSnapshot: nextPayload.state?.status === 'paused',
         });
-        router.replace(`/sheet?id=${bound.characterId}&sessionId=${nextPayload.session.id}&joinUrl=${encodeURIComponent(url || bound.joinUrl || '')}` as any);
+        router.replace(`/sheet?id=${bound.characterId}&sessionId=${nextPayload.session.id}&joinUrl=${encodeURIComponent(resolvedUrl || bound.joinUrl || '')}` as any);
         return;
       }
 
@@ -83,7 +114,7 @@ export default function SessionJoinScreen() {
 
       await loadEligibleCharacters(nextPayload);
     } catch (error) {
-      Alert.alert('Sessao LAN', 'Nao foi possivel entrar na sessao. Confira se voce esta na mesma rede do mestre.');
+      Alert.alert('Sessao LAN', 'Nao foi possivel entrar na sessao. Confira o codigo/URL e se voce esta na mesma rede do mestre.');
       console.error(error);
     } finally {
       setLoading(false);
@@ -168,6 +199,16 @@ export default function SessionJoinScreen() {
     setScannerVisible(false);
     setManualUrl(parsed.url || '');
     loadSession(parsed.url, parsed.data);
+  };
+
+  const handleManualJoin = () => {
+    const raw = manualUrl.trim();
+    const parsed = parseJoinQrCode(raw);
+    if (parsed) {
+      loadSession(parsed.url, parsed.data);
+      return;
+    }
+    loadSession(raw);
   };
 
   return (
@@ -257,9 +298,9 @@ export default function SessionJoinScreen() {
 
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Entrada manual</Text>
-            <Text style={styles.hint}>Se o QR nao abriu automaticamente, cole a URL LAN mostrada pelo mestre.</Text>
-            <TextInput style={styles.input} value={manualUrl} onChangeText={setManualUrl} placeholder="tcp://192.168.0.10:43115/lan_..." placeholderTextColor={appColors.placeholderLight} autoCapitalize="none" />
-            <TouchableOpacity style={styles.primaryButton} onPress={() => loadSession(manualUrl.trim())}>
+            <Text style={styles.hint}>Digite o codigo curto da mesa ou cole o convite/URL LAN mostrado pelo mestre.</Text>
+            <TextInput style={styles.input} value={manualUrl} onChangeText={setManualUrl} placeholder="ABC123 ou tcp://192.168.0.10:43115/lan_..." placeholderTextColor={appColors.placeholderLight} autoCapitalize="characters" />
+            <TouchableOpacity style={styles.primaryButton} onPress={handleManualJoin}>
               <Text style={styles.primaryButtonText}>ENTRAR</Text>
             </TouchableOpacity>
           </View>
@@ -283,14 +324,15 @@ function parseJoinQrCode(value: string) {
     const params = new URLSearchParams(raw.slice(queryStart + 1));
     const url = params.get('url') || undefined;
     const data = params.get('data') || undefined;
-    if (url || data) return { url, data };
+    const code = params.get('code') || undefined;
+    if (url || data || code) return { url: url || code, data, code };
   }
 
-  if (/^(https?|tcp):\/\//i.test(raw)) return { url: raw, data: undefined };
+  if (/^(https?|tcp):\/\//i.test(raw)) return { url: raw, data: undefined, code: undefined };
 
   try {
     const payload = JSON.parse(raw);
-    if (payload?.type === 'ficha-dnd-lan-session') return { url: undefined, data: raw };
+    if (payload?.type === 'ficha-dnd-lan-session') return { url: undefined, data: raw, code: payload?.session?.inviteCode };
   } catch {
     return null;
   }

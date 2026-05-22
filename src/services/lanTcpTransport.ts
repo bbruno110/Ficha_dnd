@@ -158,6 +158,43 @@ export async function fetchLanTcpPayload(url: string) {
   return connectLanTcpClient(url);
 }
 
+export async function resolveLanTcpUrlByInviteCode(inviteCode: string) {
+  const normalizedCode = inviteCode.trim().toUpperCase();
+  if (!normalizedCode) return '';
+
+  const localIp = await getLocalIpAddress();
+  const parts = localIp.split('.');
+  if (parts.length !== 4) return '';
+
+  const subnet = parts.slice(0, 3).join('.');
+  const hosts = Array.from(new Set([
+    '10.0.2.2',
+    '10.0.3.2',
+    localIp,
+    ...Array.from({ length: 254 }, (_, index) => `${subnet}.${index + 1}`),
+  ].filter((host) => host && host !== '0.0.0.0' && host !== '127.0.0.1')));
+
+  let nextIndex = 0;
+  let foundUrl = '';
+  const workerCount = Math.min(32, hosts.length);
+
+  const scanNext = async () => {
+    while (!foundUrl && nextIndex < hosts.length) {
+      const host = hosts[nextIndex];
+      nextIndex += 1;
+
+      const payload = await fetchLanTcpProbePayload(host, 420);
+      if (payload?.session?.inviteCode?.toUpperCase() === normalizedCode) {
+        foundUrl = `tcp://${host}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
+        return;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, scanNext));
+  return foundUrl;
+}
+
 export async function sendLanTcpJoin(url: string | undefined, entry: Record<string, unknown>) {
   if (!url) return false;
   await connectLanTcpClient(url);
@@ -271,6 +308,54 @@ function loadTcpSocket() {
     tcpModule = null;
     throw error instanceof Error ? error : new Error(String(error));
   }
+}
+
+function fetchLanTcpProbePayload(host: string, timeoutMs: number) {
+  const TcpSocket = loadTcpSocket();
+
+  return new Promise<LanSessionPayload | null>((resolve) => {
+    let settled = false;
+    let socket: TcpSocket | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (payload: LanSessionPayload | null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try {
+        socket?.destroy();
+      } catch {
+        // Probe connection already closed.
+      }
+      resolve(payload);
+    };
+
+    try {
+      socket = TcpSocket.createConnection({
+        host,
+        port: LAN_TCP_PORT,
+        interface: Platform.OS === 'android' ? 'wifi' : undefined,
+        reuseAddress: true,
+        connectTimeout: timeoutMs,
+      }, () => {
+        if (!socket) return;
+        configureSocket(socket);
+        sendEnvelope(socket, { type: 'hello' });
+      });
+
+      timer = setTimeout(() => finish(null), timeoutMs);
+      socket.on('error', () => finish(null));
+      socket.on('close', () => finish(null));
+
+      createLineReader(socket, (message) => {
+        if (message.type === 'session_snapshot' || message.type === 'payload_update') {
+          finish(message.payload);
+        }
+      });
+    } catch {
+      finish(null);
+    }
+  });
 }
 
 function makeHostPayload() {

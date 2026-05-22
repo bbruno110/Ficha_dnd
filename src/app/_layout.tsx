@@ -7,7 +7,7 @@ import { initializeDatabase } from '../database/init';
 
 export default function RootLayout() {
   return (
-    <SQLiteProvider databaseName="dnd_dados12155.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_dados121510.db" onInit={initializeDatabase}>
       <ThemeProvider value={DarkTheme}>
         <LinearGradient
           colors={appGradients.main}

@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -347,6 +348,23 @@ export default function LanSessionScreen() {
     setJoinLink('');
     setSelectedPlayerId(null);
     await loadSavedSessions();
+  };
+
+  const handleCopyInviteCode = async () => {
+    if (!payload) return;
+    await Clipboard.setStringAsync(payload.session.inviteCode);
+    Alert.alert(
+      'Codigo copiado',
+      joinUrl
+        ? `Codigo ${payload.session.inviteCode} copiado. O jogador pode digitar esse codigo em Entrada manual na mesma rede.`
+        : `Codigo ${payload.session.inviteCode} copiado, mas a mesa ainda nao tem socket TCP ativo para entrada por codigo.`
+    );
+  };
+
+  const handleCopyJoinInvite = async () => {
+    if (!payload || !joinLink) return;
+    await Clipboard.setStringAsync(joinLink);
+    Alert.alert('Convite copiado', 'O jogador pode colar esse convite em Entrada manual para entrar como jogador.');
   };
 
   const handleDeleteSavedSession = (session: LanSessionSummary) => {
@@ -944,6 +962,10 @@ export default function LanSessionScreen() {
         </View>
 
         <View style={styles.toolbar}>
+          <TouchableOpacity style={styles.smallButton} onPress={handleCopyInviteCode}>
+            <Ionicons name="copy-outline" size={15} color={appColors.textPrimary} />
+            <Text style={styles.smallButtonText}>Copiar código</Text>
+          </TouchableOpacity>
           <TouchableOpacity style={[styles.smallButton, paused ? styles.smallButtonSuccess : styles.smallButtonActive]} onPress={handleTogglePause}>
             <Ionicons name={paused ? 'play' : 'pause'} size={15} color={paused ? appColors.success : appColors.primary} />
             <Text style={[styles.smallButtonText, paused ? styles.smallButtonTextSuccess : styles.smallButtonTextActive]}>{paused ? 'Retomar' : 'Pausar'}</Text>
@@ -982,6 +1004,17 @@ export default function LanSessionScreen() {
 
         <View style={styles.linkBox}>
           <Text style={styles.linkText}>{joinLink}</Text>
+        </View>
+
+        <View style={styles.toolbar}>
+          <TouchableOpacity style={styles.smallButton} onPress={handleCopyInviteCode}>
+            <Ionicons name="copy-outline" size={15} color={appColors.textPrimary} />
+            <Text style={styles.smallButtonText}>Copiar código</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.smallButton} onPress={handleCopyJoinInvite}>
+            <Ionicons name="link" size={15} color={appColors.textPrimary} />
+            <Text style={styles.smallButtonText}>Copiar convite</Text>
+          </TouchableOpacity>
         </View>
       </View>
     );

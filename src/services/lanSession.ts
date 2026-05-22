@@ -8,6 +8,7 @@ import {
   getLanTcpHostEvents,
   getLanTcpHostJoinedRows,
   isTcpLanUrl,
+  resolveLanTcpUrlByInviteCode,
   sendLanTcpEvent,
   sendLanTcpJoin,
   startLanTcpHost,
@@ -527,6 +528,12 @@ export async function fetchLanSessionPayload(url: string): Promise<LanSessionPay
   const response = await fetchWithTimeout(url);
   if (!response.ok) throw new Error(`Sessao LAN indisponivel (${response.status})`);
   return response.json();
+}
+
+export async function resolveLanSessionUrlByInviteCode(code: string) {
+  const inviteCode = code.trim().toUpperCase();
+  if (!inviteCode) return '';
+  return resolveLanTcpUrlByInviteCode(inviteCode);
 }
 
 export async function fetchLanSessionEvents(joinUrl: string, sessionId?: string): Promise<LanSessionEvent[]> {
