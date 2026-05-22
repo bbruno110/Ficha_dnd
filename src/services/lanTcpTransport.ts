@@ -1,5 +1,5 @@
 import * as Network from 'expo-network';
-import { Platform } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 
 import type { LanSessionEvent, LanSessionPayload } from './lanSession';
 
@@ -297,6 +297,10 @@ function loadTcpSocket() {
   }
 
   try {
+    if (!NativeModules.TcpSockets) {
+      throw new Error('Modulo TCP nativo indisponivel. Recompile e reinstale o dev build Android.');
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const loaded = require('react-native-tcp-socket');
     tcpModule = (loaded.default || loaded) as TcpSocketModule;

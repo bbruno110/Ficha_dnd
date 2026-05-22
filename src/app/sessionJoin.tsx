@@ -114,7 +114,10 @@ export default function SessionJoinScreen() {
 
       await loadEligibleCharacters(nextPayload);
     } catch (error) {
-      Alert.alert('Sessao LAN', 'Nao foi possivel entrar na sessao. Confira o codigo/URL e se voce esta na mesma rede do mestre.');
+      const message = error instanceof Error && error.message.includes('Modulo TCP nativo indisponivel')
+        ? 'Este build Android nao tem o modulo TCP nativo ativo. Recompile e reinstale o dev build no emulador/celular.'
+        : 'Nao foi possivel entrar na sessao. Confira o codigo/URL e se voce esta na mesma rede do mestre.';
+      Alert.alert('Sessao LAN', message);
       console.error(error);
     } finally {
       setLoading(false);
