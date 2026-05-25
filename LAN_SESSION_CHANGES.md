@@ -36,7 +36,7 @@ O protocolo envia quadros JSON por linha (`\n`) em uma conexao persistente:
 - `event`: jogador/mestre envia evento de sessao, magia, recurso, efeito ou inventario.
 - `payload_update`: mestre publica o novo estado da mesa para os clientes conectados.
 
-O transporte HTTP/relay deixou de ser usado ao iniciar uma sessao nova. O codigo antigo permanece apenas como compatibilidade para links `http://...` ja salvos.
+O transporte padrao de sessoes novas e TCP direto. O app nao usa mais HTTP/relay como fallback; se o build nao conseguir abrir `tcp://`, a sessao avisa que o socket nativo esta indisponivel.
 
 Importante: socket TCP depende do modulo nativo `react-native-tcp-socket`. Use um dev build/native build (`npx expo run:android` ou EAS Development Build). O Expo Go nao embute esse modulo e, nesse ambiente, a tela mostra o alerta de socket indisponivel em vez de ficar presa em `INICIANDO...`.
 

@@ -85,7 +85,7 @@ export async function migrateDatabaseV2(db: SQLiteDatabase) {
   ]);
 
   await addColumnsIfMissing(db, [
-    ['lan_sessions', 'transport_mode', "TEXT NOT NULL DEFAULT 'relay'"],
+    ['lan_sessions', 'transport_mode', "TEXT NOT NULL DEFAULT 'tcp'"],
     ['lan_sessions', 'host_ip', 'TEXT'],
     ['lan_sessions', 'host_port', 'INTEGER'],
     ['lan_sessions', 'protocol_version', 'INTEGER NOT NULL DEFAULT 1'],
@@ -609,6 +609,10 @@ export async function seedCoreEffectJsonExamples(db: SQLiteDatabase) {
       '[{"type":"heal","healDice":"2d4+2","target":{"mode":"self","count":1},"consumeOnUse":true}]',
     ],
     [
+      'Poção de Força do Gigante da Colina',
+      '[{"type":"stat","kind":"stat","target":"FOR","mode":"set","value":21,"targeting":{"mode":"self","count":1},"condition":{"key":"hill_giant_strength","name":"Força do Gigante da Colina","applyOn":"always","duration":{"value":1,"unit":"hour","untilSave":false,"repeatSave":"none"},"color":"#f4a261"},"durationText":"1 Hora","durationValue":1,"durationUnit":"hour","consumeOnUse":true}]',
+    ],
+    [
       'Antitoxina',
       '[{"type":"buff","target":{"mode":"self","count":1},"condition":{"key":"antitoxin","name":"Antitoxina","applyOn":"always","duration":{"value":1,"unit":"hour"}},"bonus":{"saveAdvantageAgainst":["poisoned","Veneno"]},"consumeOnUse":true}]',
     ],
@@ -621,6 +625,22 @@ export async function seedCoreEffectJsonExamples(db: SQLiteDatabase) {
       '[{"type":"damage","damageDice":"2d6","damageType":"Ácido","target":{"mode":"creature","count":1},"consumeOnUse":true}]',
     ],
   ];
+
+  await db.runAsync(
+    `INSERT OR IGNORE INTO items (name, weight, damage, damage_type, properties, descricao, effect_json, duration_value, duration_unit, criador)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+    [
+      'Poção de Força do Gigante da Colina',
+      0.25,
+      'FOR 21 (1 Hora)',
+      '-',
+      'Consumível, Mágico, Poção',
+      'Ao beber, sua Força se torna 21 por 1 hora.',
+      '[]',
+      1,
+      'hour',
+    ],
+  );
 
   for (const [name, effectJson] of itemUpdates) {
     await updateEmptyEffectJson(db, 'items', name, effectJson);

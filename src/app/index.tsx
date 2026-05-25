@@ -21,9 +21,12 @@ export default function HomeScreen() {
       await prepareLanSessionStorage(db);
       const result = await db.getAllAsync<Character>(
         `SELECT c.id, c.name, c.level, c.class, c.race,
-                s.id as sessionId, s.name as sessionName
+                s.id as sessionId, s.name as sessionName, s.join_url as joinUrl
          FROM characters c
-         LEFT JOIN lan_session_players p ON p.character_id = c.id
+         LEFT JOIN lan_session_players p
+           ON p.character_id = c.id
+          AND COALESCE(p.is_active, 1) = 1
+          AND p.kicked_at IS NULL
          LEFT JOIN lan_sessions s ON s.id = p.session_id
          GROUP BY c.id
          ORDER BY c.created_at DESC`
@@ -66,6 +69,10 @@ export default function HomeScreen() {
   };
 
   const handleOpenSheet = (character: Character) => {
+    if (character.sessionId) {
+      router.push(`/sheet?id=${character.id}&sessionId=${character.sessionId}&joinUrl=${encodeURIComponent(character.joinUrl || '')}` as any);
+      return;
+    }
     router.push(`/sheet?id=${character.id}`);
   };
 

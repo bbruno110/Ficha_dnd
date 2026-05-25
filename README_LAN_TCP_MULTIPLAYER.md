@@ -14,7 +14,7 @@ Mestre abre a sessao
 -> mestre e jogadores trocam mensagens persistentes por socket
 ```
 
-O fluxo novo nao depende de HTTP polling para sessoes novas. O caminho HTTP/relay antigo ficou apenas como compatibilidade para links antigos.
+O fluxo usa TCP direto. O app nao troca mais para HTTP relay: se nao existir uma URL `tcp://`, a sessao nao entra em tempo real.
 
 ## Arquivos principais
 
@@ -103,6 +103,33 @@ npx expo run:android
 Depois, mantenha todos na mesma rede Wi-Fi. O celular do mestre precisa continuar com o app aberto durante a sessao, porque ele e o host TCP.
 
 Se o Android ou Windows pedir permissao de rede/firewall durante testes, permita acesso na rede privada/local.
+
+## Como testar emulador + celular fisico sem relay
+
+Quando o mestre roda no emulador Android, a URL TCP pode sair como `tcp://10.0.2.x:43115/...`. Esse endereco pertence a rede interna do emulador; outro emulador ou um celular fisico nao acessam esse IP direto.
+
+Para socket puro, prefira este teste:
+
+```powershell
+npm run android
+```
+
+Use o celular fisico como mestre. O QR deve mostrar `tcp://192.168.x.x:43115/...`; o emulador ou outro celular entra por essa URL/codigo na mesma rede.
+
+Para testar dois emuladores com o mestre em um emulador, redirecione a porta TCP do emulador mestre para o host:
+
+```powershell
+adb devices
+adb -s emulator-5554 emu redir add tcp:43115:43115
+```
+
+No segundo emulador, entre manualmente pelo codigo da mesa ou por uma URL usando o host do emulador:
+
+```powershell
+tcp://10.0.2.2:43115/lan_...
+```
+
+Para celular fisico entrar em uma mesa hospedada por emulador, tambem seria necessario expor a porta do PC na rede local com um port-forward do sistema. O caminho mais limpo para validar socket real e deixar o celular ser o mestre.
 
 ## Protocolo TCP
 

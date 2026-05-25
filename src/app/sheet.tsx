@@ -1,11 +1,11 @@
 // ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
-import DiceRoller3D, { type DiceRollRequest } from '@/components/DiceRoller3D';
+import DiceRoller3D, { type DiceRollRequest, type DiceRollResult } from '@/components/DiceRoller3D';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Animated, BackHandler, FlatList, Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
 import {
   applyLanSessionStateToCharacter,
@@ -17,8 +17,11 @@ import {
   makeLanEventId,
   rememberLanSessionEvent,
   sendLanSessionEvent,
+  unlinkCharacterFromLanSession,
+  type LanResourceRequest,
   type LanSessionEvent,
   type LanSessionPayload,
+  type LanSessionStatus,
   type LanTradeItem,
   type LanEffectTarget,
   type LanEffectUnit,
@@ -93,6 +96,7 @@ export default function CharacterSheetScreen() {
   const [actionQty, setActionQty] = useState(1);
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
   const [lanInfo, setLanInfo] = useState<{ sessionId: string; joinUrl: string } | null>(null);
+  const [lanSessionStatus, setLanSessionStatus] = useState<LanSessionStatus | null>(null);
   const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
   const [incomingTrades, setIncomingTrades] = useState<LanSessionEvent[]>([]);
   const [targetPickerMode, setTargetPickerMode] = useState<'send' | 'trade' | null>(null);
@@ -191,6 +195,7 @@ export default function CharacterSheetScreen() {
             skill_values: loadedSkills,
             equipment: parsedEquip,
             spells: JSON.parse((result as any).spells || '[]'),
+            active_effects: JSON.parse((result as any).active_effects_json || '[]'),
           };
           setCharacter(charData);
 
@@ -225,6 +230,10 @@ export default function CharacterSheetScreen() {
     damage: item.damage,
     damage_type: item.damage_type,
     properties: item.properties,
+    descricao: item.descricao,
+    effect_json: item.effect_json,
+    duration_value: item.duration_value,
+    duration_unit: item.duration_unit,
   });
 
   const updateCharacterEquipmentOnly = async (equipment: any) => {
@@ -336,6 +345,31 @@ export default function CharacterSheetScreen() {
 
       if (!isForMe(event)) continue;
 
+      if (event.type === 'player_kicked') {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) {
+          await unlinkCharacterFromLanSession(db, Number(character.id), sessionValue);
+          setLanInfo(null);
+          setLanSessionStatus(null);
+          setLanPlayers([]);
+          setIncomingTrades([]);
+          showCustomAlert(
+            'Removido da sessao',
+            event.message || 'O mestre removeu este personagem da sessao LAN.',
+            [{ text: 'OK', color: appColors.primary, onPress: () => router.replace(`/sheet?id=${character.id}` as any) }]
+          );
+        }
+        continue;
+      }
+
+      if (event.type === 'resource_review') {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) {
+          showCustomAlert('Resposta do mestre', event.message || 'O mestre revisou seu pedido.');
+        }
+        continue;
+      }
+
       if (event.type === 'send_item') {
         const fresh = await rememberLanSessionEvent(db, event);
         if (fresh) {
@@ -384,9 +418,14 @@ export default function CharacterSheetScreen() {
     let active = true;
 
     const refreshLan = async () => {
+      const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
       const storedInfo = routeSessionId
-        ? { sessionId: routeSessionId, joinUrl: routeJoinUrl || '' }
-        : await getLocalLanSessionForCharacter(db, Number(character.id));
+        ? {
+          sessionId: routeSessionId,
+          joinUrl: routeJoinUrl || localInfo?.joinUrl || '',
+          payloadJson: localInfo?.payloadJson,
+        }
+        : localInfo;
 
       if (!storedInfo?.sessionId) return;
 
@@ -403,7 +442,8 @@ export default function CharacterSheetScreen() {
         } catch {
           nextPayload = null;
         }
-      } else if ((storedInfo as any).payloadJson) {
+      }
+      if (!nextPayload && (storedInfo as any).payloadJson) {
         try {
           nextPayload = JSON.parse((storedInfo as any).payloadJson);
         } catch {
@@ -413,20 +453,43 @@ export default function CharacterSheetScreen() {
 
       if (nextPayload && active) {
         const selfKey = makeLanCharacterKey(nextInfo.sessionId, character);
+        setLanSessionStatus(nextPayload.state?.status || 'active');
+        const isStillInSession = Boolean(nextPayload.state?.players?.some((player) => (
+          player.remoteKey === selfKey ||
+          player.sourceCharacterId === Number(character.id) ||
+          player.characterId === Number(character.id) ||
+          player.characterName === character.name
+        )));
+        const wasKicked = nextPayload.events?.some((event) => (
+          event.type === 'player_kicked' &&
+          (event.toKey === selfKey || event.toName === character.name)
+        ));
+        if (!isStillInSession && (wasKicked || nextPayload.state?.status === 'ended')) {
+          await unlinkCharacterFromLanSession(db, Number(character.id), nextInfo.sessionId);
+          if (active) {
+            setLanInfo(null);
+            setLanPlayers([]);
+            setIncomingTrades([]);
+            setLanSessionStatus(null);
+          }
+          return;
+        }
         const changedBySession = await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id));
         if (changedBySession) {
-          const updated = await db.getFirstAsync<Record<string, unknown>>(`SELECT hp_current, hp_max, xp, gp, sp, cp, stats, equipment FROM characters WHERE id = ?`, [Number(character.id)]);
+          const updated = await db.getFirstAsync<Record<string, unknown>>(`SELECT hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats, equipment, active_effects_json FROM characters WHERE id = ?`, [Number(character.id)]);
           if (updated && active) {
             setCharacter((prev: any) => ({
               ...prev,
               hp_current: updated.hp_current,
               hp_max: updated.hp_max,
+              temp_hp: updated.temp_hp,
               xp: updated.xp,
               gp: updated.gp,
               sp: updated.sp,
               cp: updated.cp,
               stats: JSON.parse(String(updated.stats || '{}')),
               equipment: JSON.parse(String(updated.equipment || '{}')),
+              active_effects: JSON.parse(String(updated.active_effects_json || '[]')),
             }));
           }
         }
@@ -453,6 +516,15 @@ export default function CharacterSheetScreen() {
       clearInterval(timer);
     };
   }, [character, routeSessionId, routeJoinUrl]);
+
+  useEffect(() => {
+    if (!routeSessionId) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      router.replace('/' as any);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [routeSessionId, router]);
 
   // Se estiver carregando ou sem personagem, encerra o render aqui
   if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color={appColors.primary} /></View>;
@@ -514,6 +586,20 @@ export default function CharacterSheetScreen() {
   const checkProficiency = (idx: string, group: any[]) => group.includes(idx);
   const proficientSaves = dbSaves.filter((save: any) => checkProficiency(save.id, character.save_values));
   const proficientSkills = dbSkills.filter((skill: any) => checkProficiency(skill.id, character.skill_values));
+  const isLanReadOnly = Boolean(lanInfo?.sessionId && lanSessionStatus && lanSessionStatus !== 'active');
+  const activeVisualEffects = Array.isArray(character.active_effects) ? character.active_effects : [];
+  const activeConditionEffect = activeVisualEffects.find((effect: any) => effect?.color || effect?.secondaryColor || effect?.status);
+  const conditionFrameStyle = activeConditionEffect?.color
+    ? { borderWidth: 3, borderColor: String(activeConditionEffect.color) }
+    : null;
+
+  const handleSheetBack = () => {
+    if (lanInfo?.sessionId || routeSessionId) {
+      router.replace('/' as any);
+      return;
+    }
+    router.back();
+  };
 
 
   // ==============================================================================
@@ -530,8 +616,94 @@ export default function CharacterSheetScreen() {
     } catch (e) { console.error(e); }
   };
 
+  const ensureLanWritable = () => {
+    if (!isLanReadOnly) return true;
+    showCustomAlert('Sessao em leitura', 'Esta sessao esta pausada ou encerrada. A ficha fica somente para consulta.');
+    return false;
+  };
+
+  const sendResourceRequest = async (request: LanResourceRequest) => {
+    if (!character) return false;
+    if (!lanInfo?.joinUrl) {
+      showCustomAlert('Sessao offline', 'Nao ha socket TCP ativo para enviar este pedido ao mestre.');
+      return false;
+    }
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'resource_request',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: 'master',
+        toName: 'Mestre',
+        resourceRequest: request,
+        message: request.message,
+        createdAt: new Date().toISOString(),
+      });
+      showCustomAlert('Pedido enviado', 'O mestre recebeu sua solicitacao para revisar.');
+      return true;
+    } catch {
+      showCustomAlert('Pedido falhou', 'Nao consegui enviar o pedido para a sessao LAN.');
+      return false;
+    }
+  };
+
+  const notifyInventoryPatch = async (equipment: any, reason: string) => {
+    if (!lanInfo?.joinUrl || !character) return;
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'inventory_patch',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: 'master',
+        toName: 'Mestre',
+        inventoryPatch: { equipment, reason },
+        message: reason,
+        createdAt: new Date().toISOString(),
+      });
+    } catch {
+      // A alteracao local continua valida; o mestre sincroniza quando receber o proximo snapshot aceito.
+    }
+  };
+
+  const notifyNumberPatch = async (patch: LanSessionEvent['numberPatch'], reason: string) => {
+    if (!lanInfo?.joinUrl || !character) return;
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'player_patch',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: 'master',
+        toName: 'Mestre',
+        numberPatch: patch,
+        message: reason,
+        createdAt: new Date().toISOString(),
+      });
+    } catch {
+      showCustomAlert('Sincronizacao falhou', 'Nao consegui enviar esta alteracao ao mestre.');
+    }
+  };
+
   const handleXP = (action: 'add' | 'remove') => {
+    if (!ensureLanWritable()) return;
     const amount = parseInt(inputValue) || 0;
+    if (lanInfo?.sessionId && amount > 0) {
+      sendResourceRequest({
+        kind: 'xp',
+        action,
+        amount: action === 'add' ? amount : -amount,
+        message: `${action === 'add' ? '+' : '-'}${amount} XP`,
+      });
+      setXpModalVisible(false);
+      setInputValue('');
+      return;
+    }
+
     let newXp = Math.max(0, action === 'add' ? character.xp + amount : character.xp - amount);
     
     let calcNewLevel = 1;
@@ -550,7 +722,19 @@ export default function CharacterSheetScreen() {
   };
 
   const handleHP = (action: 'damage' | 'heal') => {
+    if (!ensureLanWritable()) return;
     const amount = parseInt(inputValue) || 0;
+    if (lanInfo?.sessionId && amount > 0) {
+      sendResourceRequest({
+        kind: 'hp',
+        action,
+        amount: action === 'heal' ? amount : -amount,
+        message: `${action === 'heal' ? '+' : '-'}${amount} HP`,
+      });
+      setHpModalVisible(false);
+      setInputValue('');
+      return;
+    }
     
     let newDisplayCurrent = action === 'damage' 
       ? Math.max(0, displayHpCurrent - amount) 
@@ -565,8 +749,24 @@ export default function CharacterSheetScreen() {
   };
 
   const handleTempBuffSubmit = () => {
+    if (!ensureLanWritable()) return;
     let newStats = { ...character.stats };
     const val = parseInt(tempBuffValue) || 0;
+    if (lanInfo?.sessionId) {
+      sendResourceRequest({
+        kind: 'stat',
+        action: 'temp',
+        field: activeBuffStat,
+        value: val,
+        duration: 1,
+        unit: 'rest',
+        message: `${activeBuffStat} ${val >= 0 ? '+' : ''}${val} temporario`,
+      });
+      setTempBuffModalVisible(false);
+      setTempBuffValue('');
+      return;
+    }
+
     if (val === 0) delete newStats.temp_mods[activeBuffStat];
     else newStats.temp_mods[activeBuffStat] = val;
     updateDB({ stats: newStats });
@@ -575,6 +775,7 @@ export default function CharacterSheetScreen() {
   };
 
   const clearTempBuff = () => {
+    if (!ensureLanWritable()) return;
     let newStats = { ...character.stats };
     delete newStats.temp_mods[activeBuffStat];
     updateDB({ stats: newStats });
@@ -583,44 +784,92 @@ export default function CharacterSheetScreen() {
   };
 
   const goToEditScreen = () => {
+    if (!ensureLanWritable()) return;
     setLevelUpModalVisible(false);
-    router.push(`/edit?id=${character.id}&levelUpTo=${newLevelData}`);
+    router.push(`/edit?id=${character.id}&levelUpTo=${newLevelData}${lanInfo?.sessionId ? `&sessionId=${lanInfo.sessionId}&joinUrl=${encodeURIComponent(lanInfo.joinUrl || '')}` : ''}` as any);
   };
 
   const handleCoinSubmit = () => {
-    updateDB({ [activeCoinType]: Math.max(0, parseInt(inputValue) || 0) });
+    if (!ensureLanWritable()) return;
+    const nextValue = Math.max(0, parseInt(inputValue) || 0);
+    if (lanInfo?.sessionId && nextValue > Number(character[activeCoinType] || 0)) {
+      showCustomAlert('Moedas bloqueadas', 'Durante a sessao LAN, apenas o mestre pode adicionar moedas.');
+      return;
+    }
+    updateDB({ [activeCoinType]: nextValue });
+    if (lanInfo?.sessionId) {
+      void notifyNumberPatch({ [activeCoinType]: nextValue }, `${character.name} ajustou ${COIN_NAMES[activeCoinType]} para ${nextValue}.`);
+    }
     setCoinModalVisible(false); setInputValue('');
   };
 
-  const updateCoins = (type: 'gp' | 'sp' | 'cp', delta: number) => updateDB({ [type]: Math.max(0, character[type] + delta) });
+  const updateCoins = (type: 'gp' | 'sp' | 'cp', delta: number) => {
+    if (!ensureLanWritable()) return;
+    if (lanInfo?.sessionId && delta > 0) {
+      showCustomAlert('Moedas bloqueadas', 'Durante a sessao LAN, apenas o mestre pode adicionar moedas.');
+      return;
+    }
+    const nextValue = Math.max(0, character[type] + delta);
+    updateDB({ [type]: nextValue });
+    if (lanInfo?.sessionId) {
+      void notifyNumberPatch({ [type]: nextValue }, `${character.name} reduziu ${COIN_NAMES[type]} para ${nextValue}.`);
+    }
+  };
 
   const executeCoinConversion = (sourceAmount: number, targetAmount: number) => {
-    updateDB({
+    if (!ensureLanWritable()) return;
+    const nextCoins = {
       [convertFrom]: character[convertFrom] - sourceAmount,
       [convertTo]: character[convertTo] + targetAmount
-    });
+    };
+    updateDB(nextCoins);
+    if (lanInfo?.sessionId) {
+      void notifyNumberPatch(nextCoins, `${character.name} converteu ${sourceAmount} ${COIN_NAMES[convertFrom]} em ${targetAmount} ${COIN_NAMES[convertTo]}.`);
+    }
     setConvertModalVisible(false);
     setConvertAmount('');
     showCustomAlert("Câmbio Realizado", `Você converteu ${sourceAmount} ${COIN_NAMES[convertFrom]} em ${targetAmount} ${COIN_NAMES[convertTo]}.`);
   };
 
   const updateBagQty = (index: number, delta: number) => {
+    if (!ensureLanWritable()) return;
+    if (lanInfo?.sessionId && delta > 0) {
+      showCustomAlert('Inventario bloqueado', 'Durante a sessao LAN, apenas o mestre pode adicionar itens ao jogador.');
+      return;
+    }
+
     let newBag = [...character.equipment.bag];
+    const item = newBag[index];
+    if (!item) return;
+
     newBag[index].qty += delta;
     if (newBag[index].qty <= 0) newBag = newBag.filter((_, i) => i !== index);
-    updateDB({ equipment: { ...character.equipment, bag: newBag } });
+    const nextEquipment = { ...character.equipment, bag: newBag };
+    updateDB({ equipment: nextEquipment });
+    if (lanInfo?.sessionId && delta < 0) {
+      void notifyInventoryPatch(nextEquipment, `${character.name} reduziu ${Math.abs(delta)}x ${item.name} da mochila.`);
+    }
   };
 
   const addItemToBag = (item: any) => {
+    if (!ensureLanWritable()) return;
+    if (lanInfo?.sessionId) {
+      showCustomAlert('Inventario bloqueado', 'Durante a sessao LAN, peca ao mestre para entregar itens.');
+      setItemModalVisible(false);
+      setItemSearch('');
+      return;
+    }
+
     let newBag = [...character.equipment.bag];
     const existingIndex = newBag.findIndex((i: any) => i.name === item.name);
     if (existingIndex > -1) newBag[existingIndex].qty += 1;
-    else newBag.push({ name: item.name, qty: 1, weight: item.weight, damage: item.damage, damage_type: item.damage_type, properties: item.properties });
+    else newBag.push({ name: item.name, qty: 1, weight: item.weight, damage: item.damage, damage_type: item.damage_type, properties: item.properties, descricao: item.descricao, effect_json: item.effect_json, duration_value: item.duration_value, duration_unit: item.duration_unit });
     updateDB({ equipment: { ...character.equipment, bag: newBag } });
     setItemModalVisible(false); setItemSearch('');
   };
 
   const handleSendItemToPlayer = async (target: PublicLanPlayer) => {
+    if (!ensureLanWritable()) return;
     if (!selectedBagItem || !lanInfo || !character) return;
     const tradeItem = makeTradeItem(selectedBagItem.item, actionQty);
     const removed = await removeTradeItemFromBagByIndex(selectedBagItem.index, tradeItem.qty);
@@ -652,6 +901,7 @@ export default function CharacterSheetScreen() {
   };
 
   const handleOfferTradeToPlayer = async (target: PublicLanPlayer) => {
+    if (!ensureLanWritable()) return;
     if (!selectedBagItem || !lanInfo || !character) return;
     const offeredItem = makeTradeItem(selectedBagItem.item, actionQty);
 
@@ -677,6 +927,7 @@ export default function CharacterSheetScreen() {
   };
 
   const handleAcceptTrade = async () => {
+    if (!ensureLanWritable()) return;
     if (!selectedTradeOffer || !tradeCounterItem || !lanInfo || !character) return;
     const requestedItem = makeTradeItem(tradeCounterItem.item, tradeCounterQty);
     const removed = await removeTradeItemFromBagByIndex(tradeCounterItem.index, requestedItem.qty);
@@ -713,6 +964,7 @@ export default function CharacterSheetScreen() {
   };
 
   const handleDeclineTrade = async (event: LanSessionEvent) => {
+    if (!ensureLanWritable()) return;
     if (!lanInfo || !character) return;
     try {
       await sendLanSessionEvent(lanInfo.joinUrl, {
@@ -795,17 +1047,19 @@ export default function CharacterSheetScreen() {
   };
 
   const rollSpellForTargets = () => {
+    if (!ensureLanWritable()) return;
     if (!selectedSpell) return;
     const diceParts = getDiceParts(getSpellDiceText(selectedSpell));
     if (diceParts[0]) {
+      setSpellRollResult('Rolando...');
       setDiceRollRequest({ ...diceParts[0], nonce: Date.now() });
-    }
-    const result = rollDiceExpression(getSpellDiceText(selectedSpell));
-    if (!result) {
-      showCustomAlert('Rolagem indisponivel', 'Nao encontrei uma formula de dado nesta magia. Informe o valor manualmente.');
       return;
     }
+    showCustomAlert('Rolagem indisponivel', 'Nao encontrei uma formula de dado nesta magia. Informe o valor manualmente.');
+  };
 
+  const handleSpellDiceComplete = (result: DiceRollResult) => {
+    if (!selectedSpell || !spellCastVisible) return;
     setSpellRollResult(`${result.total} (${result.breakdown})`);
     setSpellTargetAmounts((current) => {
       const next = { ...current };
@@ -852,7 +1106,80 @@ export default function CharacterSheetScreen() {
     await sendLanSessionEvent(lanInfo.joinUrl, event);
   };
 
+  const applyStructuredItemEffects = (bagIndex: number, item: any, qty: number, effects: any[]) => {
+    updateBagQty(bagIndex, -qty);
+
+    const nextStats = { ...character.stats, temp_mods: { ...(character.stats?.temp_mods || {}) } };
+    const dbUpdates: any = {};
+    const messages: string[] = [];
+    let nextActiveEffects = Array.isArray(character.active_effects) ? [...character.active_effects] : [];
+
+    for (const effect of effects) {
+      const kind = String(effect.kind || effect.type || '').toLowerCase();
+      const target = String(effect.target || '').toUpperCase();
+      const value = Number(effect.value || 0);
+      const dice = effect.healDice || effect.damageDice || effect.dice || '';
+
+      if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target) && value) {
+        if (effect.mode === 'set') {
+          const base = Number(nextStats[target] || 10);
+          nextStats.temp_mods[target] = value - base;
+          messages.push(`${target} definido como ${value}.`);
+        } else {
+          nextStats.temp_mods[target] = (Number(nextStats.temp_mods[target]) || 0) + value * qty;
+          messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty}.`);
+        }
+      }
+
+      if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
+        dbUpdates.temp_hp = Math.max(Number(character.temp_hp || 0), Number(character.temp_hp || 0) + value * qty);
+        messages.push(`PV temporario +${value * qty}.`);
+      }
+
+      if (kind === 'heal') {
+        const fixedHeal = Number(value || String(dice).match(/^\d+$/)?.[0] || 0) * qty;
+        if (fixedHeal > 0) {
+          dbUpdates.hp_current = Math.min(Number(character.hp_max || 0), Number(character.hp_current || 0) + fixedHeal);
+          messages.push(`Recuperou ${fixedHeal} PV.`);
+        } else if (dice) {
+          messages.push(`Role a cura: ${qty}x ${dice}.`);
+        }
+      }
+
+      const condition = effect.condition;
+      if (condition?.key && condition.key !== 'none') {
+        if (effect.save?.ability && condition.applyOn === 'failed_save') {
+          messages.push(`Teste ${effect.save.ability}${effect.save.dc ? ` CD ${effect.save.dc}` : ''}; se falhar aplica ${condition.name || 'condicao'}.`);
+          continue;
+        }
+        const duration = condition.duration || {};
+        nextActiveEffects.push({
+          id: `local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          name: condition.name || item.name,
+          status: condition.key,
+          target: target && target !== 'UNDEFINED' ? target : 'custom',
+          value,
+          remaining: Math.max(1, Number(duration.value || effect.durationValue || 1)),
+          unit: duration.unit || effect.durationUnit || 'rest',
+          durationText: effect.durationText || item.duration_unit || '',
+          color: condition.color,
+          source: item.name,
+        });
+        messages.push(`${condition.name || 'Condicao'} aplicada.`);
+      }
+    }
+
+    dbUpdates.stats = nextStats;
+    if (nextActiveEffects.length !== (Array.isArray(character.active_effects) ? character.active_effects.length : 0)) {
+      dbUpdates.active_effects_json = nextActiveEffects;
+    }
+    updateDB(dbUpdates);
+    setCharacter((prev: any) => ({ ...prev, active_effects: nextActiveEffects }));
+    showCustomAlert('Efeito aplicado', messages.length ? messages.join('\n') : `${item.name} foi usado.`);
+  };
+
   const applySpellCast = async () => {
+    if (!ensureLanWritable()) return;
     if (!selectedSpell || !lanInfo) return;
     const targets = lanPlayers.filter((player) => spellTargetKeys.includes(player.key));
     if (targets.length === 0) {
@@ -874,6 +1201,24 @@ export default function CharacterSheetScreen() {
   };
 
   const processConsumeItem = (bagIndex: number, item: any, qty: number) => {
+    if (!ensureLanWritable()) return;
+    const structuredEffects = parseStructuredEffects(item.effect_json);
+    if (structuredEffects.length > 0) {
+      showCustomAlert(
+        `Consumir ${qty}x ${item.name}`,
+        'Confirmar uso deste item?',
+        [
+          { text: 'Cancelar', color: '#666' },
+          {
+            text: 'Usar',
+            color: '#00fa9a',
+            onPress: () => applyStructuredItemEffects(bagIndex, item, qty, structuredEffects),
+          },
+        ]
+      );
+      return;
+    }
+
     const effect = item.damage && item.damage !== '-' ? item.damage : 'Efeito oculto';
     
     // Parse da tag "Escolher"
@@ -1012,6 +1357,7 @@ export default function CharacterSheetScreen() {
   };
 
   const processThrowItem = (bagIndex: number, item: any, qty: number) => {
+    if (!ensureLanWritable()) return;
     const isThrowableWeapon = item.properties && item.properties.includes('Arremesso');
     
     const itemWeight = parseFloat(item.weight) || 0;
@@ -1076,6 +1422,7 @@ export default function CharacterSheetScreen() {
   };
 
   const handleEquipItem = (itemToEquip: any) => {
+    if (!ensureLanWritable()) return;
     if (!activeSlot) return;
     let newBag = [...character.equipment.bag];
     let newSlots = { ...character.equipment.slots };
@@ -1140,7 +1487,11 @@ export default function CharacterSheetScreen() {
       newSlots[activeSlot] = null;
     }
 
-    updateDB({ equipment: { bag: newBag, slots: newSlots }, stats: newStats });
+    const nextEquipment = { bag: newBag, slots: newSlots };
+    updateDB({ equipment: nextEquipment, stats: newStats });
+    if (lanInfo?.sessionId) {
+      void notifyInventoryPatch(nextEquipment, `${character.name} atualizou equipamentos equipados.`);
+    }
     setSlotModalVisible(false);
   };
 
@@ -1249,6 +1600,12 @@ export default function CharacterSheetScreen() {
           )}
         </View>
 
+        {isLanReadOnly && (
+          <Text style={[styles.sessionPartyHint, { color: appColors.warning, marginBottom: 10 }]}>
+            Sessao pausada ou encerrada. Modo leitura.
+          </Text>
+        )}
+
         {lanPlayers.length === 0 ? (
           <Text style={styles.emptyText}>Aguardando sincronizacao da mesa.</Text>
         ) : lanPlayers.map((player) => {
@@ -1336,7 +1693,14 @@ export default function CharacterSheetScreen() {
     }
 
     return (
-      <TouchableOpacity style={[styles.equipSlotBox, item && styles.equipSlotBoxFilled]} onPress={() => { setActiveSlot(slotKey); setSlotModalVisible(true); }}>
+      <TouchableOpacity
+        style={[styles.equipSlotBox, item && styles.equipSlotBoxFilled, isLanReadOnly && { opacity: 0.65 }]}
+        onPress={() => {
+          if (!ensureLanWritable()) return;
+          setActiveSlot(slotKey);
+          setSlotModalVisible(true);
+        }}
+      >
         <Text style={styles.equipSlotLabel}>{label}</Text>
         {item ? (
           <>
@@ -1353,11 +1717,11 @@ export default function CharacterSheetScreen() {
   // ==============================================================================
 
   return (
-    <LinearGradient colors={appGradients.main} style={styles.container}>
+    <LinearGradient colors={appGradients.main} style={[styles.container, conditionFrameStyle]}>
       <Stack.Screen options={{ headerShown: false }} />
 
       <View style={styles.topBar}>
-        <TouchableOpacity style={styles.topBarBack} onPress={() => router.back()}><Text style={styles.topBarBackText}>{"<"}</Text></TouchableOpacity>
+        <TouchableOpacity style={styles.topBarBack} onPress={handleSheetBack}><Text style={styles.topBarBackText}>{"<"}</Text></TouchableOpacity>
         <Text style={styles.topBarTitle}>{character.name}</Text>
       </View>
 
@@ -1385,26 +1749,26 @@ export default function CharacterSheetScreen() {
               <View style={styles.levelXpRow}>
                 <View style={styles.badge}><Text style={styles.badgeText}>Nv. {character.level}</Text></View>
                 
-                <TouchableOpacity style={styles.badge} onPress={() => setXpModalVisible(true)}>
+                <TouchableOpacity style={[styles.badge, isLanReadOnly && { opacity: 0.55 }]} onPress={() => { if (ensureLanWritable()) setXpModalVisible(true); }}>
                   <Text style={styles.badgeText}>XP: {character.xp} / {XP_TABLE[character.level] || 'MAX'}</Text>
                 </TouchableOpacity>
 
                 {isPendingLevelUp && (
-                  <TouchableOpacity style={styles.levelUpIconBtn} onPress={() => {setNewLevelData(expectedLevel); setLevelUpModalVisible(true);}}>
+                  <TouchableOpacity style={[styles.levelUpIconBtn, isLanReadOnly && { opacity: 0.55 }]} onPress={() => { if (!ensureLanWritable()) return; setNewLevelData(expectedLevel); setLevelUpModalVisible(true);}}>
                     <Ionicons name="arrow-up" size={24} color="#ffffff" />
                   </TouchableOpacity>
                 )}
               </View>
             </View>
 
-            <TouchableOpacity style={[styles.hpBarStyle, hpBonusFromCon !== 0 && {borderColor: hpBonusFromCon > 0 ? '#00fa9a' : '#ff6666', borderWidth: 1}]} onPress={() => setHpModalVisible(true)}>
+            <TouchableOpacity style={[styles.hpBarStyle, hpBonusFromCon !== 0 && {borderColor: hpBonusFromCon > 0 ? '#00fa9a' : '#ff6666', borderWidth: 1}, isLanReadOnly && { opacity: 0.65 }]} onPress={() => { if (ensureLanWritable()) setHpModalVisible(true); }}>
               <Text style={styles.hpTextStyle}>{displayHpCurrent} <Text style={styles.hpMaxTextStyle}>/ {displayHpMax}</Text></Text>
               <Text style={styles.combatLabel}>PONTOS DE VIDA {hpBonusFromCon !== 0 && `(CON ${hpBonusFromCon > 0 ? '+' : ''}${hpBonusFromCon})`}</Text>
             </TouchableOpacity>
 
             <View style={styles.combatStatsRow}>
-              <TouchableOpacity style={[styles.combatStatSmall, caSumBuffs !== 0 && {borderColor: caColor, borderWidth: 1}]} 
-                onPress={() => { setActiveBuffStat('CA'); setTempBuffValue(String(caTemp)); setTempBuffModalVisible(true); }}>
+              <TouchableOpacity style={[styles.combatStatSmall, caSumBuffs !== 0 && {borderColor: caColor, borderWidth: 1}, isLanReadOnly && { opacity: 0.65 }]} 
+                onPress={() => { if (!ensureLanWritable()) return; setActiveBuffStat('CA'); setTempBuffValue(String(caTemp)); setTempBuffModalVisible(true); }}>
                 {caSumBuffs !== 0 && <Text style={{position: 'absolute', top: 8, right: 12, fontSize: 11, fontWeight: 'bold', color: caColor}}>{caSumBuffs > 0 ? `+${caSumBuffs}` : caSumBuffs}</Text>}
                 <Text style={[styles.combatStatValue, caSumBuffs !== 0 && {color: caColor}]}>{armorClassTotal}</Text>
                 <Text style={styles.combatLabel}>C.A</Text>
@@ -1429,8 +1793,8 @@ export default function CharacterSheetScreen() {
 
                 return (
                   <TouchableOpacity key={key} 
-                    style={[styles.attrBox, hasBuffs && {borderColor: buffColor, borderWidth: 1}]}
-                    onPress={() => { setActiveBuffStat(key); setTempBuffValue(String(tempV)); setTempBuffModalVisible(true); }}
+                    style={[styles.attrBox, hasBuffs && {borderColor: buffColor, borderWidth: 1}, isLanReadOnly && { opacity: 0.65 }]}
+                    onPress={() => { if (!ensureLanWritable()) return; setActiveBuffStat(key); setTempBuffValue(String(tempV)); setTempBuffModalVisible(true); }}
                   >
                     {hasBuffs && <Text style={{position: 'absolute', top: 8, right: 10, fontSize: 11, fontWeight: 'bold', color: buffColor}}>{sumBuffs > 0 ? `+${sumBuffs}` : sumBuffs}</Text>}
                     <Text style={styles.attrLabel}>{key}</Text>
@@ -1517,7 +1881,7 @@ export default function CharacterSheetScreen() {
 
             <View style={styles.headerSpaceBetween}>
               <Text style={styles.sectionTitle}>MOEDAS</Text>
-              <TouchableOpacity style={styles.addBtn} onPress={() => setConvertModalVisible(true)}>
+              <TouchableOpacity style={[styles.addBtn, isLanReadOnly && { opacity: 0.55 }]} onPress={() => { if (ensureLanWritable()) setConvertModalVisible(true); }}>
                 <Text style={styles.addBtnText}>💱 CÂMBIO</Text>
               </TouchableOpacity>
             </View>
@@ -1525,19 +1889,21 @@ export default function CharacterSheetScreen() {
             <View style={styles.coinManager}>
               {[ { l: 'PO', k: 'gp', c: '#ffd700' }, { l: 'PP', k: 'sp', c: '#c0c0c0' }, { l: 'PC', k: 'cp', c: '#cd7f32' } ].map(c => (
                 <View key={c.k} style={styles.coinControl}>
-                  <TouchableOpacity onPress={() => updateCoins(c.k as any, -1)} style={styles.coinBtn}><Text style={styles.qtyBtnText}>-</Text></TouchableOpacity>
-                  <TouchableOpacity style={styles.coinDisplay} onPress={() => { setActiveCoinType(c.k as any); setInputValue(character[c.k].toString()); setCoinModalVisible(true); }}>
+                  <TouchableOpacity onPress={() => updateCoins(c.k as any, -1)} style={[styles.coinBtn, isLanReadOnly && { opacity: 0.55 }]}><Text style={styles.qtyBtnText}>-</Text></TouchableOpacity>
+                  <TouchableOpacity style={[styles.coinDisplay, isLanReadOnly && { opacity: 0.65 }]} onPress={() => { if (!ensureLanWritable()) return; setActiveCoinType(c.k as any); setInputValue(character[c.k].toString()); setCoinModalVisible(true); }}>
                     <Text style={[styles.coinLabel, {color: c.c}]}>{c.l}</Text>
                     <Text style={[styles.coinValText, {textDecorationLine: 'underline'}]}>{character[c.k]}</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={() => updateCoins(c.k as any, 1)} style={styles.coinBtn}><Text style={styles.qtyBtnText}>+</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={() => updateCoins(c.k as any, 1)} style={[styles.coinBtn, isLanReadOnly && { opacity: 0.55 }]}><Text style={styles.qtyBtnText}>+</Text></TouchableOpacity>
                 </View>
               ))}
             </View>
 
             <View style={styles.headerSpaceBetween}>
                 <Text style={styles.sectionTitle}>MOCHILA (Bolsos)</Text>
-                <TouchableOpacity style={styles.addBtn} onPress={() => setItemModalVisible(true)}><Text style={styles.addBtnText}>+ ITEM</Text></TouchableOpacity>
+                {!lanInfo?.sessionId && (
+                  <TouchableOpacity style={styles.addBtn} onPress={() => setItemModalVisible(true)}><Text style={styles.addBtnText}>+ ITEM</Text></TouchableOpacity>
+                )}
             </View>
             
             <View style={styles.cardBlock}>
@@ -1551,14 +1917,17 @@ export default function CharacterSheetScreen() {
                   return (
                     <View key={i} style={styles.itemRow}>
                         <View style={styles.qtyContainer}>
-                            <TouchableOpacity onPress={() => updateBagQty(i, -1)} style={styles.smallQtyBtn}><Text style={styles.smallQtyBtnText}>-</Text></TouchableOpacity>
+                            <TouchableOpacity onPress={() => updateBagQty(i, -1)} style={[styles.smallQtyBtn, isLanReadOnly && { opacity: 0.55 }]}><Text style={styles.smallQtyBtnText}>-</Text></TouchableOpacity>
                             <Text style={styles.itemQty}>{item.qty}</Text>
-                            <TouchableOpacity onPress={() => updateBagQty(i, 1)} style={styles.smallQtyBtn}><Text style={styles.smallQtyBtnText}>+</Text></TouchableOpacity>
+                            {!lanInfo?.sessionId && (
+                              <TouchableOpacity onPress={() => updateBagQty(i, 1)} style={styles.smallQtyBtn}><Text style={styles.smallQtyBtnText}>+</Text></TouchableOpacity>
+                            )}
                         </View>
                         
                         <TouchableOpacity 
                           style={{flex: 1}} 
                           onPress={() => {
+                            if (!ensureLanWritable()) return;
                             setActionQty(1);
                             setSelectedBagItem({item, index: i});
                           }}
@@ -1739,7 +2108,7 @@ export default function CharacterSheetScreen() {
                   </ScrollView>
 
                   {lanInfo?.joinUrl && lanPlayers.length > 0 && (
-                    <TouchableOpacity style={[styles.tradeActionButton, {marginTop: 14}]} onPress={() => startSpellCast(selectedSpell)}>
+                    <TouchableOpacity style={[styles.tradeActionButton, {marginTop: 14}, isLanReadOnly && { opacity: 0.55 }]} onPress={() => { if (ensureLanWritable()) startSpellCast(selectedSpell); }}>
                       <Ionicons name="sparkles" size={18} color="#00bfff" />
                       <Text style={styles.tradeActionButtonText}>Usar na sessao</Text>
                     </TouchableOpacity>
@@ -2021,7 +2390,8 @@ export default function CharacterSheetScreen() {
 
                 <View style={{gap: 12, width: '100%'}}>
                   {isConsumable && (
-                    <TouchableOpacity style={styles.actionBtnConsume} onPress={() => {
+                    <TouchableOpacity style={[styles.actionBtnConsume, isLanReadOnly && { opacity: 0.55 }]} onPress={() => {
+                      if (!ensureLanWritable()) return;
                       const {item, index} = selectedBagItem;
                       const qty = actionQty;
                       setSelectedBagItem(null);
@@ -2032,7 +2402,8 @@ export default function CharacterSheetScreen() {
                     </TouchableOpacity>
                   )}
 
-                  <TouchableOpacity style={styles.actionBtnThrow} onPress={() => {
+                  <TouchableOpacity style={[styles.actionBtnThrow, isLanReadOnly && { opacity: 0.55 }]} onPress={() => {
+                    if (!ensureLanWritable()) return;
                     const {item, index} = selectedBagItem;
                     const qty = actionQty;
                     setSelectedBagItem(null);
@@ -2044,12 +2415,12 @@ export default function CharacterSheetScreen() {
 
                   {lanInfo?.joinUrl && lanPlayers.some(player => !player.isSelf) && (
                     <>
-                      <TouchableOpacity style={styles.tradeActionButton} onPress={() => setTargetPickerMode('send')}>
+                      <TouchableOpacity style={[styles.tradeActionButton, isLanReadOnly && { opacity: 0.55 }]} onPress={() => { if (ensureLanWritable()) setTargetPickerMode('send'); }}>
                         <Ionicons name="send" size={18} color="#00bfff" />
                         <Text style={styles.tradeActionButtonText}>Enviar para</Text>
                       </TouchableOpacity>
 
-                      <TouchableOpacity style={styles.tradeActionButton} onPress={() => setTargetPickerMode('trade')}>
+                      <TouchableOpacity style={[styles.tradeActionButton, isLanReadOnly && { opacity: 0.55 }]} onPress={() => { if (ensureLanWritable()) setTargetPickerMode('trade'); }}>
                         <Ionicons name="swap-horizontal" size={18} color="#00bfff" />
                         <Text style={styles.tradeActionButtonText}>Propor troca</Text>
                       </TouchableOpacity>
@@ -2291,7 +2662,7 @@ export default function CharacterSheetScreen() {
           </View>
         </View>
       </Modal>
-        <DiceRoller3D rollRequest={diceRollRequest}/>
+        <DiceRoller3D rollRequest={diceRollRequest} onRollComplete={handleSpellDiceComplete}/>
     </LinearGradient>
   );
 }
@@ -2318,6 +2689,17 @@ function parseSpellDuration(duration?: string): { durationRemaining: number; dur
   if (raw.includes('hora')) return { durationRemaining: value, durationUnit: 'hour' };
   if (raw.includes('min')) return { durationRemaining: value, durationUnit: 'minute' };
   return { durationRemaining: 1, durationUnit: 'rest' };
+}
+
+function parseStructuredEffects(value: unknown) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function rollDiceExpression(expression: string) {

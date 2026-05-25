@@ -3,7 +3,7 @@
     "name": "Ficha D&D",
     "slug": "ficha-dnd",
     "version": "1.5.10",
-    "newArchEnabled": false,
+    "newArchEnabled": true,
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "fichadnd",

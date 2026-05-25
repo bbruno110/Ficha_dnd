@@ -2,7 +2,7 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Canvas, useFrame, useThree } from '@react-three/fiber/native';
 import * as CANNON from 'cannon-es';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Dimensions, PanResponder, Pressable, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Animated, Dimensions, Modal, PanResponder, Pressable, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import * as THREE from 'three';
 import { appColors, diceRollerStyles as styles } from '@/styles/globalStyles';
 
@@ -33,6 +33,7 @@ const DICE_TYPES: DieType[] = [
 function SingleDie({ die, world, diceMat, skipAnim, count, onResult }: { die: DieType, world: CANNON.World, diceMat: CANNON.Material, skipAnim: boolean, count: number, onResult: (val: string, position: {x: number, y: number}, fontSize: number) => void }) {
   const meshRef = useRef<THREE.Mesh>(null!);
   const edgesRef = useRef<THREE.LineSegments>(null!);
+  const doneRef = useRef(false);
   const [isDone, setIsDone] = useState(false);
   const { camera, size } = useThree();
 
@@ -118,7 +119,8 @@ function SingleDie({ die, world, diceMat, skipAnim, count, onResult }: { die: Di
   }, [world, body]);
 
   const finalize = (forcedSkip = false) => {
-    if (isDone) return;
+    if (doneRef.current) return;
+    doneRef.current = true;
     setIsDone(true);
     
     if (forcedSkip) {
@@ -203,8 +205,13 @@ function SingleDie({ die, world, diceMat, skipAnim, count, onResult }: { die: Di
       if (skipAnim) finalize(true); 
   }, [skipAnim]);
 
+  useEffect(() => {
+    const timer = setTimeout(() => finalize(false), 2800);
+    return () => clearTimeout(timer);
+  }, []);
+
   useFrame(() => {
-    if (isDone) return;
+    if (doneRef.current || isDone) return;
     meshRef.current.position.copy(body.position as any);
     meshRef.current.quaternion.copy(body.quaternion as any);
     
@@ -301,7 +308,15 @@ export type DiceRollRequest = {
   nonce: number;
 };
 
-export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRequest }) {
+export type DiceRollResult = {
+  total: number;
+  breakdown: string;
+  rolls: number[];
+  highest: number;
+  lowest: number;
+};
+
+export default function DiceRoller3D({ rollRequest, onRollComplete }: { rollRequest?: DiceRollRequest; onRollComplete?: (result: DiceRollResult) => void }) {
   const [isOpen, setIsOpen] = useState(false);
   const [diceCount, setDiceCount] = useState(1);
   const [activeDie, setActiveDie] = useState<DieType | null>(null);
@@ -318,8 +333,7 @@ export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRe
     if (!rollRequest) return;
     const die = DICE_TYPES.find((entry) => entry.max === rollRequest.sides);
     if (!die) return;
-    setDiceCount(Math.max(1, Math.min(6, rollRequest.count || 1)));
-    rollDice(die);
+    rollDice(die, Math.max(1, Math.min(6, rollRequest.count || 1)));
   }, [rollRequest?.nonce]);
 
   const panResponder = useRef(PanResponder.create({
@@ -350,7 +364,8 @@ export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRe
     }
   })).current;
 
-  const rollDice = (die: DieType) => {
+  const rollDice = (die: DieType, count = diceCount) => {
+    setDiceCount(count);
     setFinalData(null);
     setSkipAnim(false); 
     setActiveDie(null); 
@@ -373,6 +388,13 @@ export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRe
     }
 
     setFinalData({ total, rolls, highest, lowest });
+    onRollComplete?.({
+      total,
+      breakdown: `${rolls.length}d${activeDie?.max || '?'}[${rolls.map((roll) => roll.val).join(',')}]`,
+      rolls: rolls.map((roll) => parseInt(roll.val, 10) || 0),
+      highest,
+      lowest,
+    });
   };
 
   const handleCloseCanvas = () => {
@@ -387,7 +409,8 @@ export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRe
 
   return (
     <>
-      {activeDie && (
+      <Modal visible={!!activeDie} transparent animationType="fade" statusBarTranslucent onRequestClose={handleCloseCanvas}>
+        {activeDie && (
         <View style={styles.canvasContainer}>
           <Pressable style={StyleSheet.absoluteFillObject} onPress={handleCloseCanvas} />
           
@@ -441,7 +464,8 @@ export default function DiceRoller3D({ rollRequest }: { rollRequest?: DiceRollRe
             </View>
           )}
         </View>
-      )}
+        )}
+      </Modal>
 
       <Animated.View style={[styles.draggableContainer, { transform: [{ translateX: pan.x }, { translateY: pan.y }] }]} {...panResponder.panHandlers}>
         {isOpen && (

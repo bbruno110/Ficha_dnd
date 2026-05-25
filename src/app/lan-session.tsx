@@ -11,16 +11,23 @@ import QrCodeView from '@/components/QrCodeView';
 import {
   addLanPlayerEffect,
   advanceLanSessionTime,
+  applyLanInventoryTransferEvent,
+  applyLanPlayerInventoryPatch,
+  applyLanPlayerNumberPatch,
+  applyLanResourceRequest,
   buildJoinDeepLink,
   buildLanSessionPayload,
   deleteLanSession,
+  endLanSession,
   formatElapsedTime,
+  getBoundLanCharacter,
   getCustomCatalogOptions,
   getLanSessionEvents,
   getLanSessionState,
   getMasterJoinedPlayers,
   getNativeSessionEvents,
   getSavedLanSessions,
+  isEmulatorOnlyTcpUrl,
   keysFromSelection,
   kickLanSessionPlayer,
   makeInviteCode,
@@ -39,6 +46,7 @@ import {
   stopLanServer,
   summarizeEffect,
   syncLanSessionPayload,
+  updateLanPlayerEquipment,
   updateLanPlayerNumbers,
   upsertLanSessionPlayerFromNetwork,
   type CatalogOption,
@@ -50,6 +58,7 @@ import {
   type LanSessionPlayerState,
   type LanSessionState,
   type LanSessionSummary,
+  type LanTradeItem,
 } from '@/services/lanSession';
 import { appColors, appGradients, lanSessionStyles as styles } from '@/styles/globalStyles';
 
@@ -72,6 +81,14 @@ type EffectOption = {
   durationValue?: number | null;
   durationUnit?: LanEffectUnit | null;
   durationText?: string;
+  statusKey?: string;
+  color?: string;
+  secondaryColor?: string;
+};
+
+type InventoryItemOption = LanTradeItem & {
+  id: number;
+  descricao?: string;
 };
 
 export default function LanSessionScreen() {
@@ -103,14 +120,23 @@ export default function LanSessionScreen() {
   const [effectValue, setEffectValue] = useState('2');
   const [effectDuration, setEffectDuration] = useState('3');
   const [effectUnit, setEffectUnit] = useState<LanEffectUnit>('turn');
+  const [effectMode, setEffectMode] = useState<'add' | 'set'>('add');
   const [effectSource, setEffectSource] = useState('');
+  const [effectStatusKey, setEffectStatusKey] = useState('');
+  const [effectColor, setEffectColor] = useState('');
+  const [effectSecondaryColor, setEffectSecondaryColor] = useState('');
   const [effectSearch, setEffectSearch] = useState('');
+  const [effectSaveInfo, setEffectSaveInfo] = useState('');
   const [effectOptions, setEffectOptions] = useState<EffectOption[]>([]);
   const [expandedPlayerIds, setExpandedPlayerIds] = useState<number[]>([]);
   const [reviewedSpellEventIds, setReviewedSpellEventIds] = useState<string[]>([]);
+  const [reviewedRequestEventIds, setReviewedRequestEventIds] = useState<string[]>([]);
   const [xpPool, setXpPool] = useState('1000');
 
   const [inventoryModalPlayer, setInventoryModalPlayer] = useState<LanSessionPlayerState | null>(null);
+  const [inventoryCatalog, setInventoryCatalog] = useState<InventoryItemOption[]>([]);
+  const [inventorySearch, setInventorySearch] = useState('');
+  const [grantItemQty, setGrantItemQty] = useState('1');
   
   // NOVO: Estado para o Modal de Edição Rápida (HP, XP, Moedas, Atributos)
   const [quickEdit, setQuickEdit] = useState<{
@@ -151,6 +177,21 @@ export default function LanSessionScreen() {
     }).slice(0, 12);
   }, [effectOptions, effectSearch]);
 
+  const filteredInventoryCatalog = useMemo(() => {
+    const search = inventorySearch.trim().toLowerCase();
+    return inventoryCatalog.filter((item) => {
+      if (!search) return true;
+      return item.name.toLowerCase().includes(search) || String(item.descricao || '').toLowerCase().includes(search);
+    }).slice(0, 20);
+  }, [inventoryCatalog, inventorySearch]);
+
+  const reviewedRequestEventSet = useMemo(() => {
+    const reviewedIds = sessionEvents
+      .filter((event) => event.type === 'resource_review' && event.tradeId)
+      .map((event) => String(event.tradeId));
+    return new Set([...reviewedRequestEventIds, ...reviewedIds]);
+  }, [reviewedRequestEventIds, sessionEvents]);
+
   const loadSavedSessions = useCallback(async () => {
     setSavedSessions(await getSavedLanSessions(db));
   }, [db]);
@@ -168,12 +209,51 @@ export default function LanSessionScreen() {
        ORDER BY name ASC`
     );
     const items = await db.getAllAsync<Record<string, unknown>>(
-      `SELECT id, name, damage, damage_type, properties, descricao, effect_json, duration_value, duration_unit
+      `SELECT id, name, weight, damage, damage_type, properties, descricao, effect_json, duration_value, duration_unit
        FROM items
        ORDER BY name ASC`
     );
+    const conditions = await db.getAllAsync<Record<string, unknown>>(
+      `SELECT id, name, status_key, target, value, duration_value, duration_unit, kind,
+              description, color, secondary_color, icon
+       FROM lan_effect_catalog
+       ORDER BY visual_priority DESC, name ASC`
+    );
+
+    setInventoryCatalog(items.map((row) => ({
+      id: Number(row.id) || 0,
+      name: String(row.name || 'Item'),
+      qty: 1,
+      weight: Number(row.weight) || 0,
+      damage: String(row.damage || ''),
+      damage_type: String(row.damage_type || ''),
+      properties: String(row.properties || ''),
+      descricao: String(row.descricao || ''),
+      effect_json: String(row.effect_json || '[]'),
+      duration_value: row.duration_value == null ? null : Number(row.duration_value),
+      duration_unit: row.duration_unit ? String(row.duration_unit) : null,
+    })));
 
     setEffectOptions([
+      ...conditions.map((row) => ({
+        key: `condition:${row.id}`,
+        name: String(row.name || 'Condicao'),
+        group: 'Condicao',
+        detail: String(row.description || 'Condicao da mesa'),
+        effects: [{
+          target: row.target || 'custom',
+          value: Number(row.value) || 0,
+          status: row.status_key,
+          color: row.color,
+          secondaryColor: row.secondary_color,
+        }],
+        durationValue: Number(row.duration_value) || 1,
+        durationUnit: normalizeEffectUnit(row.duration_unit),
+        durationText: String(row.description || ''),
+        statusKey: row.status_key ? String(row.status_key) : undefined,
+        color: row.color ? String(row.color) : undefined,
+        secondaryColor: row.secondary_color ? String(row.secondary_color) : undefined,
+      })),
       ...spells.map((row) => ({
         key: `spell:${row.id}`,
         name: String(row.name || 'Magia'),
@@ -258,7 +338,56 @@ export default function LanSessionScreen() {
           }
 
           if (event.type === 'spell_effect' && event.spellEffect) {
+            const fresh = await rememberLanSessionEvent(db, event);
+            if (!fresh) continue;
+            const targetPlayer = currentState.players.find((entry) => entry.remoteKey === event.toKey || entry.characterName === event.toName);
+            if (!targetPlayer) continue;
+            await addLanPlayerEffect(db, targetPlayer.id, {
+              name: event.spellEffect.spellName,
+              target: event.spellEffect.target || 'custom',
+              value: event.spellEffect.value || 0,
+              remaining: event.spellEffect.durationRemaining || 1,
+              unit: event.spellEffect.durationUnit || 'rest',
+              durationText: event.spellEffect.durationText,
+              kind: event.spellEffect.target === 'PV_TEMP' ? 'temp_hp' : undefined,
+              source: event.fromName,
+            });
+          }
+
+          if (event.type === 'send_item' || event.type === 'trade_accept') {
+            const fresh = await rememberLanSessionEvent(db, event);
+            if (!fresh) continue;
+            await applyLanInventoryTransferEvent(db, event);
+          }
+
+          if (event.type === 'trade_offer' || event.type === 'trade_decline') {
+            const fresh = await rememberLanSessionEvent(db, event);
+            if (fresh) await syncLanSessionPayload(db, activeSessionId);
+          }
+
+          if (event.type === 'player_patch' && event.numberPatch) {
+            const applied = await applyLanPlayerNumberPatch(db, activeSessionId, event.fromKey, event.numberPatch);
+            if (applied) {
+              await rememberLanSessionEvent(db, event);
+              await syncLanSessionPayload(db, activeSessionId);
+            }
+          }
+
+          if (event.type === 'resource_request' && event.resourceRequest) {
             await rememberLanSessionEvent(db, event);
+          }
+
+          if (event.type === 'inventory_patch' && event.inventoryPatch) {
+            const applied = await applyLanPlayerInventoryPatch(
+              db,
+              activeSessionId,
+              event.fromKey,
+              event.inventoryPatch.equipment
+            );
+            if (applied) {
+              await rememberLanSessionEvent(db, event);
+              await syncLanSessionPayload(db, activeSessionId);
+            }
           }
         }
       }
@@ -299,6 +428,11 @@ export default function LanSessionScreen() {
           'Socket TCP indisponível',
           'A sessão foi criada localmente, mas este build não conseguiu abrir o servidor TCP. Gere/rode um dev build nativo; o Expo Go não suporta socket TCP local.'
         );
+      } else if (isEmulatorOnlyTcpUrl(nextJoinUrl)) {
+        Alert.alert(
+          'IP do emulador detectado',
+          'A mesa abriu em IP interno do emulador. Para socket puro, use o celular fisico como mestre ou redirecione a porta TCP do emulador e entre manualmente por tcp://10.0.2.2:43115/... em outro emulador.'
+        );
       }
     } catch (error) {
       Alert.alert('Sessão LAN', 'Não foi possível iniciar a sessão LAN neste dispositivo.');
@@ -309,6 +443,16 @@ export default function LanSessionScreen() {
   };
 
   const handleResumeSavedSession = async (session: LanSessionSummary) => {
+    if (!session.isMaster) {
+      const bound = await getBoundLanCharacter(db, session.id);
+      if (bound?.characterId) {
+        router.replace(`/sheet?id=${bound.characterId}&sessionId=${session.id}&joinUrl=${encodeURIComponent(session.joinUrl || bound.joinUrl || '')}` as any);
+      } else {
+        router.replace(`/sessionJoin?code=${session.inviteCode}&url=${encodeURIComponent(session.joinUrl || '')}` as any);
+      }
+      return;
+    }
+
     setLoading(true);
     try {
       await resumeLanSession(db, session.id);
@@ -329,6 +473,11 @@ export default function LanSessionScreen() {
           'Socket TCP indisponível',
           'A mesa foi retomada, mas este build não conseguiu abrir o servidor TCP. Sem a URL tcp://, jogadores não conectam em tempo real.'
         );
+      } else if (isEmulatorOnlyTcpUrl(nextJoinUrl)) {
+        Alert.alert(
+          'IP do emulador detectado',
+          'A mesa retomou em IP interno do emulador. Para socket puro, use o celular fisico como mestre ou redirecione a porta TCP do emulador e entre manualmente por tcp://10.0.2.2:43115/... em outro emulador.'
+        );
       }
     } catch (error) {
       Alert.alert('Sessão LAN', 'Não foi possível retomar esta sessão.');
@@ -339,7 +488,11 @@ export default function LanSessionScreen() {
   };
 
   const handleStopSession = async () => {
-    if (payload) await pauseLanSession(db, payload.session.id);
+    if (payload) {
+      await endLanSession(db, payload.session.id);
+      await recordMasterTimelineEvent('Mestre finalizou a sessao LAN.');
+      await syncLanSessionPayload(db, payload.session.id);
+    }
     await stopLanServer();
     setPayload(null);
     setSessionState(null);
@@ -396,20 +549,25 @@ export default function LanSessionScreen() {
 
   const handleTogglePause = async () => {
     if (!payload || !sessionState) return;
-    const nextPayload = sessionState.status === 'paused'
+    const wasPaused = sessionState.status === 'paused';
+    const nextPayload = wasPaused
       ? await resumeLanSession(db, payload.session.id)
       : await pauseLanSession(db, payload.session.id);
+    await recordMasterTimelineEvent(wasPaused ? 'Mestre continuou a sessao.' : 'Mestre pausou a sessao.');
 
     if (nextPayload) {
-      setPayload(nextPayload);
-      setSessionState(nextPayload.state || null);
+      const syncedPayload = await syncLanSessionPayload(db, payload.session.id);
+      setPayload(syncedPayload || nextPayload);
+      setSessionState((syncedPayload || nextPayload).state || null);
     }
     await loadSavedSessions();
   };
 
   const handleAdvanceTime = async (unit: LanAdvanceUnit) => {
     if (!payload) return;
-    const nextPayload = await advanceLanSessionTime(db, payload.session.id, unit);
+    await advanceLanSessionTime(db, payload.session.id, unit);
+    await recordMasterTimelineEvent(`Mestre avancou ${formatAdvanceUnit(unit)}.`);
+    const nextPayload = await syncLanSessionPayload(db, payload.session.id);
     if (nextPayload) {
       setPayload(nextPayload);
       setSessionState(nextPayload.state || null);
@@ -445,6 +603,21 @@ export default function LanSessionScreen() {
     });
   };
 
+  const recordMasterTimelineEvent = async (message: string, player?: LanSessionPlayerState) => {
+    if (!payload) return;
+    await rememberLanSessionEvent(db, {
+      id: makeLanEventId(),
+      sessionId: payload.session.id,
+      type: 'timeline_event',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: player?.remoteKey || 'party',
+      toName: player?.characterName || 'Party',
+      message,
+      createdAt: new Date().toISOString(),
+    });
+  };
+
   const handleUpdatePlayer = async (
     player: LanSessionPlayerState,
     field: 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp',
@@ -452,7 +625,8 @@ export default function LanSessionScreen() {
   ) => {
     const patch = { [field]: Math.max(0, value) };
     await updateLanPlayerNumbers(db, player.id, patch);
-    if (payload) await reloadSessionState(payload.session.id);
+    await recordMasterTimelineEvent(`Mestre ajustou ${formatPlayerField(field)} de ${player.characterName} para ${Math.max(0, value)}.`, player);
+    if (payload) await reloadSessionState(payload.session.id, true);
   };
 
   const handleKickPlayer = (player: LanSessionPlayerState) => {
@@ -480,11 +654,16 @@ export default function LanSessionScreen() {
 
   const handleSelectEffectOption = (option: EffectOption) => {
     const firstEffect = option.effects[0] || {};
-    setEffectName(option.name);
+    setEffectName(firstEffect.conditionName || option.name);
     setEffectSource(option.group);
+    setEffectStatusKey(option.statusKey || String(firstEffect.status || ''));
+    setEffectColor(option.color || String(firstEffect.color || ''));
+    setEffectSecondaryColor(option.secondaryColor || String(firstEffect.secondaryColor || ''));
+    setEffectSaveInfo(formatEffectSaveInfo(firstEffect));
     setEffectSearch(option.name);
     setEffectTarget(normalizeEffectTarget(firstEffect.target || firstEffect.stat || firstEffect.type));
     setEffectValue(String(firstEffect.value ?? firstEffect.val ?? firstEffect.amount ?? 0));
+    setEffectMode(firstEffect.mode === 'set' ? 'set' : 'add');
     setEffectDuration(String(option.durationValue || firstEffect.durationValue || firstEffect.duration || 1));
     setEffectUnit(option.durationUnit || normalizeEffectUnit(firstEffect.durationUnit || firstEffect.unit) || inferUnitFromText(option.durationText));
   };
@@ -500,6 +679,7 @@ export default function LanSessionScreen() {
         xp: player.xp + baseShare + (index < remainder ? 1 : 0),
       });
     }
+    await recordMasterTimelineEvent(`Mestre distribuiu ${totalXp} XP para a party.`);
     await reloadSessionState(payload.session.id, true);
   };
 
@@ -535,6 +715,46 @@ export default function LanSessionScreen() {
     await reloadSessionState(payload.session.id, true);
   };
 
+  const handleReviewResourceRequest = async (event: LanSessionEvent, accepted: boolean) => {
+    if (!payload) return;
+    await applyLanResourceRequest(db, event, accepted);
+    setReviewedRequestEventIds((current) => Array.from(new Set([...current, event.id])));
+    await reloadSessionState(payload.session.id, true);
+  };
+
+  const handleGrantItemToPlayer = async (item: InventoryItemOption) => {
+    if (!inventoryModalPlayer || !payload) return;
+    const qty = Math.max(1, parseInt(grantItemQty, 10) || 1);
+    const equipment = inventoryModalPlayer.equipment as any;
+    const bag = Array.isArray(equipment?.bag) ? [...equipment.bag] : [];
+    const existingIndex = bag.findIndex((entry: any) => String(entry.name || '') === item.name);
+    const nextItem = {
+      name: item.name,
+      qty,
+      weight: item.weight || 0,
+      damage: item.damage || '',
+      damage_type: item.damage_type || '',
+      properties: item.properties || '',
+    };
+
+    if (existingIndex >= 0) {
+      bag[existingIndex] = { ...bag[existingIndex], qty: (Number(bag[existingIndex].qty) || 0) + qty };
+    } else {
+      bag.push(nextItem);
+    }
+
+    await updateLanPlayerEquipment(
+      db,
+      inventoryModalPlayer.id,
+      { ...equipment, bag },
+      `Mestre entregou ${qty}x ${item.name} para ${inventoryModalPlayer.characterName}.`
+    );
+    await reloadSessionState(payload.session.id, true);
+    const nextState = await getLanSessionState(db, payload.session.id);
+    const nextPlayer = nextState.players.find((player) => player.id === inventoryModalPlayer.id);
+    if (nextPlayer) setInventoryModalPlayer(nextPlayer);
+  };
+
   const toggleExpandedPlayer = (playerId: number) => {
     setExpandedPlayerIds((current) => (
       current.includes(playerId) ? current.filter((id) => id !== playerId) : [...current, playerId]
@@ -558,16 +778,22 @@ export default function LanSessionScreen() {
         unit: effectUnit,
         durationText: `${Math.max(1, parseInt(effectDuration, 10) || 1)} ${effectUnit}`,
         kind: effectTarget === 'PV_TEMP' ? 'temp_hp' : effectTarget === 'HP' ? 'hp' : effectTarget === 'custom' ? 'custom' : 'stat',
-        source: effectSource.trim() || undefined,
+        mode: effectMode,
+        source: [effectSource.trim(), effectSaveInfo].filter(Boolean).join(' - ') || undefined,
+        status: effectStatusKey || undefined,
+        color: effectColor || undefined,
+        secondaryColor: effectSecondaryColor || undefined,
       });
     }
 
-    if (payload) await reloadSessionState(payload.session.id);
+    await recordMasterTimelineEvent(`Mestre aplicou ${effectName.trim() || 'efeito temporario'} em ${targets.length} alvo(s).`);
+    if (payload) await reloadSessionState(payload.session.id, true);
   };
 
   const handleRemoveEffect = async (playerId: number, effectId: string) => {
     await removeLanPlayerEffect(db, playerId, effectId);
-    if (payload) await reloadSessionState(payload.session.id);
+    await recordMasterTimelineEvent('Mestre removeu um efeito ativo.');
+    if (payload) await reloadSessionState(payload.session.id, true);
   };
 
   // NOVO: Funções para o Modal de Edição Rápida
@@ -589,7 +815,8 @@ export default function LanSessionScreen() {
 
     if (type === 'XP') {
        await updateLanPlayerNumbers(db, player.id, { xp: player.xp + val });
-       if (payload) await reloadSessionState(payload.session.id);
+       await recordMasterTimelineEvent(`Mestre ajustou XP de ${player.characterName} em ${val >= 0 ? '+' : ''}${val}.`, player);
+       if (payload) await reloadSessionState(payload.session.id, true);
     } else if (type === 'COIN') {
        const gp = parseInt(qeGP, 10) || 0;
        const sp = parseInt(qeSP, 10) || 0;
@@ -604,7 +831,8 @@ export default function LanSessionScreen() {
        if (newSp >= 10) { newGp += Math.floor(newSp / 10); newSp %= 10; }
        
        await updateLanPlayerNumbers(db, player.id, { gp: newGp, sp: newSp, cp: newCp });
-       if (payload) await reloadSessionState(payload.session.id);
+       await recordMasterTimelineEvent(`Mestre ajustou moedas de ${player.characterName}.`, player);
+       if (payload) await reloadSessionState(payload.session.id, true);
     } else if (type === 'HP' && !qeIsTemp) {
        await handleUpdatePlayer(player, 'hpCurrent', val);
     } else {
@@ -623,7 +851,8 @@ export default function LanSessionScreen() {
            kind: effKind,
            source: qeIsTemp ? 'Mestre' : 'Mestre (Permanente)',
        });
-       if (payload) await reloadSessionState(payload.session.id);
+       await recordMasterTimelineEvent(`Mestre aplicou ${effName} em ${player.characterName}.`, player);
+       if (payload) await reloadSessionState(payload.session.id, true);
     }
     setQuickEdit(null);
   };
@@ -810,6 +1039,45 @@ export default function LanSessionScreen() {
                 <Ionicons name="close" size={22} color={appColors.textPrimary} />
               </TouchableOpacity>
             </View>
+
+            <View style={styles.inventoryBox}>
+              <Text style={styles.strongText}>Entregar item</Text>
+              <TextInput
+                style={styles.searchInput}
+                value={inventorySearch}
+                onChangeText={setInventorySearch}
+                placeholder="Buscar item do acervo..."
+                placeholderTextColor={appColors.placeholderLight}
+              />
+              <View style={styles.toolbar}>
+                <TouchableOpacity style={styles.smallButton} onPress={() => setGrantItemQty(String(Math.max(1, (parseInt(grantItemQty, 10) || 1) - 1)))}>
+                  <Ionicons name="remove" size={16} color={appColors.textPrimary} />
+                </TouchableOpacity>
+                <TextInput
+                  style={[styles.input, { width: 86, textAlign: 'center', marginBottom: 0 }]}
+                  value={grantItemQty}
+                  onChangeText={setGrantItemQty}
+                  keyboardType="numeric"
+                  placeholder="Qtd"
+                  placeholderTextColor={appColors.placeholderLight}
+                />
+                <TouchableOpacity style={styles.smallButton} onPress={() => setGrantItemQty(String((parseInt(grantItemQty, 10) || 1) + 1))}>
+                  <Ionicons name="add" size={16} color={appColors.textPrimary} />
+                </TouchableOpacity>
+              </View>
+              <ScrollView style={{ maxHeight: 170 }} nestedScrollEnabled={true} keyboardShouldPersistTaps="handled">
+                {filteredInventoryCatalog.map((item) => (
+                  <TouchableOpacity key={item.id} style={styles.catalogRow} onPress={() => handleGrantItemToPlayer(item)}>
+                    <View style={styles.catalogTextBox}>
+                      <Text style={styles.catalogName}>{item.name}</Text>
+                      <Text style={styles.catalogMeta}>{[item.damage, item.damage_type, item.properties].filter(Boolean).join(' - ') || item.descricao || 'Item do acervo'}</Text>
+                    </View>
+                    <Ionicons name="add-circle" size={20} color={appColors.success} />
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
+
             <ScrollView>
               {bag.length === 0 ? (
                 <Text style={styles.hint}>O inventário está vazio.</Text>
@@ -881,19 +1149,19 @@ export default function LanSessionScreen() {
 
       {savedSessions.length > 0 && (
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Retomar mesa</Text>
+          <Text style={styles.sectionTitle}>Sessoes salvas</Text>
           {savedSessions.map((session) => (
             <View key={session.id} style={styles.savedSessionRow}>
               <View style={styles.savedSessionContent}>
                 <TouchableOpacity style={styles.savedSessionTextBox} onPress={() => handleResumeSavedSession(session)} disabled={loading}>
                   <Text style={styles.savedSessionTitle}>{session.name}</Text>
                   <Text style={styles.savedSessionMeta}>
-                    Nivel {session.level} - Turno {session.currentTurn} - {session.playerCount} jogador(es)
+                    {session.isMaster ? 'Mestre' : 'Jogador'} - Nivel {session.level} - Turno {session.currentTurn} - {session.playerCount} jogador(es)
                   </Text>
                 </TouchableOpacity>
                 <View style={styles.savedSessionActions}>
                   <TouchableOpacity style={[styles.smallButton, styles.smallButtonSuccess]} onPress={() => handleResumeSavedSession(session)} disabled={loading}>
-                    <Ionicons name="play" size={16} color={appColors.success} />
+                    <Ionicons name={session.isMaster ? 'play' : 'person'} size={16} color={appColors.success} />
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger]} onPress={() => handleDeleteSavedSession(session)} disabled={loading}>
                     <Ionicons name="trash" size={16} color={appColors.danger} />
@@ -1055,13 +1323,24 @@ export default function LanSessionScreen() {
               />
               <Text style={styles.sessionEventText}>{formatSessionEvent(event)}</Text>
               
-              {event.type === 'spell_effect' && event.fromKey !== 'master' && !reviewedSpellEventIds.includes(event.id) && (
+              {event.type === 'spell_effect' && event.fromKey !== 'master' && reviewedSpellEventIds.includes('__spell_review_disabled__') && !reviewedSpellEventIds.includes(event.id) && (
                 <View style={styles.savedSessionActions}>
                   <TouchableOpacity style={[styles.smallButton, styles.smallButtonSuccess]} onPress={() => handleAcceptSpellEffect(event, true)}>
                     <Text style={[styles.smallButtonText, styles.smallButtonTextSuccess]}>OK</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger]} onPress={() => handleAcceptSpellEffect(event, false)}>
                     <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Não</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+
+              {event.type === 'resource_request' && event.fromKey !== 'master' && !reviewedRequestEventSet.has(event.id) && (
+                <View style={styles.savedSessionActions}>
+                  <TouchableOpacity style={[styles.smallButton, styles.smallButtonSuccess]} onPress={() => handleReviewResourceRequest(event, true)}>
+                    <Text style={[styles.smallButtonText, styles.smallButtonTextSuccess]}>OK</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger]} onPress={() => handleReviewResourceRequest(event, false)}>
+                    <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Nao</Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -1289,6 +1568,7 @@ export default function LanSessionScreen() {
       <View style={styles.inventoryBox}>
         <Text style={styles.strongText}>{effectName}</Text>
         <Text style={styles.inventoryText}>Fonte: {effectSource || 'base'} - ajuste alvo, valor e duração antes de aplicar.</Text>
+        {effectSaveInfo ? <Text style={styles.inventoryText}>{effectSaveInfo}</Text> : null}
       </View>
 
       <ScrollView horizontal showsHorizontalScrollIndicator={false} nestedScrollEnabled={true}>
@@ -1304,6 +1584,22 @@ export default function LanSessionScreen() {
           ))}
         </View>
       </ScrollView>
+
+      {['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(effectTarget) && (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} nestedScrollEnabled={true} keyboardShouldPersistTaps="handled">
+          <View style={styles.filterRail}>
+            {(['add', 'set'] as const).map((mode) => (
+              <TouchableOpacity
+                key={mode}
+                style={[styles.filterChip, effectMode === mode && styles.filterChipActive]}
+                onPress={() => setEffectMode(mode)}
+              >
+                <Text style={[styles.filterChipText, effectMode === mode && styles.filterChipTextActive]}>{mode === 'set' ? 'Definir valor' : 'Somar bonus'}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </ScrollView>
+      )}
 
       <View style={{ flexDirection: 'row', gap: 12, marginVertical: 8 }}>
         <View style={{ flex: 1 }}>
@@ -1418,21 +1714,102 @@ function formatSessionEvent(event: LanSessionEvent) {
   }
   if (event.type === 'spell_effect') {
     if (event.fromKey === event.toKey || event.fromName === event.toName) return `${event.fromName} usou ${event.spellEffect?.spellName || 'efeito'}.`;
-    return `${event.fromName} quer aplicar ${event.spellEffect?.spellName || 'efeito'} em ${event.toName}.`;
+    return `${event.fromName} aplicou ${event.spellEffect?.spellName || 'efeito'} em ${event.toName}.`;
   }
   if (event.type === 'spell_hp') return `${event.fromName} usou ${event.spellEffect?.spellName || 'magia'} em ${event.toName}.`;
+  if (event.type === 'resource_request') return `${event.fromName} pediu: ${formatResourceRequest(event.resourceRequest)}.`;
+  if (event.type === 'resource_review') return event.message || `Revisao de pedido: ${event.toName}.`;
+  if (event.type === 'inventory_patch') return event.message || `${event.fromName} atualizou o inventario.`;
+  if (event.type === 'player_patch') return event.message || `${event.fromName} atualizou recursos proprios.`;
+  if (event.type === 'send_item') return `${event.fromName} enviou ${event.item?.qty || 1}x ${event.item?.name || 'item'} para ${event.toName}.`;
+  if (event.type === 'trade_offer') return `${event.fromName} ofereceu troca para ${event.toName}.`;
+  if (event.type === 'trade_accept') return `${event.fromName} aceitou troca com ${event.toName}.`;
+  if (event.type === 'trade_decline') return `${event.fromName} recusou troca com ${event.toName}.`;
+  if (event.type === 'timeline_event') return event.message || 'Evento da sessao.';
   return event.type;
+}
+
+function formatResourceRequest(request?: LanSessionEvent['resourceRequest']) {
+  if (!request) return 'ajuste';
+  if (request.message) return request.message;
+  const amount = Number(request.amount ?? request.value ?? 0);
+  const sign = amount >= 0 ? '+' : '';
+  if (request.kind === 'xp') return `XP ${sign}${amount}`;
+  if (request.kind === 'hp') return `HP ${sign}${amount}`;
+  if (request.kind === 'stat') return `${request.field || 'atributo'} ${sign}${amount}`;
+  if (request.kind === 'inventory') return request.item ? `${request.item.qty}x ${request.item.name}` : 'inventario';
+  return 'ajuste';
+}
+
+function formatPlayerField(field: 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp') {
+  const labels = {
+    hpCurrent: 'vida atual',
+    hpMax: 'vida maxima',
+    tempHp: 'vida temporaria',
+    xp: 'XP',
+    gp: 'ouro',
+    sp: 'prata',
+    cp: 'cobre',
+  };
+  return labels[field];
+}
+
+function formatAdvanceUnit(unit: LanAdvanceUnit) {
+  const labels: Record<LanAdvanceUnit, string> = {
+    turn: 'um turno',
+    minute: 'um minuto',
+    hour: 'uma hora',
+    shortRest: 'um descanso curto',
+    longRest: 'um descanso longo',
+  };
+  return labels[unit];
 }
 
 function parseOptionEffects(value: unknown) {
   if (!value) return [];
-  if (Array.isArray(value)) return value;
+  if (Array.isArray(value)) return value.map(normalizeCatalogEffect);
   try {
     const parsed = JSON.parse(String(value));
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? parsed.map(normalizeCatalogEffect) : [];
   } catch {
     return [];
   }
+}
+
+function normalizeCatalogEffect(effect: any) {
+  const condition = effect?.condition || {};
+  const save = effect?.save || {};
+  const conditionDuration = condition?.duration || {};
+  const kind = String(effect?.kind || effect?.type || '').toLowerCase();
+  const target = effect?.target || (kind === 'temp_hp' ? 'PV_TEMP' : kind === 'stat' ? effect?.stat : 'custom');
+
+  return {
+    ...effect,
+    target,
+    value: effect?.value ?? effect?.amount ?? 0,
+    status: condition?.key || effect?.status,
+    conditionName: condition?.name,
+    color: condition?.color || effect?.color,
+    secondaryColor: condition?.secondaryColor || effect?.secondaryColor,
+    saveAbility: save?.ability,
+    saveDc: save?.dc,
+    saveOnSuccess: save?.onSuccess,
+    durationValue: effect?.durationValue ?? conditionDuration?.value,
+    durationUnit: effect?.durationUnit ?? conditionDuration?.unit,
+    mode: effect?.mode === 'set' || effect?.operation === 'set' || kind === 'stat_set' ? 'set' : 'add',
+  };
+}
+
+function formatEffectSaveInfo(effect: any) {
+  if (!effect?.saveAbility) return '';
+  const successLabels: Record<string, string> = {
+    none: 'sucesso sem efeito adicional',
+    half: 'sucesso reduz pela metade',
+    negates: 'sucesso anula',
+  };
+  const dc = effect.saveDc ? ` CD ${effect.saveDc}` : '';
+  const failure = effect.conditionName ? `; falha aplica ${effect.conditionName}` : '';
+  return `Teste ${effect.saveAbility}${dc} (${successLabels[String(effect.saveOnSuccess || 'none')] || 'sucesso definido pelo mestre'}${failure}).`;
 }
 
 function normalizeEffectUnit(value: unknown): LanEffectUnit | null {

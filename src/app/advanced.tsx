@@ -27,6 +27,26 @@ const SPELL_SAVES = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'];
 const SPELL_DAMAGE_TYPES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'Outro'];
 
 const VALID_TABLES = ['items', 'races', 'classes', 'subclasses', 'spells', 'starting_kits', 'spellcasting_progression'];
+const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
+const RANGE_MODES = ['Pessoal', 'Toque', 'Distancia', 'Cubo', 'Cone', 'Esfera', 'Linha'];
+const RANGE_UNITS = ['m', 'cm'];
+const SAVE_CHOICES = ['Nenhum', ...SPELL_SAVES];
+const SAVE_SUCCESS_CHOICES = [
+  { key: 'none', label: 'Nada' },
+  { key: 'half', label: 'Metade' },
+  { key: 'negates', label: 'Anula' },
+];
+const CONDITION_OPTIONS = [
+  { key: 'none', name: 'Nenhuma', color: '' },
+  { key: 'poisoned', name: 'Envenenado', color: '#69d56f' },
+  { key: 'stunned', name: 'Tonto', color: '#ffd166' },
+  { key: 'paralyzed', name: 'Paralisado', color: '#b388ff' },
+  { key: 'blinded', name: 'Cego', color: '#8ecae6' },
+  { key: 'deafened', name: 'Surdo', color: '#a0a0a0' },
+  { key: 'frightened', name: 'Amedrontado', color: '#ff8fa3' },
+  { key: 'restrained', name: 'Contido', color: '#f4a261' },
+  { key: 'prone', name: 'Caido', color: '#cdb4db' },
+];
 
 export default function AdvancedCreatorScreen() {
   const router = useRouter();
@@ -47,6 +67,14 @@ export default function AdvancedCreatorScreen() {
   const [tempEffType, setTempEffType] = useState('Cortante');
   const [tempEffDuration, setTempEffDuration] = useState(''); 
   const [tempEffTurns, setTempEffTurns] = useState(''); 
+  const [itemEffectAmountMode, setItemEffectAmountMode] = useState<'dice' | 'value' | 'none'>('dice');
+  const [itemDiceCount, setItemDiceCount] = useState('1');
+  const [itemDiceSides, setItemDiceSides] = useState('6');
+  const [itemFlatBonus, setItemFlatBonus] = useState('0');
+  const [itemSaveAbility, setItemSaveAbility] = useState('Nenhum');
+  const [itemSaveDc, setItemSaveDc] = useState('10');
+  const [itemSaveOnSuccess, setItemSaveOnSuccess] = useState('none');
+  const [itemConditionKey, setItemConditionKey] = useState('none');
 
   // Estados de Raça & Classe
   const [stats, setStats] = useState({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' });
@@ -81,6 +109,9 @@ export default function AdvancedCreatorScreen() {
   const [castTimeValue, setCastTimeValue] = useState('1');
   const [castTimeType, setCastTimeType] = useState('Ação');
   const [spellRange, setSpellRange] = useState('18m');
+  const [spellRangeMode, setSpellRangeMode] = useState('Distancia');
+  const [spellRangeValue, setSpellRangeValue] = useState('18');
+  const [spellRangeUnit, setSpellRangeUnit] = useState('m');
   const [spellComponents, setSpellComponents] = useState<string[]>(['V', 'S']);
   const [spellDurationValue, setSpellDurationValue] = useState('');
   const [spellDurationType, setSpellDurationType] = useState('Instantânea');
@@ -88,6 +119,14 @@ export default function AdvancedCreatorScreen() {
   const [tempSpellDice, setTempSpellDice] = useState('');
   const [tempSpellDmgType, setTempSpellDmgType] = useState('Fogo');
   const [tempSpellCustomType, setTempSpellCustomType] = useState('');
+  const [spellEffectAmountMode, setSpellEffectAmountMode] = useState<'dice' | 'value' | 'none'>('dice');
+  const [spellDiceCount, setSpellDiceCount] = useState('1');
+  const [spellDiceSides, setSpellDiceSides] = useState('8');
+  const [spellFlatBonus, setSpellFlatBonus] = useState('0');
+  const [spellSaveAbility, setSpellSaveAbility] = useState('Nenhum');
+  const [spellSaveDc, setSpellSaveDc] = useState('');
+  const [spellSaveOnSuccess, setSpellSaveOnSuccess] = useState('negates');
+  const [spellConditionKey, setSpellConditionKey] = useState('none');
   const [spellSaves, setSpellSaves] = useState<string[]>([]);
   const [spellDescription, setSpellDescription] = useState('');
 
@@ -251,13 +290,14 @@ export default function AdvancedCreatorScreen() {
 
   const resetForms = () => {
     setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffVal(''); setTempEffType('Cortante'); setTempEffDuration(''); setTempEffTurns(''); setItemDescription('');
+    setItemEffectAmountMode('dice'); setItemDiceCount('1'); setItemDiceSides('6'); setItemFlatBonus('0'); setItemSaveAbility('Nenhum'); setItemSaveDc('10'); setItemSaveOnSuccess('none'); setItemConditionKey('none');
     setStats({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' }); setSpeed('9m'); setHitDice('8'); setGold('10'); setSubclassLevel('3'); setIsCaster(false); setSaves([]);
     setSubclassParents([]); setSubclassSearch(''); setTempSubclassLevel('3'); setBonusSkills('0');
     if(dbClasses.length > 0) setTempSubclassParent(dbClasses[0].name);
     setSpellCategory('Magia'); setSpellLevel('Truque'); setSpellClassesReq([]); setSpellClassSearch(''); setTempSpellClassLvl('1');
     if(dbClasses.length > 0) setTempSpellClass(dbClasses[0].name);
-    setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRange('18m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
-    setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellSaves([]); setSpellDescription(''); 
+    setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRange('18m'); setSpellRangeMode('Distancia'); setSpellRangeValue('18'); setSpellRangeUnit('m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
+    setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellEffectAmountMode('dice'); setSpellDiceCount('1'); setSpellDiceSides('8'); setSpellFlatBonus('0'); setSpellSaveAbility('Nenhum'); setSpellSaveDc(''); setSpellSaveOnSuccess('negates'); setSpellConditionKey('none'); setSpellSaves([]); setSpellDescription(''); 
     setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
     setSelectedFeatures([]); setCasterType('total');
   };
@@ -337,36 +377,40 @@ export default function AdvancedCreatorScreen() {
     try {
       if (activeTab === 'Magia/Skill') {
         let finalCastTime = castTimeType === 'Passiva' ? 'Passiva' : `${castTimeValue} ${castTimeType}`.trim();
+        const finalRange = formatStructuredRange(spellRangeMode, spellRangeValue, spellRangeUnit);
         const finalDuration = spellDurationValue ? `${spellDurationValue} ${spellDurationType}` : spellDurationType;
         const spellDurationMeta = parseDurationMetadata(finalDuration);
-        const spellEffectJson = JSON.stringify(spellEffectsList.map((eff) => ({
-          kind: eff.type === 'Cura' ? 'heal' : eff.type === 'Outro' ? 'custom' : 'damage',
-          dice: eff.dice || '',
-          type: eff.type || 'Outro',
-          durationText: finalDuration,
-          durationValue: spellDurationMeta.value,
-          durationUnit: spellDurationMeta.unit,
-        })));
+        const spellEffectJson = JSON.stringify(spellEffectsList.map((eff) => toStructuredSpellEffect(eff, finalDuration, spellDurationMeta)));
         
         let damageParts: string[] = [];
         let typeParts: string[] = [];
         
         spellEffectsList.forEach(eff => {
-          if (eff.type === 'Cura') damageParts.push(eff.dice ? `Cura ${eff.dice}` : 'Cura');
-          else if (eff.type === 'Outro') damageParts.push(eff.dice || 'Efeito Especial');
-          else { damageParts.push(`${eff.dice}`); typeParts.push(eff.type); }
+          if (eff.type === 'Cura') {
+            if (eff.dice) damageParts.push(`Cura ${eff.dice}`);
+          }
+          else if (eff.type === 'Outro') {
+            if (eff.dice) damageParts.push(eff.dice);
+          }
+          else {
+            if (eff.dice) {
+              damageParts.push(`${eff.dice}`);
+              typeParts.push(eff.type);
+            }
+          }
         });
 
         const finalDamageDice = damageParts.length > 0 ? damageParts.join(' + ') : '-';
         const finalDamageType = Array.from(new Set(typeParts)).length > 0 ? Array.from(new Set(typeParts)).join(', ') : 'Nenhum';
-        const finalSaves = spellSaves.length > 0 ? spellSaves.join(', ') : 'Nenhum';
+        const structuredSaves = spellEffectsList.map((eff) => eff.saveAbility).filter((save) => save && save !== 'Nenhum');
+        const finalSaves = structuredSaves.length > 0 ? Array.from(new Set(structuredSaves)).join(', ') : 'Nenhum';
         const classReqString = spellClassesReq.map(c => `${c.name}:${c.minLevel}`).join(', ') || 'Nenhum';
         const justClassNames = spellClassesReq.map(c => c.name).join(',') || 'Nenhum';
 
         // SALVA EXATAMENTE A CATEGORIA ESCOLHIDA NA TELA
         await db.runAsync(
           `INSERT INTO spells (name, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type, saving_throw, description, effect_json, duration_value, duration_unit, class_level_required, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, spellLevel, spellCategory, justClassNames, finalCastTime, spellRange, spellComponents.join(', '), finalDuration, finalDamageDice, finalDamageType, finalSaves, spellDescription, spellEffectJson, spellDurationMeta.value, spellDurationMeta.unit, classReqString]
+          [name, spellLevel, spellCategory, justClassNames, finalCastTime, finalRange, spellComponents.join(', '), finalDuration, finalDamageDice, finalDamageType, finalSaves, spellDescription, spellEffectJson, spellDurationMeta.value, spellDurationMeta.unit, classReqString]
         );
       }
       else if (activeTab === 'Item') {
@@ -386,12 +430,14 @@ export default function AdvancedCreatorScreen() {
               else damageValueParts.push(`${eff.type} ${eff.val}${suffix}`);
           } 
           else if (eff.type === 'Outro') {
-              damageValueParts.push(eff.val);
+              if (eff.val) damageValueParts.push(eff.val);
           }
           // Se for um tipo de dano (Fogo, Cortante, etc), separamos o dado (1d6) do tipo (Fogo)
           else {
-              damageValueParts.push(eff.val); 
-              damageTypeParts.push(eff.type);
+              if (eff.val) {
+                damageValueParts.push(eff.val);
+                damageTypeParts.push(eff.type);
+              }
           }
         });
 
@@ -498,6 +544,46 @@ export default function AdvancedCreatorScreen() {
     </View>
   );
 
+  const renderDiceSelector = (
+    count: string,
+    setCount: React.Dispatch<React.SetStateAction<string>>,
+    sides: string,
+    setSides: React.Dispatch<React.SetStateAction<string>>,
+    bonus: string,
+    setBonus: React.Dispatch<React.SetStateAction<string>>
+  ) => (
+    <View style={{ marginBottom: 15 }}>
+      <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center', marginBottom: 10 }}>
+        <TextInput
+          style={[styles.input, { flex: 0.35, textAlign: 'center', paddingVertical: 8 }]}
+          keyboardType="numeric"
+          value={count}
+          onChangeText={(value) => setCount(value.replace(/[^0-9]/g, ''))}
+          placeholder="Qtd"
+          placeholderTextColor="#666"
+        />
+        <Text style={styles.label}>d</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }}>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            {DICE_SIDES.map((side) => (
+              <TouchableOpacity key={side} style={[styles.limitBtn, sides === String(side) && styles.limitBtnActive]} onPress={() => setSides(String(side))}>
+                <Text style={[styles.limitBtnText, sides === String(side) && styles.limitBtnTextActive]}>{side}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </ScrollView>
+      </View>
+      <TextInput
+        style={[styles.input, { backgroundColor: 'rgba(0,0,0,0.4)' }]}
+        keyboardType="numeric"
+        value={bonus}
+        onChangeText={(value) => setBonus(value.replace(/[^0-9-]/g, ''))}
+        placeholder="Bonus fixo opcional"
+        placeholderTextColor="#666"
+      />
+    </View>
+  );
+
   const renderItemForm = () => {
     const isAttribute = ['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo'].includes(tempEffType);
 
@@ -521,7 +607,19 @@ export default function AdvancedCreatorScreen() {
 
         <Text style={styles.label}>CONSTRUTOR DE EFEITOS (Dano, Cura, Atributos)</Text>
         <View style={styles.effectBuilder}>
-          <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} placeholder="Valor (Ex: 1d6, 2, +1)" placeholderTextColor="#888" value={tempEffVal} onChangeText={setTempEffVal} />
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>VALOR DO EFEITO</Text>
+          <View style={{flexDirection: 'row', gap: 8, marginBottom: 12}}>
+            {(['dice', 'value', 'none'] as const).map(mode => (
+              <TouchableOpacity key={mode} style={[styles.limitBtn, itemEffectAmountMode === mode && styles.limitBtnActive]} onPress={() => setItemEffectAmountMode(mode)}>
+                <Text style={[styles.limitBtnText, itemEffectAmountMode === mode && styles.limitBtnTextActive]}>{mode === 'dice' ? 'Dado' : mode === 'value' ? 'Valor' : 'Sem valor'}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {itemEffectAmountMode === 'dice' && renderDiceSelector(itemDiceCount, setItemDiceCount, itemDiceSides, setItemDiceSides, itemFlatBonus, setItemFlatBonus)}
+          {itemEffectAmountMode === 'value' && (
+            <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} keyboardType="numeric" placeholder="Valor fixo (Ex: +2, -1, 21)" placeholderTextColor="#888" value={tempEffVal} onChangeText={(value) => setTempEffVal(value.replace(/[^0-9+-]/g, ''))} />
+          )}
           
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
             <View style={{flexDirection: 'row', gap: 8}}>
@@ -550,14 +648,63 @@ export default function AdvancedCreatorScreen() {
               </View>
             </View>
           )}
+
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>TESTE DE RESISTENCIA DO ITEM</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 10}}>
+            <View style={{flexDirection: 'row', gap: 8}}>
+              {SAVE_CHOICES.map(save => (
+                <TouchableOpacity key={save} style={[styles.limitBtn, itemSaveAbility === save && styles.limitBtnActive]} onPress={() => setItemSaveAbility(save)}>
+                  <Text style={[styles.limitBtnText, itemSaveAbility === save && styles.limitBtnTextActive]}>{save}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+
+          {itemSaveAbility !== 'Nenhum' && (
+            <>
+              <View style={{flexDirection: 'row', gap: 10, marginBottom: 10}}>
+                <TextInput style={[styles.input, {flex: 0.35, textAlign: 'center', backgroundColor: 'rgba(0,0,0,0.4)'}]} keyboardType="numeric" value={itemSaveDc} onChangeText={(value) => setItemSaveDc(value.replace(/[^0-9]/g, ''))} placeholder="CD" placeholderTextColor="#888" />
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: 1}}>
+                  <View style={{flexDirection: 'row', gap: 8}}>
+                    {SAVE_SUCCESS_CHOICES.map(result => (
+                      <TouchableOpacity key={result.key} style={[styles.limitBtn, itemSaveOnSuccess === result.key && styles.limitBtnActive]} onPress={() => setItemSaveOnSuccess(result.key)}>
+                        <Text style={[styles.limitBtnText, itemSaveOnSuccess === result.key && styles.limitBtnTextActive]}>{result.label}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </ScrollView>
+              </View>
+
+              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA CONDICAO</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
+                <View style={{flexDirection: 'row', gap: 8}}>
+                  {CONDITION_OPTIONS.map(condition => (
+                    <TouchableOpacity key={condition.key} style={[styles.limitBtn, itemConditionKey === condition.key && styles.limitBtnActive]} onPress={() => setItemConditionKey(condition.key)}>
+                      <Text style={[styles.limitBtnText, itemConditionKey === condition.key && styles.limitBtnTextActive]}>{condition.name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </ScrollView>
+            </>
+          )}
           
           <TouchableOpacity style={styles.addEffectBtn} onPress={() => {
-            if(!tempEffVal && tempEffType !== 'Outro') {
+            const amount = buildEffectAmount(itemEffectAmountMode, itemDiceCount, itemDiceSides, itemFlatBonus, tempEffVal);
+            if(!amount && tempEffType !== 'Outro' && itemConditionKey === 'none') {
                 Alert.alert("Aviso", "Insira um valor ou dado para o efeito.");
                 return;
             }
-            setItemEffects([...itemEffects, {val: tempEffVal, type: tempEffType, duration: isAttribute ? tempEffDuration : '', turns: tempEffTurns}]);
-            setTempEffVal(''); setTempEffDuration(''); setTempEffTurns('');
+            setItemEffects([...itemEffects, {
+              val: amount,
+              type: tempEffType,
+              duration: isAttribute ? tempEffDuration : '',
+              turns: tempEffTurns,
+              saveAbility: itemSaveAbility,
+              saveDc: itemSaveDc,
+              saveOnSuccess: itemSaveOnSuccess,
+              conditionKey: itemConditionKey,
+            }]);
+            setTempEffVal(''); setTempEffDuration(''); setTempEffTurns(''); setItemConditionKey('none'); setItemSaveAbility('Nenhum');
           }}>
             <Text style={styles.addEffectBtnText}>+ ADICIONAR EFEITO</Text>
           </TouchableOpacity>
@@ -573,6 +720,9 @@ export default function AdvancedCreatorScreen() {
               else if (eff.type === 'Escolher Atributo') displayText = `Escolher ${eff.val}${suffix}`;
               else if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) displayText = `${eff.type} ${eff.val}${suffix}`;
               else displayText = `${eff.val} ${eff.type}`;
+              const condition = getConditionOption(eff.conditionKey);
+              if (eff.saveAbility && eff.saveAbility !== 'Nenhum') displayText += ` | Teste ${eff.saveAbility} CD ${eff.saveDc || '?'}`;
+              if (condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
 
               return (
                 <View key={i} style={styles.effectRow}>
@@ -634,11 +784,13 @@ export default function AdvancedCreatorScreen() {
                 setSpellDurationType('Permanente');
                 setSpellComponents([]);
                 setSpellRange('Pessoal');
+                setSpellRangeMode('Pessoal');
               } else {
                 setSpellLevel('Nível 1');
                 setCastTimeType('Ação Bônus');
                 setSpellComponents([]);
                 setSpellRange('Pessoal');
+                setSpellRangeMode('Pessoal');
               }
             }}>
               <Text style={[styles.toggleBtnText, spellCategory === cat && styles.toggleBtnTextActive]}>{cat}</Text>
@@ -683,16 +835,36 @@ export default function AdvancedCreatorScreen() {
         <View style={styles.row}>
           <View style={[styles.formGroup, {flex: 1, marginRight: 10}]}>
             <Text style={styles.label}>ALCANCE</Text>
-            <TextInput style={styles.input} value={spellRange} onChangeText={setSpellRange} placeholder="Ex: 18m, Toque" placeholderTextColor="#666"/>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginTop: 8}}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 8}}>
               <View style={{flexDirection: 'row', gap: 5}}>
-                {SPELL_RANGES.map(r => (
-                  <TouchableOpacity key={r} style={[styles.limitBtn, spellRange === r && styles.limitBtnActive, {paddingVertical: 4, paddingHorizontal: 8}]} onPress={() => setSpellRange(r)}>
-                    <Text style={[styles.limitBtnText, spellRange === r && styles.limitBtnTextActive, {fontSize: 9}]}>{r}</Text>
+                {RANGE_MODES.map(r => (
+                  <TouchableOpacity key={r} style={[styles.limitBtn, spellRangeMode === r && styles.limitBtnActive, {paddingVertical: 4, paddingHorizontal: 8}]} onPress={() => setSpellRangeMode(r)}>
+                    <Text style={[styles.limitBtnText, spellRangeMode === r && styles.limitBtnTextActive, {fontSize: 9}]}>{r}</Text>
                   </TouchableOpacity>
                 ))}
               </View>
             </ScrollView>
+            {!['Pessoal', 'Toque'].includes(spellRangeMode) && (
+              <View style={{flexDirection: 'row', gap: 8}}>
+                <TextInput
+                  style={[styles.input, {flex: 0.45, textAlign: 'center'}]}
+                  value={spellRangeValue}
+                  onChangeText={(value) => setSpellRangeValue(value.replace(/[^0-9]/g, ''))}
+                  keyboardType="numeric"
+                  placeholder="Valor"
+                  placeholderTextColor="#666"
+                />
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: 0.55}}>
+                  <View style={{flexDirection: 'row', gap: 5}}>
+                    {RANGE_UNITS.map(unit => (
+                      <TouchableOpacity key={unit} style={[styles.limitBtn, spellRangeUnit === unit && styles.limitBtnActive, {paddingVertical: 4, paddingHorizontal: 8}]} onPress={() => setSpellRangeUnit(unit)}>
+                        <Text style={[styles.limitBtnText, spellRangeUnit === unit && styles.limitBtnTextActive, {fontSize: 9}]}>{unit}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </ScrollView>
+              </View>
+            )}
           </View>
           
           {spellCategory === 'Magia' && (
@@ -734,7 +906,19 @@ export default function AdvancedCreatorScreen() {
 
         <Text style={styles.label}>CONSTRUTOR DE EFEITOS (Adicione múltiplos)</Text>
         <View style={styles.effectBuilder}>
-          <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} placeholder="Valor/Dado (Ex: 8d6, +2 ou vazio)" placeholderTextColor="#888" value={tempSpellDice} onChangeText={setTempSpellDice} />
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>VALOR / DADO</Text>
+          <View style={{flexDirection: 'row', gap: 8, marginBottom: 12}}>
+            {(['dice', 'value', 'none'] as const).map(mode => (
+              <TouchableOpacity key={mode} style={[styles.limitBtn, spellEffectAmountMode === mode && styles.limitBtnActive]} onPress={() => setSpellEffectAmountMode(mode)}>
+                <Text style={[styles.limitBtnText, spellEffectAmountMode === mode && styles.limitBtnTextActive]}>{mode === 'dice' ? 'Dado' : mode === 'value' ? 'Valor' : 'Sem valor'}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {spellEffectAmountMode === 'dice' && renderDiceSelector(spellDiceCount, setSpellDiceCount, spellDiceSides, setSpellDiceSides, spellFlatBonus, setSpellFlatBonus)}
+          {spellEffectAmountMode === 'value' && (
+            <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} keyboardType="numeric" placeholder="Valor fixo (Ex: +2, -1)" placeholderTextColor="#888" value={tempSpellDice} onChangeText={(value) => setTempSpellDice(value.replace(/[^0-9+-]/g, ''))} />
+          )}
           
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
             <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
@@ -749,16 +933,63 @@ export default function AdvancedCreatorScreen() {
           {tempSpellDmgType === 'Outro' && (
             <TextInput style={[styles.input, {marginBottom: 15, backgroundColor: 'rgba(0,0,0,0.4)'}]} placeholder="Qual o efeito? (Ex: Cegueira, Empurrão...)" value={tempSpellCustomType} onChangeText={setTempSpellCustomType} placeholderTextColor="#888" />
           )}
+
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>TESTE DE RESISTENCIA</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 10}}>
+            <View style={{flexDirection: 'row', gap: 8}}>
+              {SAVE_CHOICES.map(save => (
+                <TouchableOpacity key={save} style={[styles.limitBtn, spellSaveAbility === save && styles.limitBtnActive]} onPress={() => setSpellSaveAbility(save)}>
+                  <Text style={[styles.limitBtnText, spellSaveAbility === save && styles.limitBtnTextActive]}>{save}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+
+          {spellSaveAbility !== 'Nenhum' && (
+            <>
+              <View style={{flexDirection: 'row', gap: 10, marginBottom: 10}}>
+                <TextInput style={[styles.input, {flex: 0.35, textAlign: 'center', backgroundColor: 'rgba(0,0,0,0.4)'}]} keyboardType="numeric" value={spellSaveDc} onChangeText={(value) => setSpellSaveDc(value.replace(/[^0-9]/g, ''))} placeholder="CD" placeholderTextColor="#888" />
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: 1}}>
+                  <View style={{flexDirection: 'row', gap: 8}}>
+                    {SAVE_SUCCESS_CHOICES.map(result => (
+                      <TouchableOpacity key={result.key} style={[styles.limitBtn, spellSaveOnSuccess === result.key && styles.limitBtnActive]} onPress={() => setSpellSaveOnSuccess(result.key)}>
+                        <Text style={[styles.limitBtnText, spellSaveOnSuccess === result.key && styles.limitBtnTextActive]}>{result.label}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </ScrollView>
+              </View>
+
+              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA CONDICAO</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
+                <View style={{flexDirection: 'row', gap: 8}}>
+                  {CONDITION_OPTIONS.map(condition => (
+                    <TouchableOpacity key={condition.key} style={[styles.limitBtn, spellConditionKey === condition.key && styles.limitBtnActive]} onPress={() => setSpellConditionKey(condition.key)}>
+                      <Text style={[styles.limitBtnText, spellConditionKey === condition.key && styles.limitBtnTextActive]}>{condition.name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </ScrollView>
+            </>
+          )}
           
           <TouchableOpacity style={styles.addEffectBtn} onPress={() => {
             const finalType = tempSpellDmgType === 'Outro' ? tempSpellCustomType : tempSpellDmgType;
+            const amount = buildEffectAmount(spellEffectAmountMode, spellDiceCount, spellDiceSides, spellFlatBonus, tempSpellDice);
             if (!finalType) { Alert.alert('Aviso', 'Defina o nome do efeito especial.'); return; }
-            if (!tempSpellDice && tempSpellDmgType !== 'Outro' && tempSpellDmgType !== 'Cura') {
+            if (!amount && tempSpellDmgType !== 'Outro' && tempSpellDmgType !== 'Cura' && spellConditionKey === 'none') {
               Alert.alert('Aviso', 'Adicione um dado/valor para este tipo de dano.'); return; 
             }
             
-            setSpellEffectsList([...spellEffectsList, {dice: tempSpellDice, type: finalType}]);
-            setTempSpellDice(''); setTempSpellCustomType(''); setTempSpellDmgType('Fogo');
+            setSpellEffectsList([...spellEffectsList, {
+              dice: amount,
+              type: finalType,
+              saveAbility: spellSaveAbility,
+              saveDc: spellSaveDc,
+              saveOnSuccess: spellSaveOnSuccess,
+              conditionKey: spellConditionKey,
+            }]);
+            setTempSpellDice(''); setTempSpellCustomType(''); setTempSpellDmgType('Fogo'); setSpellConditionKey('none'); setSpellSaveAbility('Nenhum');
           }}>
             <Text style={styles.addEffectBtnText}>+ ADICIONAR EFEITO</Text>
           </TouchableOpacity>
@@ -767,7 +998,10 @@ export default function AdvancedCreatorScreen() {
         {spellEffectsList.length > 0 && (
           <View style={{marginBottom: 20}}>
             {spellEffectsList.map((eff, i) => {
-              const displayText = eff.dice ? `${eff.dice} (${eff.type})` : `${eff.type}`;
+              const condition = getConditionOption(eff.conditionKey);
+              let displayText = eff.dice ? `${eff.dice} (${eff.type})` : `${eff.type}`;
+              if (eff.saveAbility && eff.saveAbility !== 'Nenhum') displayText += ` | Teste ${eff.saveAbility}${eff.saveDc ? ` CD ${eff.saveDc}` : ''}`;
+              if (condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
               return (
                 <View key={i} style={styles.effectRow}>
                   <Text style={styles.effectText}>{displayText}</Text>
@@ -777,17 +1011,6 @@ export default function AdvancedCreatorScreen() {
             })}
           </View>
         )}
-
-        <Text style={styles.label}>TESTES DE RESISTÊNCIA NECESSÁRIOS</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 20}}>
-          <View style={{flexDirection: 'row', gap: 10}}>
-            {SPELL_SAVES.map(sv => (
-              <TouchableOpacity key={sv} style={[styles.toggleBtn, spellSaves.includes(sv) && styles.toggleBtnActive]} onPress={() => toggleArrayItem(setSpellSaves, sv)}>
-                <Text style={[styles.toggleBtnText, spellSaves.includes(sv) && styles.toggleBtnTextActive]}>{sv}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </ScrollView>
 
         {spellLevel !== 'Passiva' && (
           <>
@@ -1240,21 +1463,101 @@ function parseDurationMetadata(duration: string) {
   return { value: 1, unit: 'rest' };
 }
 
+function buildEffectAmount(mode: 'dice' | 'value' | 'none', count: string, sides: string, bonus: string, fixedValue: string) {
+  if (mode === 'none') return '';
+  if (mode === 'value') return String(fixedValue || '').trim();
+
+  const diceCount = Math.max(1, parseInt(count, 10) || 1);
+  const diceSides = DICE_SIDES.includes(parseInt(sides, 10)) ? parseInt(sides, 10) : 6;
+  const flat = parseInt(bonus, 10) || 0;
+  return `${diceCount}d${diceSides}${flat === 0 ? '' : flat > 0 ? `+${flat}` : flat}`;
+}
+
+function formatStructuredRange(mode: string, value: string, unit: string) {
+  if (mode === 'Pessoal' || mode === 'Toque') return mode;
+  const amount = Math.max(1, parseInt(value, 10) || 1);
+  if (mode === 'Distancia') return `${amount}${unit || 'm'}`;
+  return `${mode} ${amount}${unit || 'm'}`;
+}
+
+function getConditionOption(key?: string) {
+  return CONDITION_OPTIONS.find((condition) => condition.key === key) || CONDITION_OPTIONS[0];
+}
+
+function buildSavePayload(ability?: string, dc?: string, onSuccess?: string) {
+  if (!ability || ability === 'Nenhum') return undefined;
+  const parsedDc = parseInt(String(dc || ''), 10);
+  return {
+    ability,
+    dc: Number.isFinite(parsedDc) && parsedDc > 0 ? parsedDc : undefined,
+    dcSource: Number.isFinite(parsedDc) && parsedDc > 0 ? 'manual' : 'caster',
+    onSuccess: onSuccess || 'none',
+  };
+}
+
+function buildConditionPayload(conditionKey: string | undefined, hasSave: boolean, durationValue?: number | null, durationUnit?: string | null) {
+  const condition = getConditionOption(conditionKey);
+  if (!condition || condition.key === 'none') return undefined;
+  return {
+    key: condition.key,
+    name: condition.name,
+    applyOn: hasSave ? 'failed_save' : 'always',
+    color: condition.color,
+    duration: {
+      value: durationValue || 1,
+      unit: durationUnit || 'turn',
+      untilSave: hasSave,
+      repeatSave: hasSave ? 'end_of_turn' : 'none',
+    },
+  };
+}
+
+function toStructuredSpellEffect(effect: any, durationText: string, durationMeta: { value: number | null; unit: string | null }) {
+  const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
+  const condition = buildConditionPayload(effect.conditionKey, Boolean(save), durationMeta.value, durationMeta.unit);
+  const isHeal = effect.type === 'Cura';
+  const isCustom = effect.type === 'Outro' || (!isHeal && !SPELL_DAMAGE_TYPES.includes(effect.type));
+
+  return {
+    type: condition && !effect.dice ? 'condition' : isHeal ? 'heal' : isCustom ? 'custom' : 'damage',
+    kind: condition && !effect.dice ? 'condition' : isHeal ? 'heal' : isCustom ? 'custom' : 'damage',
+    dice: effect.dice || '',
+    damageDice: !isHeal && !isCustom ? effect.dice || '' : undefined,
+    healDice: isHeal ? effect.dice || '' : undefined,
+    damageType: !isHeal && !isCustom ? effect.type : undefined,
+    customType: isCustom ? effect.type : undefined,
+    durationText,
+    durationValue: durationMeta.value,
+    durationUnit: durationMeta.unit,
+    save,
+    condition,
+  };
+}
+
 function toStructuredItemEffect(effect: any) {
   const durationValue = effect.duration === 'Temp' && effect.turns ? Math.max(1, parseInt(effect.turns) || 1) : null;
   const isStat = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(effect.type);
   const isTempHp = effect.type === 'PV_TEMP';
+  const isDamage = !isStat && !isTempHp && effect.type !== 'Cura' && effect.type !== 'Outro' && effect.type !== 'Escolher Atributo';
+  const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
+  const condition = buildConditionPayload(effect.conditionKey, Boolean(save), durationValue, durationValue ? 'turn' : null);
 
   return {
-    kind: isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : 'custom',
+    type: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',
+    kind: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',
     target: isTempHp ? 'PV_TEMP' : isStat ? effect.type : undefined,
     value: parseInt(String(effect.val).replace('+', '')) || 0,
     dice: /d\d+/i.test(String(effect.val)) ? String(effect.val) : '',
-    type: effect.type,
+    damageDice: /d\d+/i.test(String(effect.val)) && isDamage ? String(effect.val) : undefined,
+    healDice: effect.type === 'Cura' ? String(effect.val || '') : undefined,
+    damageType: isDamage ? effect.type : undefined,
+    effectType: effect.type,
     durationText: effect.duration === 'Temp'
       ? durationValue ? `${durationValue} turno(s)` : 'Temporario'
       : effect.duration === 'Perm' ? 'Permanente' : '',
     durationValue,
     durationUnit: durationValue ? 'turn' : null,
+    save,
+    condition,
   };
 }

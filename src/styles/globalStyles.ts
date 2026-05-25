@@ -946,7 +946,7 @@ export const characterCardStyles = StyleSheet.create({
 });
 
 export const diceRollerStyles = StyleSheet.create({
-  canvasContainer: { ...StyleSheet.absoluteFillObject, zIndex: 9999, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center' },
+  canvasContainer: { flex: 1, zIndex: 999999, elevation: 999999, backgroundColor: 'rgba(0,0,0,0.72)', justifyContent: 'center' },
   resultOverlay: { position: 'absolute', alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.9)', paddingHorizontal: 50, paddingVertical: 20, borderRadius: 25, borderWidth: 2, borderColor: '#00bfff', alignItems: 'center', elevation: 10 },
   totalText: { color: '#00fa9a', fontSize: 64, fontWeight: 'bold', textShadowColor: 'rgba(0, 250, 154, 0.5)', textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 10 },
   

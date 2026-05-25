@@ -10,6 +10,7 @@ export type Character = {
   race: string;
   sessionId?: string | null;
   sessionName?: string | null;
+  joinUrl?: string | null;
 };
 
 type Props = {

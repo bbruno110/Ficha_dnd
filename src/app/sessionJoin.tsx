@@ -92,7 +92,7 @@ export default function SessionJoinScreen() {
         }
       }
       await importLanCatalog(db, nextPayload);
-      await saveLanSession(db, nextPayload, resolvedUrl);
+      await saveLanSession(db, nextPayload, resolvedUrl, { isMaster: false });
 
       setPayload(nextPayload);
       setJoinUrl(resolvedUrl || '');
@@ -114,9 +114,12 @@ export default function SessionJoinScreen() {
 
       await loadEligibleCharacters(nextPayload);
     } catch (error) {
-      const message = error instanceof Error && error.message.includes('Modulo TCP nativo indisponivel')
+      const errorMessage = error instanceof Error ? error.message : '';
+      const message = errorMessage.includes('Modulo TCP nativo indisponivel')
         ? 'Este build Android nao tem o modulo TCP nativo ativo. Recompile e reinstale o dev build no emulador/celular.'
-        : 'Nao foi possivel entrar na sessao. Confira o codigo/URL e se voce esta na mesma rede do mestre.';
+        : errorMessage.includes('tcp://')
+          ? 'Esta entrada nao usa socket TCP. Cole uma URL tcp:// ou digite o codigo de uma mesa TCP na mesma rede.'
+          : 'Nao foi possivel entrar na sessao. Confira o codigo/URL e se voce esta na mesma rede do mestre.';
       Alert.alert('Sessao LAN', message);
       console.error(error);
     } finally {
@@ -162,7 +165,7 @@ export default function SessionJoinScreen() {
 
   const handleCreateCharacter = () => {
     if (!payload) return;
-    router.push({
+    router.replace({
       pathname: '/create' as any,
       params: {
         sessionId: payload.session.id,
@@ -219,7 +222,7 @@ export default function SessionJoinScreen() {
       <Stack.Screen options={{ headerShown: false }} />
 
       <View style={styles.topBar}>
-        <TouchableOpacity onPress={() => router.back()}>
+        <TouchableOpacity onPress={() => router.replace(payload ? '/lan-session' as any : '/' as any)}>
           <Ionicons name="arrow-back" size={28} color={appColors.textPrimary} />
         </TouchableOpacity>
         <View style={styles.topBarCenter}>
