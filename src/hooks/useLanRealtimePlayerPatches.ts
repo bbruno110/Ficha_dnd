@@ -75,12 +75,18 @@ export function useLanRealtimePlayerPatches({
     };
 
     void applyEvents();
+
+    const timer = setInterval(() => {
+      void applyEvents();
+    }, 3000);
+
     const unsubscribe = subscribeLanSessionClientUpdates(joinUrl, () => {
       void applyEvents();
     });
 
     return () => {
       disposed = true;
+      clearInterval(timer);
       unsubscribe();
     };
   }, [characterName, enabled, joinUrl, onKicked, onNumberPatch, selfKey, sessionId]);

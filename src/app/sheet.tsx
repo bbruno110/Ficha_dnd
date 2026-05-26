@@ -12,7 +12,6 @@ import {
   makeLanCharacterKey,
   makeLanEventId,
   rememberLanSessionEvent,
-  resetLanClientConnection,
   sendLanSessionEvent,
   subscribeLanSessionClientUpdates,
   unlinkCharacterFromLanSession,
@@ -229,6 +228,52 @@ export default function CharacterSheetScreen() {
     }, [id])
   );
 
+  const syncLanFromHost = useCallback(async () => {
+  if (!lanInfo?.joinUrl || !lanInfo?.sessionId || !character?.id) return;
+
+  try {
+    const nextPayload = await fetchLanSessionPayload(lanInfo.joinUrl);
+
+    if (nextPayload.session.id !== lanInfo.sessionId) {
+      return;
+    }
+
+    await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id));
+
+    setLanSessionStatus(nextPayload.state?.status || null);
+
+    const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+    setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+
+    const freshCharacter = await db.getFirstAsync(
+      `SELECT * FROM characters WHERE id = ?`,
+      [Number(character.id)]
+    );
+
+    if (freshCharacter) {
+      let parsedEquip = JSON.parse((freshCharacter as any).equipment || '{}');
+
+      if (Array.isArray(parsedEquip)) {
+        parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
+      } else {
+        parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
+      }
+
+      setCharacter({
+        ...(freshCharacter as any),
+        stats: JSON.parse((freshCharacter as any).stats || '{}'),
+        equipment: parsedEquip,
+        spells: JSON.parse((freshCharacter as any).spells || '[]'),
+        active_effects: JSON.parse((freshCharacter as any).active_effects_json || '[]'),
+        save_values: JSON.parse((freshCharacter as any).save_values || '[]'),
+        skill_values: JSON.parse((freshCharacter as any).skill_values || '[]'),
+      });
+    }
+  } catch (error) {
+    console.warn('[LAN] Não foi possível re-sincronizar com o mestre:', error);
+  }
+}, [db, lanInfo?.joinUrl, lanInfo?.sessionId, character?.id]);
+
   useLanRealtimePlayerPatches({
     enabled: Boolean(character && lanInfo?.sessionId && lanInfo?.joinUrl),
     joinUrl: lanInfo?.joinUrl,
@@ -295,84 +340,11 @@ export default function CharacterSheetScreen() {
   useLanAppLifecycle({
     enabled: Boolean(character && lanInfo?.sessionId && lanInfo?.joinUrl),
     onBackground: async () => {
-      resetLanClientConnection();
-    // Não destrói a sessão. Apenas deixa o socket ser recriado ao voltar.
-    // O Android pode pausar a rede em background.
+      // Não fecha a conexão manualmente.
+      // O Android pode pausar o socket em background; ao voltar, o app re-sincroniza.
     },
     onForeground: async () => {
-      if (!character || !lanInfo?.sessionId || !lanInfo?.joinUrl) return;
-
-      try {
-        resetLanClientConnection();
-        const nextPayload = await fetchLanSessionPayload(lanInfo.joinUrl);
-
-        const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
-
-      setLanSessionStatus(nextPayload.state?.status || 'active');
-      setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
-
-      const wasKicked = nextPayload.events?.some((event) => (
-        event.type === 'player_kicked' &&
-        (event.toKey === selfKey || event.toName === character.name)
-      ));
-
-      if (wasKicked || nextPayload.state?.status === 'ended') {
-        await unlinkCharacterFromLanSession(db, Number(character.id), lanInfo.sessionId);
-
-        setLanInfo(null);
-        setLanSessionStatus(null);
-        setLanPlayers([]);
-        setIncomingTrades([]);
-
-        showCustomAlert(
-          'Sessão encerrada',
-          wasKicked
-            ? 'O mestre removeu este personagem da sessão.'
-            : 'Esta sessão foi encerrada pelo mestre.',
-          [{ text: 'OK', color: appColors.primary, onPress: () => router.replace(`/sheet?id=${character.id}` as any) }]
-        );
-        return;
-      }
-
-      const changedBySession = await applyLanSessionStateToCharacter(
-        db,
-        nextPayload,
-        Number(character.id)
-      );
-
-      if (changedBySession) {
-        const updated = await db.getFirstAsync<Record<string, unknown>>(
-          `SELECT hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats, equipment, active_effects_json
-           FROM characters
-           WHERE id = ?`,
-          [Number(character.id)]
-        );
-
-        if (updated) {
-          setCharacter((prev: any) => ({
-            ...prev,
-            hp_current: updated.hp_current,
-            hp_max: updated.hp_max,
-            temp_hp: updated.temp_hp,
-            xp: updated.xp,
-            gp: updated.gp,
-            sp: updated.sp,
-            cp: updated.cp,
-            stats: JSON.parse(String(updated.stats || '{}')),
-            equipment: JSON.parse(String(updated.equipment || '{}')),
-            active_effects: JSON.parse(String(updated.active_effects_json || '[]')),
-          }));
-        }
-      }
-
-      const events = await fetchLanSessionEvents(lanInfo.joinUrl, lanInfo.sessionId);
-      await handleLanEvents(
-        events.filter((event) => event.sessionId === lanInfo.sessionId),
-        lanInfo.sessionId
-      );
-      } catch (error) {
-      console.warn('[LAN] Não foi possível reconectar ao voltar para o app:', error);
-      }
+      await syncLanFromHost();
     },
   });
 

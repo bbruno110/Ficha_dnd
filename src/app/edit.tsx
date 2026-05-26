@@ -514,7 +514,14 @@ export default function EditCharacterScreen() {
 
       if (sessionId) {
         const joinedCharacter = await joinLanSessionWithCharacter(db, String(sessionId), character.id);
-        await notifyMasterJoin(firstParam(joinUrl), String(sessionId), joinedCharacter);
+
+        await notifyMasterJoin(
+          firstParam(joinUrl),
+          String(sessionId),
+          joinedCharacter,
+          '',
+          { reviewSnapshot: true }
+        );
       }
 
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!

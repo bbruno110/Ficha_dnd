@@ -787,55 +787,86 @@ useLanAppLifecycle({
   };
 
   const handleUpdatePlayerPatch = async (
-    player: LanSessionPlayerState,
-    patch: NumberPatch,
-    message: string
-  ) => {
-    if (!payload) return;
+      player: LanSessionPlayerState,
+      patch: NumberPatch,
+      message: string
+    ) => {
+      if (!payload) return;
 
-    const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
-      if (value == null) return next;
-      return {
-        ...next,
-        [key]: Math.max(0, Math.floor(Number(value) || 0)),
-      };
-    }, {});
-    if (Object.keys(cleanPatch).length === 0) return;
+      const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
+        if (value == null) return next;
+        return {
+          ...next,
+          [key]: Math.max(0, Math.floor(Number(value) || 0)),
+        };
+      }, {});
 
-    // Atualiza a tela do mestre imediatamente, sem esperar SQLite/payload.
-    setSessionState((current) => {
-      if (!current) return current;
-      return {
-        ...current,
-        players: current.players.map((entry) => (
-          entry.id === player.id ? { ...entry, ...cleanPatch } : entry
-        )),
-      };
-    });
+      if (Object.keys(cleanPatch).length === 0) return;
 
-    // Persiste localmente sem disparar payload_update pesado.
-    await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
+      // 1. Atualiza a tela do mestre imediatamente.
+      setSessionState((current) => {
+        if (!current) return current;
 
-    // Evento delta pequeno: chega no celular do jogador imediatamente via socket.
-    const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
-      id: makeLanEventId(),
-      sessionId: payload.session.id,
-      type: 'player_patch',
-      fromKey: 'master',
-      fromName: 'Mestre',
-      toKey: player.remoteKey || '',
-      toName: player.characterName,
-      numberPatch: cleanPatch,
-      message,
-      createdAt: new Date().toISOString(),
-    });
+        return {
+          ...current,
+          players: current.players.map((entry) =>
+            entry.id === player.id
+              ? { ...entry, ...cleanPatch }
+              : entry
+          ),
+        };
+      });
 
-    if (event) {
-      setSessionEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20));
-    }
+      // 2. Atualiza o payload local em memória também, para evitar voltar para valor antigo.
+      setPayload((current) => {
+        if (!current?.state) return current;
 
-    await reloadSessionState(payload.session.id, false);
-  };
+        return {
+          ...current,
+          state: {
+            ...current.state,
+            players: current.state.players.map((entry) =>
+              entry.id === player.id
+                ? { ...entry, ...cleanPatch }
+                : entry
+            ),
+          },
+        };
+      });
+
+      // 3. Persiste no SQLite do mestre.
+      await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
+
+      // 4. Atualiza o payload oficial ANTES de mandar o patch rápido.
+      // Assim qualquer snapshot/payload_update que chegar no jogador já vem com HP correto.
+      const syncedPayload = await syncLanSessionPayload(db, payload.session.id);
+
+      if (syncedPayload) {
+        setPayload(syncedPayload);
+        setSessionState(syncedPayload.state || null);
+      }
+
+      // 5. Envia o delta rápido para o jogador.
+      const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
+        id: makeLanEventId(),
+        sessionId: payload.session.id,
+        type: 'player_patch',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: player.remoteKey || '',
+        toName: player.characterName,
+        numberPatch: cleanPatch,
+        message,
+        createdAt: new Date().toISOString(),
+      });
+
+      if (event) {
+        setSessionEvents((current) =>
+          [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
+        );
+      }
+
+    };
 
   const handleUpdatePlayer = async (
     player: LanSessionPlayerState,

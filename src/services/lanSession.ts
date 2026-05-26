@@ -625,7 +625,7 @@ export async function startLanServer(payload: LanSessionPayload) {
 
   // IMPORTANTE:
   // Desative temporariamente o foreground service até confirmar que o TCP inicia.
-  // await startLanForegroundSession(payload, joinUrl);
+  await startLanForegroundSession(payload, joinUrl);
 
   return joinUrl;
 }
@@ -1538,6 +1538,7 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
 
 export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerId: number, accepted: boolean) {
   await ensureLanSchema(db);
+
   const player = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT * FROM lan_session_players WHERE id = ?`,
     [playerId]
@@ -1546,22 +1547,47 @@ export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerI
 
   const sessionId = String(player.session_id || '');
   const pending = parseJsonValue<Record<string, unknown> | null>(player.pending_character_snapshot, null);
+  const oldSnapshot = normalizeCharacterState(
+    parseJsonValue<Record<string, unknown>>(player.character_snapshot, {})
+  );
+
+  let acceptedMessage = 'Mestre recusou a ficha atualizada; estado da sessão mantido.';
+  let toName = oldSnapshot.characterName;
 
   if (accepted && pending) {
     const normalized = normalizeCharacterState(pending);
+    toName = normalized.characterName;
+
     await db.runAsync(
       `UPDATE lan_session_players
-       SET character_name = ?, character_snapshot = ?, pending_character_snapshot = NULL, notes = NULL,
-           hp_current = ?, hp_max = ?, temp_hp = ?, xp = ?, gp = ?, sp = ?, cp = ?,
-           stats_json = ?, equipment_json = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
+       SET character_name = ?,
+           character_snapshot = ?,
+           pending_character_snapshot = NULL,
+           notes = NULL,
+           level = ?,
+           class_name = ?,
+           race = ?,
+           hp_current = ?,
+           hp_max = ?,
+           temp_hp = ?,
+           xp = ?,
+           gp = ?,
+           sp = ?,
+           cp = ?,
+           stats_json = ?,
+           equipment_json = ?,
+           revision_seq = COALESCE(revision_seq, 0) + 1,
            last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
         normalized.characterName,
         JSON.stringify(pending),
+        normalized.level,
+        normalized.className,
+        normalized.race,
         normalized.hpCurrent,
         normalized.hpMax,
-        toNumber((pending as any).temp_hp),
+        normalized.tempHp,
         normalized.xp,
         normalized.gp,
         normalized.sp,
@@ -1571,10 +1597,17 @@ export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerI
         playerId,
       ]
     );
+
+    acceptedMessage =
+      normalized.level > oldSnapshot.level
+        ? `${normalized.characterName} subiu de nível ${oldSnapshot.level} -> ${normalized.level}. HP ${oldSnapshot.hpCurrent}/${oldSnapshot.hpMax} -> ${normalized.hpCurrent}/${normalized.hpMax}.`
+        : `Mestre aceitou a ficha atualizada de ${normalized.characterName}.`;
   } else {
     await db.runAsync(
       `UPDATE lan_session_players
-       SET pending_character_snapshot = NULL, notes = NULL, last_seen_at = CURRENT_TIMESTAMP
+       SET pending_character_snapshot = NULL,
+           notes = NULL,
+           last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [playerId]
     );
@@ -1587,10 +1620,11 @@ export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerI
     fromKey: 'master',
     fromName: 'Mestre',
     toKey: String(player.remote_key || ''),
-    toName: normalizeCharacterState(parseJsonValue<Record<string, unknown>>(player.character_snapshot, {})).characterName,
-    message: accepted ? 'Mestre aceitou a ficha atualizada.' : 'Mestre recusou a ficha atualizada; estado da sessao mantido.',
+    toName,
+    message: acceptedMessage,
     createdAt: new Date().toISOString(),
   });
+
   await syncLanSessionPayload(db, sessionId);
 }
 
@@ -1727,6 +1761,12 @@ async function recordEffectPatchEvent(
   });
 }
 
+function normalizeJsonColumn(value: unknown) {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
 export async function applyLanSessionStateToCharacter(
   db: SQLiteDatabase,
   payload: LanSessionPayload,
@@ -1745,13 +1785,38 @@ export async function applyLanSessionStateToCharacter(
   if (!match) return false;
 
   const stats = applyEffectsToStats(match.stats, match.effects);
+  const snapshot = match.characterSnapshot || {};
+
+  const snapshotSpells = (snapshot as any).spells;
+  const snapshotSaveValues = (snapshot as any).save_values;
+  const snapshotSkillValues = (snapshot as any).skill_values;
+  const snapshotProficiencies = (snapshot as any).proficiencies;
 
   await db.runAsync(
     `UPDATE characters
-     SET hp_current = ?, hp_max = ?, temp_hp = ?, xp = ?, gp = ?, sp = ?, cp = ?,
-         stats = ?, equipment = ?, active_effects_json = ?, updated_at = CURRENT_TIMESTAMP
+     SET level = ?,
+         class = ?,
+         race = ?,
+         hp_current = ?,
+         hp_max = ?,
+         temp_hp = ?,
+         xp = ?,
+         gp = ?,
+         sp = ?,
+         cp = ?,
+         stats = ?,
+         equipment = ?,
+         active_effects_json = ?,
+         spells = COALESCE(?, spells),
+         save_values = COALESCE(?, save_values),
+         skill_values = COALESCE(?, skill_values),
+         proficiencies = COALESCE(?, proficiencies),
+         updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
     [
+      match.level,
+      match.className,
+      match.race,
       match.hpCurrent,
       match.hpMax,
       match.tempHp,
@@ -1762,6 +1827,10 @@ export async function applyLanSessionStateToCharacter(
       JSON.stringify(stats),
       JSON.stringify(match.equipment),
       JSON.stringify(match.effects),
+      snapshotSpells == null ? null : normalizeJsonColumn(snapshotSpells),
+      snapshotSaveValues == null ? null : normalizeJsonColumn(snapshotSaveValues),
+      snapshotSkillValues == null ? null : normalizeJsonColumn(snapshotSkillValues),
+      snapshotProficiencies == null ? null : normalizeJsonColumn(snapshotProficiencies),
       characterId,
     ]
   );
@@ -1891,14 +1960,14 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
       id: toNumber(row.id),
       sessionId,
       remoteKey: row.remote_key ? String(row.remote_key) : undefined,
-    clientId: row.client_id ? String(row.client_id) : undefined,
+      clientId: row.client_id ? String(row.client_id) : undefined,
       playerName: String(row.player_name || normalized.playerName),
       characterId: row.character_id == null ? null : toNumber(row.character_id),
       sourceCharacterId: normalized.sourceCharacterId,
       characterName: String(row.character_name || normalized.characterName),
-      level: normalized.level,
-      className: normalized.className,
-      race: normalized.race,
+      level: toNumber(row.level, normalized.level),
+      className: String(row.class_name || normalized.className),
+      race: String(row.race || normalized.race),
       hpCurrent: toNumber(row.hp_current, normalized.hpCurrent),
       hpMax: toNumber(row.hp_max, normalized.hpMax),
       tempHp: toNumber(row.temp_hp, normalized.tempHp),
@@ -2115,7 +2184,11 @@ function normalizeCharacterState(character: Record<string, unknown>) {
 function describeCharacterDiff(current: Record<string, unknown>, incoming: ReturnType<typeof normalizeCharacterState>) {
   const diffs: string[] = [];
   const currentSnapshot = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(current.character_snapshot, {}));
+
   const currentValues = {
+    level: toNumber(current.level, currentSnapshot.level),
+    className: String(current.class_name || currentSnapshot.className || '-'),
+    race: String(current.race || currentSnapshot.race || '-'),
     hpCurrent: toNumber(current.hp_current, currentSnapshot.hpCurrent),
     hpMax: toNumber(current.hp_max, currentSnapshot.hpMax),
     tempHp: toNumber(current.temp_hp, currentSnapshot.tempHp),
@@ -2127,19 +2200,49 @@ function describeCharacterDiff(current: Record<string, unknown>, incoming: Retur
     equipment: parseJsonValue<Record<string, unknown>>(current.equipment_json, currentSnapshot.equipment),
   };
 
+  if (incoming.level !== currentValues.level) {
+    if (incoming.level > currentValues.level) {
+      diffs.push(`Subiu de nível ${currentValues.level} -> ${incoming.level}`);
+    } else {
+      diffs.push(`Nível alterado ${currentValues.level} -> ${incoming.level}`);
+    }
+  }
+
+  if (incoming.className !== currentValues.className) {
+    diffs.push(`Classe alterada: ${currentValues.className} -> ${incoming.className}`);
+  }
+
+  if (incoming.race !== currentValues.race) {
+    diffs.push(`Raça alterada: ${currentValues.race} -> ${incoming.race}`);
+  }
+
   if (
     incoming.hpCurrent !== currentValues.hpCurrent ||
     incoming.hpMax !== currentValues.hpMax ||
     incoming.tempHp !== currentValues.tempHp
   ) {
-    diffs.push(`HP ${currentValues.hpCurrent}/${currentValues.hpMax} (+${currentValues.tempHp}) -> ${incoming.hpCurrent}/${incoming.hpMax} (+${incoming.tempHp})`);
+    diffs.push(
+      `HP ${currentValues.hpCurrent}/${currentValues.hpMax} (+${currentValues.tempHp}) -> ${incoming.hpCurrent}/${incoming.hpMax} (+${incoming.tempHp})`
+    );
   }
-  if (incoming.xp !== currentValues.xp) diffs.push(`XP ${currentValues.xp} -> ${incoming.xp}`);
+
+  if (incoming.xp !== currentValues.xp) {
+    diffs.push(`XP ${currentValues.xp} -> ${incoming.xp}`);
+  }
+
   if (incoming.gp !== currentValues.gp || incoming.sp !== currentValues.sp || incoming.cp !== currentValues.cp) {
-    diffs.push(`Moedas ${currentValues.gp} PO, ${currentValues.sp} PP, ${currentValues.cp} PC -> ${incoming.gp} PO, ${incoming.sp} PP, ${incoming.cp} PC`);
+    diffs.push(
+      `Moedas ${currentValues.gp} PO, ${currentValues.sp} PP, ${currentValues.cp} PC -> ${incoming.gp} PO, ${incoming.sp} PP, ${incoming.cp} PC`
+    );
   }
-  if (JSON.stringify(incoming.stats) !== JSON.stringify(currentValues.stats)) diffs.push('Atributos alterados');
-  if (JSON.stringify(incoming.equipment) !== JSON.stringify(currentValues.equipment)) diffs.push('Inventario alterado');
+
+  if (JSON.stringify(incoming.stats) !== JSON.stringify(currentValues.stats)) {
+    diffs.push('Atributos alterados');
+  }
+
+  if (JSON.stringify(incoming.equipment) !== JSON.stringify(currentValues.equipment)) {
+    diffs.push('Inventário alterado');
+  }
 
   return diffs;
 }
