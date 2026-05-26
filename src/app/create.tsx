@@ -1,4 +1,4 @@
-// ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
+// ================= create.tsx =================
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
@@ -12,7 +12,8 @@ import {
 } from 'react-native';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE
-import SpellSelector, { SpellItem } from '../components/SpellSelector';
+import SpellSelector, { SpellItem } from '../components/SpellSelector';
+
 import { joinLanSessionWithCharacter, notifyMasterJoin } from '@/services/lanSession';
 import { appColors, appGradients, createStyles as styles } from '@/styles/globalStyles';
 

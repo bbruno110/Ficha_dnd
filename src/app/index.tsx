@@ -1,3 +1,4 @@
+// ================= index.tsx =================
 import { Ionicons } from '@expo/vector-icons';
 import Constants from 'expo-constants'; // 1. Importar o Constants
 import { LinearGradient } from 'expo-linear-gradient';
@@ -5,7 +6,8 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useState } from 'react';
 import { Alert, FlatList, Text, TouchableOpacity, View } from 'react-native';
-import CharacterCard, { Character } from '../components/CharacterCard';
+import CharacterCard, { Character } from '../components/CharacterCard';
+
 import { prepareLanSessionStorage, unlinkCharacterFromLanSession } from '@/services/lanSession';
 import { appColors, appGradients, homeStyles as styles } from '@/styles/globalStyles';
 

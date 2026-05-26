@@ -1,4 +1,16 @@
-// ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
+// ================= advanced.tsx =================
+import {
+  createEffect,
+  deleteEffectIfUnused,
+  disableEffect,
+  duplicateEffect,
+  listEffects,
+  normalizeStatusKey,
+  updateEffect,
+} from '@/services/effects/effectCatalogService';
+import type { LanEffectCatalogItem } from '@/services/effects/effectTypes';
+import { makeLanEventId, rememberLanSessionEvent, syncLanSessionPayload } from '@/services/lanSession';
+import { appGradients, advancedStyles as styles } from '@/styles/globalStyles';
 import { Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
 import { documentDirectory, EncodingType, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
@@ -8,14 +20,13 @@ import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
-import { appGradients, advancedStyles as styles } from '@/styles/globalStyles';
 
 // ================= TIPAGENS =================
 type SpellClassReq = { name: string; minLevel: string }; 
 type SelectedFeature = { name: string; level: string };
 type SpellItem = { id: number; name: string; level: string; category?: string; casting_time?: string; range?: string; damage?: string; description?: string; classes?: string; };
 
-const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Acervo'];
+const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Condicoes/Efeitos', 'Acervo'];
 const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capacete', 'Capa', 'Bota', 'Luva', 'Consumível', 'Ferramenta', 'Mochila/Saco', 'Outro'];
 const EFFECT_CATEGORIES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
 const ITEM_PROPS = ['Acuidade', 'Leve', 'Pesada', 'Duas mãos', 'Versátil', 'Arremesso', 'Munição', 'Alcance', 'Recarga', 'Especial', 'Foco Arcano', 'Foco Divino', 'Foco Druídico', 'Consumível', 'Mágico'];
@@ -148,6 +159,36 @@ export default function AdvancedCreatorScreen() {
   const [myCreations, setMyCreations] = useState<any[]>([]);
   const [selectedAcervo, setSelectedAcervo] = useState<string[]>([]);
 
+  // Estados de Condicoes / Efeitos
+  const [effectCatalog, setEffectCatalog] = useState<LanEffectCatalogItem[]>([]);
+  const [editingEffectId, setEditingEffectId] = useState<number | null>(null);
+  const [effectStatusKey, setEffectStatusKey] = useState('');
+  const [effectKind, setEffectKind] = useState('condition');
+  const [effectCategory, setEffectCategory] = useState('custom');
+  const [effectColor, setEffectColor] = useState('#8E44AD');
+  const [effectSecondaryColor, setEffectSecondaryColor] = useState('#D2B4DE');
+  const [effectIcon, setEffectIcon] = useState('sparkles');
+  const [effectDescription, setEffectDescription] = useState('');
+  const [effectPriority, setEffectPriority] = useState('40');
+  const [effectStackable, setEffectStackable] = useState(false);
+  const [effectRemovableBySave, setEffectRemovableBySave] = useState(false);
+  const [effectRepeatSave, setEffectRepeatSave] = useState('none');
+  const [effectSaveAbility, setEffectSaveAbility] = useState('Nenhum');
+  const [effectSaveOnSuccess, setEffectSaveOnSuccess] = useState('remove');
+  const [effectDurationValue, setEffectDurationValue] = useState('1');
+  const [effectDurationUnit, setEffectDurationUnit] = useState('turn');
+  const [effectRulesNote, setEffectRulesNote] = useState('');
+
+  const conditionOptions = [
+    { key: 'none', name: 'Nenhuma', color: '' },
+    ...effectCatalog.filter((effect) => effect.active !== false).map((effect) => ({
+      key: effect.statusKey,
+      name: effect.name,
+      color: effect.color,
+      secondaryColor: effect.secondaryColor,
+    })),
+  ];
+
   useEffect(() => {
     async function fetchData() {
       try {
@@ -156,10 +197,12 @@ export default function AdvancedCreatorScreen() {
         const features = await db.getAllAsync<{name: string, description: string}>(
           "SELECT name, description FROM spells WHERE level = 'Passiva' OR casting_time = 'Passiva' ORDER BY name"
         );
+        const effects = await listEffects(db, { includeInactive: true });
         
         setDbClasses(classes);
         setDbItemsCatalog(items);
         setDbFeatures(features);
+        setEffectCatalog(effects);
         
         if(classes.length > 0) {
           setTempSpellClass(classes[0].name);
@@ -300,6 +343,96 @@ export default function AdvancedCreatorScreen() {
     setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellEffectAmountMode('dice'); setSpellDiceCount('1'); setSpellDiceSides('8'); setSpellFlatBonus('0'); setSpellSaveAbility('Nenhum'); setSpellSaveDc(''); setSpellSaveOnSuccess('negates'); setSpellConditionKey('none'); setSpellSaves([]); setSpellDescription(''); 
     setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
     setSelectedFeatures([]); setCasterType('total');
+    setEditingEffectId(null); setEffectStatusKey(''); setEffectKind('condition'); setEffectCategory('custom'); setEffectColor('#8E44AD'); setEffectSecondaryColor('#D2B4DE'); setEffectIcon('sparkles'); setEffectDescription(''); setEffectPriority('40'); setEffectStackable(false); setEffectRemovableBySave(false); setEffectRepeatSave('none'); setEffectSaveAbility('Nenhum'); setEffectSaveOnSuccess('remove'); setEffectDurationValue('1'); setEffectDurationUnit('turn'); setEffectRulesNote('');
+  };
+
+  const loadEffectCatalog = async () => {
+    setEffectCatalog(await listEffects(db, { includeInactive: true }));
+  };
+
+  const publishEffectCatalogPatchToActiveSessions = async (
+    action: 'upsert' | 'disable' | 'delete',
+    effect?: LanEffectCatalogItem | null,
+    statusKey?: string,
+  ) => {
+    const sessions = await db.getAllAsync<Record<string, unknown>>(
+      `SELECT id FROM lan_sessions
+       WHERE status = 'active' AND COALESCE(is_master, 1) = 1`
+    );
+    for (const session of sessions) {
+      const sessionId = String(session.id || '');
+      if (!sessionId) continue;
+      await rememberLanSessionEvent(db, {
+        id: makeLanEventId(),
+        sessionId,
+        type: 'effect_catalog_patch',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: 'party',
+        toName: 'Party',
+        effectCatalogPatch: {
+          action,
+          effect: effect ? {
+            statusKey: effect.statusKey,
+            name: effect.name,
+            kind: effect.kind,
+            color: effect.color,
+            secondaryColor: effect.secondaryColor,
+            icon: effect.icon,
+            description: effect.description,
+            visualPriority: effect.visualPriority,
+            active: effect.active,
+          } : undefined,
+          statusKey: statusKey || effect?.statusKey,
+        },
+        message: `Catalogo de efeitos atualizado: ${effect?.name || statusKey || action}.`,
+        createdAt: new Date().toISOString(),
+      });
+      await syncLanSessionPayload(db, sessionId);
+    }
+  };
+
+  const startEditEffect = (effect: LanEffectCatalogItem) => {
+    setEditingEffectId(effect.id || null);
+    setName(effect.name);
+    setEffectStatusKey(effect.statusKey);
+    setEffectKind(effect.kind || 'condition');
+    setEffectCategory(effect.category || 'custom');
+    setEffectColor(effect.color || '#888888');
+    setEffectSecondaryColor(effect.secondaryColor || '');
+    setEffectIcon(effect.icon || 'sparkles');
+    setEffectDescription(effect.description || '');
+    setEffectPriority(String(effect.visualPriority || 0));
+    setEffectStackable(Boolean(effect.stackable));
+    setEffectRemovableBySave(Boolean(effect.removableBySave));
+    setEffectRepeatSave(String(effect.repeatSave || 'none'));
+    setEffectSaveAbility(effect.saveAbility ? String(effect.saveAbility) : 'Nenhum');
+    setEffectSaveOnSuccess(String(effect.saveOnSuccess || 'remove'));
+    setEffectDurationValue(String(effect.defaultDurationValue || 1));
+    setEffectDurationUnit(String(effect.defaultDurationUnit || 'turn'));
+    setEffectRulesNote(String((effect.rulesJson as any)?.mechanicalNote || ''));
+  };
+
+  const handleDuplicateEffect = async (effect: LanEffectCatalogItem) => {
+    if (!effect.id) return;
+    const copy = await duplicateEffect(db, effect.id);
+    await loadEffectCatalog();
+    await publishEffectCatalogPatchToActiveSessions('upsert', copy);
+  };
+
+  const handleDisableEffect = async (effect: LanEffectCatalogItem) => {
+    if (!effect.id) return;
+    await disableEffect(db, effect.id);
+    await loadEffectCatalog();
+    await publishEffectCatalogPatchToActiveSessions('disable', effect, effect.statusKey);
+  };
+
+  const handleDeleteEffect = async (effect: LanEffectCatalogItem) => {
+    if (!effect.id) return;
+    const deleted = await deleteEffectIfUnused(db, effect.id);
+    if (!deleted) Alert.alert('Em uso', 'Esse efeito esta ativo em alguma sessao. Ele foi mantido.');
+    if (deleted) await publishEffectCatalogPatchToActiveSessions('delete', effect, effect.statusKey);
+    await loadEffectCatalog();
   };
 
   const handleTabChange = (tab: string) => { setActiveTab(tab); if (tab !== 'Acervo') resetForms(); };
@@ -375,7 +508,35 @@ export default function AdvancedCreatorScreen() {
   const handleSave = async () => {
     if (!name.trim()) { Alert.alert('Erro', 'O nome é obrigatório!'); return; }
     try {
-      if (activeTab === 'Magia/Skill') {
+      if (activeTab === 'Condicoes/Efeitos') {
+        const payload = {
+          name: name.trim(),
+          statusKey: normalizeStatusKey(effectStatusKey || name),
+          kind: effectKind as any,
+          category: effectCategory || 'custom',
+          description: effectDescription,
+          color: effectColor || '#888888',
+          secondaryColor: effectSecondaryColor || undefined,
+          icon: effectIcon || undefined,
+          stackable: effectStackable,
+          removableBySave: effectRemovableBySave,
+          repeatSave: effectRepeatSave,
+          saveAbility: effectSaveAbility === 'Nenhum' ? null : effectSaveAbility,
+          saveOnSuccess: effectSaveOnSuccess,
+          defaultDurationValue: Math.max(0, parseInt(effectDurationValue, 10) || 0),
+          defaultDurationUnit: effectDurationUnit as any,
+          visualPriority: parseInt(effectPriority, 10) || 0,
+          rulesJson: effectRulesNote ? { mechanicalNote: effectRulesNote } : {},
+          active: true,
+          creator: 'proprio',
+        };
+        const savedEffect = editingEffectId
+          ? await updateEffect(db, editingEffectId, payload)
+          : await createEffect(db, payload);
+        await loadEffectCatalog();
+        await publishEffectCatalogPatchToActiveSessions('upsert', savedEffect);
+      }
+      else if (activeTab === 'Magia/Skill') {
         let finalCastTime = castTimeType === 'Passiva' ? 'Passiva' : `${castTimeValue} ${castTimeType}`.trim();
         const finalRange = formatStructuredRange(spellRangeMode, spellRangeValue, spellRangeUnit);
         const finalDuration = spellDurationValue ? `${spellDurationValue} ${spellDurationType}` : spellDurationType;
@@ -678,7 +839,7 @@ export default function AdvancedCreatorScreen() {
               <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA CONDICAO</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
                 <View style={{flexDirection: 'row', gap: 8}}>
-                  {CONDITION_OPTIONS.map(condition => (
+                  {conditionOptions.map(condition => (
                     <TouchableOpacity key={condition.key} style={[styles.limitBtn, itemConditionKey === condition.key && styles.limitBtnActive]} onPress={() => setItemConditionKey(condition.key)}>
                       <Text style={[styles.limitBtnText, itemConditionKey === condition.key && styles.limitBtnTextActive]}>{condition.name}</Text>
                     </TouchableOpacity>
@@ -703,6 +864,9 @@ export default function AdvancedCreatorScreen() {
               saveDc: itemSaveDc,
               saveOnSuccess: itemSaveOnSuccess,
               conditionKey: itemConditionKey,
+              conditionName: getConditionOption(itemConditionKey, conditionOptions).name,
+              conditionColor: getConditionOption(itemConditionKey, conditionOptions).color,
+              conditionSecondaryColor: (getConditionOption(itemConditionKey, conditionOptions) as any).secondaryColor,
             }]);
             setTempEffVal(''); setTempEffDuration(''); setTempEffTurns(''); setItemConditionKey('none'); setItemSaveAbility('Nenhum');
           }}>
@@ -720,7 +884,7 @@ export default function AdvancedCreatorScreen() {
               else if (eff.type === 'Escolher Atributo') displayText = `Escolher ${eff.val}${suffix}`;
               else if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) displayText = `${eff.type} ${eff.val}${suffix}`;
               else displayText = `${eff.val} ${eff.type}`;
-              const condition = getConditionOption(eff.conditionKey);
+              const condition = getConditionOption(eff.conditionKey, conditionOptions);
               if (eff.saveAbility && eff.saveAbility !== 'Nenhum') displayText += ` | Teste ${eff.saveAbility} CD ${eff.saveDc || '?'}`;
               if (condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
 
@@ -963,7 +1127,7 @@ export default function AdvancedCreatorScreen() {
               <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA CONDICAO</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
                 <View style={{flexDirection: 'row', gap: 8}}>
-                  {CONDITION_OPTIONS.map(condition => (
+                  {conditionOptions.map(condition => (
                     <TouchableOpacity key={condition.key} style={[styles.limitBtn, spellConditionKey === condition.key && styles.limitBtnActive]} onPress={() => setSpellConditionKey(condition.key)}>
                       <Text style={[styles.limitBtnText, spellConditionKey === condition.key && styles.limitBtnTextActive]}>{condition.name}</Text>
                     </TouchableOpacity>
@@ -988,6 +1152,9 @@ export default function AdvancedCreatorScreen() {
               saveDc: spellSaveDc,
               saveOnSuccess: spellSaveOnSuccess,
               conditionKey: spellConditionKey,
+              conditionName: getConditionOption(spellConditionKey, conditionOptions).name,
+              conditionColor: getConditionOption(spellConditionKey, conditionOptions).color,
+              conditionSecondaryColor: (getConditionOption(spellConditionKey, conditionOptions) as any).secondaryColor,
             }]);
             setTempSpellDice(''); setTempSpellCustomType(''); setTempSpellDmgType('Fogo'); setSpellConditionKey('none'); setSpellSaveAbility('Nenhum');
           }}>
@@ -998,7 +1165,7 @@ export default function AdvancedCreatorScreen() {
         {spellEffectsList.length > 0 && (
           <View style={{marginBottom: 20}}>
             {spellEffectsList.map((eff, i) => {
-              const condition = getConditionOption(eff.conditionKey);
+              const condition = getConditionOption(eff.conditionKey, conditionOptions);
               let displayText = eff.dice ? `${eff.dice} (${eff.type})` : `${eff.type}`;
               if (eff.saveAbility && eff.saveAbility !== 'Nenhum') displayText += ` | Teste ${eff.saveAbility}${eff.saveDc ? ` CD ${eff.saveDc}` : ''}`;
               if (condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
@@ -1367,6 +1534,139 @@ export default function AdvancedCreatorScreen() {
     </View>
   );
 
+  const renderEffectCatalogForm = () => (
+    <>
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>CHAVE DO SISTEMA</Text>
+        <TextInput
+          style={styles.input}
+          value={effectStatusKey}
+          onChangeText={(value) => setEffectStatusKey(normalizeStatusKey(value))}
+          placeholder={normalizeStatusKey(name || 'dor_de_cabeca')}
+          placeholderTextColor="#666"
+        />
+      </View>
+
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>TIPO MECANICO</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          <View style={{flexDirection: 'row', gap: 8}}>
+            {['condition', 'buff', 'debuff', 'disease', 'curse', 'custom'].map((kind) => (
+              <TouchableOpacity key={kind} style={[styles.limitBtn, effectKind === kind && styles.limitBtnActive]} onPress={() => setEffectKind(kind)}>
+                <Text style={[styles.limitBtnText, effectKind === kind && styles.limitBtnTextActive]}>{kind}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </ScrollView>
+      </View>
+
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>VISUAL</Text>
+        <View style={{flexDirection: 'row', gap: 10}}>
+          <TextInput style={[styles.input, {flex: 1}]} value={effectColor} onChangeText={setEffectColor} placeholder="#8E44AD" placeholderTextColor="#666" />
+          <TextInput style={[styles.input, {flex: 1}]} value={effectSecondaryColor} onChangeText={setEffectSecondaryColor} placeholder="#D2B4DE" placeholderTextColor="#666" />
+        </View>
+        <View style={{flexDirection: 'row', gap: 10, marginTop: 8}}>
+          <TextInput style={[styles.input, {flex: 1}]} value={effectIcon} onChangeText={setEffectIcon} placeholder="brain" placeholderTextColor="#666" />
+          <TextInput style={[styles.input, {flex: 1}]} value={effectPriority} onChangeText={(value) => setEffectPriority(value.replace(/[^0-9-]/g, ''))} keyboardType="numeric" placeholder="40" placeholderTextColor="#666" />
+        </View>
+        <View style={{height: 10}} />
+        <View style={{height: 12, borderRadius: 6, backgroundColor: effectColor || '#888', borderWidth: 1, borderColor: effectSecondaryColor || 'rgba(255,255,255,0.2)'}} />
+      </View>
+
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>DURACAO PADRAO</Text>
+        <View style={{flexDirection: 'row', gap: 10, marginBottom: 10}}>
+          <TextInput style={[styles.input, {flex: 0.35}]} value={effectDurationValue} onChangeText={(value) => setEffectDurationValue(value.replace(/[^0-9]/g, ''))} keyboardType="numeric" placeholder="1" placeholderTextColor="#666" />
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: 1}}>
+            <View style={{flexDirection: 'row', gap: 8}}>
+              {['turn', 'minute', 'hour', 'day', 'rest', 'while_equipped', 'until_save', 'permanent', 'manual'].map((unit) => (
+                <TouchableOpacity key={unit} style={[styles.limitBtn, effectDurationUnit === unit && styles.limitBtnActive]} onPress={() => setEffectDurationUnit(unit)}>
+                  <Text style={[styles.limitBtnText, effectDurationUnit === unit && styles.limitBtnTextActive]}>{unit}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+        </View>
+      </View>
+
+      <View style={styles.effectBuilder}>
+        <View style={styles.ruleRow}>
+          <View style={styles.ruleTextBox}>
+            <Text style={styles.ruleTitle}>Pode empilhar</Text>
+            <Text style={styles.ruleDescription}>Permite mais de uma instancia do mesmo status no alvo.</Text>
+          </View>
+          <Switch value={effectStackable} onValueChange={setEffectStackable} />
+        </View>
+        <View style={styles.ruleRow}>
+          <View style={styles.ruleTextBox}>
+            <Text style={styles.ruleTitle}>Remove por teste</Text>
+            <Text style={styles.ruleDescription}>Cria saves pendentes durante a passagem de turno.</Text>
+          </View>
+          <Switch value={effectRemovableBySave} onValueChange={setEffectRemovableBySave} />
+        </View>
+
+        {effectRemovableBySave && (
+          <>
+            <Text style={styles.label}>TESTE PADRAO</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 10}}>
+              <View style={{flexDirection: 'row', gap: 8}}>
+                {SAVE_CHOICES.map((save) => (
+                  <TouchableOpacity key={save} style={[styles.limitBtn, effectSaveAbility === save && styles.limitBtnActive]} onPress={() => setEffectSaveAbility(save)}>
+                    <Text style={[styles.limitBtnText, effectSaveAbility === save && styles.limitBtnTextActive]}>{save}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </ScrollView>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 10}}>
+              <View style={{flexDirection: 'row', gap: 8}}>
+                {['none', 'start_of_turn', 'end_of_turn', 'action', 'manual'].map((repeat) => (
+                  <TouchableOpacity key={repeat} style={[styles.limitBtn, effectRepeatSave === repeat && styles.limitBtnActive]} onPress={() => setEffectRepeatSave(repeat)}>
+                    <Text style={[styles.limitBtnText, effectRepeatSave === repeat && styles.limitBtnTextActive]}>{repeat}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </ScrollView>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={{flexDirection: 'row', gap: 8}}>
+                {['remove', 'reduce_duration', 'ignore', 'half_damage', 'negates'].map((result) => (
+                  <TouchableOpacity key={result} style={[styles.limitBtn, effectSaveOnSuccess === result && styles.limitBtnActive]} onPress={() => setEffectSaveOnSuccess(result)}>
+                    <Text style={[styles.limitBtnText, effectSaveOnSuccess === result && styles.limitBtnTextActive]}>{result}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </ScrollView>
+          </>
+        )}
+      </View>
+
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>DESCRICAO PUBLICA</Text>
+        <TextInput style={[styles.input, {minHeight: 80, textAlignVertical: 'top'}]} multiline value={effectDescription} onChangeText={setEffectDescription} placeholder="O personagem esta sob um efeito..." placeholderTextColor="#666" />
+      </View>
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>NOTA MECANICA</Text>
+        <TextInput style={[styles.input, {minHeight: 70, textAlignVertical: 'top'}]} multiline value={effectRulesNote} onChangeText={setEffectRulesNote} placeholder="Regra opcional da mesa" placeholderTextColor="#666" />
+      </View>
+
+      <View style={{marginTop: 14}}>
+        <Text style={styles.label}>CATALOGO</Text>
+        {effectCatalog.map((effect) => (
+          <View key={effect.id || effect.statusKey} style={styles.effectRow}>
+            <View style={{flex: 1}}>
+              <Text style={styles.effectText}>{effect.name} <Text style={{color: effect.color}}>{effect.statusKey}</Text></Text>
+              <Text style={styles.hpHint}>{effect.kind} - prioridade {effect.visualPriority} {effect.active ? '' : '- inativo'}</Text>
+            </View>
+            <TouchableOpacity onPress={() => startEditEffect(effect)}><Ionicons name="create-outline" size={19} color="#00bfff" /></TouchableOpacity>
+            <TouchableOpacity onPress={() => handleDuplicateEffect(effect)}><Ionicons name="copy-outline" size={19} color="#00fa9a" /></TouchableOpacity>
+            <TouchableOpacity onPress={() => handleDisableEffect(effect)}><Ionicons name="pause-circle-outline" size={19} color="#ffd166" /></TouchableOpacity>
+            <TouchableOpacity onPress={() => handleDeleteEffect(effect)}><Ionicons name="trash" size={19} color="#ff6666" /></TouchableOpacity>
+          </View>
+        ))}
+      </View>
+    </>
+  );
+
   return (
     <LinearGradient colors={appGradients.main} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
@@ -1432,6 +1732,7 @@ export default function AdvancedCreatorScreen() {
                 {activeTab === 'Subclasse' && renderSubclassForm()}
                 {activeTab === 'Magia/Skill' && renderSpellForm()}
                 {activeTab === 'Kit' && renderKitForm()}
+                {activeTab === 'Condicoes/Efeitos' && renderEffectCatalogForm()}
               </View>
               <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
                 <Ionicons name="save-outline" size={20} color="#02112b" />
@@ -1480,8 +1781,9 @@ function formatStructuredRange(mode: string, value: string, unit: string) {
   return `${mode} ${amount}${unit || 'm'}`;
 }
 
-function getConditionOption(key?: string) {
-  return CONDITION_OPTIONS.find((condition) => condition.key === key) || CONDITION_OPTIONS[0];
+function getConditionOption(key?: string, options = CONDITION_OPTIONS) {
+  if (!key || key === 'none') return options[0] || CONDITION_OPTIONS[0];
+  return options.find((condition) => condition.key === key) || CONDITION_OPTIONS.find((condition) => condition.key === key) || { key, name: key, color: '' };
 }
 
 function buildSavePayload(ability?: string, dc?: string, onSuccess?: string) {
@@ -1495,14 +1797,16 @@ function buildSavePayload(ability?: string, dc?: string, onSuccess?: string) {
   };
 }
 
-function buildConditionPayload(conditionKey: string | undefined, hasSave: boolean, durationValue?: number | null, durationUnit?: string | null) {
-  const condition = getConditionOption(conditionKey);
+function buildConditionPayload(effect: any, hasSave: boolean, durationValue?: number | null, durationUnit?: string | null) {
+  const condition = getConditionOption(effect.conditionKey);
   if (!condition || condition.key === 'none') return undefined;
   return {
     key: condition.key,
-    name: condition.name,
+    statusKey: condition.key,
+    name: effect.conditionName || condition.name,
     applyOn: hasSave ? 'failed_save' : 'always',
-    color: condition.color,
+    color: effect.conditionColor || condition.color,
+    secondaryColor: effect.conditionSecondaryColor,
     duration: {
       value: durationValue || 1,
       unit: durationUnit || 'turn',
@@ -1514,7 +1818,7 @@ function buildConditionPayload(conditionKey: string | undefined, hasSave: boolea
 
 function toStructuredSpellEffect(effect: any, durationText: string, durationMeta: { value: number | null; unit: string | null }) {
   const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
-  const condition = buildConditionPayload(effect.conditionKey, Boolean(save), durationMeta.value, durationMeta.unit);
+  const condition = buildConditionPayload(effect, Boolean(save), durationMeta.value, durationMeta.unit);
   const isHeal = effect.type === 'Cura';
   const isCustom = effect.type === 'Outro' || (!isHeal && !SPELL_DAMAGE_TYPES.includes(effect.type));
 
@@ -1540,7 +1844,7 @@ function toStructuredItemEffect(effect: any) {
   const isTempHp = effect.type === 'PV_TEMP';
   const isDamage = !isStat && !isTempHp && effect.type !== 'Cura' && effect.type !== 'Outro' && effect.type !== 'Escolher Atributo';
   const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
-  const condition = buildConditionPayload(effect.conditionKey, Boolean(save), durationValue, durationValue ? 'turn' : null);
+  const condition = buildConditionPayload(effect, Boolean(save), durationValue, durationValue ? 'turn' : null);
 
   return {
     type: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',

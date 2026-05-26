@@ -1,22 +1,38 @@
-import { NativeModules, Platform } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { SQLiteDatabase } from 'expo-sqlite';
+import { DeviceEventEmitter, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 
 import {
+  applyEffectToPlayer,
+  ensureEffectSchema,
+  listEffects,
+  removeEffectFromPlayer,
+  tickTurnEffects,
+  type LanEffectPatch,
+  type LanPendingSave,
+} from './effects';
+import {
   fetchLanTcpPayload,
-  LAN_TCP_PORT,
   getLanTcpClientEvents,
   getLanTcpHostEvents,
   getLanTcpHostJoinedRows,
   isTcpLanUrl,
+  LAN_TCP_PORT,
+  resetLanTcpClient,
   resolveLanTcpUrlByInviteCode,
   sendLanTcpEvent,
   sendLanTcpJoin,
   startLanTcpHost,
   stopLanTcpHost,
+  subscribeLanTcpClientUpdates,
+  subscribeLanTcpHostUpdates,
   updateLanTcpHostPayload,
 } from './lanTcpTransport';
 
 const LAN_START_TIMEOUT_MS = 4500;
+const LAN_CLIENT_ID_KEY = 'ficha_dnd_lan_client_id';
+const LAN_FOREGROUND_STOP_EVENT = 'LanSessionForegroundStop';
+const POST_NOTIFICATIONS_PERMISSION = 'android.permission.POST_NOTIFICATIONS' as Parameters<typeof PermissionsAndroid.check>[0];
 
 const CUSTOM_TABLES = [
   'items',
@@ -43,7 +59,22 @@ export type SelectableCustomTable = (typeof SELECTABLE_CUSTOM_TABLES)[number];
 export type CatalogSelection = Partial<Record<SelectableCustomTable, number[]>>;
 
 export type LanSessionStatus = 'active' | 'paused' | 'ended';
-export type LanEffectUnit = 'turn' | 'minute' | 'hour' | 'rest';
+export type LanEffectUnit =
+  | 'instant'
+  | 'turn'
+  | 'round'
+  | 'minute'
+  | 'hour'
+  | 'day'
+  | 'short_rest'
+  | 'long_rest'
+  | 'rest'
+  | 'concentration'
+  | 'while_equipped'
+  | 'while_active'
+  | 'until_save'
+  | 'permanent'
+  | 'manual';
 export type LanAdvanceUnit = 'turn' | 'minute' | 'hour' | 'shortRest' | 'longRest';
 export type LanEffectTarget = 'FOR' | 'DES' | 'CON' | 'INT' | 'SAB' | 'CAR' | 'CA' | 'HP' | 'PV_TEMP' | 'custom';
 export type LanEffectKind = 'stat' | 'hp' | 'temp_hp' | 'status' | 'custom';
@@ -68,15 +99,28 @@ export type LanSessionEffect = {
   mode?: 'add' | 'set';
   durationText?: string;
   status?: string;
+  statusKey?: string;
   source?: string;
+  sourceType?: string;
+  sourceId?: string;
   color?: string;
   secondaryColor?: string;
+  icon?: string;
+  visibleToPlayer?: boolean;
+  publicNote?: string;
+  privateNote?: string;
+  saveDc?: number | null;
+  saveAbility?: string | null;
+  repeatSave?: string | null;
+  removableBySave?: boolean;
+  visualPriority?: number;
 };
 
 export type LanSessionPlayerState = {
   id: number;
   sessionId: string;
   remoteKey?: string;
+  clientId?: string;
   playerName: string;
   characterId?: number | null;
   sourceCharacterId?: number | null;
@@ -94,6 +138,7 @@ export type LanSessionPlayerState = {
   stats: Record<string, unknown>;
   equipment: Record<string, unknown>;
   effects: LanSessionEffect[];
+  characterSnapshot?: Record<string, unknown>;
   pendingCharacter?: Record<string, unknown> | null;
   pendingDiff?: string[];
 };
@@ -111,6 +156,7 @@ export type LanSessionPayload = {
   createdAt: string;
   session: LanSessionRules;
   catalog: Record<CustomTable, Record<string, unknown>[]>;
+  effectCatalog?: Record<string, unknown>[];
   selectedCatalog?: CatalogSelection;
   state?: LanSessionState;
   events?: LanSessionEvent[];
@@ -152,7 +198,7 @@ export type LanTradeItem = {
 };
 
 export type LanResourceRequest = {
-  kind: 'xp' | 'hp' | 'stat' | 'inventory';
+  kind: 'xp' | 'hp' | 'temp_hp' | 'coin' | 'stat' | 'buff' | 'condition' | 'inventory';
   action?: 'add' | 'remove' | 'heal' | 'damage' | 'set' | 'temp';
   amount?: number;
   field?: string;
@@ -181,6 +227,8 @@ export type LanSessionEventType =
   | 'player_patch'
   | 'inventory_patch'
   | 'effect_patch'
+  | 'effect_catalog_patch'
+  | 'pending_save_patch'
   | 'session_patch'
   | 'timeline_event';
 
@@ -206,15 +254,31 @@ export type LanSessionEvent = {
   spellEffect?: {
     spellName: string;
     mode: LanSpellEventMode;
+    effectMode?: 'add' | 'set';
     amount?: number;
     target?: LanEffectTarget;
     value?: number;
     durationText?: string;
     durationRemaining?: number;
     durationUnit?: LanEffectUnit;
+    status?: string;
+    color?: string;
+    secondaryColor?: string;
     description?: string;
   };
   expiredEffect?: LanSessionEffect;
+  effectPatch?: LanEffectPatch;
+  effectCatalogPatch?: {
+    action: 'upsert' | 'disable' | 'delete';
+    effect?: Record<string, unknown>;
+    statusKey?: string;
+  };
+  pendingSavePatch?: {
+    action: 'create' | 'resolve';
+    save?: LanPendingSave;
+    id?: string;
+    result?: Record<string, unknown>;
+  };
   resourceRequest?: LanResourceRequest;
   inventoryPatch?: {
     equipment: Record<string, unknown>;
@@ -243,6 +307,10 @@ type LanNativeModule = {
   updatePayload: (payload: string) => Promise<boolean>;
   getJoinedPlayers: () => Promise<string[]>;
   getSessionEvents: () => Promise<string[]>;
+  startForegroundSession?: (sessionName: string, inviteCode: string, joinUrl: string, playerCount: number) => Promise<boolean>;
+  updateForegroundSession?: (sessionName: string, inviteCode: string, joinUrl: string, playerCount: number) => Promise<boolean>;
+  stopForegroundSession?: () => Promise<boolean>;
+  consumeForegroundStopRequest?: () => Promise<boolean>;
 };
 
 const lanNative = NativeModules.LanSessionModule as LanNativeModule | undefined;
@@ -368,6 +436,7 @@ export async function buildLanSessionPayload(
   }
 
   await appendRelatedSpellProgressions(db, catalog);
+  const effectCatalog = await listEffects(db);
 
   return {
     type: 'ficha-dnd-lan-session',
@@ -375,6 +444,26 @@ export async function buildLanSessionPayload(
     createdAt: new Date().toISOString(),
     session,
     catalog,
+    effectCatalog: effectCatalog.map((effect) => ({
+      statusKey: effect.statusKey,
+      name: effect.name,
+      kind: effect.kind,
+      category: effect.category,
+      description: effect.description,
+      color: effect.color,
+      secondaryColor: effect.secondaryColor,
+      icon: effect.icon,
+      stackable: effect.stackable,
+      removableBySave: effect.removableBySave,
+      repeatSave: effect.repeatSave,
+      saveAbility: effect.saveAbility,
+      saveOnSuccess: effect.saveOnSuccess,
+      defaultDurationValue: effect.defaultDurationValue,
+      defaultDurationUnit: effect.defaultDurationUnit,
+      visualPriority: effect.visualPriority,
+      rulesJson: effect.rulesJson,
+      active: effect.active,
+    })),
     selectedCatalog: normalizedSelection,
     state: {
       status: 'active',
@@ -386,12 +475,29 @@ export async function buildLanSessionPayload(
   };
 }
 
-export async function saveLanSession(db: SQLiteDatabase, payload: LanSessionPayload, joinUrl?: string, options?: { isMaster?: boolean }) {
+export async function saveLanSession(
+  db: SQLiteDatabase,
+  payload: LanSessionPayload,
+  joinUrl?: string,
+  options?: { isMaster?: boolean }
+) {
   await ensureLanSchema(db);
-  const state = payload.state || { status: 'active' as const, currentTurn: 1, elapsedMinutes: 0, players: [] };
+
+  const state = payload.state || {
+    status: 'active' as const,
+    currentTurn: 1,
+    elapsedMinutes: 0,
+    players: [],
+  };
+
   const selectedCatalog = normalizeCatalogSelection(payload.selectedCatalog);
   const transport = getTransportInfoFromJoinUrl(joinUrl);
-  const isMaster = options?.isMaster ?? true;
+
+  // IMPORTANTE:
+  // Por segurança, o padrão agora é jogador.
+  // Só vira mestre quando a tela do mestre passar explicitamente { isMaster: true }.
+  const isMaster = options?.isMaster === true;
+
   const existingSession = await db.getFirstAsync<{ id: string }>(
     `SELECT id FROM lan_sessions WHERE id = ?`,
     [payload.session.id]
@@ -418,32 +524,38 @@ export async function saveLanSession(db: SQLiteDatabase, payload: LanSessionPayl
   if (existingSession) {
     await db.runAsync(
       `UPDATE lan_sessions
-       SET name = ?, master_name = ?, level = ?, allow_existing = ?, invite_code = ?,
-           join_url = ?, payload_json = ?, active = 1, status = ?, current_turn = ?,
-           elapsed_minutes = ?, selected_catalog_json = ?, transport_mode = ?,
-           host_ip = ?, host_port = ?, protocol_version = 1, is_master = ?,
+       SET name = ?,
+           master_name = ?,
+           level = ?,
+           allow_existing = ?,
+           invite_code = ?,
+           join_url = ?,
+           payload_json = ?,
+           status = ?,
+           current_turn = ?,
+           elapsed_minutes = ?,
+           selected_catalog_json = ?,
+           transport_mode = ?,
+           host_ip = ?,
+           host_port = ?,
+           is_master = ?,
+           active = CASE WHEN ? = 'ended' THEN 0 ELSE 1 END,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [...values, payload.session.id]
+      [...values, state.status, payload.session.id]
     );
-    return;
+  } else {
+    await db.runAsync(
+      `INSERT INTO lan_sessions (
+        id, name, master_name, level, allow_existing, invite_code,
+        join_url, payload_json, status, current_turn, elapsed_minutes,
+        selected_catalog_json, transport_mode, host_ip, host_port,
+        is_master, active, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'ended' THEN 0 ELSE 1 END, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [payload.session.id, ...values, state.status]
+    );
   }
-
-  await db.runAsync(
-    `INSERT INTO lan_sessions (
-      id, name, master_name, level, allow_existing, invite_code, join_url, payload_json,
-      active, status, current_turn, elapsed_minutes, current_seq, selected_catalog_json,
-      transport_mode, host_ip, host_port, protocol_version, is_master, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)`,
-    [
-      payload.session.id,
-      ...values.slice(0, 7),
-      ...values.slice(7, 10),
-      0,
-      ...values.slice(10, 15),
-    ]
-  );
 }
 
 export async function getSavedLanSessions(db: SQLiteDatabase): Promise<LanSessionSummary[]> {
@@ -480,6 +592,8 @@ export async function getSavedLanSessions(db: SQLiteDatabase): Promise<LanSessio
 
 export async function deleteLanSession(db: SQLiteDatabase, sessionId: string) {
   await ensureLanSchema(db);
+  await db.runAsync(`DELETE FROM lan_pending_saves WHERE session_id = ?`, [sessionId]);
+  await db.runAsync(`DELETE FROM lan_active_effects WHERE session_id = ?`, [sessionId]);
   await db.runAsync(`DELETE FROM lan_session_trades WHERE session_id = ?`, [sessionId]);
   await db.runAsync(`DELETE FROM lan_session_pending_requests WHERE session_id = ?`, [sessionId]);
   await db.runAsync(`DELETE FROM lan_session_events WHERE session_id = ?`, [sessionId]);
@@ -488,12 +602,32 @@ export async function deleteLanSession(db: SQLiteDatabase, sessionId: string) {
 }
 
 export async function startLanServer(payload: LanSessionPayload) {
+  await stopLanTcpHost();
+
+  let joinUrl = '';
+
   try {
-    return await withTimeout(startLanTcpHost(payload), LAN_START_TIMEOUT_MS);
-  } catch {
+    joinUrl = await withTimeout(startLanTcpHost(payload), LAN_START_TIMEOUT_MS);
+  } catch (error) {
     await stopLanTcpHost();
-    return '';
+
+    const message = error instanceof Error ? error.message : String(error);
+
+    throw new Error(
+      `[LAN TCP] Não foi possível abrir o servidor TCP na porta ${LAN_TCP_PORT}. ` +
+      `Erro original: ${message}`
+    );
   }
+
+  if (!joinUrl) {
+    throw new Error('[LAN TCP] O servidor TCP iniciou, mas nenhuma URL LAN foi gerada.');
+  }
+
+  // IMPORTANTE:
+  // Desative temporariamente o foreground service até confirmar que o TCP inicia.
+  // await startLanForegroundSession(payload, joinUrl);
+
+  return joinUrl;
 }
 
 export function isEmulatorOnlyTcpUrl(url?: string) {
@@ -516,7 +650,18 @@ export async function getNativeSessionEvents(joinUrl?: string) {
   return [];
 }
 
+export function subscribeLanSessionHostUpdates(joinUrl: string | undefined, listener: () => void) {
+  if (!isTcpLanUrl(joinUrl)) return () => {};
+  return subscribeLanTcpHostUpdates(listener);
+}
+
+export function subscribeLanSessionClientUpdates(joinUrl: string | undefined, listener: () => void) {
+  if (!isTcpLanUrl(joinUrl)) return () => {};
+  return subscribeLanTcpClientUpdates(listener);
+}
+
 export async function stopLanServer() {
+  await stopLanForegroundSession();
   await stopLanTcpHost();
   if (Platform.OS !== 'android' || !lanNative?.stopSession) return false;
   return lanNative.stopSession();
@@ -542,6 +687,73 @@ export async function fetchLanSessionEvents(joinUrl: string, sessionId?: string)
 export async function sendLanSessionEvent(joinUrl: string | undefined, event: LanSessionEvent) {
   if (isTcpLanUrl(joinUrl)) return sendLanTcpEvent(joinUrl, event);
   throw new Error('Sessao LAN sem socket TCP ativo.');
+}
+
+export async function rememberAndSendLanSessionEvent(
+  db: SQLiteDatabase,
+  joinUrl: string | undefined,
+  event: LanSessionEvent
+) {
+  await ensureLanSchema(db);
+  const existing = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM lan_session_events WHERE id = ?`,
+    [event.id]
+  );
+  if (existing) return null;
+
+  const eventWithSeq = await withLanEventSeq(db, event);
+  await db.runAsync(
+    `INSERT INTO lan_session_events (
+      id, session_id, seq, type, from_key, to_key, client_msg_id, payload_json, processed
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+    [
+      eventWithSeq.id,
+      eventWithSeq.sessionId,
+      eventWithSeq.seq ?? null,
+      eventWithSeq.type,
+      eventWithSeq.fromKey || null,
+      eventWithSeq.toKey || null,
+      eventWithSeq.clientMsgId || null,
+      JSON.stringify(eventWithSeq),
+    ]
+  );
+
+  if (joinUrl) {
+    await sendLanSessionEvent(joinUrl, eventWithSeq);
+  }
+
+  return eventWithSeq;
+}
+
+export function resetLanClientConnection() {
+  resetLanTcpClient();
+}
+
+export async function getLanClientId() {
+  let id = await AsyncStorage.getItem(LAN_CLIENT_ID_KEY);
+  if (!id) {
+    id = `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    await AsyncStorage.setItem(LAN_CLIENT_ID_KEY, id);
+  }
+  return id;
+}
+
+export async function closeAllLanSessionsBeforeCreate(db: SQLiteDatabase) {
+  await ensureLanSchema(db);
+  await db.runAsync(
+    `UPDATE lan_sessions
+     SET status = 'ended', active = 0, updated_at = CURRENT_TIMESTAMP
+     WHERE active = 1`
+  );
+  await db.runAsync(
+    `UPDATE lan_session_players
+     SET is_active = 0,
+         is_connected = 0,
+         kicked_at = COALESCE(kicked_at, CURRENT_TIMESTAMP),
+         last_seen_at = CURRENT_TIMESTAMP
+     WHERE session_id IN (SELECT id FROM lan_sessions WHERE active = 0)`
+  );
 }
 
 export async function importLanCatalog(db: SQLiteDatabase, payload: LanSessionPayload) {
@@ -741,6 +953,26 @@ export async function refreshLanSessionPayload(db: SQLiteDatabase, sessionId: st
     inviteCode: String(row.invite_code || payload.session.inviteCode),
   };
   payload.selectedCatalog = normalizeCatalogSelection(row.selected_catalog_json ? parseJsonValue(row.selected_catalog_json, {}) : payload.selectedCatalog);
+  payload.effectCatalog = (await listEffects(db)).map((effect) => ({
+    statusKey: effect.statusKey,
+    name: effect.name,
+    kind: effect.kind,
+    category: effect.category,
+    description: effect.description,
+    color: effect.color,
+    secondaryColor: effect.secondaryColor,
+    icon: effect.icon,
+    stackable: effect.stackable,
+    removableBySave: effect.removableBySave,
+    repeatSave: effect.repeatSave,
+    saveAbility: effect.saveAbility,
+    saveOnSuccess: effect.saveOnSuccess,
+    defaultDurationValue: effect.defaultDurationValue,
+    defaultDurationUnit: effect.defaultDurationUnit,
+    visualPriority: effect.visualPriority,
+    rulesJson: effect.rulesJson,
+    active: effect.active,
+  }));
   payload.state = await getLanSessionState(db, sessionId);
   payload.events = await getLanSessionEvents(db, sessionId, 50);
 
@@ -760,13 +992,34 @@ export async function syncLanSessionPayload(db: SQLiteDatabase, sessionId: strin
     await lanNative.updatePayload(JSON.stringify(payload));
   }
 
-  const row = await db.getFirstAsync<{ joinUrl?: string }>(
-    `SELECT join_url as joinUrl FROM lan_sessions WHERE id = ?`,
+  const row = await db.getFirstAsync<{ joinUrl?: string; isMaster?: number }>(
+    `SELECT join_url as joinUrl, is_master as isMaster FROM lan_sessions WHERE id = ?`,
     [sessionId]
   );
-  updateLanHostPayload(row?.joinUrl, payload);
+  updateLanHostPayload(row?.joinUrl, payload, { broadcast: true });
+  if (toNumber(row?.isMaster) === 1) {
+    await updateLanForegroundSession(payload, row?.joinUrl);
+  }
 
   return payload;
+}
+
+export function subscribeLanForegroundStop(listener: () => void) {
+  if (Platform.OS !== 'android') return () => {};
+  const subscription = DeviceEventEmitter.addListener(LAN_FOREGROUND_STOP_EVENT, listener);
+  return () => {
+    subscription.remove();
+  };
+}
+
+export async function consumeLanForegroundStopRequest() {
+  if (Platform.OS !== 'android' || !lanNative?.consumeForegroundStopRequest) return false;
+
+  try {
+    return await lanNative.consumeForegroundStopRequest();
+  } catch {
+    return false;
+  }
 }
 
 export async function rebuildLanSessionCatalog(
@@ -788,7 +1041,7 @@ export async function rebuildLanSessionCatalog(
   }, selection);
   payload.state = await getLanSessionState(db, sessionId);
 
-  await saveLanSession(db, payload, joinUrl || summary.joinUrl);
+  await saveLanSession(db, payload, joinUrl || summary.joinUrl, { isMaster: summary.isMaster });
   await syncLanSessionPayload(db, sessionId);
   return payload;
 }
@@ -833,7 +1086,7 @@ export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId:
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
     [
       sessionId,
-      makeLanCharacterKey(sessionId, { ...character, id: characterId }),
+      makeLanCharacterKey(sessionId, { ...(character || {}), id: characterId }),
       playerName || normalized.characterName,
       characterId,
       normalized.characterName,
@@ -857,9 +1110,11 @@ export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId:
 
 export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: string, character: Record<string, unknown> | null, playerName = '', options?: { reviewSnapshot?: boolean }) {
   if (!joinUrl || !character) return false;
+  const clientId = await getLanClientId();
   if (isTcpLanUrl(joinUrl)) {
     return sendLanTcpJoin(joinUrl, {
       sessionId,
+      clientId,
       playerName: playerName || character.name,
       remoteKey: makeLanCharacterKey(sessionId, character),
       character,
@@ -872,16 +1127,33 @@ export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: s
 export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entry: any) {
   await ensureLanSchema(db);
   const sessionId = String(entry?.sessionId || '');
+  const clientId = String(entry?.clientId || '');
   const character = entry?.character || {};
   if (!sessionId || !character) return null;
 
   const normalized = normalizeCharacterState(character);
   const remoteKey = String(entry.remoteKey || `${sessionId}:${entry.playerName || normalized.playerName}:${normalized.sourceCharacterId || normalized.characterName}`);
   const playerName = String(entry.playerName || normalized.playerName || normalized.characterName);
-  const existing = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT * FROM lan_session_players WHERE session_id = ? AND remote_key = ?`,
+
+  const kickedSameCharacter = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT id FROM lan_session_players
+     WHERE session_id = ? AND remote_key = ? AND kicked_at IS NOT NULL
+     LIMIT 1`,
     [sessionId, remoteKey]
   );
+  if (kickedSameCharacter) return null;
+
+  const existing = clientId
+    ? await db.getFirstAsync<Record<string, unknown>>(
+        `SELECT * FROM lan_session_players
+         WHERE session_id = ? AND client_id = ? AND COALESCE(is_active, 1) = 1 AND kicked_at IS NULL
+         LIMIT 1`,
+        [sessionId, clientId]
+      )
+    : await db.getFirstAsync<Record<string, unknown>>(
+        `SELECT * FROM lan_session_players WHERE session_id = ? AND remote_key = ? LIMIT 1`,
+        [sessionId, remoteKey]
+      );
 
   if (existing) {
     if (!toNumber(existing.is_active, 1) || existing.kicked_at) {
@@ -892,10 +1164,10 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
     if (pendingDiff.length > 0) {
       await db.runAsync(
         `UPDATE lan_session_players
-         SET player_name = ?, character_name = ?, pending_character_snapshot = ?, notes = ?,
-             is_connected = 1, last_seen_at = CURRENT_TIMESTAMP
+         SET remote_key = ?, client_id = COALESCE(?, client_id), player_name = ?, character_name = ?,
+             pending_character_snapshot = ?, notes = ?, is_connected = 1, last_seen_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
-        [playerName, normalized.characterName, JSON.stringify(character), JSON.stringify(pendingDiff), Number(existing.id)]
+        [remoteKey, clientId || null, playerName, normalized.characterName, JSON.stringify(character), JSON.stringify(pendingDiff), Number(existing.id)]
       );
       await rememberLanSessionEvent(db, {
         id: makeLanEventId(),
@@ -908,31 +1180,30 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
         message: `${normalized.characterName} voltou com alteracoes pendentes: ${pendingDiff.join('; ')}.`,
         createdAt: new Date().toISOString(),
       });
-      await syncLanSessionPayload(db, sessionId);
       return Number(existing.id);
     }
 
     await db.runAsync(
       `UPDATE lan_session_players
-       SET player_name = ?, character_name = ?, character_snapshot = ?,
+       SET remote_key = ?, client_id = COALESCE(?, client_id), player_name = ?, character_name = ?, character_snapshot = ?,
            pending_character_snapshot = NULL, notes = NULL, is_connected = 1,
            last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [playerName, normalized.characterName, JSON.stringify(character), Number(existing.id)]
+      [remoteKey, clientId || null, playerName, normalized.characterName, JSON.stringify(character), Number(existing.id)]
     );
-    await syncLanSessionPayload(db, sessionId);
     return Number(existing.id);
   }
 
   const result = await db.runAsync(
     `INSERT INTO lan_session_players (
-      session_id, remote_key, player_name, character_id, character_name, character_snapshot,
+      session_id, remote_key, client_id, player_name, character_id, character_name, character_snapshot,
       hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
     )
-    VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
+    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
     [
       sessionId,
       remoteKey,
+      clientId || null,
       playerName,
       normalized.characterName,
       JSON.stringify(character),
@@ -959,14 +1230,14 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
     message: `${normalized.characterName} entrou na sessao.`,
     createdAt: new Date().toISOString(),
   });
-  await syncLanSessionPayload(db, sessionId);
   return Number(result.lastInsertRowId);
 }
 
 export async function updateLanPlayerNumbers(
   db: SQLiteDatabase,
   playerId: number,
-  patch: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>
+  patch: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>,
+  options?: { syncPayload?: boolean }
 ) {
   await ensureLanSchema(db);
   const allowed = {
@@ -1000,7 +1271,7 @@ export async function updateLanPlayerNumbers(
     await updateLocalCharacterNumbers(db, Number(player.character_id), patch);
   }
 
-  if (player?.session_id) {
+  if (options?.syncPayload && player?.session_id) {
     await syncLanSessionPayload(db, String(player.session_id));
   }
 }
@@ -1204,17 +1475,44 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
       });
     }
 
-    if (request.kind === 'stat' && request.field) {
+    if (request.kind === 'temp_hp') {
+      await updateLanPlayerNumbers(db, playerId, {
+        tempHp: Math.max(0, toNumber(player.temp_hp) + toNumber(request.amount ?? request.value)),
+      });
+    }
+
+    if (request.kind === 'coin') {
+      const coinField = normalizeCoinField(request.field);
+      if (coinField) {
+        await updateLanPlayerNumbers(db, playerId, {
+          [coinField]: Math.max(0, toNumber(player[coinField]) + toNumber(request.amount ?? request.value)),
+        });
+      }
+    }
+
+    if ((request.kind === 'stat' || request.kind === 'buff' || request.kind === 'condition') && request.field) {
+      const target = request.kind === 'condition' ? 'custom' : normalizeEffectTarget(request.field);
       await addLanPlayerEffect(db, playerId, {
         name: request.message || `Pedido de ${request.field}`,
-        target: normalizeEffectTarget(request.field),
+        target,
         value: toNumber(request.value ?? request.amount),
         remaining: Math.max(1, toNumber(request.duration, 1)),
         unit: request.unit || 'rest',
         durationText: request.duration ? `${request.duration} ${request.unit || 'rest'}` : 'Pedido do jogador',
-        kind: request.field === 'PV_TEMP' ? 'temp_hp' : request.field === 'HP' ? 'hp' : 'stat',
+        kind: request.kind === 'condition' ? 'status' : request.field === 'PV_TEMP' ? 'temp_hp' : request.field === 'HP' ? 'hp' : 'stat',
+        status: request.kind === 'condition' ? request.field : undefined,
         source: event.fromName,
       });
+    }
+
+    if (request.kind === 'inventory' && request.item) {
+      const equipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(player.equipment_json, {}));
+      await updateLanPlayerEquipment(
+        db,
+        playerId,
+        addTradeItemToEquipment(equipment, request.item),
+        `Mestre entregou ${request.item.qty}x ${request.item.name} para ${event.fromName}.`
+      );
     }
   }
 
@@ -1302,60 +1600,45 @@ export async function addLanPlayerEffect(
   effect: Omit<LanSessionEffect, 'id'>
 ) {
   await ensureLanSchema(db);
-  const player = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT session_id, temp_hp, effects_json FROM lan_session_players WHERE id = ?`,
-    [playerId]
-  );
-  if (!player) return;
-
-  const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []);
-  const normalizedEffect: LanSessionEffect = {
-    ...effect,
-    id: `effect_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    kind: effect.kind || inferEffectKind(effect.target),
-    remaining: Math.max(1, Math.floor(effect.remaining || 1)),
-    value: Math.floor(effect.value || 0),
-  };
-  effects.push({
-    ...normalizedEffect,
+  const result = await applyEffectToPlayer(db, playerId, {
+    statusKey: effect.statusKey || effect.status,
+    name: effect.name,
+    target: effect.target,
+    value: effect.value,
+    remaining: effect.remaining,
+    unit: effect.unit,
+    mode: effect.mode,
+    kind: effect.kind,
+    durationText: effect.durationText,
+    sourceName: effect.source,
+    sourceType: effect.sourceType,
+    sourceId: effect.sourceId,
+    color: effect.color,
+    secondaryColor: effect.secondaryColor,
+    icon: effect.icon,
+    visibleToPlayer: effect.visibleToPlayer,
+    publicNote: effect.publicNote,
+    privateNote: effect.privateNote,
+    saveDc: effect.saveDc,
+    saveAbility: effect.saveAbility,
+    repeatSave: effect.repeatSave,
+    useCatalogDefaults: Boolean(effect.statusKey || effect.status),
   });
+  if (!result) return;
 
-  const nextTempHp = normalizedEffect.target === 'PV_TEMP'
-    ? Math.max(0, toNumber(player.temp_hp) + Math.max(0, normalizedEffect.value))
-    : toNumber(player.temp_hp);
-
-  await db.runAsync(
-    `UPDATE lan_session_players
-     SET effects_json = ?, temp_hp = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
-         last_seen_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
-    [JSON.stringify(effects), nextTempHp, playerId]
-  );
-  await syncLanSessionPayload(db, String(player.session_id));
+  await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.snapshot.name} aplicado em ${result.targetName}.`);
+  await syncLanSessionPayload(db, result.sessionId);
+  return result;
 }
 
 export async function removeLanPlayerEffect(db: SQLiteDatabase, playerId: number, effectId: string) {
   await ensureLanSchema(db);
-  const player = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT session_id, temp_hp, effects_json FROM lan_session_players WHERE id = ?`,
-    [playerId]
-  );
-  if (!player) return;
+  const result = await removeEffectFromPlayer(db, playerId, effectId);
+  if (!result) return;
 
-  const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []);
-  const removed = effects.find((effect) => effect.id === effectId);
-  const nextEffects = effects.filter((effect) => effect.id !== effectId);
-  const nextTempHp = removed?.target === 'PV_TEMP'
-    ? Math.max(0, toNumber((player as any).temp_hp) - Math.max(0, toNumber(removed.value)))
-    : toNumber((player as any).temp_hp);
-  await db.runAsync(
-    `UPDATE lan_session_players
-     SET effects_json = ?, temp_hp = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
-         last_seen_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
-    [JSON.stringify(nextEffects), nextTempHp, playerId]
-  );
-  await syncLanSessionPayload(db, String(player.session_id));
+  await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.removed.name} removido de ${result.targetName}.`);
+  await syncLanSessionPayload(db, result.sessionId);
+  return result;
 }
 
 export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: string, unit: LanAdvanceUnit) {
@@ -1374,55 +1657,74 @@ export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: strin
     [nextTurn, elapsedMinutes + minuteDelta, sessionId]
   );
 
-  const players = await db.getAllAsync<Record<string, unknown>>(
-    `SELECT id, remote_key, player_name, character_id, character_snapshot, hp_max, temp_hp, effects_json
-     FROM lan_session_players
-     WHERE session_id = ?`,
-    [sessionId]
-  );
+  const tickResult = await tickTurnEffects(db, sessionId, unit);
 
-  for (const player of players) {
-    const effects = parseJsonValue<LanSessionEffect[]>(player.effects_json, []);
-    const { active, expired } = tickEffects(effects, unit);
-    const nextHp = unit === 'longRest' ? toNumber(player.hp_max) : undefined;
-    const expiredTempHp = expired
-      .filter((effect) => effect.target === 'PV_TEMP')
-      .reduce((sum, effect) => sum + Math.max(0, toNumber(effect.value)), 0);
-    const nextTempHp = Math.max(0, toNumber(player.temp_hp) - expiredTempHp);
-
-    await db.runAsync(
-      `UPDATE lan_session_players
-       SET effects_json = ?, hp_current = COALESCE(?, hp_current), temp_hp = ?,
-           revision_seq = COALESCE(revision_seq, 0) + 1, last_seen_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [JSON.stringify(active), nextHp ?? null, nextTempHp, toNumber(player.id)]
+  for (const patch of tickResult.patches) {
+    const target = tickResult.expired.find((entry) => entry.targetKey === patch.targetKey)
+      || tickResult.restored.find((entry) => entry.targetKey === patch.targetKey);
+    await recordEffectPatchEvent(
+      db,
+      sessionId,
+      patch.targetKey,
+      target?.targetName || patch.targetKey,
+      patch,
+      'Efeitos atualizados pela passagem de tempo.'
     );
+  }
 
-    if (nextHp !== undefined && player.character_id) {
-      await db.runAsync(`UPDATE characters SET hp_current = ? WHERE id = ?`, [nextHp, Number(player.character_id)]);
-    }
+  for (const entry of tickResult.expired) {
+    await rememberLanSessionEvent(db, {
+      id: makeLanEventId(),
+      sessionId,
+      type: 'effect_expired',
+      fromKey: 'session',
+      fromName: 'Sessao',
+      toKey: entry.targetKey,
+      toName: entry.targetName,
+      expiredEffect: entry.effect as LanSessionEffect,
+      message: `${entry.targetName}: ${entry.effect.name} acabou.`,
+      createdAt: new Date().toISOString(),
+    });
+  }
 
-    const normalized = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(player.character_snapshot, {}));
-    const characterName = normalized.characterName;
-    const playerKey = String(player.remote_key || `${sessionId}:${player.character_id || characterName}:${characterName}`);
-
-    for (const effect of expired) {
-      await rememberLanSessionEvent(db, {
-        id: makeLanEventId(),
-        sessionId,
-        type: 'effect_expired',
-        fromKey: 'session',
-        fromName: 'Sessao',
-        toKey: playerKey,
-        toName: characterName,
-        expiredEffect: effect,
-        message: `${characterName}: ${effect.name} acabou.`,
-        createdAt: new Date().toISOString(),
-      });
-    }
+  for (const save of tickResult.pendingSaves) {
+    await rememberLanSessionEvent(db, {
+      id: makeLanEventId(),
+      sessionId,
+      type: 'pending_save_patch',
+      fromKey: 'session',
+      fromName: 'Sessao',
+      toKey: save.targetKey,
+      toName: save.targetKey,
+      pendingSavePatch: { action: 'create', save },
+      message: `Teste pendente criado para ${save.sourceName || 'efeito'}.`,
+      createdAt: new Date().toISOString(),
+    });
   }
 
   return syncLanSessionPayload(db, sessionId);
+}
+
+async function recordEffectPatchEvent(
+  db: SQLiteDatabase,
+  sessionId: string,
+  targetKey: string,
+  targetName: string,
+  patch: LanEffectPatch,
+  message: string,
+) {
+  await rememberLanSessionEvent(db, {
+    id: makeLanEventId(),
+    sessionId,
+    type: 'effect_patch',
+    fromKey: 'host',
+    fromName: 'Host',
+    toKey: targetKey,
+    toName: targetName,
+    effectPatch: patch,
+    message,
+    createdAt: new Date().toISOString(),
+  });
 }
 
 export async function applyLanSessionStateToCharacter(
@@ -1488,10 +1790,31 @@ export function formatElapsedTime(totalMinutes: number) {
 
 export function summarizeEffect(effect: LanSessionEffect) {
   const sign = effect.value > 0 ? '+' : '';
-  const unitLabel = effect.unit === 'turn' ? 'turnos' : effect.unit === 'minute' ? 'min' : effect.unit === 'hour' ? 'h' : 'descanso';
+  const unitLabel = formatEffectUnitLabel(effect.unit);
   const targetLabel = effect.target === 'PV_TEMP' ? 'PV temp.' : effect.target;
   const valueText = effect.target === 'custom' || effect.value === 0 ? '' : ` ${targetLabel} ${sign}${effect.value}`;
   return `${effect.name}:${valueText} (${effect.remaining} ${unitLabel})`;
+}
+
+function formatEffectUnitLabel(unit: LanEffectUnit) {
+  const labels: Record<LanEffectUnit, string> = {
+    instant: 'instant.',
+    turn: 'turnos',
+    round: 'rodadas',
+    minute: 'min',
+    hour: 'h',
+    day: 'dias',
+    short_rest: 'desc. curto',
+    long_rest: 'desc. longo',
+    rest: 'descanso',
+    concentration: 'conc.',
+    while_equipped: 'equipado',
+    while_active: 'ativo',
+    until_save: 'ate save',
+    permanent: 'permanente',
+    manual: 'manual',
+  };
+  return labels[unit] || 'tempo';
 }
 
 function inferEffectKind(target: LanEffectTarget): LanEffectKind {
@@ -1568,6 +1891,7 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
       id: toNumber(row.id),
       sessionId,
       remoteKey: row.remote_key ? String(row.remote_key) : undefined,
+    clientId: row.client_id ? String(row.client_id) : undefined,
       playerName: String(row.player_name || normalized.playerName),
       characterId: row.character_id == null ? null : toNumber(row.character_id),
       sourceCharacterId: normalized.sourceCharacterId,
@@ -1585,6 +1909,7 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
       stats,
       equipment,
       effects: parseJsonValue<LanSessionEffect[]>(row.effects_json, []),
+      characterSnapshot: snapshot,
       pendingCharacter,
       pendingDiff: Array.isArray(pendingDiff) ? pendingDiff : [],
     };
@@ -1592,6 +1917,7 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
 }
 
 async function ensureLanSchema(db: SQLiteDatabase) {
+  await ensureEffectSchema(db);
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS lan_sessions (
       id TEXT PRIMARY KEY,
@@ -1621,6 +1947,7 @@ async function ensureLanSchema(db: SQLiteDatabase) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
       remote_key TEXT,
+      client_id TEXT,
       player_name TEXT,
       character_id INTEGER,
       character_name TEXT,
@@ -1700,6 +2027,7 @@ async function ensureLanSchema(db: SQLiteDatabase) {
     ['lan_sessions', 'is_master', 'INTEGER NOT NULL DEFAULT 1'],
     ['lan_sessions', 'updated_at', 'DATETIME'],
     ['lan_session_players', 'remote_key', 'TEXT'],
+    ['lan_session_players', 'client_id', 'TEXT'],
     ['lan_session_players', 'character_name', 'TEXT'],
     ['lan_session_players', 'hp_current', 'INTEGER DEFAULT 0'],
     ['lan_session_players', 'hp_max', 'INTEGER DEFAULT 0'],
@@ -1903,11 +2231,19 @@ function normalizeEffectTarget(value: unknown): LanEffectTarget {
   return 'custom';
 }
 
+function normalizeCoinField(value: unknown): 'gp' | 'sp' | 'cp' | null {
+  if (value === 'gp' || value === 'sp' || value === 'cp') return value;
+  return null;
+}
+
 function describeResourceRequest(request: LanResourceRequest) {
   if (request.message) return request.message;
   if (request.kind === 'xp') return `XP ${toNumber(request.amount) >= 0 ? '+' : ''}${toNumber(request.amount)}`;
   if (request.kind === 'hp') return `HP ${toNumber(request.amount) >= 0 ? '+' : ''}${toNumber(request.amount)}`;
-  if (request.kind === 'stat') return `${request.field || 'atributo'} ${toNumber(request.value ?? request.amount) >= 0 ? '+' : ''}${toNumber(request.value ?? request.amount)}`;
+  if (request.kind === 'temp_hp') return `PV temporario ${toNumber(request.amount ?? request.value) >= 0 ? '+' : ''}${toNumber(request.amount ?? request.value)}`;
+  if (request.kind === 'coin') return `${request.field || 'moedas'} ${toNumber(request.amount ?? request.value) >= 0 ? '+' : ''}${toNumber(request.amount ?? request.value)}`;
+  if (request.kind === 'stat' || request.kind === 'buff') return `${request.field || 'atributo'} ${toNumber(request.value ?? request.amount) >= 0 ? '+' : ''}${toNumber(request.value ?? request.amount)}`;
+  if (request.kind === 'condition') return `condicao ${request.field || 'manual'}`;
   if (request.kind === 'inventory') return request.item ? `${request.item.qty}x ${request.item.name}` : 'inventario';
   return 'pedido';
 }
@@ -2082,8 +2418,70 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-function updateLanHostPayload(joinUrl: string | undefined, payload: LanSessionPayload) {
-  if (isTcpLanUrl(joinUrl)) updateLanTcpHostPayload(payload);
+function updateLanHostPayload(joinUrl: string | undefined, payload: LanSessionPayload, options?: { broadcast?: boolean }) {
+  if (isTcpLanUrl(joinUrl)) updateLanTcpHostPayload(payload, options);
+}
+
+async function startLanForegroundSession(payload: LanSessionPayload, joinUrl: string | undefined) {
+  if (!canUseLanForegroundService(joinUrl) || !lanNative?.startForegroundSession) return;
+
+  try {
+    await requestLanNotificationPermission();
+    const info = getLanForegroundInfo(payload, joinUrl || '');
+    await lanNative.startForegroundSession(info.sessionName, info.inviteCode, info.joinUrl, info.playerCount);
+  } catch (error) {
+    console.warn('[LAN] Nao foi possivel iniciar notificacao foreground da mesa:', error);
+  }
+}
+
+async function updateLanForegroundSession(payload: LanSessionPayload, joinUrl: string | undefined) {
+  if (!canUseLanForegroundService(joinUrl) || !lanNative?.updateForegroundSession) return;
+
+  try {
+    const info = getLanForegroundInfo(payload, joinUrl || '');
+    await lanNative.updateForegroundSession(info.sessionName, info.inviteCode, info.joinUrl, info.playerCount);
+  } catch (error) {
+    console.warn('[LAN] Nao foi possivel atualizar notificacao foreground da mesa:', error);
+  }
+}
+
+async function stopLanForegroundSession() {
+  if (Platform.OS !== 'android' || !lanNative?.stopForegroundSession) return false;
+
+  try {
+    return await lanNative.stopForegroundSession();
+  } catch {
+    return false;
+  }
+}
+
+async function requestLanNotificationPermission() {
+  if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return true;
+
+  const alreadyGranted = await PermissionsAndroid.check(POST_NOTIFICATIONS_PERMISSION);
+  if (alreadyGranted) return true;
+
+  const result = await PermissionsAndroid.request(POST_NOTIFICATIONS_PERMISSION, {
+    title: 'Notificacao da mesa LAN',
+    message: 'Permita a notificacao persistente para manter a sessao do mestre visivel em segundo plano.',
+    buttonPositive: 'Permitir',
+    buttonNegative: 'Agora nao',
+  });
+
+  return result === PermissionsAndroid.RESULTS.GRANTED;
+}
+
+function canUseLanForegroundService(joinUrl: string | undefined) {
+  return Platform.OS === 'android' && isTcpLanUrl(joinUrl);
+}
+
+function getLanForegroundInfo(payload: LanSessionPayload, joinUrl: string) {
+  return {
+    sessionName: payload.session.name || 'Mesa LAN',
+    inviteCode: payload.session.inviteCode || '',
+    joinUrl,
+    playerCount: payload.state?.players?.length || 0,
+  };
 }
 
 function toNumber(value: unknown, fallback = 0) {

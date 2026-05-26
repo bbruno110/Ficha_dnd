@@ -1,5 +1,7 @@
 import { SQLiteDatabase } from 'expo-sqlite';
 
+import { ensureEffectSchema } from '../services/effects/effectSchema';
+
 type ColumnDefinition = [table: string, column: string, definition: string];
 
 type LanEffectCatalogSeed = {
@@ -68,6 +70,7 @@ export async function migrateDatabaseV2(db: SQLiteDatabase) {
   ]);
 
   await createLanEffectCatalog(db);
+  await ensureEffectSchema(db);
   await addColumnsIfMissing(db, [
     ['lan_effect_catalog', 'status_key', 'TEXT'],
     ['lan_effect_catalog', 'color', 'TEXT'],
@@ -486,6 +489,76 @@ export async function seedImprovedLanEffectCatalog(db: SQLiteDatabase) {
       repeatSave: 'on_damage',
       visualPriority: 82,
       rulesJson: '{"unconscious":true,"wakeOnDamage":true}',
+    },
+    {
+      name: 'Confuso',
+      statusKey: 'confused',
+      durationUnit: 'minute',
+      description: 'Age de forma imprevisivel conforme decisao do mestre.',
+      color: '#06B6D4',
+      secondaryColor: '#A5F3FC',
+      icon: 'shuffle',
+      removableBySave: 1,
+      repeatSave: 'end_of_turn',
+      saveAbility: 'SAB',
+      saveOnSuccess: 'negates',
+      visualPriority: 64,
+      rulesJson: '{"control":"master_table"}',
+    },
+    {
+      name: 'Fraqueza',
+      statusKey: 'weakness',
+      durationUnit: 'hour',
+      description: 'Penalidade fisica temporaria definida pela mesa.',
+      color: '#A16207',
+      secondaryColor: '#FEF08A',
+      icon: 'battery-low',
+      removableBySave: 1,
+      repeatSave: 'end_of_turn',
+      saveAbility: 'CON',
+      saveOnSuccess: 'negates',
+      visualPriority: 50,
+      rulesJson: '{"suggestedPenalty":"FOR or damage reduction"}',
+    },
+    {
+      name: 'Embriaguez',
+      statusKey: 'drunk',
+      durationUnit: 'hour',
+      description: 'Coordenacao e julgamento prejudicados.',
+      color: '#BE123C',
+      secondaryColor: '#FDA4AF',
+      icon: 'wine',
+      repeatSave: 'none',
+      visualPriority: 38,
+      rulesJson: '{"suggestedPenalty":"DES checks disadvantage"}',
+    },
+    {
+      name: 'Sangramento',
+      statusKey: 'bleeding',
+      durationUnit: 'turn',
+      description: 'Perde sangue e pode sofrer dano recorrente.',
+      color: '#DC2626',
+      secondaryColor: '#7F1D1D',
+      icon: 'droplet',
+      stackable: 1,
+      removableBySave: 1,
+      repeatSave: 'end_of_turn',
+      saveAbility: 'CON',
+      saveOnSuccess: 'remove',
+      visualPriority: 86,
+      rulesJson: '{"tickDamage":"1d4","tickTiming":"end_of_turn"}',
+    },
+    {
+      name: 'Dor de Cabeca',
+      statusKey: 'dor_de_cabeca',
+      durationUnit: 'hour',
+      description: 'O personagem esta com forte dor de cabeca.',
+      color: '#8E44AD',
+      secondaryColor: '#D2B4DE',
+      icon: 'brain',
+      repeatSave: 'none',
+      visualPriority: 40,
+      rulesJson: '{"mechanicalNote":"Pode impor desvantagem em concentracao, se o mestre desejar."}',
     },
   ];
 

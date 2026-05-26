@@ -1,14 +1,9 @@
 import * as Network from 'expo-network';
-import { NativeModules, Platform } from 'react-native';
+import { NativeModules } from 'react-native';
 
 import type { LanSessionEvent, LanSessionPayload } from './lanSession';
 
 export const LAN_TCP_PORT = 43115;
-
-type TcpSocketModule = {
-  createServer: (listener: (socket: TcpSocket) => void) => TcpServer;
-  createConnection: (options: Record<string, unknown>, callback: () => void) => TcpSocket;
-};
 
 type TcpServer = {
   listen: (options: Record<string, unknown>, callback?: () => void) => TcpServer;
@@ -30,7 +25,8 @@ type TcpEnvelope =
   | { type: 'session_snapshot'; payload: LanSessionPayload }
   | { type: 'join'; entry: Record<string, unknown> }
   | { type: 'event'; event: LanSessionEvent }
-  | { type: 'payload_update'; payload: LanSessionPayload };
+  | { type: 'payload_update'; payload: LanSessionPayload }
+  | { type: 'session_rejected'; reason: string; currentSessionId?: string };
 
 let tcpModule: TcpSocketModule | null | undefined;
 let hostServer: TcpServer | null = null;
@@ -39,12 +35,14 @@ let hostUrl = '';
 let hostSockets = new Set<TcpSocket>();
 let hostJoinedRows: Record<string, unknown>[] = [];
 let hostEvents: LanSessionEvent[] = [];
+let hostUpdateListeners = new Set<() => void>();
 
 let clientSocket: TcpSocket | null = null;
 let clientUrl = '';
 let clientPayload: LanSessionPayload | null = null;
 let clientEvents: LanSessionEvent[] = [];
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
+let clientUpdateListeners = new Set<() => void>();
 
 export function isTcpLanUrl(url?: string) {
   return /^tcp:\/\//i.test(String(url || '').trim());
@@ -62,21 +60,45 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
   const server = TcpSocket.createServer((socket) => {
     configureSocket(socket);
     hostSockets.add(socket);
-    sendEnvelope(socket, { type: 'session_snapshot', payload: makeHostPayload() });
 
     createLineReader(socket, (message) => {
       if (message.type === 'hello') {
+        if (!isEnvelopeForCurrentSession(message.sessionId)) {
+          sendEnvelope(socket, {
+            type: 'session_rejected',
+            reason: 'SESSION_ID_MISMATCH',
+            currentSessionId: hostPayload?.session.id,
+          });
+          socket.destroy();
+          return;
+        }
+
         sendEnvelope(socket, { type: 'session_snapshot', payload: makeHostPayload() });
+        return;
       }
 
       if (message.type === 'join') {
-        upsertByKey(hostJoinedRows, message.entry, 'remoteKey');
-        broadcastHostPayload();
+        const entrySessionId = String(message.entry?.sessionId || '');
+        if (!isEnvelopeForCurrentSession(entrySessionId)) {
+          sendEnvelope(socket, {
+            type: 'session_rejected',
+            reason: 'JOIN_SESSION_ID_MISMATCH',
+            currentSessionId: hostPayload?.session.id,
+          });
+          socket.destroy();
+          return;
+        }
+
+        upsertByKey(hostJoinedRows, message.entry, String(message.entry?.clientId || '') ? 'clientId' : 'remoteKey');
+        notifyHostUpdates();
+        return;
       }
 
       if (message.type === 'event') {
+        if (!isEnvelopeForCurrentSession(message.event?.sessionId)) return;
         upsertByKey(hostEvents, message.event, 'id');
         broadcastEnvelope({ type: 'event', event: message.event });
+        notifyHostUpdates();
       }
     });
 
@@ -138,10 +160,13 @@ export async function stopLanTcpHost() {
   hostEvents = [];
 }
 
-export function updateLanTcpHostPayload(payload: LanSessionPayload) {
+export function updateLanTcpHostPayload(payload: LanSessionPayload, options?: { broadcast?: boolean }) {
   if (!hostServer || hostPayload?.session.id !== payload.session.id) return false;
   hostPayload = payload;
-  broadcastHostPayload();
+  if (options?.broadcast !== false) {
+    broadcastHostPayload();
+  }
+  notifyHostUpdates();
   return true;
 }
 
@@ -167,23 +192,23 @@ export async function resolveLanTcpUrlByInviteCode(inviteCode: string) {
   if (parts.length !== 4) return '';
 
   const subnet = parts.slice(0, 3).join('.');
+  const emulatorHosts = /^10\.0\.[23]\.\d+$/.test(localIp) ? ['10.0.2.2', '10.0.3.2'] : [];
   const hosts = Array.from(new Set([
-    '10.0.2.2',
-    '10.0.3.2',
+    ...emulatorHosts,
     localIp,
     ...Array.from({ length: 254 }, (_, index) => `${subnet}.${index + 1}`),
   ].filter((host) => host && host !== '0.0.0.0' && host !== '127.0.0.1')));
 
   let nextIndex = 0;
   let foundUrl = '';
-  const workerCount = Math.min(32, hosts.length);
+  const workerCount = Math.min(8, hosts.length);
 
   const scanNext = async () => {
     while (!foundUrl && nextIndex < hosts.length) {
       const host = hosts[nextIndex];
       nextIndex += 1;
 
-      const payload = await fetchLanTcpProbePayload(host, 420);
+      const payload = await fetchLanTcpProbePayload(host, 300);
       if (payload?.session?.inviteCode?.toUpperCase() === normalizedCode) {
         foundUrl = `tcp://${host}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
         return;
@@ -199,8 +224,10 @@ export async function sendLanTcpJoin(url: string | undefined, entry: Record<stri
   if (!url) return false;
   await connectLanTcpClient(url);
   if (!clientSocket) return false;
-  sendEnvelope(clientSocket, { type: 'join', entry });
-  return true;
+  if (sendEnvelope(clientSocket, { type: 'join', entry })) return true;
+
+  await connectLanTcpClient(url);
+  return Boolean(clientSocket && sendEnvelope(clientSocket, { type: 'join', entry }));
 }
 
 export async function sendLanTcpEvent(url: string | undefined, event: LanSessionEvent) {
@@ -208,11 +235,17 @@ export async function sendLanTcpEvent(url: string | undefined, event: LanSession
   if (isCurrentHostUrl(url)) {
     upsertByKey(hostEvents, event, 'id');
     broadcastEnvelope({ type: 'event', event });
+    notifyHostUpdates();
     return;
   }
   await connectLanTcpClient(url);
   if (!clientSocket) throw new Error('Socket TCP indisponivel.');
-  sendEnvelope(clientSocket, { type: 'event', event });
+  if (sendEnvelope(clientSocket, { type: 'event', event })) return;
+
+  await connectLanTcpClient(url);
+  if (!clientSocket || !sendEnvelope(clientSocket, { type: 'event', event })) {
+    throw new Error('Socket TCP indisponivel.');
+  }
 }
 
 export async function getLanTcpClientEvents(url: string, sessionId?: string) {
@@ -247,10 +280,12 @@ async function connectLanTcpClient(url: string) {
   const target = parseTcpUrl(url);
 
   clientConnectPromise = new Promise<LanSessionPayload>((resolve, reject) => {
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+
     const socket = TcpSocket.createConnection({
       host: target.host,
       port: target.port,
-      interface: Platform.OS === 'android' ? 'wifi' : undefined,
       reuseAddress: true,
       connectTimeout: 5000,
     }, () => {
@@ -258,29 +293,116 @@ async function connectLanTcpClient(url: string) {
       sendEnvelope(socket, { type: 'hello', sessionId: target.sessionId });
     });
 
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error('Tempo esgotado ao conectar no host TCP.'));
+    const cleanupClientSocket = (resetUrl = false) => {
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+
+      try {
+        socket.destroy();
+      } catch {
+        // socket ja fechado
+      }
+
+      if (clientSocket === socket) {
+        clientSocket = null;
+      }
+
+      clientPayload = null;
+      clientEvents = [];
+
+      if (resetUrl) {
+        clientUrl = '';
+      }
+    };
+
+    const applyPayloadUpdate = (payload: LanSessionPayload) => {
+      if (target.sessionId && payload.session.id !== target.sessionId) return false;
+      clientPayload = payload;
+      clientSocket = socket;
+      mergeClientPayloadEvents(payload, target.sessionId);
+      notifyClientUpdates();
+      return true;
+    };
+
+    const rejectOnce = (error: Error, resetUrl = true) => {
+      if (settled) return;
+      settled = true;
+      cleanupClientSocket(resetUrl);
+      reject(error);
+    };
+
+    const resolveOnce = (payload: LanSessionPayload) => {
+      if (settled) return;
+      if (target.sessionId && payload.session.id !== target.sessionId) {
+        rejectOnce(new Error('Sessao rejeitada pelo host: SESSION_ID_MISMATCH'));
+        return;
+      }
+
+      settled = true;
+
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+
+      applyPayloadUpdate(payload);
+      resolve(payload);
+    };
+
+    timeout = setTimeout(() => {
+      rejectOnce(new Error('Tempo esgotado ao conectar no host TCP.'));
     }, 6500);
 
     socket.on('error', (error) => {
-      clearTimeout(timeout);
-      reject(error instanceof Error ? error : new Error(String(error)));
+      if (!settled) {
+        rejectOnce(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+
+      if (clientSocket === socket) {
+        clientSocket = null;
+        notifyClientUpdates();
+      }
+
+      try {
+        socket.destroy();
+      } catch {
+        // Socket already closed.
+      }
     });
+
     socket.on('close', () => {
-      if (clientSocket === socket) clientSocket = null;
+      if (clientSocket === socket) {
+        clientSocket = null;
+        notifyClientUpdates();
+      }
+
+      if (!settled) {
+        rejectOnce(new Error('Conexao TCP fechada antes de receber a sessao.'));
+      }
     });
 
     createLineReader(socket, (message) => {
+      if (message.type === 'session_rejected') {
+        rejectOnce(new Error(`Sessao rejeitada pelo host: ${message.reason}`));
+        return;
+      }
+
       if (message.type === 'session_snapshot' || message.type === 'payload_update') {
-        clientPayload = message.payload;
-        clientSocket = socket;
-        clearTimeout(timeout);
-        resolve(message.payload);
+        if (!settled) {
+          resolveOnce(message.payload);
+        } else {
+          applyPayloadUpdate(message.payload);
+        }
+        return;
       }
 
       if (message.type === 'event') {
+        if (target.sessionId && message.event.sessionId !== target.sessionId) return;
         upsertByKey(clientEvents, message.event, 'id');
+        notifyClientUpdates();
       }
     });
   }).finally(() => {
@@ -338,7 +460,6 @@ function fetchLanTcpProbePayload(host: string, timeoutMs: number) {
       socket = TcpSocket.createConnection({
         host,
         port: LAN_TCP_PORT,
-        interface: Platform.OS === 'android' ? 'wifi' : undefined,
         reuseAddress: true,
         connectTimeout: timeoutMs,
       }, () => {
@@ -355,6 +476,9 @@ function fetchLanTcpProbePayload(host: string, timeoutMs: number) {
         if (message.type === 'session_snapshot' || message.type === 'payload_update') {
           finish(message.payload);
         }
+        if (message.type === 'session_rejected') {
+          finish(null);
+        }
       });
     } catch {
       finish(null);
@@ -367,8 +491,34 @@ function makeHostPayload() {
   return {
     ...hostPayload,
     state: hostPayload.state,
-    events: hostEvents.slice(-50),
+    events: mergeRecentEvents(hostPayload.events || [], hostEvents),
   };
+}
+
+export function subscribeLanTcpHostUpdates(listener: () => void) {
+  hostUpdateListeners.add(listener);
+  return () => {
+    hostUpdateListeners.delete(listener);
+  };
+}
+
+export function subscribeLanTcpClientUpdates(listener: () => void) {
+  clientUpdateListeners.add(listener);
+  return () => {
+    clientUpdateListeners.delete(listener);
+  };
+}
+
+function notifyHostUpdates() {
+  for (const listener of hostUpdateListeners) {
+    listener();
+  }
+}
+
+function notifyClientUpdates() {
+  for (const listener of clientUpdateListeners) {
+    listener();
+  }
 }
 
 function broadcastHostPayload() {
@@ -383,7 +533,24 @@ function broadcastEnvelope(message: TcpEnvelope) {
 }
 
 function sendEnvelope(socket: TcpSocket, message: TcpEnvelope) {
-  socket.write(`${JSON.stringify(message)}\n`);
+  try {
+    socket.write(`${JSON.stringify(message)}\n`);
+    return true;
+  } catch {
+    try {
+      socket.destroy();
+    } catch {
+      // socket já estava morto
+    }
+
+    hostSockets.delete(socket);
+
+    if (clientSocket === socket) {
+      clientSocket = null;
+    }
+
+    return false;
+  }
 }
 
 function createLineReader(socket: TcpSocket, onMessage: (message: TcpEnvelope) => void) {
@@ -410,6 +577,34 @@ function configureSocket(socket: TcpSocket) {
   socket.setKeepAlive?.(true, 1000);
 }
 
+function mergeClientPayloadEvents(payload: LanSessionPayload, sessionId?: string) {
+  for (const event of payload.events || []) {
+    if (sessionId && event.sessionId !== sessionId) continue;
+    upsertByKey(clientEvents, event, 'id');
+  }
+}
+
+function mergeRecentEvents(...eventLists: LanSessionEvent[][]) {
+  const eventsById = new Map<string, LanSessionEvent>();
+
+  for (const events of eventLists) {
+    for (const event of events) {
+      if (!event?.id) continue;
+      eventsById.set(event.id, event);
+    }
+  }
+
+  return [...eventsById.values()]
+    .sort((a, b) => getEventTimestamp(b) - getEventTimestamp(a))
+    .slice(0, 50);
+}
+
+function getEventTimestamp(event: LanSessionEvent) {
+  const timestamp = Date.parse(event.createdAt || '');
+  if (Number.isFinite(timestamp)) return timestamp;
+  return Number.isFinite(event.seq) ? Number(event.seq) : 0;
+}
+
 function closeClientSocket() {
   if (!clientSocket) return;
   try {
@@ -420,12 +615,68 @@ function closeClientSocket() {
   clientSocket = null;
 }
 
+export function resetLanTcpClient() {
+  closeClientSocket();
+  clientUrl = '';
+  clientPayload = null;
+  clientEvents = [];
+  clientConnectPromise = null;
+}
+
 async function getLocalIpAddress() {
-  const ipAddress = await Network.getIpAddressAsync();
-  if (!ipAddress || ipAddress === '0.0.0.0' || ipAddress === '127.0.0.1') {
-    throw new Error('Nao encontrei um IP Wi-Fi valido para hospedar a sessao TCP.');
+  const expoIp = await Network.getIpAddressAsync().catch(() => '');
+
+  if (isUsableLanIp(expoIp)) {
+    return expoIp;
   }
-  return ipAddress;
+
+  const nativeIps = await LanNative?.getLocalIpv4Addresses?.().catch(() => []);
+
+  const selectedNativeIp = selectBestLanIp(nativeIps || []);
+
+  if (selectedNativeIp) {
+    return selectedNativeIp;
+  }
+
+  throw new Error(
+    'Não encontrei um IP local válido. Conecte-se a um Wi-Fi ou ligue o roteador/hotspot antes de iniciar a sessão.'
+  );
+}
+
+function selectBestLanIp(ips: string[]) {
+  const validIps = ips.filter(isUsableLanIp);
+
+  return (
+    validIps.find((ip) => ip.startsWith('192.168.')) ||
+    validIps.find((ip) => /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) ||
+    validIps.find((ip) => ip.startsWith('10.')) ||
+    validIps[0] ||
+    ''
+  );
+}
+
+type TcpSocketModule = {
+  createServer: (listener: (socket: TcpSocket) => void) => TcpServer;
+  createConnection: (options: Record<string, unknown>, callback: () => void) => TcpSocket;
+};
+
+type LanNativeModule = {
+  getLocalIpv4Addresses?: () => Promise<string[]>;
+};
+
+const LanNative = NativeModules.LanSessionModule as LanNativeModule | undefined;
+
+function isUsableLanIp(ip?: string | null) {
+  if (!ip) return false;
+  if (ip === '0.0.0.0') return false;
+  if (ip === '127.0.0.1') return false;
+  if (ip.startsWith('169.254.')) return false;
+  return true;
+}
+
+function isEnvelopeForCurrentSession(sessionId?: string) {
+  if (!sessionId) return true;
+  return Boolean(hostPayload?.session.id && sessionId === hostPayload.session.id);
 }
 
 function parseTcpUrl(url: string) {
@@ -440,6 +691,11 @@ function parseTcpUrl(url: string) {
 
 function upsertByKey<T extends Record<string, any>>(list: T[], item: T, key: string) {
   const itemKey = item?.[key];
+  if (!itemKey) {
+    list.push(item);
+    return;
+  }
+
   const index = list.findIndex((entry) => entry?.[key] && entry[key] === itemKey);
   if (index >= 0) list[index] = item;
   else list.push(item);

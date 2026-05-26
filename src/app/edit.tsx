@@ -1,4 +1,4 @@
-// ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
+// ================= edit.tsx =================
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
@@ -7,7 +7,8 @@ import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
-import SpellSelector from '../components/SpellSelector';
+import SpellSelector from '../components/SpellSelector';
+
 import { joinLanSessionWithCharacter, notifyMasterJoin } from '@/services/lanSession';
 import { appColors, appGradients, editStyles as styles } from '@/styles/globalStyles';
 

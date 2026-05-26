@@ -1,12 +1,8 @@
-// ================= IMPORTAÇÕES DA CAMADA BÁSICA =================
+// ================= sheet.tsx =================
 import DiceRoller3D, { type DiceRollRequest, type DiceRollResult } from '@/components/DiceRoller3D';
-import { Ionicons } from '@expo/vector-icons';
-import { LinearGradient } from 'expo-linear-gradient';
-import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
-import { useSQLiteContext } from 'expo-sqlite';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Animated, BackHandler, FlatList, Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
-import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
+import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
+import { useLanRealtimePlayerPatches } from '@/hooks/useLanRealtimePlayerPatches';
+import { getCurrentBreathColor, getVisibleEffects } from '@/services/effects/effectVisualService';
 import {
   applyLanSessionStateToCharacter,
   fetchLanSessionEvents,
@@ -16,17 +12,26 @@ import {
   makeLanCharacterKey,
   makeLanEventId,
   rememberLanSessionEvent,
+  resetLanClientConnection,
   sendLanSessionEvent,
+  subscribeLanSessionClientUpdates,
   unlinkCharacterFromLanSession,
+  type LanEffectTarget,
+  type LanEffectUnit,
   type LanResourceRequest,
   type LanSessionEvent,
   type LanSessionPayload,
   type LanSessionStatus,
   type LanTradeItem,
-  type LanEffectTarget,
-  type LanEffectUnit,
   type PublicLanPlayer,
 } from '@/services/lanSession';
+import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
+import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
+import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
+import { useSQLiteContext } from 'expo-sqlite';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Animated, BackHandler, FlatList, Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 const XP_TABLE = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000, 85000, 100000, 120000, 140000, 165000, 195000, 225000, 265000, 305000, 355000];
 
@@ -121,11 +126,17 @@ export default function CharacterSheetScreen() {
   const [spellEffectFilter, setSpellEffectFilter] = useState('Todos');
   const [spellSortOrder, setSpellSortOrder] = useState<'A-Z' | 'Z-A'>('A-Z');
   const [diceRollRequest, setDiceRollRequest] = useState<DiceRollRequest | undefined>();
+  const [effectFrame, setEffectFrame] = useState(0);
   
   // Estado para o Detalhe da Magia e Animação
   const [selectedSpell, setSelectedSpell] = useState<any>(null);
   const spellScaleAnim = useRef(new Animated.Value(0.85)).current;
   const spellFadeAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const timer = setInterval(() => setEffectFrame((frame) => (frame + 1) % 24), 1400);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (selectedSpell) {
@@ -218,6 +229,153 @@ export default function CharacterSheetScreen() {
     }, [id])
   );
 
+  useLanRealtimePlayerPatches({
+    enabled: Boolean(character && lanInfo?.sessionId && lanInfo?.joinUrl),
+    joinUrl: lanInfo?.joinUrl,
+    sessionId: lanInfo?.sessionId,
+    selfKey: lanInfo?.sessionId && character
+      ? makeLanCharacterKey(lanInfo.sessionId, character)
+      : '',
+    characterName: character?.name,
+    onNumberPatch: async (patch) => {
+      if (!character) return;
+
+      const nextCharacter = {
+        ...character,
+        hp_current: patch.hpCurrent ?? character.hp_current,
+        hp_max: patch.hpMax ?? character.hp_max,
+        temp_hp: patch.tempHp ?? character.temp_hp,
+        xp: patch.xp ?? character.xp,
+        gp: patch.gp ?? character.gp,
+        sp: patch.sp ?? character.sp,
+        cp: patch.cp ?? character.cp,
+      };
+
+      setCharacter(nextCharacter);
+
+      await db.runAsync(
+        `UPDATE characters
+        SET hp_current = ?,
+            hp_max = ?,
+            temp_hp = ?,
+            xp = ?,
+            gp = ?,
+            sp = ?,
+            cp = ?
+        WHERE id = ?`,
+        [
+          nextCharacter.hp_current,
+          nextCharacter.hp_max,
+          nextCharacter.temp_hp,
+          nextCharacter.xp,
+          nextCharacter.gp,
+          nextCharacter.sp,
+          nextCharacter.cp,
+          character.id,
+        ]
+      );
+    },
+    onKicked: async (event) => {
+      if (!character || !lanInfo?.sessionId) return;
+
+      await unlinkCharacterFromLanSession(db, Number(character.id), lanInfo.sessionId);
+      setLanInfo(null);
+      setLanSessionStatus(null);
+      setLanPlayers([]);
+      setIncomingTrades([]);
+
+      showCustomAlert(
+        'Removido da sessão',
+        event.message || 'O mestre removeu este personagem da sessão LAN.',
+        [{ text: 'OK', color: appColors.primary, onPress: () => router.replace(`/sheet?id=${character.id}` as any) }]
+      );
+    },
+  });
+
+  useLanAppLifecycle({
+    enabled: Boolean(character && lanInfo?.sessionId && lanInfo?.joinUrl),
+    onBackground: async () => {
+      resetLanClientConnection();
+    // Não destrói a sessão. Apenas deixa o socket ser recriado ao voltar.
+    // O Android pode pausar a rede em background.
+    },
+    onForeground: async () => {
+      if (!character || !lanInfo?.sessionId || !lanInfo?.joinUrl) return;
+
+      try {
+        resetLanClientConnection();
+        const nextPayload = await fetchLanSessionPayload(lanInfo.joinUrl);
+
+        const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+
+      setLanSessionStatus(nextPayload.state?.status || 'active');
+      setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+
+      const wasKicked = nextPayload.events?.some((event) => (
+        event.type === 'player_kicked' &&
+        (event.toKey === selfKey || event.toName === character.name)
+      ));
+
+      if (wasKicked || nextPayload.state?.status === 'ended') {
+        await unlinkCharacterFromLanSession(db, Number(character.id), lanInfo.sessionId);
+
+        setLanInfo(null);
+        setLanSessionStatus(null);
+        setLanPlayers([]);
+        setIncomingTrades([]);
+
+        showCustomAlert(
+          'Sessão encerrada',
+          wasKicked
+            ? 'O mestre removeu este personagem da sessão.'
+            : 'Esta sessão foi encerrada pelo mestre.',
+          [{ text: 'OK', color: appColors.primary, onPress: () => router.replace(`/sheet?id=${character.id}` as any) }]
+        );
+        return;
+      }
+
+      const changedBySession = await applyLanSessionStateToCharacter(
+        db,
+        nextPayload,
+        Number(character.id)
+      );
+
+      if (changedBySession) {
+        const updated = await db.getFirstAsync<Record<string, unknown>>(
+          `SELECT hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats, equipment, active_effects_json
+           FROM characters
+           WHERE id = ?`,
+          [Number(character.id)]
+        );
+
+        if (updated) {
+          setCharacter((prev: any) => ({
+            ...prev,
+            hp_current: updated.hp_current,
+            hp_max: updated.hp_max,
+            temp_hp: updated.temp_hp,
+            xp: updated.xp,
+            gp: updated.gp,
+            sp: updated.sp,
+            cp: updated.cp,
+            stats: JSON.parse(String(updated.stats || '{}')),
+            equipment: JSON.parse(String(updated.equipment || '{}')),
+            active_effects: JSON.parse(String(updated.active_effects_json || '[]')),
+          }));
+        }
+      }
+
+      const events = await fetchLanSessionEvents(lanInfo.joinUrl, lanInfo.sessionId);
+      await handleLanEvents(
+        events.filter((event) => event.sessionId === lanInfo.sessionId),
+        lanInfo.sessionId
+      );
+      } catch (error) {
+      console.warn('[LAN] Não foi possível reconectar ao voltar para o app:', error);
+      }
+    },
+  });
+
   const getSelfLanKey = (sessionValue?: string) => {
     if (!character || !sessionValue) return '';
     return makeLanCharacterKey(sessionValue, character);
@@ -290,37 +448,13 @@ export default function CharacterSheetScreen() {
     const target = event.spellEffect.target || 'custom';
     const value = Number(event.spellEffect.value || 0);
 
-    if (target === 'custom' || value === 0) {
-      showCustomAlert('Efeito recebido', `${event.fromName} aplicou ${event.spellEffect.spellName}.`);
-      return;
-    }
-
-    if (target === 'PV_TEMP') {
-      showCustomAlert('PV temporario', `${event.fromName} aplicou ${event.spellEffect.spellName}: +${Math.max(0, value)} PV temporarios registrados na mesa.`);
-      return;
-    }
-
-    const newStats = { ...character.stats, temp_mods: { ...(character.stats.temp_mods || {}) } };
-    newStats.temp_mods[target] = (parseInt(newStats.temp_mods[target]) || 0) + value;
-    await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [JSON.stringify(newStats), character.id]);
-    setCharacter((prev: any) => ({ ...prev, stats: newStats }));
-    showCustomAlert('Efeito recebido', `${event.fromName} aplicou ${event.spellEffect.spellName}: ${target} ${value > 0 ? '+' : ''}${value}.`);
+    const valueText = target !== 'custom' && value !== 0 ? `: ${target} ${value > 0 ? '+' : ''}${value}` : '';
+    showCustomAlert('Efeito recebido', `${event.fromName} aplicou ${event.spellEffect.spellName}${valueText}.`);
   };
 
   const applyExpiredEffectToSelf = async (event: LanSessionEvent) => {
     if (!character || !event.expiredEffect) return;
     const effect = event.expiredEffect;
-    const target = effect.target;
-
-    if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target)) {
-      const newStats = { ...character.stats, temp_mods: { ...(character.stats.temp_mods || {}) } };
-      const nextValue = (parseInt(newStats.temp_mods[target]) || 0) - Number(effect.value || 0);
-      if (nextValue === 0) delete newStats.temp_mods[target];
-      else newStats.temp_mods[target] = nextValue;
-      await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [JSON.stringify(newStats), character.id]);
-      setCharacter((prev: any) => ({ ...prev, stats: newStats }));
-    }
-
     showCustomAlert('Efeito encerrado', event.message || `${effect.name} acabou.`);
   };
 
@@ -344,6 +478,50 @@ export default function CharacterSheetScreen() {
       }
 
       if (!isForMe(event)) continue;
+
+      if (event.type === 'player_patch' && event.numberPatch) {
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (!fresh) continue;
+
+        const patch = event.numberPatch;
+
+        const nextCharacter = {
+          ...character,
+          hp_current: patch.hpCurrent ?? character.hp_current,
+          hp_max: patch.hpMax ?? character.hp_max,
+          temp_hp: patch.tempHp ?? character.temp_hp,
+          xp: patch.xp ?? character.xp,
+          gp: patch.gp ?? character.gp,
+          sp: patch.sp ?? character.sp,
+          cp: patch.cp ?? character.cp,
+        };
+
+        setCharacter(nextCharacter);
+
+        await db.runAsync(
+          `UPDATE characters
+          SET hp_current = ?,
+              hp_max = ?,
+              temp_hp = ?,
+              xp = ?,
+              gp = ?,
+              sp = ?,
+              cp = ?
+          WHERE id = ?`,
+          [
+            nextCharacter.hp_current,
+            nextCharacter.hp_max,
+            nextCharacter.temp_hp,
+            nextCharacter.xp,
+            nextCharacter.gp,
+            nextCharacter.sp,
+            nextCharacter.cp,
+            character.id,
+          ]
+        );
+
+        continue;
+      }
 
       if (event.type === 'player_kicked') {
         const fresh = await rememberLanSessionEvent(db, event);
@@ -410,12 +588,25 @@ export default function CharacterSheetScreen() {
         const fresh = await rememberLanSessionEvent(db, event);
         if (fresh) await applyExpiredEffectToSelf(event);
       }
+
+      if (event.type === 'effect_patch' && event.effectPatch) {
+        await rememberLanSessionEvent(db, event);
+      }
+
+      if (event.type === 'effect_catalog_patch' && event.effectCatalogPatch) {
+        await rememberLanSessionEvent(db, event);
+      }
+
+      if (event.type === 'pending_save_patch' && event.pendingSavePatch) {
+        await rememberLanSessionEvent(db, event);
+      }
     }
   };
 
   useEffect(() => {
     if (!character) return;
     let active = true;
+    let unsubscribeRealtime: (() => void) | undefined;
 
     const refreshLan = async () => {
       const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
@@ -434,6 +625,11 @@ export default function CharacterSheetScreen() {
         joinUrl: decodeParam(storedInfo.joinUrl || ''),
       };
       if (active) setLanInfo(nextInfo);
+      if (nextInfo.joinUrl && !unsubscribeRealtime) {
+        unsubscribeRealtime = subscribeLanSessionClientUpdates(nextInfo.joinUrl, () => {
+          void refreshLan();
+        });
+      }
 
       let nextPayload: LanSessionPayload | null = null;
       if (nextInfo.joinUrl) {
@@ -514,6 +710,7 @@ export default function CharacterSheetScreen() {
     return () => {
       active = false;
       clearInterval(timer);
+      unsubscribeRealtime?.();
     };
   }, [character, routeSessionId, routeJoinUrl]);
 
@@ -587,10 +784,10 @@ export default function CharacterSheetScreen() {
   const proficientSaves = dbSaves.filter((save: any) => checkProficiency(save.id, character.save_values));
   const proficientSkills = dbSkills.filter((skill: any) => checkProficiency(skill.id, character.skill_values));
   const isLanReadOnly = Boolean(lanInfo?.sessionId && lanSessionStatus && lanSessionStatus !== 'active');
-  const activeVisualEffects = Array.isArray(character.active_effects) ? character.active_effects : [];
-  const activeConditionEffect = activeVisualEffects.find((effect: any) => effect?.color || effect?.secondaryColor || effect?.status);
-  const conditionFrameStyle = activeConditionEffect?.color
-    ? { borderWidth: 3, borderColor: String(activeConditionEffect.color) }
+  const activeVisualEffects = getVisibleEffects(character.active_effects);
+  const activeConditionColor = getCurrentBreathColor(activeVisualEffects as any, effectFrame);
+  const conditionFrameStyle = activeConditionColor
+    ? { borderWidth: 3, borderColor: String(activeConditionColor) }
     : null;
 
   const handleSheetBack = () => {
@@ -748,13 +945,35 @@ export default function CharacterSheetScreen() {
     setInputValue('');
   };
 
+  const handleTempHP = () => {
+    if (!ensureLanWritable()) return;
+    const amount = Math.max(0, parseInt(inputValue) || 0);
+    if (amount <= 0) return;
+
+    if (lanInfo?.sessionId) {
+      sendResourceRequest({
+        kind: 'temp_hp',
+        action: 'add',
+        amount,
+        message: `+${amount} PV temporario`,
+      });
+      setHpModalVisible(false);
+      setInputValue('');
+      return;
+    }
+
+    updateDB({ temp_hp: Math.max(0, Number(character.temp_hp || 0) + amount) });
+    setHpModalVisible(false);
+    setInputValue('');
+  };
+
   const handleTempBuffSubmit = () => {
     if (!ensureLanWritable()) return;
     let newStats = { ...character.stats };
     const val = parseInt(tempBuffValue) || 0;
     if (lanInfo?.sessionId) {
       sendResourceRequest({
-        kind: 'stat',
+        kind: 'buff',
         action: 'temp',
         field: activeBuffStat,
         value: val,
@@ -776,6 +995,12 @@ export default function CharacterSheetScreen() {
 
   const clearTempBuff = () => {
     if (!ensureLanWritable()) return;
+    if (lanInfo?.sessionId) {
+      showCustomAlert('Buff oficial', 'Durante a sessao LAN, peca ao mestre para remover buffs ou debuffs.');
+      setTempBuffModalVisible(false);
+      setTempBuffValue('');
+      return;
+    }
     let newStats = { ...character.stats };
     delete newStats.temp_mods[activeBuffStat];
     updateDB({ stats: newStats });
@@ -793,7 +1018,16 @@ export default function CharacterSheetScreen() {
     if (!ensureLanWritable()) return;
     const nextValue = Math.max(0, parseInt(inputValue) || 0);
     if (lanInfo?.sessionId && nextValue > Number(character[activeCoinType] || 0)) {
-      showCustomAlert('Moedas bloqueadas', 'Durante a sessao LAN, apenas o mestre pode adicionar moedas.');
+      const amount = nextValue - Number(character[activeCoinType] || 0);
+      sendResourceRequest({
+        kind: 'coin',
+        action: 'add',
+        field: activeCoinType,
+        amount,
+        message: `+${amount} ${COIN_NAMES[activeCoinType]}`,
+      });
+      setCoinModalVisible(false);
+      setInputValue('');
       return;
     }
     updateDB({ [activeCoinType]: nextValue });
@@ -806,7 +1040,13 @@ export default function CharacterSheetScreen() {
   const updateCoins = (type: 'gp' | 'sp' | 'cp', delta: number) => {
     if (!ensureLanWritable()) return;
     if (lanInfo?.sessionId && delta > 0) {
-      showCustomAlert('Moedas bloqueadas', 'Durante a sessao LAN, apenas o mestre pode adicionar moedas.');
+      sendResourceRequest({
+        kind: 'coin',
+        action: 'add',
+        field: type,
+        amount: delta,
+        message: `+${delta} ${COIN_NAMES[type]}`,
+      });
       return;
     }
     const nextValue = Math.max(0, character[type] + delta);
@@ -1009,6 +1249,30 @@ export default function CharacterSheetScreen() {
     }
   };
 
+  const notifySelfLanSpellEvent = async (spellEffect: NonNullable<LanSessionEvent['spellEffect']>) => {
+    if (!lanInfo?.joinUrl || !character) return;
+    const selfKey = getSelfLanKey(lanInfo.sessionId);
+    if (!selfKey) return;
+
+    try {
+      const event: LanSessionEvent = {
+        id: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: spellEffect.mode === 'effect' ? 'spell_effect' : 'spell_hp',
+        fromKey: selfKey,
+        fromName: character.name,
+        toKey: selfKey,
+        toName: character.name,
+        spellEffect,
+        createdAt: new Date().toISOString(),
+      };
+      await rememberLanSessionEvent(db, event);
+      await sendLanSessionEvent(lanInfo.joinUrl, event);
+    } catch {
+      // O item ja foi aplicado localmente; o proximo snapshot oficial corrige caso o host nao receba.
+    }
+  };
+
   const getSpellCastMode = (spell: any): 'heal' | 'damage' | 'effect' => {
     const text = `${spell.damage_dice || ''} ${spell.damage || ''} ${spell.damage_type || ''} ${spell.description || ''}`.toLowerCase();
     if ((text.includes('tempor') || text.includes('temp')) && (text.includes('pv') || text.includes('hp') || text.includes('vida'))) return 'effect';
@@ -1113,12 +1377,14 @@ export default function CharacterSheetScreen() {
     const dbUpdates: any = {};
     const messages: string[] = [];
     let nextActiveEffects = Array.isArray(character.active_effects) ? [...character.active_effects] : [];
+    const lanEffects: NonNullable<LanSessionEvent['spellEffect']>[] = [];
 
     for (const effect of effects) {
       const kind = String(effect.kind || effect.type || '').toLowerCase();
       const target = String(effect.target || '').toUpperCase();
       const value = Number(effect.value || 0);
       const dice = effect.healDice || effect.damageDice || effect.dice || '';
+      const duration = getItemEffectDuration(item, effect);
 
       if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target) && value) {
         if (effect.mode === 'set') {
@@ -1129,11 +1395,32 @@ export default function CharacterSheetScreen() {
           nextStats.temp_mods[target] = (Number(nextStats.temp_mods[target]) || 0) + value * qty;
           messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty}.`);
         }
+        lanEffects.push({
+          spellName: item.name,
+          mode: 'effect',
+          effectMode: effect.mode === 'set' ? 'set' : 'add',
+          target: target as LanEffectTarget,
+          value: effect.mode === 'set' ? value : value * qty,
+          durationText: duration.text,
+          durationRemaining: duration.remaining,
+          durationUnit: duration.unit,
+          description: item.descricao || item.properties || '',
+        });
       }
 
       if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
         dbUpdates.temp_hp = Math.max(Number(character.temp_hp || 0), Number(character.temp_hp || 0) + value * qty);
         messages.push(`PV temporario +${value * qty}.`);
+        lanEffects.push({
+          spellName: item.name,
+          mode: 'effect',
+          target: 'PV_TEMP',
+          value: value * qty,
+          durationText: duration.text,
+          durationRemaining: duration.remaining,
+          durationUnit: duration.unit,
+          description: item.descricao || item.properties || '',
+        });
       }
 
       if (kind === 'heal') {
@@ -1141,6 +1428,12 @@ export default function CharacterSheetScreen() {
         if (fixedHeal > 0) {
           dbUpdates.hp_current = Math.min(Number(character.hp_max || 0), Number(character.hp_current || 0) + fixedHeal);
           messages.push(`Recuperou ${fixedHeal} PV.`);
+          lanEffects.push({
+            spellName: item.name,
+            mode: 'heal',
+            amount: fixedHeal,
+            description: item.descricao || item.properties || '',
+          });
         } else if (dice) {
           messages.push(`Role a cura: ${qty}x ${dice}.`);
         }
@@ -1165,6 +1458,19 @@ export default function CharacterSheetScreen() {
           color: condition.color,
           source: item.name,
         });
+        lanEffects.push({
+          spellName: condition.name || item.name,
+          mode: 'effect',
+          target: normalizeLanEffectTarget(target),
+          value,
+          durationText: duration.text,
+          durationRemaining: duration.remaining,
+          durationUnit: duration.unit,
+          status: condition.key,
+          color: condition.color,
+          secondaryColor: condition.secondaryColor,
+          description: item.descricao || item.properties || '',
+        });
         messages.push(`${condition.name || 'Condicao'} aplicada.`);
       }
     }
@@ -1175,6 +1481,9 @@ export default function CharacterSheetScreen() {
     }
     updateDB(dbUpdates);
     setCharacter((prev: any) => ({ ...prev, active_effects: nextActiveEffects }));
+    for (const lanEffect of lanEffects) {
+      void notifySelfLanSpellEvent(lanEffect);
+    }
     showCustomAlert('Efeito aplicado', messages.length ? messages.join('\n') : `${item.name} foi usado.`);
   };
 
@@ -1240,6 +1549,8 @@ export default function CharacterSheetScreen() {
       let msgParts = [];
       let showHpModal = false;
       let dbUpdates: any = {};
+      const lanEffects: NonNullable<LanSessionEvent['spellEffect']>[] = [];
+      const duration = getItemEffectDuration(item, {});
 
       // 1. Aplica o Atributo Escolhido (caso exista)
       if (chosenAttr) {
@@ -1247,10 +1558,30 @@ export default function CharacterSheetScreen() {
         if (escolherIsPerm) {
           newStats[chosenAttr] = String((parseInt(newStats[chosenAttr]) || 10) + totalVal);
           newStats.extra_points = (parseInt(newStats.extra_points) || 0) + totalVal;
+          lanEffects.push({
+            spellName: item.name,
+            mode: 'effect',
+            target: chosenAttr as LanEffectTarget,
+            value: totalVal,
+            durationText: 'Permanente',
+            durationRemaining: 999999,
+            durationUnit: 'hour',
+            description: item.descricao || item.properties || '',
+          });
           msgParts.push(`✨ Escolha: ${totalVal > 0 ? '+'+totalVal : totalVal} em ${chosenAttr} (Permanente)`);
         } else {
           if(!newStats.temp_mods) newStats.temp_mods = {};
           newStats.temp_mods[chosenAttr] = (parseInt(newStats.temp_mods[chosenAttr]) || 0) + totalVal;
+          lanEffects.push({
+            spellName: item.name,
+            mode: 'effect',
+            target: chosenAttr as LanEffectTarget,
+            value: totalVal,
+            durationText: duration.text,
+            durationRemaining: duration.remaining,
+            durationUnit: duration.unit,
+            description: item.descricao || item.properties || '',
+          });
           msgParts.push(`⏳ Escolha: ${totalVal > 0 ? '+'+totalVal : totalVal} em ${chosenAttr} (Temporário)`);
         }
       }
@@ -1270,10 +1601,30 @@ export default function CharacterSheetScreen() {
                   newStats[attr] = String((parseInt(newStats[attr]) || 10) + val);
                   newStats.extra_points = (parseInt(newStats.extra_points) || 0) + val;
               }
+              lanEffects.push({
+                spellName: item.name,
+                mode: 'effect',
+                target: attr as LanEffectTarget,
+                value: val,
+                durationText: 'Permanente',
+                durationRemaining: 999999,
+                durationUnit: 'hour',
+                description: item.descricao || item.properties || '',
+              });
               msgParts.push(`💪 Permanente: ${val > 0 ? '+'+val : val} em ${attr}`);
           } else {
               if(!newStats.temp_mods) newStats.temp_mods = {};
               newStats.temp_mods[attr] = (parseInt(newStats.temp_mods[attr]) || 0) + val;
+              lanEffects.push({
+                spellName: item.name,
+                mode: 'effect',
+                target: attr as LanEffectTarget,
+                value: val,
+                durationText: duration.text,
+                durationRemaining: duration.remaining,
+                durationUnit: duration.unit,
+                description: item.descricao || item.properties || '',
+              });
               msgParts.push(`⏳ Temporário: ${val > 0 ? '+'+val : val} em ${attr}`);
           }
         }
@@ -1290,6 +1641,12 @@ export default function CharacterSheetScreen() {
             if(!isNaN(curaValor)) {
                const novoHp = Math.min(character.hp_max, character.hp_current + Math.abs(curaValor));
                dbUpdates.hp_current = novoHp;
+               lanEffects.push({
+                 spellName: item.name,
+                 mode: 'heal',
+                 amount: Math.abs(curaValor),
+                 description: item.descricao || item.properties || '',
+               });
                msgParts.push(`💖 Recuperou ${Math.abs(curaValor)} Pontos de Vida.`);
             }
           } else {
@@ -1298,6 +1655,12 @@ export default function CharacterSheetScreen() {
                const curaValor = parseInt(genericNumMatch[0]) * qty;
                const novoHp = Math.min(character.hp_max, character.hp_current + Math.abs(curaValor));
                dbUpdates.hp_current = novoHp;
+               lanEffects.push({
+                 spellName: item.name,
+                 mode: 'heal',
+                 amount: Math.abs(curaValor),
+                 description: item.descricao || item.properties || '',
+               });
                msgParts.push(`💖 Recuperou ${Math.abs(curaValor)} Pontos de Vida.`);
             }
           }
@@ -1311,6 +1674,9 @@ export default function CharacterSheetScreen() {
 
       dbUpdates.stats = newStats;
       if (Object.keys(dbUpdates).length > 0) updateDB(dbUpdates);
+      for (const lanEffect of lanEffects) {
+        void notifySelfLanSpellEvent(lanEffect);
+      }
 
       setTimeout(() => {
         showCustomAlert(
@@ -1604,6 +1970,17 @@ export default function CharacterSheetScreen() {
           <Text style={[styles.sessionPartyHint, { color: appColors.warning, marginBottom: 10 }]}>
             Sessao pausada ou encerrada. Modo leitura.
           </Text>
+        )}
+
+        {activeVisualEffects.length > 0 && (
+          <View style={[styles.sessionPlayerRow, { alignItems: 'flex-start' }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.sessionPlayerName}>Voce esta sob efeito de</Text>
+              <Text style={styles.sessionPlayerMeta}>
+                {activeVisualEffects.map((effect: any) => effect.name || effect.status || 'Efeito').join(', ')}
+              </Text>
+            </View>
+          </View>
         )}
 
         {lanPlayers.length === 0 ? (
@@ -2615,6 +2992,9 @@ export default function CharacterSheetScreen() {
             <Text style={styles.modalTitle}>{xpModalVisible ? 'Gerenciar XP' : 'Gerenciar HP'}</Text>
             <TextInput style={styles.modalInputLarge} keyboardType="numeric" value={inputValue} onChangeText={setInputValue} autoFocus />
             <View style={styles.modalRowButtons}>
+              {!xpModalVisible && (
+                <TouchableOpacity style={styles.modalBtn} onPress={handleTempHP}><Text style={{color:'#00bfff', fontWeight:'bold'}}>PV Temp</Text></TouchableOpacity>
+              )}
               <TouchableOpacity style={styles.modalBtn} onPress={() => xpModalVisible ? handleXP('remove') : handleHP('damage')}><Text style={{color:'#ff6666', fontWeight:'bold'}}>{xpModalVisible ? '- Remover' : '⚔️ Dano'}</Text></TouchableOpacity>
               <TouchableOpacity style={styles.modalBtn} onPress={() => xpModalVisible ? handleXP('add') : handleHP('heal')}><Text style={{color:'#00fa9a', fontWeight:'bold'}}>{xpModalVisible ? '+ Adicionar' : '💖 Cura'}</Text></TouchableOpacity>
             </View>
@@ -2689,6 +3069,39 @@ function parseSpellDuration(duration?: string): { durationRemaining: number; dur
   if (raw.includes('hora')) return { durationRemaining: value, durationUnit: 'hour' };
   if (raw.includes('min')) return { durationRemaining: value, durationUnit: 'minute' };
   return { durationRemaining: 1, durationUnit: 'rest' };
+}
+
+function getItemEffectDuration(item: any, effect: any): { text: string; remaining: number; unit: LanEffectUnit } {
+  const conditionDuration = effect?.condition?.duration || {};
+  const remaining = Math.max(
+    1,
+    Number(effect?.durationValue ?? effect?.duration_value ?? conditionDuration.value ?? item?.duration_value ?? 1) || 1
+  );
+  const unit = normalizeLanEffectUnit(
+    effect?.durationUnit ?? effect?.duration_unit ?? conditionDuration.unit ?? item?.duration_unit
+  );
+  return {
+    text: `${remaining} ${unit}`,
+    remaining,
+    unit,
+  };
+}
+
+function normalizeLanEffectUnit(value: unknown): LanEffectUnit {
+  if (value === 'turn' || value === 'minute' || value === 'hour' || value === 'rest') return value;
+  const raw = String(value || '').toLowerCase();
+  if (raw.includes('turno') || raw.includes('rodada')) return 'turn';
+  if (raw.includes('hora')) return 'hour';
+  if (raw.includes('min')) return 'minute';
+  return 'rest';
+}
+
+function normalizeLanEffectTarget(value: unknown): LanEffectTarget {
+  const target = String(value || '').toUpperCase();
+  if (target === 'FOR' || target === 'DES' || target === 'CON' || target === 'INT' || target === 'SAB' || target === 'CAR' || target === 'CA' || target === 'HP' || target === 'PV_TEMP') {
+    return target as LanEffectTarget;
+  }
+  return 'custom';
 }
 
 function parseStructuredEffects(value: unknown) {

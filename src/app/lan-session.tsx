@@ -1,13 +1,9 @@
-import { Ionicons } from '@expo/vector-icons';
-import * as Clipboard from 'expo-clipboard';
-import { LinearGradient } from 'expo-linear-gradient';
-import { Stack, useRouter } from 'expo-router';
-import { useSQLiteContext } from 'expo-sqlite';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, Modal, ScrollView, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
-
 import DiceRoller3D from '@/components/DiceRoller3D';
 import QrCodeView from '@/components/QrCodeView';
+import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
+import { listEffects } from '@/services/effects/effectCatalogService';
+import { listPendingSaves, resolveSave } from '@/services/effects/effectResolver';
+import type { LanPendingSave } from '@/services/effects/effectTypes';
 import {
   addLanPlayerEffect,
   advanceLanSessionTime,
@@ -17,6 +13,7 @@ import {
   applyLanResourceRequest,
   buildJoinDeepLink,
   buildLanSessionPayload,
+  consumeLanForegroundStopRequest,
   deleteLanSession,
   endLanSession,
   formatElapsedTime,
@@ -36,14 +33,18 @@ import {
   pauseLanSession,
   rebuildLanSessionCatalog,
   refreshLanSessionPayload,
+  rememberAndSendLanSessionEvent,
   rememberLanSessionEvent,
   removeLanPlayerEffect,
+  resetLanClientConnection,
   resumeLanSession,
   reviewLanPlayerPendingSnapshot,
   saveLanSession,
   selectionFromKeys,
   startLanServer,
   stopLanServer,
+  subscribeLanForegroundStop,
+  subscribeLanSessionHostUpdates,
   summarizeEffect,
   syncLanSessionPayload,
   updateLanPlayerEquipment,
@@ -61,6 +62,13 @@ import {
   type LanTradeItem,
 } from '@/services/lanSession';
 import { appColors, appGradients, lanSessionStyles as styles } from '@/styles/globalStyles';
+import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
+import { LinearGradient } from 'expo-linear-gradient';
+import { Stack, useRouter } from 'expo-router';
+import { useSQLiteContext } from 'expo-sqlite';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Alert, Modal, ScrollView, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 const CATALOG_FILTERS = ['Todos', 'Item', 'Raca', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit'];
 const EFFECT_TARGETS: LanEffectTarget[] = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA', 'HP', 'PV_TEMP', 'custom'];
@@ -71,6 +79,25 @@ const EFFECT_UNITS: { label: string; value: LanEffectUnit }[] = [
   { label: 'Descanso', value: 'rest' },
 ];
 const STAT_KEYS = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'];
+const INVENTORY_FILTERS = ['Todos', 'Armas', 'Armaduras', 'Consumiveis', 'Efeitos', 'Outros'] as const;
+
+type InventoryFilter = (typeof INVENTORY_FILTERS)[number];
+type ReferenceOption = { id: string; name: string; stat?: string };
+type NumberPatch = Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
+type EffectDraft = {
+  name: string;
+  target: LanEffectTarget;
+  value: number;
+  remaining: number;
+  unit: LanEffectUnit;
+  durationText?: string;
+  kind?: 'stat' | 'hp' | 'temp_hp' | 'status' | 'custom';
+  mode?: 'add' | 'set';
+  source?: string;
+  statusKey?: string;
+  color?: string;
+  secondaryColor?: string;
+};
 
 type EffectOption = {
   key: string;
@@ -89,6 +116,7 @@ type EffectOption = {
 type InventoryItemOption = LanTradeItem & {
   id: number;
   descricao?: string;
+  category?: InventoryFilter;
 };
 
 export default function LanSessionScreen() {
@@ -126,17 +154,24 @@ export default function LanSessionScreen() {
   const [effectColor, setEffectColor] = useState('');
   const [effectSecondaryColor, setEffectSecondaryColor] = useState('');
   const [effectSearch, setEffectSearch] = useState('');
+  const [selectedEffectKeys, setSelectedEffectKeys] = useState<string[]>([]);
   const [effectSaveInfo, setEffectSaveInfo] = useState('');
   const [effectOptions, setEffectOptions] = useState<EffectOption[]>([]);
   const [expandedPlayerIds, setExpandedPlayerIds] = useState<number[]>([]);
   const [reviewedSpellEventIds, setReviewedSpellEventIds] = useState<string[]>([]);
   const [reviewedRequestEventIds, setReviewedRequestEventIds] = useState<string[]>([]);
+  const [pendingSaves, setPendingSaves] = useState<LanPendingSave[]>([]);
   const [xpPool, setXpPool] = useState('1000');
 
   const [inventoryModalPlayer, setInventoryModalPlayer] = useState<LanSessionPlayerState | null>(null);
   const [inventoryCatalog, setInventoryCatalog] = useState<InventoryItemOption[]>([]);
   const [inventorySearch, setInventorySearch] = useState('');
+  const [inventoryFilter, setInventoryFilter] = useState<InventoryFilter>('Todos');
   const [grantItemQty, setGrantItemQty] = useState('1');
+  const [detailPlayer, setDetailPlayer] = useState<LanSessionPlayerState | null>(null);
+  const [skillOptions, setSkillOptions] = useState<ReferenceOption[]>([]);
+  const [saveOptions, setSaveOptions] = useState<ReferenceOption[]>([]);
+  const [spellOptions, setSpellOptions] = useState<ReferenceOption[]>([]);
   
   // NOVO: Estado para o Modal de Edição Rápida (HP, XP, Moedas, Atributos)
   const [quickEdit, setQuickEdit] = useState<{
@@ -168,6 +203,11 @@ export default function LanSessionScreen() {
   }, [catalogFilter, catalogOptions, catalogSearch]);
   
   const selectedCatalogSet = useMemo(() => new Set(selectedCatalogKeys), [selectedCatalogKeys]);
+  const selectedEffectSet = useMemo(() => new Set(selectedEffectKeys), [selectedEffectKeys]);
+  const selectedEffectOptions = useMemo(
+    () => effectOptions.filter((option) => selectedEffectSet.has(option.key)),
+    [effectOptions, selectedEffectSet]
+  );
   
   const filteredEffectOptions = useMemo(() => {
     const search = effectSearch.trim().toLowerCase();
@@ -180,10 +220,11 @@ export default function LanSessionScreen() {
   const filteredInventoryCatalog = useMemo(() => {
     const search = inventorySearch.trim().toLowerCase();
     return inventoryCatalog.filter((item) => {
-      if (!search) return true;
-      return item.name.toLowerCase().includes(search) || String(item.descricao || '').toLowerCase().includes(search);
-    }).slice(0, 20);
-  }, [inventoryCatalog, inventorySearch]);
+      const matchesFilter = inventoryFilter === 'Todos' || getInventoryItemCategory(item) === inventoryFilter;
+      const matchesSearch = !search || matchesInventorySearch(item, search);
+      return matchesFilter && matchesSearch;
+    }).slice(0, 60);
+  }, [inventoryCatalog, inventoryFilter, inventorySearch]);
 
   const reviewedRequestEventSet = useMemo(() => {
     const reviewedIds = sessionEvents
@@ -202,6 +243,8 @@ export default function LanSessionScreen() {
     setSelectedCatalogKeys((current) => current.length > 0 ? current : options.map((option) => option.key));
   }, [db]);
 
+
+
   const loadEffectOptions = useCallback(async () => {
     const spells = await db.getAllAsync<Record<string, unknown>>(
       `SELECT id, name, level, damage_dice, damage_type, duration, effect_json, duration_value, duration_unit
@@ -213,12 +256,16 @@ export default function LanSessionScreen() {
        FROM items
        ORDER BY name ASC`
     );
-    const conditions = await db.getAllAsync<Record<string, unknown>>(
-      `SELECT id, name, status_key, target, value, duration_value, duration_unit, kind,
-              description, color, secondary_color, icon
-       FROM lan_effect_catalog
-       ORDER BY visual_priority DESC, name ASC`
-    );
+    const conditions = await listEffects(db);
+    const saves = await db.getAllAsync<ReferenceOption>(`SELECT id, name, stat FROM saving_throws ORDER BY name ASC`);
+    const skills = await db.getAllAsync<ReferenceOption>(`SELECT id, name, stat FROM skills ORDER BY name ASC`);
+
+    setSaveOptions(saves);
+    setSkillOptions(skills);
+    setSpellOptions(spells.map((spell) => ({
+      id: String(spell.id || ''),
+      name: String(spell.name || 'Magia'),
+    })));
 
     setInventoryCatalog(items.map((row) => ({
       id: Number(row.id) || 0,
@@ -232,27 +279,32 @@ export default function LanSessionScreen() {
       effect_json: String(row.effect_json || '[]'),
       duration_value: row.duration_value == null ? null : Number(row.duration_value),
       duration_unit: row.duration_unit ? String(row.duration_unit) : null,
+      category: getInventoryItemCategory(row),
     })));
 
     setEffectOptions([
       ...conditions.map((row) => ({
-        key: `condition:${row.id}`,
+        key: `condition:${row.id || row.statusKey}`,
         name: String(row.name || 'Condicao'),
         group: 'Condicao',
         detail: String(row.description || 'Condicao da mesa'),
         effects: [{
           target: row.target || 'custom',
           value: Number(row.value) || 0,
-          status: row.status_key,
+          status: row.statusKey,
+          statusKey: row.statusKey,
           color: row.color,
-          secondaryColor: row.secondary_color,
+          secondaryColor: row.secondaryColor,
+          conditionName: row.name,
+          saveAbility: row.saveAbility,
+          saveOnSuccess: row.saveOnSuccess,
         }],
-        durationValue: Number(row.duration_value) || 1,
-        durationUnit: normalizeEffectUnit(row.duration_unit),
+        durationValue: Number(row.defaultDurationValue) || 1,
+        durationUnit: normalizeEffectUnit(row.defaultDurationUnit),
         durationText: String(row.description || ''),
-        statusKey: row.status_key ? String(row.status_key) : undefined,
+        statusKey: row.statusKey ? String(row.statusKey) : undefined,
         color: row.color ? String(row.color) : undefined,
-        secondaryColor: row.secondary_color ? String(row.secondary_color) : undefined,
+        secondaryColor: row.secondaryColor ? String(row.secondaryColor) : undefined,
       })),
       ...spells.map((row) => ({
         key: `spell:${row.id}`,
@@ -281,12 +333,45 @@ export default function LanSessionScreen() {
     const nextState = await getLanSessionState(db, sessionId);
     setSessionState(nextState);
     setSessionEvents(await getLanSessionEvents(db, sessionId, 20));
+    setPendingSaves(await listPendingSaves(db, sessionId));
 
     if (syncPayload) {
       const nextPayload = await syncLanSessionPayload(db, sessionId);
       if (nextPayload) setPayload(nextPayload);
     }
   }, [db]);
+
+  const resumeMasterHost = useCallback(async () => {
+  if (!payload?.session?.id) return;
+
+  try {
+    const nextPayload = await refreshLanSessionPayload(db, payload.session.id);
+    if (!nextPayload) return;
+
+    const nextJoinUrl = await startLanServer(nextPayload);
+
+    await saveLanSession(db, nextPayload, nextJoinUrl, { isMaster: true });
+
+    setPayload(nextPayload);
+    setSessionState(nextPayload.state || null);
+    setJoinUrl(nextJoinUrl);
+    setJoinLink(buildJoinDeepLink(nextJoinUrl, nextPayload));
+
+    await reloadSessionState(nextPayload.session.id, false);
+    await loadSavedSessions();
+  } catch (error) {
+    console.warn('[LAN] Não foi possível retomar o host LAN automaticamente:', error);
+  }
+}, [buildJoinDeepLink, db, loadSavedSessions, payload?.session?.id, refreshLanSessionPayload, reloadSessionState, saveLanSession, startLanServer]);
+
+useLanAppLifecycle({
+  enabled: Boolean(payload?.session?.id && joinUrl),
+  onBackground: async () => {
+  },
+  onForeground: async () => {
+    await resumeMasterHost();
+  },
+});
 
   useEffect(() => {
     loadCatalogOptions();
@@ -299,9 +384,21 @@ export default function LanSessionScreen() {
 
     const pollJoinedPlayers = async () => {
       const joinedPlayers = await getMasterJoinedPlayers(joinUrl);
+      let changedPlayers = false;
+
       for (const entry of joinedPlayers) {
         if (entry?.sessionId === activeSessionId) {
           await upsertLanSessionPlayerFromNetwork(db, entry);
+          changedPlayers = true;
+        }
+      }
+
+      if (changedPlayers) {
+        const syncedPayload = await syncLanSessionPayload(db, activeSessionId);
+
+        if (syncedPayload) {
+          setPayload(syncedPayload);
+          setSessionState(syncedPayload.state || null);
         }
       }
 
@@ -319,12 +416,7 @@ export default function LanSessionScreen() {
           if (!player) continue;
 
           if (event.type === 'public_status' && event.publicState) {
-            const statusPatch: Parameters<typeof updateLanPlayerNumbers>[2] = {
-              hpCurrent: event.publicState.hpCurrent,
-              hpMax: event.publicState.hpMax,
-            };
-            if (event.publicState.tempHp != null) statusPatch.tempHp = event.publicState.tempHp;
-            await updateLanPlayerNumbers(db, player.id, statusPatch);
+            continue;
           }
 
           if (event.type === 'spell_hp' && event.spellEffect?.amount != null) {
@@ -350,6 +442,11 @@ export default function LanSessionScreen() {
               unit: event.spellEffect.durationUnit || 'rest',
               durationText: event.spellEffect.durationText,
               kind: event.spellEffect.target === 'PV_TEMP' ? 'temp_hp' : undefined,
+              mode: event.spellEffect.effectMode,
+              status: event.spellEffect.status,
+              statusKey: event.spellEffect.status,
+              color: event.spellEffect.color,
+              secondaryColor: event.spellEffect.secondaryColor,
               source: event.fromName,
             });
           }
@@ -392,12 +489,18 @@ export default function LanSessionScreen() {
         }
       }
 
-      await reloadSessionState(activeSessionId);
+      await reloadSessionState(activeSessionId, false);
     };
 
     pollJoinedPlayers();
     const timer = setInterval(pollJoinedPlayers, 2500);
-    return () => clearInterval(timer);
+    const unsubscribeRealtime = subscribeLanSessionHostUpdates(joinUrl, () => {
+      void pollJoinedPlayers();
+    });
+    return () => {
+      clearInterval(timer);
+      unsubscribeRealtime();
+    };
   }, [activeSessionId, db, joinUrl, reloadSessionState]);
 
   const handleStartSession = async () => {
@@ -405,6 +508,11 @@ export default function LanSessionScreen() {
     setLoading(true);
 
     try {
+      // Para o host TCP atual, mas NÃO encerra/apaga sessões salvas.
+      // Isso permite várias sessões independentes no banco.
+      await stopLanServer();
+      resetLanClientConnection();
+
       const nextPayload = await buildLanSessionPayload(db, {
         id: makeSessionId(),
         name: sessionName.trim() || 'Mesa de D&D',
@@ -415,29 +523,38 @@ export default function LanSessionScreen() {
       }, selectionFromKeys(selectedCatalogKeys));
 
       const nextJoinUrl = await startLanServer(nextPayload);
-      await saveLanSession(db, nextPayload, nextJoinUrl);
+
+      if (!nextJoinUrl) {
+        throw new Error('Servidor TCP não retornou URL. A sessão não será salva.');
+      }
+
+      await saveLanSession(db, nextPayload, nextJoinUrl, { isMaster: true });
       setPayload(nextPayload);
       setSessionState(nextPayload.state || null);
       setSessionEvents([]);
+      setPendingSaves([]);
       setJoinUrl(nextJoinUrl);
       setJoinLink(buildJoinDeepLink(nextJoinUrl, nextPayload));
       setSelectedPlayerId(null);
+
       await loadSavedSessions();
-      if (!nextJoinUrl) {
-        Alert.alert(
-          'Socket TCP indisponível',
-          'A sessão foi criada localmente, mas este build não conseguiu abrir o servidor TCP. Gere/rode um dev build nativo; o Expo Go não suporta socket TCP local.'
-        );
-      } else if (isEmulatorOnlyTcpUrl(nextJoinUrl)) {
+
+      if (isEmulatorOnlyTcpUrl(nextJoinUrl)) {
         Alert.alert(
           'IP do emulador detectado',
           'A mesa abriu em IP interno do emulador. Para socket puro, use o celular fisico como mestre ou redirecione a porta TCP do emulador e entre manualmente por tcp://10.0.2.2:43115/... em outro emulador.'
         );
       }
     } catch (error) {
-      Alert.alert('Sessão LAN', 'Não foi possível iniciar a sessão LAN neste dispositivo.');
-      console.error(error);
-    } finally {
+      const message = error instanceof Error ? error.message : String(error);
+
+      Alert.alert(
+        'Erro ao iniciar sessão LAN',
+        message || 'Erro desconhecido ao iniciar a sessão.'
+      );
+
+      console.error('[LAN] Erro ao iniciar sessão:', error);
+      } finally {
       setLoading(false);
     }
   };
@@ -460,40 +577,58 @@ export default function LanSessionScreen() {
       if (!nextPayload) throw new Error('Sessão não encontrada.');
 
       const nextJoinUrl = await startLanServer(nextPayload);
-      await saveLanSession(db, nextPayload, nextJoinUrl);
+
+      if (!nextJoinUrl) {
+        throw new Error('Servidor TCP não retornou URL ao retomar a sessão. A sessão não será salva como ativa.');
+      }
+
+      await saveLanSession(db, nextPayload, nextJoinUrl, { isMaster: true });
       setPayload(nextPayload);
       setSessionState(nextPayload.state || await getLanSessionState(db, session.id));
       setSessionEvents(await getLanSessionEvents(db, session.id, 20));
+      setPendingSaves(await listPendingSaves(db, session.id));
       setJoinUrl(nextJoinUrl);
       setJoinLink(buildJoinDeepLink(nextJoinUrl, nextPayload));
       setSelectedCatalogKeys(keysFromSelection(nextPayload.selectedCatalog));
       await loadSavedSessions();
-      if (!nextJoinUrl) {
-        Alert.alert(
-          'Socket TCP indisponível',
-          'A mesa foi retomada, mas este build não conseguiu abrir o servidor TCP. Sem a URL tcp://, jogadores não conectam em tempo real.'
-        );
-      } else if (isEmulatorOnlyTcpUrl(nextJoinUrl)) {
+      if (isEmulatorOnlyTcpUrl(nextJoinUrl)) {
         Alert.alert(
           'IP do emulador detectado',
           'A mesa retomou em IP interno do emulador. Para socket puro, use o celular fisico como mestre ou redirecione a porta TCP do emulador e entre manualmente por tcp://10.0.2.2:43115/... em outro emulador.'
         );
       }
     } catch (error) {
-      Alert.alert('Sessão LAN', 'Não foi possível retomar esta sessão.');
-      console.error(error);
-    } finally {
+        const message = error instanceof Error ? error.message : String(error);
+
+        Alert.alert(
+          'Erro ao retomar sessão LAN',
+          message || 'Erro desconhecido ao retomar a sessão.'
+        );
+
+        console.error('[LAN] Erro ao retomar sessão:', error);
+      } finally {
       setLoading(false);
     }
   };
 
-  const handleStopSession = async () => {
+  const handleStopSession = useCallback(async () => {
     if (payload) {
       await endLanSession(db, payload.session.id);
-      await recordMasterTimelineEvent('Mestre finalizou a sessao LAN.');
+      await rememberLanSessionEvent(db, {
+        id: makeLanEventId(),
+        sessionId: payload.session.id,
+        type: 'timeline_event',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: 'party',
+        toName: 'Party',
+        message: 'Mestre finalizou a sessao LAN.',
+        createdAt: new Date().toISOString(),
+      });
       await syncLanSessionPayload(db, payload.session.id);
     }
     await stopLanServer();
+    resetLanClientConnection();
     setPayload(null);
     setSessionState(null);
     setSessionEvents([]);
@@ -501,7 +636,39 @@ export default function LanSessionScreen() {
     setJoinLink('');
     setSelectedPlayerId(null);
     await loadSavedSessions();
-  };
+  }, [db, loadSavedSessions, payload]);
+
+  useEffect(() => {
+    if (!payload?.session?.id) return;
+
+    let handlingStopRequest = false;
+    const stopFromNotification = async () => {
+      if (handlingStopRequest) return;
+      handlingStopRequest = true;
+      try {
+        await handleStopSession();
+      } finally {
+        handlingStopRequest = false;
+      }
+    };
+
+    const unsubscribe = subscribeLanForegroundStop(() => {
+      void stopFromNotification();
+    });
+
+    const timer = setInterval(() => {
+      void (async () => {
+        if (await consumeLanForegroundStopRequest()) {
+          await stopFromNotification();
+        }
+      })();
+    }, 1500);
+
+    return () => {
+      unsubscribe();
+      clearInterval(timer);
+    };
+  }, [handleStopSession, payload?.session?.id]);
 
   const handleCopyInviteCode = async () => {
     if (!payload) return;
@@ -532,6 +699,7 @@ export default function LanSessionScreen() {
           onPress: async () => {
             if (payload?.session.id === session.id) {
               await stopLanServer();
+              resetLanClientConnection();
               setPayload(null);
               setSessionState(null);
               setSessionEvents([]);
@@ -618,15 +786,68 @@ export default function LanSessionScreen() {
     });
   };
 
+  const handleUpdatePlayerPatch = async (
+    player: LanSessionPlayerState,
+    patch: NumberPatch,
+    message: string
+  ) => {
+    if (!payload) return;
+
+    const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
+      if (value == null) return next;
+      return {
+        ...next,
+        [key]: Math.max(0, Math.floor(Number(value) || 0)),
+      };
+    }, {});
+    if (Object.keys(cleanPatch).length === 0) return;
+
+    // Atualiza a tela do mestre imediatamente, sem esperar SQLite/payload.
+    setSessionState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        players: current.players.map((entry) => (
+          entry.id === player.id ? { ...entry, ...cleanPatch } : entry
+        )),
+      };
+    });
+
+    // Persiste localmente sem disparar payload_update pesado.
+    await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
+
+    // Evento delta pequeno: chega no celular do jogador imediatamente via socket.
+    const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
+      id: makeLanEventId(),
+      sessionId: payload.session.id,
+      type: 'player_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: player.remoteKey || '',
+      toName: player.characterName,
+      numberPatch: cleanPatch,
+      message,
+      createdAt: new Date().toISOString(),
+    });
+
+    if (event) {
+      setSessionEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20));
+    }
+
+    await reloadSessionState(payload.session.id, false);
+  };
+
   const handleUpdatePlayer = async (
     player: LanSessionPlayerState,
     field: 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp',
     value: number
   ) => {
-    const patch = { [field]: Math.max(0, value) };
-    await updateLanPlayerNumbers(db, player.id, patch);
-    await recordMasterTimelineEvent(`Mestre ajustou ${formatPlayerField(field)} de ${player.characterName} para ${Math.max(0, value)}.`, player);
-    if (payload) await reloadSessionState(payload.session.id, true);
+    const cleanValue = Math.max(0, Math.floor(Number(value) || 0));
+    await handleUpdatePlayerPatch(
+      player,
+      { [field]: cleanValue },
+      `Mestre ajustou ${formatPlayerField(field)} de ${player.characterName} para ${cleanValue}.`
+    );
   };
 
   const handleKickPlayer = (player: LanSessionPlayerState) => {
@@ -639,6 +860,12 @@ export default function LanSessionScreen() {
           text: 'Remover',
           style: 'destructive',
           onPress: async () => {
+            setSessionState((current) => current
+              ? { ...current, players: current.players.filter((entry) => entry.id !== player.id) }
+              : current
+            );
+            if (selectedPlayerId === player.id) setSelectedPlayerId(null);
+            setExpandedPlayerIds((current) => current.filter((id) => id !== player.id));
             await kickLanSessionPlayer(db, player.id);
             if (payload) await reloadSessionState(payload.session.id, true);
           },
@@ -649,10 +876,16 @@ export default function LanSessionScreen() {
 
   const handleReviewPending = async (player: LanSessionPlayerState, accepted: boolean) => {
     await reviewLanPlayerPendingSnapshot(db, player.id, accepted);
-    if (payload) await reloadSessionState(payload.session.id, true);
+    if (payload?.session?.id) await reloadSessionState(payload!.session.id, true);
   };
 
   const handleSelectEffectOption = (option: EffectOption) => {
+    setSelectedEffectKeys((current) => (
+      current.includes(option.key)
+        ? current.filter((key) => key !== option.key)
+        : [...current, option.key]
+    ));
+
     const firstEffect = option.effects[0] || {};
     setEffectName(firstEffect.conditionName || option.name);
     setEffectSource(option.group);
@@ -660,12 +893,18 @@ export default function LanSessionScreen() {
     setEffectColor(option.color || String(firstEffect.color || ''));
     setEffectSecondaryColor(option.secondaryColor || String(firstEffect.secondaryColor || ''));
     setEffectSaveInfo(formatEffectSaveInfo(firstEffect));
-    setEffectSearch(option.name);
     setEffectTarget(normalizeEffectTarget(firstEffect.target || firstEffect.stat || firstEffect.type));
     setEffectValue(String(firstEffect.value ?? firstEffect.val ?? firstEffect.amount ?? 0));
     setEffectMode(firstEffect.mode === 'set' ? 'set' : 'add');
     setEffectDuration(String(option.durationValue || firstEffect.durationValue || firstEffect.duration || 1));
     setEffectUnit(option.durationUnit || normalizeEffectUnit(firstEffect.durationUnit || firstEffect.unit) || inferUnitFromText(option.durationText));
+  };
+
+  const clearSelectedEffects = () => {
+    setSelectedEffectKeys([]);
+    setEffectSaveInfo('');
+    setEffectSource('');
+    setEffectName('Efeito temporario');
   };
 
   const handleDistributeXp = async () => {
@@ -675,9 +914,7 @@ export default function LanSessionScreen() {
     const remainder = totalXp % sessionState.players.length;
     for (let index = 0; index < sessionState.players.length; index += 1) {
       const player = sessionState.players[index];
-      await updateLanPlayerNumbers(db, player.id, {
-        xp: player.xp + baseShare + (index < remainder ? 1 : 0),
-      });
+      await handleUpdatePlayer(player, 'xp', player.xp + baseShare + (index < remainder ? 1 : 0));
     }
     await recordMasterTimelineEvent(`Mestre distribuiu ${totalXp} XP para a party.`);
     await reloadSessionState(payload.session.id, true);
@@ -695,6 +932,11 @@ export default function LanSessionScreen() {
         unit: event.spellEffect.durationUnit || 'rest',
         durationText: event.spellEffect.durationText,
         kind: event.spellEffect.target === 'PV_TEMP' ? 'temp_hp' : undefined,
+        mode: event.spellEffect.effectMode,
+        status: event.spellEffect.status,
+        statusKey: event.spellEffect.status,
+        color: event.spellEffect.color,
+        secondaryColor: event.spellEffect.secondaryColor,
         source: event.fromName,
       });
     }
@@ -722,6 +964,35 @@ export default function LanSessionScreen() {
     await reloadSessionState(payload.session.id, true);
   };
 
+  const handleResolvePendingSave = async (save: LanPendingSave, passed: boolean) => {
+    if (!payload) return;
+    await resolveSave(db, save.id, passed);
+    if (passed) {
+      const targetPlayer = sessionState?.players.find((entry) => entry.remoteKey === save.targetKey);
+      const activeEffectId = String((save.effectPayload as any)?.id || '');
+      if (targetPlayer && activeEffectId) {
+        await removeLanPlayerEffect(db, targetPlayer.id, activeEffectId);
+      }
+    }
+    await rememberLanSessionEvent(db, {
+      id: makeLanEventId(),
+      sessionId: payload.session.id,
+      type: 'pending_save_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: save.targetKey,
+      toName: save.targetKey,
+      pendingSavePatch: {
+        action: 'resolve',
+        id: save.id,
+        result: { passed },
+      },
+      message: `Mestre marcou ${save.sourceName || 'teste'} como ${passed ? 'sucesso' : 'falha'}.`,
+      createdAt: new Date().toISOString(),
+    });
+    await reloadSessionState(payload.session.id, true);
+  };
+
   const handleGrantItemToPlayer = async (item: InventoryItemOption) => {
     if (!inventoryModalPlayer || !payload) return;
     const qty = Math.max(1, parseInt(grantItemQty, 10) || 1);
@@ -735,6 +1006,10 @@ export default function LanSessionScreen() {
       damage: item.damage || '',
       damage_type: item.damage_type || '',
       properties: item.properties || '',
+      descricao: item.descricao || '',
+      effect_json: item.effect_json || '[]',
+      duration_value: item.duration_value ?? null,
+      duration_unit: item.duration_unit || null,
     };
 
     if (existingIndex >= 0) {
@@ -768,6 +1043,49 @@ export default function LanSessionScreen() {
     const targets = effectTargetPlayerId === 'ALL'
       ? sessionState.players
       : sessionState.players.filter(p => p.id === effectTargetPlayerId);
+    const manualDuration = Math.max(1, parseInt(effectDuration, 10) || 1);
+    const drafts: EffectDraft[] = selectedEffectOptions.length > 0
+      ? selectedEffectOptions.map(makeEffectDraftFromOption)
+      : [{
+        name: effectName.trim() || 'Efeito temporario',
+        target: effectTarget,
+        value: parseInt(effectValue, 10) || 0,
+        remaining: manualDuration,
+        unit: effectUnit,
+        durationText: `${manualDuration} ${effectUnit}`,
+        kind: effectTarget === 'PV_TEMP' ? 'temp_hp' : effectTarget === 'HP' ? 'hp' : effectTarget === 'custom' ? 'custom' : 'stat',
+        mode: effectMode,
+        source: effectSource.trim() || undefined,
+        statusKey: effectTarget === 'custom' ? effectStatusKey || undefined : undefined,
+        color: effectColor || undefined,
+        secondaryColor: effectSecondaryColor || undefined,
+      }];
+
+    for (const p of targets) {
+      for (const draft of drafts) {
+        const usesStatusCatalog = draft.kind === 'status' || draft.target === 'custom';
+        await addLanPlayerEffect(db, p.id, {
+          name: draft.name,
+          target: draft.target,
+          value: draft.value,
+          remaining: draft.remaining,
+          unit: draft.unit,
+          durationText: draft.durationText,
+          kind: draft.kind,
+          mode: draft.mode,
+          source: draft.source,
+          status: usesStatusCatalog ? draft.statusKey : undefined,
+          statusKey: usesStatusCatalog ? draft.statusKey : undefined,
+          color: draft.color,
+          secondaryColor: draft.secondaryColor,
+        });
+      }
+    }
+
+    await recordMasterTimelineEvent(`Mestre aplicou ${drafts.length} efeito(s) em ${targets.length} alvo(s).`);
+    setSelectedEffectKeys([]);
+    if (payload?.session?.id) await reloadSessionState(payload!.session.id, true);
+    if (drafts.length === 0) {
 
     for (const p of targets) {
       await addLanPlayerEffect(db, p.id, {
@@ -781,13 +1099,15 @@ export default function LanSessionScreen() {
         mode: effectMode,
         source: [effectSource.trim(), effectSaveInfo].filter(Boolean).join(' - ') || undefined,
         status: effectStatusKey || undefined,
+        statusKey: effectStatusKey || undefined,
         color: effectColor || undefined,
         secondaryColor: effectSecondaryColor || undefined,
       });
     }
 
     await recordMasterTimelineEvent(`Mestre aplicou ${effectName.trim() || 'efeito temporario'} em ${targets.length} alvo(s).`);
-    if (payload) await reloadSessionState(payload.session.id, true);
+    if (payload?.session?.id) await reloadSessionState(payload!.session.id, true);
+    }
   };
 
   const handleRemoveEffect = async (playerId: number, effectId: string) => {
@@ -814,13 +1134,24 @@ export default function LanSessionScreen() {
     const val = parseInt(qeValue, 10) || 0;
 
     if (type === 'XP') {
-       await updateLanPlayerNumbers(db, player.id, { xp: player.xp + val });
-       await recordMasterTimelineEvent(`Mestre ajustou XP de ${player.characterName} em ${val >= 0 ? '+' : ''}${val}.`, player);
-       if (payload) await reloadSessionState(payload.session.id, true);
+       await handleUpdatePlayer(player, 'xp', player.xp + val);
     } else if (type === 'COIN') {
        const gp = parseInt(qeGP, 10) || 0;
        const sp = parseInt(qeSP, 10) || 0;
        const cp = parseInt(qeCP, 10) || 0;
+       const currentCopper = player.gp * 100 + player.sp * 10 + player.cp;
+       const nextCopper = Math.max(0, currentCopper + gp * 100 + sp * 10 + cp);
+       const patchedGp = Math.floor(nextCopper / 100);
+       const patchedSp = Math.floor((nextCopper % 100) / 10);
+       const patchedCp = nextCopper % 10;
+
+       await handleUpdatePlayerPatch(
+         player,
+         { gp: patchedGp, sp: patchedSp, cp: patchedCp },
+         `Mestre ajustou moedas de ${player.characterName} para ${patchedGp} PO, ${patchedSp} PP, ${patchedCp} PC.`
+       );
+       setQuickEdit(null);
+       if (gp + sp + cp < -999999) {
        
        let newCp = player.cp + cp;
        let newSp = player.sp + sp;
@@ -830,9 +1161,10 @@ export default function LanSessionScreen() {
        if (newCp >= 10) { newSp += Math.floor(newCp / 10); newCp %= 10; }
        if (newSp >= 10) { newGp += Math.floor(newSp / 10); newSp %= 10; }
        
-       await updateLanPlayerNumbers(db, player.id, { gp: newGp, sp: newSp, cp: newCp });
-       await recordMasterTimelineEvent(`Mestre ajustou moedas de ${player.characterName}.`, player);
-       if (payload) await reloadSessionState(payload.session.id, true);
+       await handleUpdatePlayer(player, 'gp', newGp);
+       await handleUpdatePlayer(player, 'sp', newSp);
+       await handleUpdatePlayer(player, 'cp', newCp);
+       }
     } else if (type === 'HP' && !qeIsTemp) {
        await handleUpdatePlayer(player, 'hpCurrent', val);
     } else {
@@ -936,6 +1268,104 @@ export default function LanSessionScreen() {
             <TouchableOpacity style={[styles.primaryButton, { marginTop: 16 }]} onPress={handleApplyQuickEdit}>
               <Text style={styles.primaryButtonText}>SALVAR ALTERAÇÃO</Text>
             </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  const renderPlayerDetailsModal = () => {
+    if (!detailPlayer) return null;
+
+    const snapshot = detailPlayer.characterSnapshot || {};
+    const saveIds = parseStringArray(snapshot.save_values).length
+      ? parseStringArray(snapshot.save_values)
+      : parseStringArray(snapshot.proficiencies).filter((id) => id.startsWith('save_'));
+    const skillIds = parseStringArray(snapshot.skill_values).length
+      ? parseStringArray(snapshot.skill_values)
+      : parseStringArray(snapshot.proficiencies).filter((id) => id.startsWith('skill_'));
+    const spellIds = parseStringArray(snapshot.spells);
+    const bag = Array.isArray((detailPlayer.equipment as any)?.bag) ? (detailPlayer.equipment as any).bag : [];
+
+    return (
+      <Modal visible={!!detailPlayer} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalPanel}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>{detailPlayer.characterName}</Text>
+                <Text style={styles.mutedText}>{detailPlayer.race} - {detailPlayer.className} - Nivel {detailPlayer.level}</Text>
+              </View>
+              <TouchableOpacity style={styles.modalCloseButton} onPress={() => setDetailPlayer(null)}>
+                <Ionicons name="close" size={22} color={appColors.textPrimary} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView nestedScrollEnabled={true} showsVerticalScrollIndicator={true}>
+              <View style={styles.metricGrid}>
+                {STAT_KEYS.map((stat) => (
+                  <View key={stat} style={styles.metricBox}>
+                    <Text style={styles.metricLabel}>{stat}</Text>
+                    <Text style={styles.metricValue}>{String(detailPlayer.stats?.[stat] ?? '-')}</Text>
+                  </View>
+                ))}
+              </View>
+
+              <View style={styles.inventoryBox}>
+                <Text style={styles.strongText}>Recursos</Text>
+                <Text style={styles.inventoryText}>
+                  HP {detailPlayer.hpCurrent}/{detailPlayer.hpMax} - PV temp {detailPlayer.tempHp} - XP {detailPlayer.xp}
+                </Text>
+                <Text style={styles.inventoryText}>
+                  Moedas: {detailPlayer.gp} PO, {detailPlayer.sp} PP, {detailPlayer.cp} PC
+                </Text>
+              </View>
+
+              <View style={styles.inventoryBox}>
+                <Text style={styles.strongText}>Testes e pericias</Text>
+                <Text style={styles.inventoryText}>Testes: {formatReferenceNames(saveIds, saveOptions) || 'Nenhum registrado.'}</Text>
+                <Text style={styles.inventoryText}>Pericias: {formatReferenceNames(skillIds, skillOptions) || 'Nenhuma registrada.'}</Text>
+              </View>
+
+              <View style={styles.inventoryBox}>
+                <Text style={styles.strongText}>Habilidades e magias</Text>
+                <Text style={styles.inventoryText}>{String(snapshot.features_traits || 'Nenhuma habilidade/historia mecanica registrada.')}</Text>
+                {spellIds.length > 0 && (
+                  <Text style={styles.inventoryText}>Magias: {formatReferenceNames(spellIds, spellOptions)}</Text>
+                )}
+              </View>
+
+              <View style={styles.inventoryBox}>
+                <Text style={styles.strongText}>Historia</Text>
+                {['personality_traits', 'ideals', 'bonds', 'flaws', 'backstory', 'allies_organizations', 'languages'].map((field) => (
+                  snapshot[field] ? (
+                    <Text key={field} style={styles.inventoryText}>
+                      {formatCharacterField(field)}: {String(snapshot[field])}
+                    </Text>
+                  ) : null
+                ))}
+              </View>
+
+              <View style={styles.inventoryBox}>
+                <Text style={styles.strongText}>Inventario</Text>
+                {bag.length === 0 ? (
+                  <Text style={styles.inventoryText}>Bolsa vazia.</Text>
+                ) : bag.map((item: any, index: number) => (
+                  <Text key={`${item?.name || 'item'}-${index}`} style={styles.inventoryText}>
+                    {item.qty || 1}x {item.name || 'Item'}{describeInventoryItem(item) ? ` - ${describeInventoryItem(item)}` : ''}
+                  </Text>
+                ))}
+              </View>
+
+              {detailPlayer.effects.length > 0 && (
+                <View style={styles.effectBox}>
+                  <Text style={styles.strongText}>Efeitos ativos</Text>
+                  {detailPlayer.effects.map((effect) => (
+                    <Text key={effect.id} style={styles.effectText}>{summarizeEffect(effect)}</Text>
+                  ))}
+                </View>
+              )}
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -1046,9 +1476,22 @@ export default function LanSessionScreen() {
                 style={styles.searchInput}
                 value={inventorySearch}
                 onChangeText={setInventorySearch}
-                placeholder="Buscar item do acervo..."
+                placeholder="Buscar por nome, dano, tipo, propriedade ou descricao..."
                 placeholderTextColor={appColors.placeholderLight}
               />
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                <View style={styles.filterRail}>
+                  {INVENTORY_FILTERS.map((filter) => (
+                    <TouchableOpacity
+                      key={filter}
+                      style={[styles.filterChip, inventoryFilter === filter && styles.filterChipActive]}
+                      onPress={() => setInventoryFilter(filter)}
+                    >
+                      <Text style={[styles.filterChipText, inventoryFilter === filter && styles.filterChipTextActive]}>{filter}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </ScrollView>
               <View style={styles.toolbar}>
                 <TouchableOpacity style={styles.smallButton} onPress={() => setGrantItemQty(String(Math.max(1, (parseInt(grantItemQty, 10) || 1) - 1)))}>
                   <Ionicons name="remove" size={16} color={appColors.textPrimary} />
@@ -1069,12 +1512,16 @@ export default function LanSessionScreen() {
                 {filteredInventoryCatalog.map((item) => (
                   <TouchableOpacity key={item.id} style={styles.catalogRow} onPress={() => handleGrantItemToPlayer(item)}>
                     <View style={styles.catalogTextBox}>
+                      <Text style={styles.catalogTag}>{getInventoryItemCategory(item)}</Text>
                       <Text style={styles.catalogName}>{item.name}</Text>
-                      <Text style={styles.catalogMeta}>{[item.damage, item.damage_type, item.properties].filter(Boolean).join(' - ') || item.descricao || 'Item do acervo'}</Text>
+                      <Text style={styles.catalogMeta}>{describeInventoryItem(item)}</Text>
                     </View>
                     <Ionicons name="add-circle" size={20} color={appColors.success} />
                   </TouchableOpacity>
                 ))}
+                {filteredInventoryCatalog.length === 0 && (
+                  <Text style={styles.hint}>Nenhum item encontrado neste filtro.</Text>
+                )}
               </ScrollView>
             </View>
 
@@ -1337,10 +1784,10 @@ export default function LanSessionScreen() {
               {event.type === 'resource_request' && event.fromKey !== 'master' && !reviewedRequestEventSet.has(event.id) && (
                 <View style={styles.savedSessionActions}>
                   <TouchableOpacity style={[styles.smallButton, styles.smallButtonSuccess]} onPress={() => handleReviewResourceRequest(event, true)}>
-                    <Text style={[styles.smallButtonText, styles.smallButtonTextSuccess]}>OK</Text>
+                    <Text style={[styles.smallButtonText, styles.smallButtonTextSuccess]}>Aceitar</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger]} onPress={() => handleReviewResourceRequest(event, false)}>
-                    <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Nao</Text>
+                    <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Recusar</Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -1367,6 +1814,33 @@ export default function LanSessionScreen() {
         {sessionState.players.length === 0 ? (
           <Text style={styles.hint}>Nenhum jogador notificou entrada ainda.</Text>
         ) : sessionState.players.map(renderPlayerCard)}
+
+        {pendingSaves.length > 0 && (
+          <View style={styles.effectForm}>
+            <Text style={styles.strongText}>Testes pendentes</Text>
+            {pendingSaves.map((save) => {
+              const player = sessionState.players.find((entry) => entry.remoteKey === save.targetKey);
+              return (
+                <View key={save.id} style={styles.catalogRow}>
+                  <View style={styles.catalogTextBox}>
+                    <Text style={styles.catalogName}>{player?.characterName || save.targetKey}</Text>
+                    <Text style={styles.catalogMeta}>
+                      {save.sourceName || 'Efeito'} - {save.ability}{save.dc ? ` CD ${save.dc}` : ' CD manual'}
+                    </Text>
+                  </View>
+                  <View style={styles.savedSessionActions}>
+                    <TouchableOpacity style={[styles.smallButton, styles.smallButtonSuccess]} onPress={() => handleResolvePendingSave(save, true)}>
+                      <Text style={[styles.smallButtonText, styles.smallButtonTextSuccess]}>Passou</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger]} onPress={() => handleResolvePendingSave(save, false)}>
+                      <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Falhou</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
 
         {sessionState.players.length > 0 && (
           <View style={styles.effectForm}>
@@ -1470,6 +1944,10 @@ export default function LanSessionScreen() {
             </View>
 
             <View style={styles.toolbar}>
+              <TouchableOpacity style={styles.smallButton} onPress={() => setDetailPlayer(player)}>
+                <Ionicons name="document-text" size={14} color={appColors.primary} />
+                <Text style={styles.smallButtonText}>Ver ficha</Text>
+              </TouchableOpacity>
               <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger, { marginLeft: 'auto' }]} onPress={() => handleKickPlayer(player)}>
                 <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Kick / Expulsar</Text>
               </TouchableOpacity>
@@ -1549,26 +2027,50 @@ export default function LanSessionScreen() {
         placeholderTextColor={appColors.placeholderLight}
       />
 
+      {selectedEffectOptions.length > 0 && (
+        <View style={styles.inventoryBox}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.strongText}>{selectedEffectOptions.length} efeito(s) selecionado(s)</Text>
+            <TouchableOpacity onPress={clearSelectedEffects}>
+              <Text style={{ color: appColors.danger, fontSize: 12, fontWeight: 'bold' }}>Limpar</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.inventoryText}>{selectedEffectOptions.map((option) => option.name).join(', ')}</Text>
+        </View>
+      )}
+
       <ScrollView 
         style={{ maxHeight: 190 }} 
         nestedScrollEnabled={true} 
         keyboardShouldPersistTaps="handled"
       >
-        {filteredEffectOptions.map((option) => (
-          <TouchableOpacity key={option.key} style={styles.catalogRow} onPress={() => handleSelectEffectOption(option)}>
-            <View style={styles.catalogTextBox}>
-              <Text style={styles.catalogTag}>{option.group}</Text>
-              <Text style={styles.catalogName}>{option.name}</Text>
-              <Text style={styles.catalogMeta}>{option.detail || 'Sem detalhe cadastrado'}</Text>
-            </View>
-          </TouchableOpacity>
-        ))}
+        {filteredEffectOptions.map((option) => {
+          const selected = selectedEffectSet.has(option.key);
+          return (
+            <TouchableOpacity
+              key={option.key}
+              style={[styles.catalogRow, selected && styles.catalogRowActive]}
+              onPress={() => handleSelectEffectOption(option)}
+            >
+              <View style={[styles.catalogCheck, selected && styles.catalogCheckActive]}>
+                {selected && <Ionicons name="checkmark" size={15} color={appColors.primaryDark} />}
+              </View>
+              <View style={styles.catalogTextBox}>
+                <Text style={styles.catalogTag}>{option.group}</Text>
+                <Text style={styles.catalogName}>{option.name}</Text>
+                <Text style={styles.catalogMeta}>{option.detail || 'Sem detalhe cadastrado'}</Text>
+              </View>
+            </TouchableOpacity>
+          );
+        })}
       </ScrollView>
 
       <View style={styles.inventoryBox}>
-        <Text style={styles.strongText}>{effectName}</Text>
+        <Text style={styles.strongText}>{selectedEffectOptions.length > 0 ? 'Aplicacao em lote' : effectName}</Text>
         <Text style={styles.inventoryText}>Fonte: {effectSource || 'base'} - ajuste alvo, valor e duração antes de aplicar.</Text>
-        {effectSaveInfo ? <Text style={styles.inventoryText}>{effectSaveInfo}</Text> : null}
+        {selectedEffectOptions.length > 0 ? (
+          <Text style={styles.inventoryText}>Busca filtra; clique em varios itens para selecionar ou remover da selecao.</Text>
+        ) : effectSaveInfo ? <Text style={styles.inventoryText}>{effectSaveInfo}</Text> : null}
       </View>
 
       <ScrollView horizontal showsHorizontalScrollIndicator={false} nestedScrollEnabled={true}>
@@ -1667,8 +2169,8 @@ export default function LanSessionScreen() {
         ) : (
           <>
             {renderSessionControls()}
-            {renderTimelineCard()}
             {renderPlayers()}
+            {renderTimelineCard()}
             {renderCatalogCard()}
             {renderQrCard()}
           </>
@@ -1678,6 +2180,7 @@ export default function LanSessionScreen() {
       {/* MODAIS AQUI - Eles precisam estar renderizados no topo da árvore */}
       {renderCatalogModal()}
       {renderInventoryModal()}
+      {renderPlayerDetailsModal()}
       {renderQuickEditModal()}
       
       {payload && <DiceRoller3D />}
@@ -1705,19 +2208,111 @@ function getBagPreview(equipment: Record<string, unknown>) {
     .join(', ');
 }
 
+function makeEffectDraftFromOption(option: EffectOption): EffectDraft {
+  const firstEffect = option.effects[0] || {};
+  const target = normalizeEffectTarget(firstEffect.target || firstEffect.stat || firstEffect.type);
+  const remaining = Math.max(1, Number(option.durationValue || firstEffect.durationValue || firstEffect.duration || 1) || 1);
+  const unit = option.durationUnit || normalizeEffectUnit(firstEffect.durationUnit || firstEffect.unit) || inferUnitFromText(option.durationText);
+  const kind = target === 'PV_TEMP'
+    ? 'temp_hp'
+    : target === 'HP'
+      ? 'hp'
+      : target === 'custom'
+        ? 'status'
+        : 'stat';
+
+  return {
+    name: String(firstEffect.conditionName || option.name || 'Efeito'),
+    target,
+    value: Number(firstEffect.value ?? firstEffect.val ?? firstEffect.amount ?? 0) || 0,
+    remaining,
+    unit,
+    durationText: option.durationText || `${remaining} ${unit}`,
+    kind,
+    mode: firstEffect.mode === 'set' ? 'set' : 'add',
+    source: option.group,
+    statusKey: option.statusKey || String(firstEffect.statusKey || firstEffect.status || ''),
+    color: option.color || String(firstEffect.color || ''),
+    secondaryColor: option.secondaryColor || String(firstEffect.secondaryColor || ''),
+  };
+}
+
+function getInventoryItemCategory(item: Record<string, unknown>): InventoryFilter {
+  const text = `${item.name || ''} ${item.properties || ''} ${item.descricao || ''} ${item.damage || ''} ${item.damage_type || ''}`.toLowerCase();
+  const effectJson = String(item.effect_json || '').trim();
+  if (effectJson && effectJson !== '[]') return 'Efeitos';
+  if (text.includes('poção') || text.includes('pocao') || text.includes('pergaminho') || text.includes('consum')) return 'Consumiveis';
+  if (text.includes(' ca ') || text.includes('armadura') || text.includes('escudo')) return 'Armaduras';
+  if (String(item.damage || '').trim() || text.includes('arma')) return 'Armas';
+  return 'Outros';
+}
+
+function matchesInventorySearch(item: InventoryItemOption, search: string) {
+  return [
+    item.name,
+    item.damage,
+    item.damage_type,
+    item.properties,
+    item.descricao,
+    getInventoryItemCategory(item),
+  ].some((value) => String(value || '').toLowerCase().includes(search));
+}
+
+function describeInventoryItem(item: Record<string, unknown>) {
+  return [item.damage, item.damage_type, item.properties, item.descricao]
+    .filter((value) => value && value !== '-')
+    .join(' - ');
+}
+
+function parseStringArray(value: unknown) {
+  if (Array.isArray(value)) return value.map((entry) => String(entry));
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(String(value));
+    return Array.isArray(parsed) ? parsed.map((entry) => String(entry)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function formatReferenceNames(ids: string[], options: ReferenceOption[]) {
+  if (!ids.length) return '';
+  const byId = new Map(options.map((option) => [String(option.id), option]));
+  return ids.map((id) => {
+    const option = byId.get(String(id));
+    return option ? `${option.name}${option.stat ? ` (${option.stat})` : ''}` : id;
+  }).join(', ');
+}
+
+function formatCharacterField(field: string) {
+  const labels: Record<string, string> = {
+    personality_traits: 'Personalidade',
+    ideals: 'Ideais',
+    bonds: 'Vinculos',
+    flaws: 'Defeitos',
+    backstory: 'Historia',
+    allies_organizations: 'Aliados/organizacoes',
+    languages: 'Idiomas',
+  };
+  return labels[field] || field;
+}
+
 function formatSessionEvent(event: LanSessionEvent) {
+  if (event.type === 'resource_request') return `${event.fromName} pediu: ${formatResourceRequest(event.resourceRequest)}.`;
   if (event.message) return event.message;
   if (event.type === 'player_joined') return `${event.fromName} entrou na sessao.`;
   if (event.type === 'effect_expired') {
     const effectName = event.expiredEffect?.name || 'Efeito';
     return `${event.toName}: ${effectName} acabou.`;
   }
+  if (event.type === 'effect_patch') return event.message || `Efeitos oficiais atualizados para ${event.toName}.`;
+  if (event.type === 'effect_catalog_patch') return event.message || 'Catalogo de efeitos atualizado.';
+  if (event.type === 'pending_save_patch') return event.message || `Teste pendente atualizado para ${event.toName}.`;
   if (event.type === 'spell_effect') {
     if (event.fromKey === event.toKey || event.fromName === event.toName) return `${event.fromName} usou ${event.spellEffect?.spellName || 'efeito'}.`;
     return `${event.fromName} aplicou ${event.spellEffect?.spellName || 'efeito'} em ${event.toName}.`;
   }
   if (event.type === 'spell_hp') return `${event.fromName} usou ${event.spellEffect?.spellName || 'magia'} em ${event.toName}.`;
-  if (event.type === 'resource_request') return `${event.fromName} pediu: ${formatResourceRequest(event.resourceRequest)}.`;
   if (event.type === 'resource_review') return event.message || `Revisao de pedido: ${event.toName}.`;
   if (event.type === 'inventory_patch') return event.message || `${event.fromName} atualizou o inventario.`;
   if (event.type === 'player_patch') return event.message || `${event.fromName} atualizou recursos proprios.`;
@@ -1736,9 +2331,19 @@ function formatResourceRequest(request?: LanSessionEvent['resourceRequest']) {
   const sign = amount >= 0 ? '+' : '';
   if (request.kind === 'xp') return `XP ${sign}${amount}`;
   if (request.kind === 'hp') return `HP ${sign}${amount}`;
-  if (request.kind === 'stat') return `${request.field || 'atributo'} ${sign}${amount}`;
+  if (request.kind === 'temp_hp') return `PV temporario ${sign}${amount}`;
+  if (request.kind === 'coin') return `${formatCoinField(request.field)} ${sign}${amount}`;
+  if (request.kind === 'stat' || request.kind === 'buff') return `${request.field || 'atributo'} ${sign}${amount}`;
+  if (request.kind === 'condition') return `condicao ${request.field || 'manual'}`;
   if (request.kind === 'inventory') return request.item ? `${request.item.qty}x ${request.item.name}` : 'inventario';
   return 'ajuste';
+}
+
+function formatCoinField(field?: string) {
+  if (field === 'gp') return 'ouro';
+  if (field === 'sp') return 'prata';
+  if (field === 'cp') return 'cobre';
+  return 'moedas';
 }
 
 function formatPlayerField(field: 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp') {
@@ -1813,7 +2418,23 @@ function formatEffectSaveInfo(effect: any) {
 }
 
 function normalizeEffectUnit(value: unknown): LanEffectUnit | null {
-  if (value === 'turn' || value === 'minute' || value === 'hour' || value === 'rest') return value;
+  if (
+    value === 'instant' ||
+    value === 'turn' ||
+    value === 'round' ||
+    value === 'minute' ||
+    value === 'hour' ||
+    value === 'day' ||
+    value === 'short_rest' ||
+    value === 'long_rest' ||
+    value === 'rest' ||
+    value === 'concentration' ||
+    value === 'while_equipped' ||
+    value === 'while_active' ||
+    value === 'until_save' ||
+    value === 'permanent' ||
+    value === 'manual'
+  ) return value;
   return null;
 }
 
