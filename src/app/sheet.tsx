@@ -644,20 +644,29 @@ export default function CharacterSheetScreen() {
         }
         const changedBySession = await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id));
         if (changedBySession) {
-          const updated = await db.getFirstAsync<Record<string, unknown>>(`SELECT hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats, equipment, active_effects_json FROM characters WHERE id = ?`, [Number(character.id)]);
+          const updated = await db.getFirstAsync<Record<string, unknown>>(
+            `SELECT * FROM characters WHERE id = ?`,
+            [Number(character.id)]
+          );
+
           if (updated && active) {
+            let parsedEquip = JSON.parse(String(updated.equipment || '{}'));
+
+            if (Array.isArray(parsedEquip)) {
+              parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
+            } else {
+              parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
+            }
+
             setCharacter((prev: any) => ({
               ...prev,
-              hp_current: updated.hp_current,
-              hp_max: updated.hp_max,
-              temp_hp: updated.temp_hp,
-              xp: updated.xp,
-              gp: updated.gp,
-              sp: updated.sp,
-              cp: updated.cp,
+              ...(updated as any),
               stats: JSON.parse(String(updated.stats || '{}')),
-              equipment: JSON.parse(String(updated.equipment || '{}')),
+              equipment: parsedEquip,
+              spells: JSON.parse(String(updated.spells || '[]')),
               active_effects: JSON.parse(String(updated.active_effects_json || '[]')),
+              save_values: JSON.parse(String(updated.save_values || '[]')),
+              skill_values: JSON.parse(String(updated.skill_values || '[]')),
             }));
           }
         }
