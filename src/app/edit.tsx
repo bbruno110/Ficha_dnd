@@ -513,12 +513,18 @@ export default function EditCharacterScreen() {
       );
 
       if (sessionId) {
-        const joinedCharacter = await joinLanSessionWithCharacter(db, String(sessionId), character.id);
+        await joinLanSessionWithCharacter(db, String(sessionId), character.id, '', {
+          joinUrl: firstParam(joinUrl) || '',
+        });
+        const updatedCharacter = await db.getFirstAsync<Record<string, unknown>>(
+          `SELECT * FROM characters WHERE id = ?`,
+          [character.id]
+        );
 
         await notifyMasterJoin(
           firstParam(joinUrl),
           String(sessionId),
-          joinedCharacter,
+          updatedCharacter || character,
           '',
           { reviewSnapshot: true }
         );

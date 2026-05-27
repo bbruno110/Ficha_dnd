@@ -10,6 +10,7 @@ import {
   type LanEffectPatch,
   type LanPendingSave,
 } from './effects';
+import { ensureLanSyncSchema, saveLanSessionSnapshot } from './lanSyncEngine';
 import {
   fetchLanTcpPayload,
   getLanTcpClientEvents,
@@ -556,17 +557,34 @@ export async function saveLanSession(
       [payload.session.id, ...values, state.status]
     );
   }
+
+  await saveLanSessionSnapshot(db, payload).catch(() => {});
 }
 
 export async function getSavedLanSessions(db: SQLiteDatabase): Promise<LanSessionSummary[]> {
   await ensureLanSchema(db);
   const rows = await db.getAllAsync<Record<string, unknown>>(
     `SELECT s.*,
-            SUM(CASE WHEN COALESCE(p.is_active, 1) = 1 AND p.kicked_at IS NULL THEN 1 ELSE 0 END) as player_count,
-            MAX(CASE WHEN COALESCE(p.is_active, 1) = 1 AND p.kicked_at IS NULL AND p.character_id IS NOT NULL THEN 1 ELSE 0 END) as has_bound_character
+            CASE
+              WHEN COALESCE(s.is_master, 0) = 1 THEN (
+                SELECT COUNT(*)
+                FROM lan_session_players p
+                WHERE p.session_id = s.id
+                  AND COALESCE(p.is_active, 1) = 1
+                  AND p.kicked_at IS NULL
+              )
+              ELSE 0
+            END as player_count,
+            CASE
+              WHEN COALESCE(s.is_master, 0) = 0 THEN (
+                SELECT COUNT(*)
+                FROM lan_local_character_bindings b
+                WHERE b.session_id = s.id
+                  AND COALESCE(b.is_active, 1) = 1
+              )
+              ELSE 0
+            END as bound_count
      FROM lan_sessions s
-     LEFT JOIN lan_session_players p ON p.session_id = s.id
-     GROUP BY s.id
      ORDER BY COALESCE(s.updated_at, s.created_at) DESC`
   );
 
@@ -582,7 +600,7 @@ export async function getSavedLanSessions(db: SQLiteDatabase): Promise<LanSessio
     elapsedMinutes: toNumber(row.elapsed_minutes),
     joinUrl: row.join_url ? String(row.join_url) : undefined,
     active: Boolean(row.active),
-    isMaster: Boolean(row.is_master) && toNumber(row.has_bound_character) === 0,
+    isMaster: toNumber(row.is_master) === 1,
     selectedCatalog: normalizeCatalogSelection(parseJsonValue(row.selected_catalog_json, {})),
     playerCount: toNumber(row.player_count),
     createdAt: row.created_at ? String(row.created_at) : undefined,
@@ -598,12 +616,11 @@ export async function deleteLanSession(db: SQLiteDatabase, sessionId: string) {
   await db.runAsync(`DELETE FROM lan_session_pending_requests WHERE session_id = ?`, [sessionId]);
   await db.runAsync(`DELETE FROM lan_session_events WHERE session_id = ?`, [sessionId]);
   await db.runAsync(`DELETE FROM lan_session_players WHERE session_id = ?`, [sessionId]);
+  await db.runAsync(`DELETE FROM lan_local_character_bindings WHERE session_id = ?`, [sessionId]);
   await db.runAsync(`DELETE FROM lan_sessions WHERE id = ?`, [sessionId]);
 }
 
 export async function startLanServer(payload: LanSessionPayload) {
-  await stopLanTcpHost();
-
   let joinUrl = '';
 
   try {
@@ -641,12 +658,18 @@ export function isEmulatorOnlyTcpUrl(url?: string) {
 }
 
 export async function getMasterJoinedPlayers(joinUrl?: string) {
-  if (isTcpLanUrl(joinUrl)) return getLanTcpHostJoinedRows();
+  // Quando a tela do mestre já está hospedando uma sessão local, o transporte TCP
+  // mantém os joins em memória no host. Não dependa de joinUrl preenchida aqui,
+  // porque durante retomada/foreground o estado React pode ficar alguns ms atrasado.
+  if (!joinUrl || isTcpLanUrl(joinUrl)) return getLanTcpHostJoinedRows();
   return [];
 }
 
 export async function getNativeSessionEvents(joinUrl?: string) {
-  if (isTcpLanUrl(joinUrl)) return getLanTcpHostEvents();
+  // Mesmo raciocínio do roster: se somos o host local, os eventos ficam em memória
+  // no transporte e devem ser consumidos pela tela do mestre ainda que joinUrl esteja
+  // momentaneamente vazio/desatualizado.
+  if (!joinUrl || isTcpLanUrl(joinUrl)) return getLanTcpHostEvents();
   return [];
 }
 
@@ -665,6 +688,23 @@ export async function stopLanServer() {
   await stopLanTcpHost();
   if (Platform.OS !== 'android' || !lanNative?.stopSession) return false;
   return lanNative.stopSession();
+}
+
+export async function stopLanServerTransportOnly() {
+  await stopLanForegroundSession();
+  await stopLanTcpHost();
+  if (Platform.OS !== 'android' || !lanNative?.stopSession) return false;
+  return lanNative.stopSession();
+}
+
+export async function switchLanRole(nextRole: 'master' | 'player') {
+  if (nextRole === 'master') {
+    resetLanClientConnection();
+    return;
+  }
+
+  await stopLanServerTransportOnly();
+  resetLanClientConnection();
 }
 
 export async function fetchLanSessionPayload(url: string): Promise<LanSessionPayload> {
@@ -704,18 +744,24 @@ export async function rememberAndSendLanSessionEvent(
   const eventWithSeq = await withLanEventSeq(db, event);
   await db.runAsync(
     `INSERT INTO lan_session_events (
-      id, session_id, seq, type, from_key, to_key, client_msg_id, payload_json, processed
+      id, session_id, seq, server_seq, type, from_key, to_key, client_msg_id,
+      payload_json, processed, entity_type, entity_id, entity_revision, ack_required
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
     [
       eventWithSeq.id,
       eventWithSeq.sessionId,
+      eventWithSeq.seq ?? null,
       eventWithSeq.seq ?? null,
       eventWithSeq.type,
       eventWithSeq.fromKey || null,
       eventWithSeq.toKey || null,
       eventWithSeq.clientMsgId || null,
       JSON.stringify(eventWithSeq),
+      inferLanEventEntityType(eventWithSeq),
+      inferLanEventEntityId(eventWithSeq),
+      eventWithSeq.seq ?? 0,
+      shouldRequireLanAck(eventWithSeq) ? 1 : 0,
     ]
   );
 
@@ -774,18 +820,24 @@ export async function rememberLanSessionEvent(db: SQLiteDatabase, event: LanSess
 
   await db.runAsync(
     `INSERT INTO lan_session_events (
-      id, session_id, seq, type, from_key, to_key, client_msg_id, payload_json, processed
+      id, session_id, seq, server_seq, type, from_key, to_key, client_msg_id,
+      payload_json, processed, entity_type, entity_id, entity_revision, ack_required
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
     [
       eventWithSeq.id,
       eventWithSeq.sessionId,
+      eventWithSeq.seq ?? null,
       eventWithSeq.seq ?? null,
       eventWithSeq.type,
       eventWithSeq.fromKey || null,
       eventWithSeq.toKey || null,
       eventWithSeq.clientMsgId || null,
       JSON.stringify(eventWithSeq),
+      inferLanEventEntityType(eventWithSeq),
+      inferLanEventEntityId(eventWithSeq),
+      eventWithSeq.seq ?? 0,
+      shouldRequireLanAck(eventWithSeq) ? 1 : 0,
     ]
   );
   return true;
@@ -823,18 +875,39 @@ async function withLanEventSeq(db: SQLiteDatabase, event: LanSessionEvent): Prom
   return { ...event, seq: nextSeq };
 }
 
+function inferLanEventEntityType(event: LanSessionEvent) {
+  if (event.type === 'session_patch' || event.type === 'timeline_event') return 'session';
+  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
+  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
+  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  return 'player';
+}
+
+function inferLanEventEntityId(event: LanSessionEvent) {
+  return event.toKey || event.fromKey || event.tradeId || event.sessionId;
+}
+
+function shouldRequireLanAck(event: LanSessionEvent) {
+  return event.toKey !== 'master' && event.toKey !== 'party' && event.toKey !== 'session';
+}
+
 export async function getLocalLanSessionForCharacter(db: SQLiteDatabase, characterId: number) {
   await ensureLanSchema(db);
   return db.getFirstAsync<{
     sessionId: string;
     joinUrl?: string;
     payloadJson?: string;
+    remoteKey?: string;
   }>(
-    `SELECT s.id as sessionId, s.join_url as joinUrl, s.payload_json as payloadJson
-     FROM lan_session_players p
-     JOIN lan_sessions s ON s.id = p.session_id
-     WHERE p.character_id = ? AND COALESCE(p.is_active, 1) = 1 AND p.kicked_at IS NULL
-     ORDER BY COALESCE(s.updated_at, s.created_at) DESC
+    `SELECT s.id as sessionId,
+            COALESCE(b.join_url, s.join_url) as joinUrl,
+            s.payload_json as payloadJson,
+            b.remote_key as remoteKey
+     FROM lan_local_character_bindings b
+     JOIN lan_sessions s ON s.id = b.session_id
+     WHERE b.character_id = ?
+       AND COALESCE(b.is_active, 1) = 1
+     ORDER BY COALESCE(b.updated_at, b.joined_at) DESC
      LIMIT 1`,
     [characterId]
   );
@@ -848,14 +921,19 @@ export async function getBoundLanCharacter(db: SQLiteDatabase, sessionId: string
     sessionName: string;
     joinUrl?: string;
     payloadJson?: string;
+    remoteKey?: string;
   }>(
-    `SELECT p.character_id as characterId, s.id as sessionId, s.name as sessionName,
-            s.join_url as joinUrl, s.payload_json as payloadJson
-     FROM lan_session_players p
-     JOIN lan_sessions s ON s.id = p.session_id
-     WHERE p.session_id = ? AND p.character_id IS NOT NULL
-       AND COALESCE(p.is_active, 1) = 1 AND p.kicked_at IS NULL
-     ORDER BY p.last_seen_at DESC
+    `SELECT b.character_id as characterId,
+            s.id as sessionId,
+            s.name as sessionName,
+            COALESCE(b.join_url, s.join_url) as joinUrl,
+            s.payload_json as payloadJson,
+            b.remote_key as remoteKey
+     FROM lan_local_character_bindings b
+     JOIN lan_sessions s ON s.id = b.session_id
+     WHERE b.session_id = ?
+       AND COALESCE(b.is_active, 1) = 1
+     ORDER BY COALESCE(b.updated_at, b.joined_at) DESC
      LIMIT 1`,
     [sessionId]
   );
@@ -868,12 +946,18 @@ export async function getCharacterLanBinding(db: SQLiteDatabase, characterId: nu
     sessionId: string;
     sessionName: string;
     joinUrl?: string;
+    remoteKey?: string;
   }>(
-    `SELECT p.character_id as characterId, s.id as sessionId, s.name as sessionName, s.join_url as joinUrl
-     FROM lan_session_players p
-     JOIN lan_sessions s ON s.id = p.session_id
-     WHERE p.character_id = ? AND COALESCE(p.is_active, 1) = 1 AND p.kicked_at IS NULL
-     ORDER BY p.last_seen_at DESC
+    `SELECT b.character_id as characterId,
+            s.id as sessionId,
+            s.name as sessionName,
+            COALESCE(b.join_url, s.join_url) as joinUrl,
+            b.remote_key as remoteKey
+     FROM lan_local_character_bindings b
+     JOIN lan_sessions s ON s.id = b.session_id
+     WHERE b.character_id = ?
+       AND COALESCE(b.is_active, 1) = 1
+     ORDER BY COALESCE(b.updated_at, b.joined_at) DESC
      LIMIT 1`,
     [characterId]
   );
@@ -882,10 +966,21 @@ export async function getCharacterLanBinding(db: SQLiteDatabase, characterId: nu
 export async function unlinkCharacterFromLanSession(db: SQLiteDatabase, characterId: number, sessionId?: string) {
   await ensureLanSchema(db);
   if (sessionId) {
-    await db.runAsync(`DELETE FROM lan_session_players WHERE character_id = ? AND session_id = ?`, [characterId, sessionId]);
-  } else {
-    await db.runAsync(`DELETE FROM lan_session_players WHERE character_id = ?`, [characterId]);
+    await db.runAsync(
+      `UPDATE lan_local_character_bindings
+       SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+       WHERE character_id = ? AND session_id = ?`,
+      [characterId, sessionId]
+    );
+    return;
   }
+
+  await db.runAsync(
+    `UPDATE lan_local_character_bindings
+     SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+     WHERE character_id = ?`,
+    [characterId]
+  );
 }
 
 export function getPublicLanPlayers(payload: LanSessionPayload, selfKey?: string): PublicLanPlayer[] {
@@ -978,11 +1073,16 @@ export async function refreshLanSessionPayload(db: SQLiteDatabase, sessionId: st
     `UPDATE lan_sessions SET payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [JSON.stringify(payload), sessionId]
   );
+  await saveLanSessionSnapshot(db, payload).catch(() => {});
 
   return payload;
 }
 
-export async function syncLanSessionPayload(db: SQLiteDatabase, sessionId: string) {
+export async function syncLanSessionPayload(
+  db: SQLiteDatabase,
+  sessionId: string,
+  options?: { broadcast?: boolean }
+) {
   const payload = await refreshLanSessionPayload(db, sessionId);
   if (!payload) return null;
 
@@ -994,7 +1094,7 @@ export async function syncLanSessionPayload(db: SQLiteDatabase, sessionId: strin
     `SELECT join_url as joinUrl, is_master as isMaster FROM lan_sessions WHERE id = ?`,
     [sessionId]
   );
-  updateLanHostPayload(row?.joinUrl, payload, { broadcast: true });
+  updateLanHostPayload(row?.joinUrl, payload, { broadcast: options?.broadcast !== false });
   if (toNumber(row?.isMaster) === 1) {
     await updateLanForegroundSession(payload, row?.joinUrl);
   }
@@ -1071,42 +1171,48 @@ export async function resumeLanSession(db: SQLiteDatabase, sessionId: string) {
   return syncLanSessionPayload(db, sessionId);
 }
 
-export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId: string, characterId: number, playerName = '') {
+export async function joinLanSessionWithCharacter(
+  db: SQLiteDatabase,
+  sessionId: string,
+  characterId: number,
+  playerName = '',
+  options?: { joinUrl?: string; inviteCode?: string }
+) {
   await ensureLanSchema(db);
   const character = await db.getFirstAsync<Record<string, unknown>>(`SELECT * FROM characters WHERE id = ?`, [characterId]);
   const normalized = normalizeCharacterState(character || {});
+  const remoteKey = makeLanCharacterKey(sessionId, { ...(character || {}), id: characterId });
+
+  const session = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT join_url, invite_code FROM lan_sessions WHERE id = ?`,
+    [sessionId]
+  );
 
   await db.runAsync(
-    `INSERT OR REPLACE INTO lan_session_players (
-      session_id, remote_key, player_name, character_id, character_name, character_snapshot,
-      level, class_name, race, hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+    `INSERT INTO lan_local_character_bindings (
+       session_id, character_id, join_url, invite_code, remote_key, role, is_active, joined_at, updated_at
+     )
+     VALUES (?, ?, ?, ?, ?, 'player', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT(session_id, character_id) DO UPDATE SET
+       join_url = COALESCE(excluded.join_url, lan_local_character_bindings.join_url),
+       invite_code = COALESCE(excluded.invite_code, lan_local_character_bindings.invite_code),
+       remote_key = excluded.remote_key,
+       role = 'player',
+       is_active = 1,
+       updated_at = CURRENT_TIMESTAMP`,
     [
       sessionId,
-      makeLanCharacterKey(sessionId, { ...(character || {}), id: characterId }),
-      playerName || normalized.characterName,
       characterId,
-      normalized.characterName,
-      JSON.stringify(character || {}),
-      normalized.level,
-      normalized.className,
-      normalized.race,
-      normalized.hpCurrent,
-      normalized.hpMax,
-      normalized.tempHp,
-      normalized.xp,
-      normalized.gp,
-      normalized.sp,
-      normalized.cp,
-      JSON.stringify(normalized.stats),
-      JSON.stringify(normalized.equipment),
-      '[]',
+      options?.joinUrl || String(session?.join_url || '') || null,
+      options?.inviteCode || String(session?.invite_code || '') || null,
+      remoteKey,
     ]
   );
 
-  await syncLanSessionPayload(db, sessionId);
-  return character;
+  return character || {
+    id: characterId,
+    name: normalized.characterName,
+  };
 }
 
 export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: string, character: Record<string, unknown> | null, playerName = '', options?: { reviewSnapshot?: boolean }) {
@@ -1202,25 +1308,23 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
       return Number(existing.id);
     }
 
+    // Sem diff pendente: o JOIN atual deve consolidar/substituir qualquer
+    // registro provisório ou antigo no SQLite do mestre.
+    // Isso evita o bug do mestre mostrar HP 0/0, XP 0 e moedas zeradas
+    // quando o player foi criado antes como pendente/provisório.
+    await updateLanPlayerFromNormalizedSnapshot(db, Number(existing.id), character, normalized);
+
     await db.runAsync(
       `UPDATE lan_session_players
-       SET remote_key = ?, client_id = COALESCE(?, client_id), player_name = ?,
-           pending_character_snapshot = NULL, notes = NULL, is_connected = 1,
+       SET remote_key = ?,
+           client_id = COALESCE(?, client_id),
+           player_name = ?,
+           is_connected = 1,
            last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [remoteKey, clientId || null, playerName, Number(existing.id)]
     );
 
-    if (!existing.class_name || !existing.race) {
-      await db.runAsync(
-        `UPDATE lan_session_players
-         SET level = ?,
-             class_name = ?,
-             race = ?
-         WHERE id = ?`,
-        [normalized.level, normalized.className, normalized.race, Number(existing.id)]
-      );
-    }
     return Number(existing.id);
   }
 
@@ -1480,6 +1584,62 @@ export async function applyLanPlayerNumberPatch(
   if (patch.cp != null) allowedPatch.cp = nextCp;
   await updateLanPlayerNumbers(db, Number(player.id), allowedPatch);
   return true;
+}
+
+export async function ensurePendingRemotePlayerFromEvent(
+  db: SQLiteDatabase,
+  sessionId: string,
+  event: LanSessionEvent
+) {
+  await ensureLanSchema(db);
+
+  const fromKey = String(event.fromKey || '');
+  if (!fromKey || fromKey === 'master' || fromKey === 'session' || fromKey === 'party') {
+    return null;
+  }
+
+  const existing = await db.getFirstAsync<{ id: number }>(
+    `SELECT id
+     FROM lan_session_players
+     WHERE session_id = ?
+       AND remote_key = ?
+       AND COALESCE(is_active, 1) = 1
+       AND kicked_at IS NULL
+     LIMIT 1`,
+    [sessionId, fromKey]
+  );
+
+  if (existing?.id) return existing.id;
+
+  const fallbackName = String(event.fromName || 'Jogador pendente');
+  const result = await db.runAsync(
+    `INSERT INTO lan_session_players (
+      session_id,
+      remote_key,
+      player_name,
+      character_id,
+      character_name,
+      character_snapshot,
+      hp_current,
+      hp_max,
+      temp_hp,
+      xp,
+      gp,
+      sp,
+      cp,
+      stats_json,
+      equipment_json,
+      effects_json,
+      notes,
+      is_active,
+      is_connected,
+      last_seen_at
+    )
+    VALUES (?, ?, ?, NULL, ?, '{}', 0, 0, 0, 0, 0, 0, 0, '{}', '{}', '[]', ?, 1, 0, CURRENT_TIMESTAMP)`,
+    [sessionId, fromKey, fallbackName, fallbackName, JSON.stringify(['Jogador pendente: aguarde novo join/snapshot para completar a ficha.'])]
+  );
+
+  return result.lastInsertRowId;
 }
 
 export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSessionEvent, accepted: boolean) {
@@ -1766,10 +1926,10 @@ export async function applyLanSessionStateToCharacter(
   db: SQLiteDatabase,
   payload: LanSessionPayload,
   characterId: number,
-  options?: { remoteKey?: string; characterName?: string }
+  options?: { remoteKey?: string; characterName?: string; mode?: 'full' | 'structural' }
 ) {
   const character = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT id, name FROM characters WHERE id = ?`,
+    `SELECT * FROM characters WHERE id = ?`,
     [characterId]
   );
   if (!character || !payload.state?.players?.length) return false;
@@ -1796,6 +1956,50 @@ export async function applyLanSessionStateToCharacter(
   const snapshotSkillValues = (snapshot as any).skill_values;
   const snapshotProficiencies = (snapshot as any).proficiencies;
 
+  // Se o jogador acabou de fazer level up localmente, um snapshot antigo do mestre
+  // nao pode rebaixar a ficha de volta para o nivel anterior. Isso acontece quando
+  // o mestre distribui XP, o jogador sobe nivel, mas o snapshot oficial ainda nao
+  // aceitou a ficha atualizada. Mantemos os campos estruturais locais ate o mestre
+  // receber/aceitar o snapshot de level up.
+  const localStats = parseJsonValue<Record<string, unknown>>(character.stats, {});
+  const localLevel = toNumber(character.level, 1);
+  const officialLevel = toNumber(match.level, 1);
+  const localXp = toNumber(character.xp, 0);
+  const officialXp = toNumber(match.xp, 0);
+  const bestKnownXp = Math.max(localXp, officialXp);
+  const keepLocalLevelProgress =
+    localLevel > officialLevel &&
+    localLevel <= getLevelForXp(bestKnownXp);
+
+  const applyDynamicFields = options?.mode === 'full';
+
+  const nextLevel = keepLocalLevelProgress ? localLevel : officialLevel;
+  const nextClassName = keepLocalLevelProgress ? String(character.class || match.className || '-') : match.className;
+  const nextRace = keepLocalLevelProgress ? String(character.race || match.race || '-') : match.race;
+
+  // IMPORTANTE: em modo estrutural, snapshot/payload não sobrescreve estado vivo.
+  // HP, XP, moedas, inventário e efeitos devem chegar por eventos oficiais
+  // (player_patch, effect_patch, inventory_patch). Isso elimina o efeito de piscar:
+  // evento novo aplica e logo depois payload antigo volta o valor anterior.
+  const nextHpCurrent = applyDynamicFields
+    ? (keepLocalLevelProgress ? Math.max(toNumber(character.hp_current, match.hpCurrent), match.hpCurrent) : match.hpCurrent)
+    : toNumber(character.hp_current, match.hpCurrent);
+  const nextHpMax = applyDynamicFields
+    ? (keepLocalLevelProgress ? Math.max(toNumber(character.hp_max, match.hpMax), match.hpMax) : match.hpMax)
+    : toNumber(character.hp_max, match.hpMax);
+  const nextTempHp = applyDynamicFields ? match.tempHp : toNumber(character.temp_hp, match.tempHp);
+  const nextXp = applyDynamicFields ? (keepLocalLevelProgress ? bestKnownXp : officialXp) : toNumber(character.xp, officialXp);
+  const nextGp = applyDynamicFields ? match.gp : toNumber(character.gp, match.gp);
+  const nextSp = applyDynamicFields ? match.sp : toNumber(character.sp, match.sp);
+  const nextCp = applyDynamicFields ? match.cp : toNumber(character.cp, match.cp);
+  const nextStats = applyDynamicFields ? (keepLocalLevelProgress ? localStats : stats) : localStats;
+  const nextEquipment = applyDynamicFields ? match.equipment : parseJsonValue<Record<string, unknown>>(character.equipment, match.equipment);
+  const nextEffects = applyDynamicFields ? match.effects : parseJsonValue<LanSessionEffect[]>(character.active_effects_json, match.effects);
+  const nextSpells = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotSpells;
+  const nextSaveValues = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotSaveValues;
+  const nextSkillValues = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotSkillValues;
+  const nextProficiencies = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotProficiencies;
+
   await db.runAsync(
     `UPDATE characters
      SET level = ?,
@@ -1818,23 +2022,23 @@ export async function applyLanSessionStateToCharacter(
          updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
     [
-      match.level,
-      match.className,
-      match.race,
-      match.hpCurrent,
-      match.hpMax,
-      match.tempHp,
-      match.xp,
-      match.gp,
-      match.sp,
-      match.cp,
-      JSON.stringify(stats),
-      JSON.stringify(match.equipment),
-      JSON.stringify(match.effects),
-      snapshotSpells == null ? null : normalizeJsonColumn(snapshotSpells),
-      snapshotSaveValues == null ? null : normalizeJsonColumn(snapshotSaveValues),
-      snapshotSkillValues == null ? null : normalizeJsonColumn(snapshotSkillValues),
-      snapshotProficiencies == null ? null : normalizeJsonColumn(snapshotProficiencies),
+      nextLevel,
+      nextClassName,
+      nextRace,
+      nextHpCurrent,
+      nextHpMax,
+      nextTempHp,
+      nextXp,
+      nextGp,
+      nextSp,
+      nextCp,
+      JSON.stringify(nextStats),
+      JSON.stringify(nextEquipment),
+      JSON.stringify(nextEffects),
+      nextSpells == null ? null : normalizeJsonColumn(nextSpells),
+      nextSaveValues == null ? null : normalizeJsonColumn(nextSaveValues),
+      nextSkillValues == null ? null : normalizeJsonColumn(nextSkillValues),
+      nextProficiencies == null ? null : normalizeJsonColumn(nextProficiencies),
       characterId,
     ]
   );
@@ -2060,6 +2264,19 @@ async function ensureLanSchema(db: SQLiteDatabase) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS lan_local_character_bindings (
+      session_id TEXT NOT NULL,
+      character_id INTEGER NOT NULL,
+      join_url TEXT,
+      invite_code TEXT,
+      remote_key TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'player',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (session_id, character_id)
+    );
+
     CREATE TABLE IF NOT EXISTS lan_session_pending_requests (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
@@ -2086,6 +2303,8 @@ async function ensureLanSchema(db: SQLiteDatabase) {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  await ensureLanSyncSchema(db);
 
   const columns: [string, string, string][] = [
     ['lan_sessions', 'status', "TEXT NOT NULL DEFAULT 'active'"],
@@ -2124,10 +2343,17 @@ async function ensureLanSchema(db: SQLiteDatabase) {
     ['lan_session_players', 'kicked_at', 'DATETIME'],
     ['lan_session_players', 'last_seen_at', 'DATETIME'],
     ['lan_session_events', 'seq', 'INTEGER'],
+    ['lan_session_events', 'server_seq', 'INTEGER'],
     ['lan_session_events', 'from_key', 'TEXT'],
     ['lan_session_events', 'to_key', 'TEXT'],
     ['lan_session_events', 'client_msg_id', 'TEXT'],
     ['lan_session_events', 'processed', 'INTEGER NOT NULL DEFAULT 0'],
+    ['lan_session_events', 'entity_type', 'TEXT'],
+    ['lan_session_events', 'entity_id', 'TEXT'],
+    ['lan_session_events', 'entity_revision', 'INTEGER NOT NULL DEFAULT 0'],
+    ['lan_session_events', 'ack_required', 'INTEGER NOT NULL DEFAULT 0'],
+    ['lan_session_events', 'delivered_at', 'TEXT'],
+    ['lan_session_events', 'applied_at', 'TEXT'],
     ['items', 'effect_json', "TEXT DEFAULT '[]'"],
     ['items', 'duration_value', 'INTEGER'],
     ['items', 'duration_unit', 'TEXT'],
@@ -2159,26 +2385,84 @@ async function ensureLanSchema(db: SQLiteDatabase) {
   await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_lan_players_session ON lan_session_players(session_id);
     CREATE INDEX IF NOT EXISTS idx_lan_players_remote_key ON lan_session_players(session_id, remote_key);
+    CREATE INDEX IF NOT EXISTS idx_lan_local_bindings_character ON lan_local_character_bindings(character_id, is_active);
+    CREATE INDEX IF NOT EXISTS idx_lan_local_bindings_session ON lan_local_character_bindings(session_id, is_active);
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_seq ON lan_session_events(session_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_lan_events_session_server_seq ON lan_session_events(session_id, server_seq);
+    CREATE INDEX IF NOT EXISTS idx_lan_events_session_client_msg ON lan_session_events(session_id, client_msg_id);
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_created ON lan_session_events(session_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_lan_requests_session_status ON lan_session_pending_requests(session_id, status);
     CREATE INDEX IF NOT EXISTS idx_lan_trades_session_status ON lan_session_trades(session_id, status);
   `);
+
+  try {
+    await db.execAsync(`
+      DELETE FROM lan_session_players
+      WHERE remote_key IS NOT NULL
+        AND id NOT IN (
+          SELECT MAX(id)
+          FROM lan_session_players
+          WHERE remote_key IS NOT NULL
+          GROUP BY session_id, remote_key
+        );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_lan_players_session_remote_key_unique
+      ON lan_session_players(session_id, remote_key)
+      WHERE remote_key IS NOT NULL;
+    `);
+  } catch {
+    // Se houver base antiga com duplicidades difíceis, o app segue sem derrubar a inicialização.
+  }
+
+  try {
+    await db.execAsync(`
+      DELETE FROM lan_session_players
+      WHERE client_id IS NOT NULL
+        AND id NOT IN (
+          SELECT MAX(id)
+          FROM lan_session_players
+          WHERE client_id IS NOT NULL
+          GROUP BY session_id, client_id
+        );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_lan_players_session_client_id_unique
+      ON lan_session_players(session_id, client_id)
+      WHERE client_id IS NOT NULL;
+    `);
+  } catch {
+    // Mesmo motivo acima: não bloquear abertura por dados legados.
+  }
 }
 
 function normalizeCharacterState(character: Record<string, unknown>) {
   const characterName = String(character.name || 'Personagem');
+
+  // Aceita snake_case e camelCase porque snapshots podem vir do SQLite,
+  // do estado React, de payload LAN ou de versões anteriores do app.
+  const hpCurrent = toNumber(
+    character.hp_current ??
+    character.hpCurrent ??
+    character.currentHp ??
+    character.hp,
+    0
+  );
+
+  const hpMax = toNumber(
+    character.hp_max ??
+    character.hpMax ??
+    character.maxHp ??
+    character.max_hp,
+    hpCurrent
+  );
 
   return {
     playerName: characterName,
     characterName,
     sourceCharacterId: character.id == null ? null : toNumber(character.id),
     level: toNumber(character.level, 1),
-    className: String(character.class || '-'),
+    className: String(character.class || character.className || '-'),
     race: String(character.race || '-'),
-    hpCurrent: toNumber(character.hp_current),
-    hpMax: toNumber(character.hp_max),
-    tempHp: toNumber(character.temp_hp),
+    hpCurrent,
+    hpMax,
+    tempHp: toNumber(character.temp_hp ?? character.tempHp),
     xp: toNumber(character.xp),
     gp: toNumber(character.gp),
     sp: toNumber(character.sp),
@@ -2254,15 +2538,23 @@ function canAutoAcceptLevelUpSnapshot(
   const currentSnapshot = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(current.character_snapshot, {}));
   const currentLevel = toNumber(current.level, currentSnapshot.level);
   const currentXp = toNumber(current.xp, currentSnapshot.xp);
-  const levelIsAuthorizedByXp = incoming.level > currentLevel && incoming.level <= getLevelForXp(currentXp);
-  const sameOfficialXp = incoming.xp === currentXp;
+  const bestKnownXp = Math.max(currentXp, incoming.xp);
+
+  // O level up pode chegar do jogador logo apos o mestre enviar XP. Em redes LAN
+  // lentas, o roster oficial ainda pode estar com XP antigo no exato momento do
+  // reviewSnapshot. Por isso a autorizacao considera o maior XP conhecido entre
+  // o mestre e a ficha do jogador. Ainda bloqueamos inventario, moedas e mudanca
+  // de raca para nao aceitar alteracoes sensiveis sem revisao.
+  const levelIsAuthorizedByXp =
+    incoming.level > currentLevel &&
+    incoming.level <= getLevelForXp(bestKnownXp);
   const hasBlockedDiff = diffs.some((diff) => (
     diff.startsWith('Invent') ||
     diff.startsWith('Moedas') ||
     diff.startsWith('Ra')
   ));
 
-  return levelIsAuthorizedByXp && sameOfficialXp && !hasBlockedDiff;
+  return levelIsAuthorizedByXp && !hasBlockedDiff;
 }
 
 function describeCharacterDiff(current: Record<string, unknown>, incoming: ReturnType<typeof normalizeCharacterState>) {

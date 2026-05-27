@@ -16,7 +16,6 @@ import {
 } from 'react-native';
 
 import {
-  applyLanSessionStateToCharacter,
   fetchLanSessionPayload,
   getBoundLanCharacter,
   importLanCatalog,
@@ -24,6 +23,7 @@ import {
   notifyMasterJoin,
   resolveLanSessionUrlByInviteCode,
   saveLanSession,
+  switchLanRole,
   unlinkCharacterFromLanSession,
   type LanSessionPayload,
 } from '@/services/lanSession';
@@ -54,8 +54,16 @@ export default function SessionJoinScreen() {
 
   const getJoinErrorMessage = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error || '');
+    const lowerMessage = message.toLowerCase();
 
-    if (message.includes('Tempo esgotado') || message.toLowerCase().includes('timeout')) {
+    if (
+      message.includes('Tempo esgotado') ||
+      lowerMessage.includes('timeout') ||
+      lowerMessage.includes('failed to connect') ||
+      lowerMessage.includes('connection refused') ||
+      lowerMessage.includes('econnrefused') ||
+      lowerMessage.includes('enetunreach')
+    ) {
       return 'Não consegui conectar ao mestre. Verifique se os dois celulares estão na mesma rede Wi-Fi e se a sessão ainda está aberta no celular do mestre.';
     }
 
@@ -90,6 +98,7 @@ export default function SessionJoinScreen() {
     setLoading(true);
 
     try {
+      await switchLanRole('player');
       const rawInput = (url || '').trim();
       const parsedInput = rawInput && !data ? parseJoinQrCode(rawInput) : null;
 
@@ -146,7 +155,7 @@ export default function SessionJoinScreen() {
 
       const bound = await getBoundLanCharacter(db, nextPayload.session.id);
 
-      if (bound && isBoundCharacterStillInSession(nextPayload, bound.characterId)) {
+      if (bound && isBoundCharacterStillInSession(nextPayload, bound.characterId, bound.remoteKey)) {
         const currentCharacter = await db.getFirstAsync<Record<string, unknown>>(
           `SELECT * FROM characters WHERE id = ?`,
           [bound.characterId]
@@ -168,7 +177,7 @@ export default function SessionJoinScreen() {
         return;
       }
 
-      if (bound && !isBoundCharacterStillInSession(nextPayload, bound.characterId)) {
+      if (bound && !isBoundCharacterStillInSession(nextPayload, bound.characterId, bound.remoteKey)) {
         await unlinkCharacterFromLanSession(db, bound.characterId, nextPayload.session.id);
       }
 
@@ -224,11 +233,10 @@ export default function SessionJoinScreen() {
        WHERE c.level = ?
          AND NOT EXISTS (
            SELECT 1
-           FROM lan_session_players p
-           WHERE p.character_id = c.id
-             AND p.session_id != ?
-             AND COALESCE(p.is_active, 1) = 1
-             AND p.kicked_at IS NULL
+           FROM lan_local_character_bindings b
+           WHERE b.character_id = c.id
+             AND b.session_id != ?
+             AND COALESCE(b.is_active, 1) = 1
          )
        ORDER BY created_at DESC`,
       [nextPayload.session.level, nextPayload.session.id]
@@ -243,7 +251,10 @@ export default function SessionJoinScreen() {
     try {
       setLoading(true);
 
-      const character = await joinLanSessionWithCharacter(db, payload.session.id, characterId);
+      const character = await joinLanSessionWithCharacter(db, payload.session.id, characterId, '', {
+        joinUrl,
+        inviteCode: payload.session.inviteCode,
+      });
 
       const currentCharacter = await db.getFirstAsync<Record<string, unknown>>(
         `SELECT * FROM characters WHERE id = ?`,
@@ -259,8 +270,9 @@ export default function SessionJoinScreen() {
         currentCharacter || character
       );
 
-      await applyLanSessionStateToCharacter(db, payload, characterId);
-
+      // Nao aplique o payload inicial da sessão aqui.
+      // Nesse momento o mestre ainda pode nao ter persistido o jogador no SQLite oficial.
+      // Aplicar esse snapshot cedo pode sobrescrever a ficha local com estado incompleto.
       if (!masterNotified) {
         Alert.alert(
           'Sessão local',
@@ -578,11 +590,16 @@ function parseJoinQrCode(value: string) {
   return null;
 }
 
-function isBoundCharacterStillInSession(payload: LanSessionPayload, characterId: number) {
+function isBoundCharacterStillInSession(
+  payload: LanSessionPayload,
+  characterId: number,
+  remoteKey?: string
+) {
   return Boolean(
     payload.state?.players?.some((player) => (
       player.characterId === characterId ||
-      player.sourceCharacterId === characterId
+      player.sourceCharacterId === characterId ||
+      Boolean(remoteKey && player.remoteKey === remoteKey)
     ))
   );
 }

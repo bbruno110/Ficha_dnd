@@ -1,7 +1,9 @@
 import * as Network from 'expo-network';
 import { NativeModules } from 'react-native';
 
-import type { LanSessionEvent, LanSessionPayload } from './lanSession';
+declare const require: any;
+
+import type { LanSessionEvent, LanSessionPayload, LanSessionPlayerState } from './lanSession';
 
 export const LAN_TCP_PORT = 43115;
 
@@ -24,8 +26,13 @@ type TcpEnvelope =
   | { type: 'hello'; sessionId?: string }
   | { type: 'session_snapshot'; payload: LanSessionPayload }
   | { type: 'join'; entry: Record<string, unknown> }
+  | { type: 'join_ack'; sessionId: string; remoteKey?: string; clientId?: string; accepted: true }
+  | { type: 'join_rejected'; sessionId?: string; reason: string }
   | { type: 'event'; event: LanSessionEvent }
   | { type: 'payload_update'; payload: LanSessionPayload }
+  | { type: 'ack'; sessionId: string; playerKey?: string; lastAppliedSeq?: number; receivedEventIds?: string[] }
+  | { type: 'heartbeat'; sessionId?: string; sentAt: string }
+  | { type: 'heartbeat_ack'; sessionId?: string; sentAt: string }
   | { type: 'session_rejected'; reason: string; currentSessionId?: string };
 
 let tcpModule: TcpSocketModule | null | undefined;
@@ -44,10 +51,21 @@ let clientEvents: LanSessionEvent[] = [];
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
 let clientUpdateListeners = new Set<() => void>();
 let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
+let clientJoinAckWaiters = new Set<ClientJoinAckWaiter>();
+let clientHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 type ClientPayloadWaiter = {
   sessionId?: string;
   resolve: (payload: LanSessionPayload | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type ClientJoinAckWaiter = {
+  sessionId: string;
+  remoteKey?: string;
+  clientId?: string;
+  resolve: () => void;
+  reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -57,11 +75,30 @@ export function isTcpLanUrl(url?: string) {
 
 export async function startLanTcpHost(payload: LanSessionPayload) {
   const TcpSocket = loadTcpSocket();
+
+  if (hostServer && hostPayload?.session.id === payload.session.id && hostUrl) {
+    hostPayload = payload;
+    try {
+      const hostIp = await getLocalIpAddress({ allowHotspotFallback: true });
+      hostUrl = `tcp://${hostIp}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
+    } catch {
+      // Keep the previous URL if the network is temporarily unavailable.
+    }
+    broadcastHostPayload();
+    updateHostForegroundSession();
+    notifyHostUpdates();
+    return hostUrl;
+  }
+
+  const preservePendingState = hostPayload?.session.id === payload.session.id;
+  const pendingJoinedRows = preservePendingState ? [...hostJoinedRows] : [];
+  const pendingEvents = preservePendingState ? [...hostEvents] : [];
+
   await stopLanTcpHost();
 
   hostPayload = payload;
-  hostJoinedRows = [];
-  hostEvents = [];
+  hostJoinedRows = pendingJoinedRows;
+  hostEvents = pendingEvents;
   hostSockets = new Set();
 
   const server = TcpSocket.createServer((socket) => {
@@ -69,6 +106,19 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
     hostSockets.add(socket);
 
     createLineReader(socket, (message) => {
+      if (message.type === 'heartbeat') {
+        sendEnvelope(socket, {
+          type: 'heartbeat_ack',
+          sessionId: hostPayload?.session.id,
+          sentAt: new Date().toISOString(),
+        });
+        return;
+      }
+
+      if (message.type === 'ack' || message.type === 'heartbeat_ack') {
+        return;
+      }
+
       if (message.type === 'hello') {
         if (!isEnvelopeForCurrentSession(message.sessionId)) {
           sendEnvelope(socket, {
@@ -88,6 +138,11 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         const entrySessionId = String(message.entry?.sessionId || '');
         if (!isEnvelopeForCurrentSession(entrySessionId)) {
           sendEnvelope(socket, {
+            type: 'join_rejected',
+            sessionId: entrySessionId,
+            reason: 'JOIN_SESSION_ID_MISMATCH',
+          });
+          sendEnvelope(socket, {
             type: 'session_rejected',
             reason: 'JOIN_SESSION_ID_MISMATCH',
             currentSessionId: hostPayload?.session.id,
@@ -96,7 +151,49 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           return;
         }
 
-        upsertByKey(hostJoinedRows, message.entry, String(message.entry?.remoteKey || '') ? 'remoteKey' : 'clientId');
+        const now = new Date().toISOString();
+        const incomingEntry = message.entry as Record<string, unknown>;
+        const remoteKey = String(incomingEntry.remoteKey || '');
+        const clientId = String(incomingEntry.clientId || '');
+        const normalizedEntry: Record<string, unknown> & {
+          sessionId: string;
+          remoteKey?: string;
+          clientId?: string;
+          receivedAt: string;
+        } = {
+          ...incomingEntry,
+          sessionId: entrySessionId,
+          remoteKey: remoteKey || undefined,
+          clientId: clientId || undefined,
+          receivedAt: now,
+        };
+
+        upsertByKey(hostJoinedRows, normalizedEntry, remoteKey ? 'remoteKey' : 'clientId');
+
+        const character = normalizeJoinCharacter(incomingEntry.character);
+        const playerName = String(incomingEntry.playerName || character.name || 'Jogador');
+        const joinedEvent: LanSessionEvent = {
+          id: `join_${entrySessionId}_${remoteKey || clientId || Date.now()}`,
+          sessionId: entrySessionId,
+          type: 'player_joined',
+          fromKey: remoteKey || clientId || `join:${entrySessionId}`,
+          fromName: playerName,
+          toKey: 'master',
+          toName: 'Mestre',
+          message: `${playerName} entrou na sessao.`,
+          createdAt: now,
+        };
+        upsertByKey(hostEvents, joinedEvent, 'id');
+
+        sendEnvelope(socket, {
+          type: 'join_ack',
+          sessionId: hostPayload?.session.id || entrySessionId,
+          remoteKey: remoteKey || undefined,
+          clientId: clientId || undefined,
+          accepted: true,
+        });
+        broadcastHostPayload();
+        updateHostForegroundSession();
         notifyHostUpdates();
         return;
       }
@@ -130,14 +227,16 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
   });
 
   hostServer = server;
-  try {
-    const hostIp = await getLocalIpAddress();
-    hostUrl = `tcp://${hostIp}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
-    return hostUrl;
-  } catch (error) {
+  const hostIp = await getLocalIpAddress({ allowHotspotFallback: true, throwIfMissing: false });
+  if (!hostIp) {
     await stopLanTcpHost();
-    throw error;
+    throw new Error(
+      'Não encontrei um IP local válido. Ative o Wi-Fi ou ligue o roteador/hotspot antes de iniciar a sessão.'
+    );
   }
+
+  hostUrl = `tcp://${hostIp}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
+  return hostUrl;
 }
 
 export async function stopLanTcpHost() {
@@ -173,6 +272,7 @@ export function updateLanTcpHostPayload(payload: LanSessionPayload, options?: { 
   if (options?.broadcast !== false) {
     broadcastHostPayload();
   }
+  updateHostForegroundSession();
   notifyHostUpdates();
   return true;
 }
@@ -194,28 +294,17 @@ export async function resolveLanTcpUrlByInviteCode(inviteCode: string) {
   const normalizedCode = inviteCode.trim().toUpperCase();
   if (!normalizedCode) return '';
 
-  const localIp = await getLocalIpAddress();
-  const parts = localIp.split('.');
-  if (parts.length !== 4) return '';
-
-  const subnet = parts.slice(0, 3).join('.');
-  const emulatorHosts = /^10\.0\.[23]\.\d+$/.test(localIp) ? ['10.0.2.2', '10.0.3.2'] : [];
-  const hosts = Array.from(new Set([
-    ...emulatorHosts,
-    localIp,
-    ...Array.from({ length: 254 }, (_, index) => `${subnet}.${index + 1}`),
-  ].filter((host) => host && host !== '0.0.0.0' && host !== '127.0.0.1')));
-
+  const hosts = await buildLanProbeHosts();
   let nextIndex = 0;
   let foundUrl = '';
-  const workerCount = Math.min(8, hosts.length);
+  const workerCount = Math.min(10, hosts.length);
 
   const scanNext = async () => {
     while (!foundUrl && nextIndex < hosts.length) {
       const host = hosts[nextIndex];
       nextIndex += 1;
 
-      const payload = await fetchLanTcpProbePayload(host, 300);
+      const payload = await fetchLanTcpProbePayload(host, 350);
       if (payload?.session?.inviteCode?.toUpperCase() === normalizedCode) {
         foundUrl = `tcp://${host}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
         return;
@@ -229,12 +318,27 @@ export async function resolveLanTcpUrlByInviteCode(inviteCode: string) {
 
 export async function sendLanTcpJoin(url: string | undefined, entry: Record<string, unknown>) {
   if (!url) return false;
-  await connectLanTcpClient(url, { requestFresh: true });
-  if (!clientSocket) return false;
-  if (sendEnvelope(clientSocket, { type: 'join', entry })) return true;
+  const sendJoinAndWaitAck = async () => {
+    await connectLanTcpClient(url, { requestFresh: true });
+    if (!clientSocket) return false;
+    const sessionId = String(entry.sessionId || parseTcpUrl(url).sessionId || '');
+    const remoteKey = entry.remoteKey ? String(entry.remoteKey) : undefined;
+    const clientId = entry.clientId ? String(entry.clientId) : undefined;
+    const ackPromise = waitForJoinAck(sessionId, remoteKey, clientId);
+    if (!sendEnvelope(clientSocket, { type: 'join', entry })) {
+      cancelJoinAckWaiter(ackPromise);
+      return false;
+    }
+    await ackPromise;
+    return true;
+  };
 
-  await connectLanTcpClient(url, { forceReconnect: true });
-  return Boolean(clientSocket && sendEnvelope(clientSocket, { type: 'join', entry }));
+  try {
+    return await sendJoinAndWaitAck();
+  } catch {
+    await connectLanTcpClient(url, { forceReconnect: true });
+    return await sendJoinAndWaitAck();
+  }
 }
 
 export async function sendLanTcpEvent(url: string | undefined, event: LanSessionEvent) {
@@ -330,6 +434,8 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       clientPayload = null;
       clientEvents = [];
       clearClientPayloadWaiters();
+      clearClientJoinAckWaiters(new Error('Conexao TCP fechada antes do join_ack.'));
+      stopClientHeartbeat();
 
       if (resetUrl) {
         clientUrl = '';
@@ -370,6 +476,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       }
 
       applyPayloadUpdate(payload, { notify: false });
+      startClientHeartbeat(socket, target.sessionId);
       resolve(payload);
     };
 
@@ -386,6 +493,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       if (clientSocket === socket) {
         clientSocket = null;
         clearClientPayloadWaiters();
+        stopClientHeartbeat();
         notifyClientUpdates();
       }
 
@@ -400,6 +508,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       if (clientSocket === socket) {
         clientSocket = null;
         clearClientPayloadWaiters();
+        stopClientHeartbeat();
         notifyClientUpdates();
       }
 
@@ -409,7 +518,31 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
     });
 
     createLineReader(socket, (message) => {
+      if (message.type === 'heartbeat') {
+        sendEnvelope(socket, {
+          type: 'heartbeat_ack',
+          sessionId: target.sessionId,
+          sentAt: new Date().toISOString(),
+        });
+        return;
+      }
+
+      if (message.type === 'heartbeat_ack' || message.type === 'ack') {
+        return;
+      }
+
+      if (message.type === 'join_ack') {
+        resolveJoinAckWaiters(message.sessionId, message.remoteKey, message.clientId);
+        return;
+      }
+
+      if (message.type === 'join_rejected') {
+        rejectJoinAckWaiters(message.sessionId || target.sessionId, message.reason);
+        return;
+      }
+
       if (message.type === 'session_rejected') {
+        rejectJoinAckWaiters(target.sessionId, message.reason);
         rejectOnce(new Error(`Sessao rejeitada pelo host: ${message.reason}`));
         return;
       }
@@ -512,9 +645,19 @@ function fetchLanTcpProbePayload(host: string, timeoutMs: number) {
 
 function makeHostPayload() {
   if (!hostPayload) throw new Error('Host TCP sem payload.');
+
+  // IMPORTANTE:
+  // Nao misture hostJoinedRows no payload oficial.
+  // hostJoinedRows e apenas uma fila/memoria de JOIN recebido pelo TCP.
+  // O jogador so deve entrar em payload.state.players depois que a tela do mestre
+  // consumir essa fila, gravar em lan_session_players no SQLite e chamar
+  // syncLanSessionPayload/updateLanTcpHostPayload.
+  //
+  // Se o JOIN provisório for injetado aqui, todos os clientes recebem um player
+  // incompleto, muitas vezes com HP 0/0, XP 0 e moedas 0. Isso causa piscada,
+  // overwrite de ficha boa por snapshot ruim e pode derrubar o app do jogador.
   return {
     ...hostPayload,
-    state: hostPayload.state,
     events: mergeRecentEvents(hostPayload.events || [], hostEvents),
   };
 }
@@ -548,6 +691,22 @@ function notifyClientUpdates() {
 function broadcastHostPayload() {
   if (!hostPayload) return;
   broadcastEnvelope({ type: 'payload_update', payload: makeHostPayload() });
+}
+
+function updateHostForegroundSession() {
+  if (!hostPayload || !hostUrl || !LanNative?.updateForegroundSession) return;
+
+  try {
+    const payload = makeHostPayload();
+    void LanNative.updateForegroundSession(
+      payload.session.name || 'Mesa LAN',
+      payload.session.inviteCode || '',
+      hostUrl,
+      payload.state?.players?.length || 0
+    ).catch(() => {});
+  } catch {
+    // Foreground notification is best-effort; payload sync keeps running.
+  }
 }
 
 function broadcastEnvelope(message: TcpEnvelope) {
@@ -608,6 +767,104 @@ function mergeClientPayloadEvents(payload: LanSessionPayload, sessionId?: string
   }
 }
 
+function mergeJoinedPlayersIntoPayload(payload: LanSessionPayload): LanSessionPayload {
+  const state = payload.state || {
+    status: 'active' as const,
+    currentTurn: 1,
+    elapsedMinutes: 0,
+    players: [],
+  };
+  const players = [...(state.players || [])];
+
+  for (const entry of hostJoinedRows) {
+    const player = makeProvisionalPlayerFromJoin(entry, payload.session.id, players.length + 1);
+    if (!player) continue;
+
+    const index = players.findIndex((current) => (
+      Boolean(player.remoteKey && current.remoteKey === player.remoteKey) ||
+      Boolean(player.clientId && current.clientId === player.clientId) ||
+      (
+        current.characterName === player.characterName &&
+        current.playerName === player.playerName
+      )
+    ));
+
+    if (index >= 0) {
+      players[index] = {
+        ...player,
+        ...players[index],
+        remoteKey: players[index].remoteKey || player.remoteKey,
+        clientId: players[index].clientId || player.clientId,
+      };
+    } else {
+      players.push(player);
+    }
+  }
+
+  return {
+    ...payload,
+    state: {
+      ...state,
+      players,
+    },
+  };
+}
+
+function makeProvisionalPlayerFromJoin(
+  entry: Record<string, unknown>,
+  sessionId: string,
+  fallbackIndex: number
+): LanSessionPlayerState | null {
+  const character = normalizeJoinCharacter(entry.character);
+  const characterName = String(character.name || entry.playerName || 'Personagem');
+  const remoteKey = String(
+    entry.remoteKey ||
+    `${sessionId}:${character.id || entry.clientId || characterName}:${characterName}`
+  );
+  const stats = parseJsonValue<Record<string, unknown>>(character.stats, {});
+
+  return {
+    id: -Math.abs(hashString(remoteKey || characterName || String(fallbackIndex))),
+    sessionId,
+    remoteKey,
+    clientId: entry.clientId ? String(entry.clientId) : undefined,
+    playerName: String(entry.playerName || characterName),
+    characterId: null,
+    sourceCharacterId: character.id == null ? null : toNumber(character.id),
+    characterName,
+    level: toNumber(character.level, 1),
+    className: String(character.class || '-'),
+    race: String(character.race || '-'),
+    hpCurrent: toNumber(character.hp_current),
+    hpMax: toNumber(character.hp_max),
+    tempHp: toNumber(character.temp_hp),
+    xp: toNumber(character.xp),
+    gp: toNumber(character.gp),
+    sp: toNumber(character.sp),
+    cp: toNumber(character.cp),
+    stats,
+    equipment: normalizeEquipment(character.equipment),
+    effects: [],
+    characterSnapshot: character,
+  };
+}
+
+function normalizeJoinCharacter(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function normalizeEquipment(value: unknown): Record<string, unknown> {
+  const equipment = parseJsonValue<any>(value, {});
+  if (Array.isArray(equipment)) return { bag: equipment, slots: {} };
+  if (!equipment || typeof equipment !== 'object') return { bag: [], slots: {} };
+  return {
+    ...equipment,
+    bag: Array.isArray(equipment.bag) ? equipment.bag : [],
+    slots: equipment.slots || {},
+  };
+}
+
 function mergeRecentEvents(...eventLists: LanSessionEvent[][]) {
   const eventsById = new Map<string, LanSessionEvent>();
 
@@ -632,6 +889,7 @@ function getEventTimestamp(event: LanSessionEvent) {
 function closeClientSocket() {
   if (!clientSocket) {
     clearClientPayloadWaiters();
+    stopClientHeartbeat();
     return;
   }
   try {
@@ -641,6 +899,29 @@ function closeClientSocket() {
   }
   clientSocket = null;
   clearClientPayloadWaiters();
+  stopClientHeartbeat();
+}
+
+function startClientHeartbeat(socket: TcpSocket, sessionId?: string) {
+  stopClientHeartbeat();
+  clientHeartbeatTimer = setInterval(() => {
+    if (clientSocket !== socket) {
+      stopClientHeartbeat();
+      return;
+    }
+
+    sendEnvelope(socket, {
+      type: 'heartbeat',
+      sessionId,
+      sentAt: new Date().toISOString(),
+    });
+  }, 5000);
+}
+
+function stopClientHeartbeat() {
+  if (!clientHeartbeatTimer) return;
+  clearInterval(clientHeartbeatTimer);
+  clientHeartbeatTimer = null;
 }
 
 export function resetLanTcpClient() {
@@ -650,6 +931,7 @@ export function resetLanTcpClient() {
   clientEvents = [];
   clientConnectPromise = null;
   clearClientPayloadWaiters();
+  clearClientJoinAckWaiters(new Error('Cliente LAN resetado.'));
 }
 
 function requestClientSnapshot(sessionId?: string) {
@@ -704,19 +986,81 @@ function clearClientPayloadWaiters() {
   }
 }
 
-async function getLocalIpAddress() {
-  const expoIp = await Network.getIpAddressAsync().catch(() => '');
+function waitForJoinAck(sessionId: string, remoteKey?: string, clientId?: string) {
+  let waiterRef: ClientJoinAckWaiter | null = null;
 
-  if (isUsableLanIp(expoIp)) {
-    return expoIp;
+  const promise = new Promise<void>((resolve, reject) => {
+    waiterRef = {
+      sessionId,
+      remoteKey,
+      clientId,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        if (waiterRef) {
+          clientJoinAckWaiters.delete(waiterRef);
+        }
+        reject(new Error('Tempo esgotado aguardando confirmação do mestre.'));
+      }, 3500),
+    };
+    clientJoinAckWaiters.add(waiterRef);
+  }) as Promise<void> & { __waiter?: ClientJoinAckWaiter };
+
+  promise.__waiter = waiterRef || undefined;
+  return promise;
+}
+
+function cancelJoinAckWaiter(promise: Promise<void> & { __waiter?: ClientJoinAckWaiter }) {
+  if (!promise.__waiter) return;
+  clearTimeout(promise.__waiter.timer);
+  clientJoinAckWaiters.delete(promise.__waiter);
+}
+
+function resolveJoinAckWaiters(sessionId: string, remoteKey?: string, clientId?: string) {
+  for (const waiter of [...clientJoinAckWaiters]) {
+    if (waiter.sessionId !== sessionId) continue;
+    if (waiter.remoteKey && remoteKey && waiter.remoteKey !== remoteKey) continue;
+    if (waiter.clientId && clientId && waiter.clientId !== clientId) continue;
+    clearTimeout(waiter.timer);
+    clientJoinAckWaiters.delete(waiter);
+    waiter.resolve();
+  }
+}
+
+function rejectJoinAckWaiters(sessionId: string, reason: string) {
+  for (const waiter of [...clientJoinAckWaiters]) {
+    if (waiter.sessionId !== sessionId) continue;
+    clearTimeout(waiter.timer);
+    clientJoinAckWaiters.delete(waiter);
+    waiter.reject(new Error(reason || 'Join rejeitado pelo mestre.'));
+  }
+}
+
+function clearClientJoinAckWaiters(error = new Error('Conexao TCP fechada.')) {
+  for (const waiter of [...clientJoinAckWaiters]) {
+    clearTimeout(waiter.timer);
+    clientJoinAckWaiters.delete(waiter);
+    waiter.reject(error);
+  }
+}
+
+async function getLocalIpAddress(options?: { allowHotspotFallback?: boolean; throwIfMissing?: boolean }) {
+  const detectedIps = await getDetectedLanIps();
+  const selectedIp = selectBestLanIp(detectedIps);
+
+  if (selectedIp) {
+    return selectedIp;
   }
 
-  const nativeIps = await LanNative?.getLocalIpv4Addresses?.().catch(() => []);
+  if (options?.allowHotspotFallback) {
+    const fallbackIp = getLikelyHotspotHostIp();
+    if (fallbackIp) {
+      return fallbackIp;
+    }
+  }
 
-  const selectedNativeIp = selectBestLanIp(nativeIps || []);
-
-  if (selectedNativeIp) {
-    return selectedNativeIp;
+  if (options?.throwIfMissing === false) {
+    return '';
   }
 
   throw new Error(
@@ -724,16 +1068,103 @@ async function getLocalIpAddress() {
   );
 }
 
+async function getDetectedLanIps() {
+  const ips: string[] = [];
+
+  const nativeIps = await LanNative?.getLocalIpv4Addresses?.().catch(() => []);
+  if (Array.isArray(nativeIps)) {
+    ips.push(...nativeIps);
+  }
+
+  const expoIp = await Network.getIpAddressAsync().catch(() => '');
+  if (expoIp) {
+    ips.push(expoIp);
+  }
+
+  return Array.from(new Set(ips.map((ip) => String(ip || '').trim()).filter(Boolean)));
+}
+
 function selectBestLanIp(ips: string[]) {
   const validIps = ips.filter(isUsableLanIp);
+  const preferredPrefixes = [
+    '192.168.',
+    '10.',
+    '172.16.',
+    '172.17.',
+    '172.18.',
+    '172.19.',
+    '172.20.',
+    '172.21.',
+    '172.22.',
+    '172.23.',
+    '172.24.',
+    '172.25.',
+    '172.26.',
+    '172.27.',
+    '172.28.',
+    '172.29.',
+    '172.30.',
+    '172.31.',
+  ];
 
   return (
-    validIps.find((ip) => ip.startsWith('192.168.')) ||
-    validIps.find((ip) => /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) ||
-    validIps.find((ip) => ip.startsWith('10.')) ||
+    preferredPrefixes
+      .map((prefix) => validIps.find((ip) => ip.startsWith(prefix)))
+      .find(Boolean) ||
     validIps[0] ||
     ''
   );
+}
+
+function getCommonHotspotHostCandidates() {
+  return [
+    '192.168.43.1',   // Android hotspot comum
+    '192.168.49.1',   // Wi-Fi Direct / alguns Androids
+    '192.168.137.1',  // hotspot/compartilhamento comum no Windows
+    '172.20.10.1',    // iPhone hotspot
+    '192.168.0.1',
+    '192.168.1.1',
+  ];
+}
+
+function getLikelyHotspotHostIp() {
+  return getCommonHotspotHostCandidates()[0] || '';
+}
+
+async function buildLanProbeHosts() {
+  const detectedIps = await getDetectedLanIps();
+  const localIp = selectBestLanIp(detectedIps);
+  const hosts: string[] = [];
+
+  const addHost = (host?: string) => {
+    const normalized = String(host || '').trim();
+    if (!normalized || normalized === '0.0.0.0' || normalized === '127.0.0.1') return;
+    if (!hosts.includes(normalized)) hosts.push(normalized);
+  };
+
+  for (const host of getCommonHotspotHostCandidates()) {
+    addHost(host);
+  }
+
+  if (localIp) {
+    const parts = localIp.split('.');
+    const emulatorHosts = /^10\.0\.[23]\.\d+$/.test(localIp) ? ['10.0.2.2', '10.0.3.2'] : [];
+
+    for (const host of emulatorHosts) {
+      addHost(host);
+    }
+
+    addHost(localIp);
+
+    if (parts.length === 4) {
+      const subnet = parts.slice(0, 3).join('.');
+      for (let index = 1; index <= 254; index += 1) {
+        addHost(`${subnet}.${index}`);
+      }
+    }
+  }
+
+  return hosts;
 }
 
 type TcpSocketModule = {
@@ -743,6 +1174,7 @@ type TcpSocketModule = {
 
 type LanNativeModule = {
   getLocalIpv4Addresses?: () => Promise<string[]>;
+  updateForegroundSession?: (sessionName: string, inviteCode: string, joinUrl: string, playerCount: number) => Promise<boolean>;
 };
 
 const LanNative = NativeModules.LanSessionModule as LanNativeModule | undefined;
@@ -758,6 +1190,31 @@ function isUsableLanIp(ip?: string | null) {
 function isEnvelopeForCurrentSession(sessionId?: string) {
   if (!sessionId) return true;
   return Boolean(hostPayload?.session.id && sessionId === hostPayload.session.id);
+}
+
+function parseJsonValue<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value !== 'string') return value as T;
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function toNumber(value: unknown, fallback = 0) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : fallback;
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash) + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return hash || 1;
 }
 
 function parseTcpUrl(url: string) {

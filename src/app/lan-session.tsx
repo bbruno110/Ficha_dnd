@@ -16,6 +16,7 @@ import {
   consumeLanForegroundStopRequest,
   deleteLanSession,
   endLanSession,
+  ensurePendingRemotePlayerFromEvent,
   formatElapsedTime,
   getBoundLanCharacter,
   getCustomCatalogOptions,
@@ -46,6 +47,7 @@ import {
   subscribeLanForegroundStop,
   subscribeLanSessionHostUpdates,
   summarizeEffect,
+  switchLanRole,
   syncLanSessionPayload,
   updateLanPlayerEquipment,
   updateLanPlayerNumbers,
@@ -67,7 +69,7 @@ import * as Clipboard from 'expo-clipboard';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Modal, ScrollView, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 const CATALOG_FILTERS = ['Todos', 'Item', 'Raca', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit'];
@@ -122,6 +124,27 @@ type InventoryItemOption = LanTradeItem & {
 export default function LanSessionScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
+  const masterMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const sessionStateRef = useRef<LanSessionState | null>(null);
+  const payloadRef = useRef<LanSessionPayload | null>(null);
+  const batchedNumberPatchRef = useRef<Record<string, {
+    player: LanSessionPlayerState;
+    patch: NumberPatch;
+    message: string;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>>({});
+
+  const enqueueMasterMutation = useCallback((task: () => Promise<void>) => {
+    const run = masterMutationQueueRef.current
+      .catch(() => undefined)
+      .then(task);
+
+    masterMutationQueueRef.current = run.catch((error) => {
+      console.warn('[LAN MASTER MUTATION FAILED]', error);
+    });
+
+    return run;
+  }, []);
 
   const [sessionName, setSessionName] = useState('Mesa de D&D');
   const [masterName, setMasterName] = useState('Mestre');
@@ -192,6 +215,14 @@ export default function LanSessionScreen() {
     () => sessionState?.players.find((player) => player.id === selectedPlayerId) || sessionState?.players[0],
     [selectedPlayerId, sessionState?.players]
   );
+
+  useEffect(() => {
+    sessionStateRef.current = sessionState;
+  }, [sessionState]);
+
+  useEffect(() => {
+    payloadRef.current = payload;
+  }, [payload]);
   
   const filteredCatalogOptions = useMemo(() => {
     const search = catalogSearch.trim().toLowerCase();
@@ -387,13 +418,33 @@ useLanAppLifecycle({
       let changedPlayers = false;
 
       for (const entry of joinedPlayers) {
-        if (entry?.sessionId === activeSessionId) {
+        const entrySessionId = String(entry?.sessionId || '');
+        if (entrySessionId === activeSessionId) {
           try {
             const playerId = await upsertLanSessionPlayerFromNetwork(db, entry);
             if (playerId) changedPlayers = true;
           } catch (error) {
-            console.warn('[LAN] Nao foi possivel registrar entrada do jogador:', error);
+            const entryCharacter =
+              entry?.character && typeof entry.character === 'object'
+                ? entry.character as Record<string, unknown>
+                : {};
+
+            console.warn('[LAN] Nao foi possivel registrar entrada do jogador:', {
+              error,
+              activeSessionId,
+              entrySessionId,
+              remoteKey: entry?.remoteKey,
+              clientId: entry?.clientId,
+              characterName: String(entryCharacter.name || ''),
+            });
           }
+        } else if (entrySessionId) {
+          console.warn('[LAN] Join ignorado por sessionId diferente:', {
+            activeSessionId,
+            entrySessionId,
+            remoteKey: entry?.remoteKey,
+            clientId: entry?.clientId,
+          });
         }
       }
 
@@ -411,13 +462,45 @@ useLanAppLifecycle({
         const currentState = await getLanSessionState(db, activeSessionId);
         for (const event of events) {
           if (event.sessionId !== activeSessionId) continue;
+
+          if (event.type === 'resource_request' && event.resourceRequest) {
+            const fresh = await rememberLanSessionEvent(db, event);
+            await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+            if (fresh) {
+              await syncLanSessionPayload(db, activeSessionId);
+            }
+            continue;
+          }
+
+          if (event.type === 'player_joined') {
+            const fresh = await rememberLanSessionEvent(db, event);
+            // O evento de entrada também precisa criar um jogador pendente,
+            // porque em algumas redes o evento chega antes do roster do join.
+            await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+            if (fresh) await syncLanSessionPayload(db, activeSessionId);
+            continue;
+          }
+
           const player = currentState.players.find((entry) => (
             entry.remoteKey === event.fromKey ||
             entry.remoteKey === event.toKey ||
             entry.characterName === event.fromName ||
             entry.characterName === event.toName
           ));
-          if (!player) continue;
+
+          if (!player) {
+            console.warn('[LAN EVENT SKIPPED]', {
+              reason: 'PLAYER_NOT_FOUND',
+              type: event.type,
+              fromKey: event.fromKey,
+              fromName: event.fromName,
+            });
+            await rememberLanSessionEvent(db, {
+              ...event,
+              message: `[PENDENTE SEM PLAYER] ${event.message || event.type}`,
+            });
+            continue;
+          }
 
           if (event.type === 'public_status' && event.publicState) {
             continue;
@@ -474,9 +557,6 @@ useLanAppLifecycle({
             }
           }
 
-          if (event.type === 'resource_request' && event.resourceRequest) {
-            await rememberLanSessionEvent(db, event);
-          }
 
           if (event.type === 'inventory_patch' && event.inventoryPatch) {
             const applied = await applyLanPlayerInventoryPatch(
@@ -512,10 +592,9 @@ useLanAppLifecycle({
     setLoading(true);
 
     try {
-      // Para o host TCP atual, mas NÃO encerra/apaga sessões salvas.
-      // Isso permite várias sessões independentes no banco.
+      // Troca explicitamente para o papel de mestre sem apagar sessões salvas.
+      await switchLanRole('master');
       await stopLanServer();
-      resetLanClientConnection();
 
       const nextPayload = await buildLanSessionPayload(db, {
         id: makeSessionId(),
@@ -576,6 +655,7 @@ useLanAppLifecycle({
 
     setLoading(true);
     try {
+      await switchLanRole('master');
       await resumeLanSession(db, session.id);
       const nextPayload = await refreshLanSessionPayload(db, session.id);
       if (!nextPayload) throw new Error('Sessão não encontrada.');
@@ -790,87 +870,157 @@ useLanAppLifecycle({
     });
   };
 
-  const handleUpdatePlayerPatch = async (
-      player: LanSessionPlayerState,
-      patch: NumberPatch,
-      message: string
-    ) => {
-      if (!payload) return;
+  const applyOptimisticMasterPatch = (playerId: number, cleanPatch: NumberPatch) => {
+    setSessionState((current) => {
+      if (!current) return current;
+      const next = {
+        ...current,
+        players: current.players.map((entry) => entry.id === playerId ? { ...entry, ...cleanPatch } : entry),
+      };
+      sessionStateRef.current = next;
+      return next;
+    });
 
-      const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
-        if (value == null) return next;
-        return {
-          ...next,
-          [key]: Math.max(0, Math.floor(Number(value) || 0)),
-        };
-      }, {});
+    setPayload((current) => {
+      if (!current?.state) return current;
+      const next = {
+        ...current,
+        state: {
+          ...current.state,
+          players: current.state.players.map((entry) => entry.id === playerId ? { ...entry, ...cleanPatch } : entry),
+        },
+      };
+      payloadRef.current = next;
+      return next;
+    });
+  };
 
-      if (Object.keys(cleanPatch).length === 0) return;
+  const flushBatchedNumberPatch = (key: string) => {
+    const item = batchedNumberPatchRef.current[key];
+    if (!item) return;
+    if (item.timer) clearTimeout(item.timer);
+    delete batchedNumberPatchRef.current[key];
 
-      // 1. Atualiza a tela do mestre imediatamente.
-      setSessionState((current) => {
-        if (!current) return current;
+    void enqueueMasterMutation(() => applyMasterPlayerPatchInternal(item.player, item.patch, item.message, { optimistic: false }));
+  };
 
-        return {
-          ...current,
-          players: current.players.map((entry) =>
-            entry.id === player.id
-              ? { ...entry, ...cleanPatch }
-              : entry
-          ),
-        };
-      });
+  const queueMasterNumberPatch = (
+    player: LanSessionPlayerState,
+    patch: NumberPatch,
+    message: string
+  ) => {
+    const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
+      if (value == null) return next;
+      return {
+        ...next,
+        [key]: Math.max(0, Math.floor(Number(value) || 0)),
+      };
+    }, {});
 
-      // 2. Atualiza o payload local em memória também, para evitar voltar para valor antigo.
-      setPayload((current) => {
-        if (!current?.state) return current;
+    if (Object.keys(cleanPatch).length === 0) return Promise.resolve();
 
-        return {
-          ...current,
-          state: {
-            ...current.state,
-            players: current.state.players.map((entry) =>
-              entry.id === player.id
-                ? { ...entry, ...cleanPatch }
-                : entry
-            ),
-          },
-        };
-      });
+    applyOptimisticMasterPatch(player.id, cleanPatch);
 
-      // 3. Persiste no SQLite do mestre.
-      await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
+    const key = `${player.id}:numbers`;
+    const current = batchedNumberPatchRef.current[key];
+    if (current?.timer) clearTimeout(current.timer);
 
-      // 4. Atualiza o payload oficial ANTES de mandar o patch rápido.
-      // Assim qualquer snapshot/payload_update que chegar no jogador já vem com HP correto.
-      const syncedPayload = await syncLanSessionPayload(db, payload.session.id);
-
-      if (syncedPayload) {
-        setPayload(syncedPayload);
-        setSessionState(syncedPayload.state || null);
-      }
-
-      // 5. Envia o delta rápido para o jogador.
-      const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
-        id: makeLanEventId(),
-        sessionId: payload.session.id,
-        type: 'player_patch',
-        fromKey: 'master',
-        fromName: 'Mestre',
-        toKey: player.remoteKey || '',
-        toName: player.characterName,
-        numberPatch: cleanPatch,
-        message,
-        createdAt: new Date().toISOString(),
-      });
-
-      if (event) {
-        setSessionEvents((current) =>
-          [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
-        );
-      }
-
+    batchedNumberPatchRef.current[key] = {
+      player: { ...player, ...cleanPatch },
+      patch: { ...(current?.patch || {}), ...cleanPatch },
+      message,
+      timer: setTimeout(() => flushBatchedNumberPatch(key), 140),
     };
+
+    return Promise.resolve();
+  };
+
+  const applyMasterPlayerPatchInternal = async (
+    player: LanSessionPlayerState,
+    patch: NumberPatch,
+    message: string,
+    options?: { optimistic?: boolean }
+  ) => {
+    const currentPayload = payloadRef.current || payload;
+    if (!currentPayload) return;
+
+    const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
+      if (value == null) return next;
+      return {
+        ...next,
+        [key]: Math.max(0, Math.floor(Number(value) || 0)),
+      };
+    }, {});
+
+    if (Object.keys(cleanPatch).length === 0) return;
+
+    if (options?.optimistic !== false) {
+      applyOptimisticMasterPatch(player.id, cleanPatch);
+    }
+
+    // 3. Persiste no SQLite do mestre.
+    await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
+
+    // 4. Atualiza o payload oficial ANTES de mandar o patch rápido.
+    // Como as mutações do mestre agora passam por fila, um toque antigo não pode finalizar depois
+    // de um toque novo e devolver HP/XP para trás.
+    const syncedPayload = await syncLanSessionPayload(db, currentPayload.session.id, { broadcast: false });
+
+    if (syncedPayload) {
+      setPayload(syncedPayload);
+      setSessionState(syncedPayload.state || null);
+    }
+
+    // 5. Envia o valor final oficial para o jogador.
+    const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
+      id: makeLanEventId(),
+      sessionId: currentPayload.session.id,
+      type: 'player_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: player.remoteKey || '',
+      toName: player.characterName,
+      numberPatch: cleanPatch,
+      message,
+      createdAt: new Date().toISOString(),
+    });
+
+    if (event) {
+      setSessionEvents((current) =>
+        [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
+      );
+    }
+  };
+
+  const handleUpdatePlayerPatch = async (
+    player: LanSessionPlayerState,
+    patch: NumberPatch,
+    message: string
+  ) => queueMasterNumberPatch(player, patch, message);
+
+  const handleUpdatePlayerDelta = async (
+    player: LanSessionPlayerState,
+    field: 'hpCurrent' | 'xp' | 'gp' | 'sp' | 'cp' | 'tempHp',
+    delta: number,
+    messagePrefix?: string
+  ) => {
+    const visiblePlayer = sessionStateRef.current?.players.find((entry) => entry.id === player.id) || player;
+    const currentValue = Math.max(0, Math.floor(Number((visiblePlayer as any)[field]) || 0));
+    const maxHp = Math.max(0, Math.floor(Number(visiblePlayer.hpMax) || 0));
+
+    let nextValue = currentValue + delta;
+    if (field === 'hpCurrent') {
+      nextValue = Math.max(0, Math.min(maxHp, nextValue));
+    } else {
+      nextValue = Math.max(0, nextValue);
+    }
+
+    return queueMasterNumberPatch(
+      visiblePlayer,
+      { [field]: nextValue },
+      messagePrefix || `Mestre ajustou ${formatPlayerField(field as any)} de ${visiblePlayer.characterName} para ${nextValue}.`
+    );
+  };
 
   const handleUpdatePlayer = async (
     player: LanSessionPlayerState,
@@ -1948,10 +2098,10 @@ useLanAppLifecycle({
         </View>
 
         <View style={styles.toolbar}>
-          <TouchableOpacity style={styles.smallButton} onPress={() => handleUpdatePlayer(player, 'hpCurrent', player.hpCurrent - 1)}>
+          <TouchableOpacity style={styles.smallButton} onPress={() => handleUpdatePlayerDelta(player, 'hpCurrent', -1, `Mestre causou 1 de dano em ${player.characterName}.`)}>
             <Text style={styles.smallButtonText}>-1 HP</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.smallButton} onPress={() => handleUpdatePlayer(player, 'hpCurrent', Math.min(player.hpMax, player.hpCurrent + 1))}>
+          <TouchableOpacity style={styles.smallButton} onPress={() => handleUpdatePlayerDelta(player, 'hpCurrent', 1, `Mestre curou 1 HP de ${player.characterName}.`)}>
             <Text style={styles.smallButtonText}>+1 HP</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.smallButton} onPress={() => openQuickEdit(player, 'PV_TEMP')}>
