@@ -125,14 +125,6 @@ export default function LanSessionScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const masterMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const sessionStateRef = useRef<LanSessionState | null>(null);
-  const payloadRef = useRef<LanSessionPayload | null>(null);
-  const batchedNumberPatchRef = useRef<Record<string, {
-    player: LanSessionPlayerState;
-    patch: NumberPatch;
-    message: string;
-    timer: ReturnType<typeof setTimeout> | null;
-  }>>({});
 
   const enqueueMasterMutation = useCallback((task: () => Promise<void>) => {
     const run = masterMutationQueueRef.current
@@ -215,14 +207,6 @@ export default function LanSessionScreen() {
     () => sessionState?.players.find((player) => player.id === selectedPlayerId) || sessionState?.players[0],
     [selectedPlayerId, sessionState?.players]
   );
-
-  useEffect(() => {
-    sessionStateRef.current = sessionState;
-  }, [sessionState]);
-
-  useEffect(() => {
-    payloadRef.current = payload;
-  }, [payload]);
   
   const filteredCatalogOptions = useMemo(() => {
     const search = catalogSearch.trim().toLowerCase();
@@ -870,79 +854,12 @@ useLanAppLifecycle({
     });
   };
 
-  const applyOptimisticMasterPatch = (playerId: number, cleanPatch: NumberPatch) => {
-    setSessionState((current) => {
-      if (!current) return current;
-      const next = {
-        ...current,
-        players: current.players.map((entry) => entry.id === playerId ? { ...entry, ...cleanPatch } : entry),
-      };
-      sessionStateRef.current = next;
-      return next;
-    });
-
-    setPayload((current) => {
-      if (!current?.state) return current;
-      const next = {
-        ...current,
-        state: {
-          ...current.state,
-          players: current.state.players.map((entry) => entry.id === playerId ? { ...entry, ...cleanPatch } : entry),
-        },
-      };
-      payloadRef.current = next;
-      return next;
-    });
-  };
-
-  const flushBatchedNumberPatch = (key: string) => {
-    const item = batchedNumberPatchRef.current[key];
-    if (!item) return;
-    if (item.timer) clearTimeout(item.timer);
-    delete batchedNumberPatchRef.current[key];
-
-    void enqueueMasterMutation(() => applyMasterPlayerPatchInternal(item.player, item.patch, item.message, { optimistic: false }));
-  };
-
-  const queueMasterNumberPatch = (
+  const applyMasterPlayerPatchInternal = async (
     player: LanSessionPlayerState,
     patch: NumberPatch,
     message: string
   ) => {
-    const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
-      if (value == null) return next;
-      return {
-        ...next,
-        [key]: Math.max(0, Math.floor(Number(value) || 0)),
-      };
-    }, {});
-
-    if (Object.keys(cleanPatch).length === 0) return Promise.resolve();
-
-    applyOptimisticMasterPatch(player.id, cleanPatch);
-
-    const key = `${player.id}:numbers`;
-    const current = batchedNumberPatchRef.current[key];
-    if (current?.timer) clearTimeout(current.timer);
-
-    batchedNumberPatchRef.current[key] = {
-      player: { ...player, ...cleanPatch },
-      patch: { ...(current?.patch || {}), ...cleanPatch },
-      message,
-      timer: setTimeout(() => flushBatchedNumberPatch(key), 140),
-    };
-
-    return Promise.resolve();
-  };
-
-  const applyMasterPlayerPatchInternal = async (
-    player: LanSessionPlayerState,
-    patch: NumberPatch,
-    message: string,
-    options?: { optimistic?: boolean }
-  ) => {
-    const currentPayload = payloadRef.current || payload;
-    if (!currentPayload) return;
+    if (!payload) return;
 
     const cleanPatch = Object.entries(patch).reduce<NumberPatch>((next, [key, value]) => {
       if (value == null) return next;
@@ -954,27 +871,45 @@ useLanAppLifecycle({
 
     if (Object.keys(cleanPatch).length === 0) return;
 
-    if (options?.optimistic !== false) {
-      applyOptimisticMasterPatch(player.id, cleanPatch);
-    }
+    // 1. Atualiza a tela do mestre imediatamente, mas sempre mantendo o patch mais recente.
+    setSessionState((current) => {
+      if (!current) return current;
+
+      return {
+        ...current,
+        players: current.players.map((entry) =>
+          entry.id === player.id
+            ? { ...entry, ...cleanPatch }
+            : entry
+        ),
+      };
+    });
+
+    // 2. Atualiza o payload local em memória também, para evitar voltar para valor antigo.
+    setPayload((current) => {
+      if (!current?.state) return current;
+
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          players: current.state.players.map((entry) =>
+            entry.id === player.id
+              ? { ...entry, ...cleanPatch }
+              : entry
+          ),
+        },
+      };
+    });
 
     // 3. Persiste no SQLite do mestre.
     await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
 
-    // 4. Atualiza o payload oficial ANTES de mandar o patch rápido.
-    // Como as mutações do mestre agora passam por fila, um toque antigo não pode finalizar depois
-    // de um toque novo e devolver HP/XP para trás.
-    const syncedPayload = await syncLanSessionPayload(db, currentPayload.session.id, { broadcast: false });
-
-    if (syncedPayload) {
-      setPayload(syncedPayload);
-      setSessionState(syncedPayload.state || null);
-    }
-
-    // 5. Envia o valor final oficial para o jogador.
+    // 4. Envia o valor final oficial para o jogador imediatamente.
+    // Não faça broadcast de payload/snapshot aqui. O estado vivo da ficha deve ir por evento.
     const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
       id: makeLanEventId(),
-      sessionId: currentPayload.session.id,
+      sessionId: payload.session.id,
       type: 'player_patch',
       fromKey: 'master',
       fromName: 'Mestre',
@@ -990,23 +925,36 @@ useLanAppLifecycle({
         [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
       );
     }
+
+    // 5. Recalcula o payload oficial para futuras entradas/QR/retomada,
+    // mas sem mandar payload_update para os jogadores atuais.
+    // Isso impede o efeito de piscar/voltar HP antigo depois do player_patch.
+    const syncedPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
+
+    if (syncedPayload) {
+      setPayload(syncedPayload);
+      setSessionState(syncedPayload.state || null);
+    }
   };
 
   const handleUpdatePlayerPatch = async (
     player: LanSessionPlayerState,
     patch: NumberPatch,
     message: string
-  ) => queueMasterNumberPatch(player, patch, message);
+  ) => enqueueMasterMutation(() => applyMasterPlayerPatchInternal(player, patch, message));
 
   const handleUpdatePlayerDelta = async (
     player: LanSessionPlayerState,
     field: 'hpCurrent' | 'xp' | 'gp' | 'sp' | 'cp' | 'tempHp',
     delta: number,
     messagePrefix?: string
-  ) => {
-    const visiblePlayer = sessionStateRef.current?.players.find((entry) => entry.id === player.id) || player;
-    const currentValue = Math.max(0, Math.floor(Number((visiblePlayer as any)[field]) || 0));
-    const maxHp = Math.max(0, Math.floor(Number(visiblePlayer.hpMax) || 0));
+  ) => enqueueMasterMutation(async () => {
+    if (!payload) return;
+
+    const latestState = await getLanSessionState(db, payload.session.id);
+    const latestPlayer = latestState.players.find((entry) => entry.id === player.id) || player;
+    const currentValue = Math.max(0, Math.floor(Number((latestPlayer as any)[field]) || 0));
+    const maxHp = Math.max(0, Math.floor(Number(latestPlayer.hpMax) || 0));
 
     let nextValue = currentValue + delta;
     if (field === 'hpCurrent') {
@@ -1015,12 +963,12 @@ useLanAppLifecycle({
       nextValue = Math.max(0, nextValue);
     }
 
-    return queueMasterNumberPatch(
-      visiblePlayer,
+    await applyMasterPlayerPatchInternal(
+      latestPlayer,
       { [field]: nextValue },
-      messagePrefix || `Mestre ajustou ${formatPlayerField(field as any)} de ${visiblePlayer.characterName} para ${nextValue}.`
+      messagePrefix || `Mestre ajustou ${formatPlayerField(field as any)} de ${latestPlayer.characterName} para ${nextValue}.`
     );
-  };
+  });
 
   const handleUpdatePlayer = async (
     player: LanSessionPlayerState,

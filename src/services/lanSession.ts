@@ -1926,7 +1926,7 @@ export async function applyLanSessionStateToCharacter(
   db: SQLiteDatabase,
   payload: LanSessionPayload,
   characterId: number,
-  options?: { remoteKey?: string; characterName?: string; mode?: 'full' | 'structural' }
+  options?: { remoteKey?: string; characterName?: string }
 ) {
   const character = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT * FROM characters WHERE id = ?`,
@@ -1971,34 +1971,17 @@ export async function applyLanSessionStateToCharacter(
     localLevel > officialLevel &&
     localLevel <= getLevelForXp(bestKnownXp);
 
-  const applyDynamicFields = options?.mode === 'full';
-
   const nextLevel = keepLocalLevelProgress ? localLevel : officialLevel;
   const nextClassName = keepLocalLevelProgress ? String(character.class || match.className || '-') : match.className;
   const nextRace = keepLocalLevelProgress ? String(character.race || match.race || '-') : match.race;
-
-  // IMPORTANTE: em modo estrutural, snapshot/payload não sobrescreve estado vivo.
-  // HP, XP, moedas, inventário e efeitos devem chegar por eventos oficiais
-  // (player_patch, effect_patch, inventory_patch). Isso elimina o efeito de piscar:
-  // evento novo aplica e logo depois payload antigo volta o valor anterior.
-  const nextHpCurrent = applyDynamicFields
-    ? (keepLocalLevelProgress ? Math.max(toNumber(character.hp_current, match.hpCurrent), match.hpCurrent) : match.hpCurrent)
-    : toNumber(character.hp_current, match.hpCurrent);
-  const nextHpMax = applyDynamicFields
-    ? (keepLocalLevelProgress ? Math.max(toNumber(character.hp_max, match.hpMax), match.hpMax) : match.hpMax)
-    : toNumber(character.hp_max, match.hpMax);
-  const nextTempHp = applyDynamicFields ? match.tempHp : toNumber(character.temp_hp, match.tempHp);
-  const nextXp = applyDynamicFields ? (keepLocalLevelProgress ? bestKnownXp : officialXp) : toNumber(character.xp, officialXp);
-  const nextGp = applyDynamicFields ? match.gp : toNumber(character.gp, match.gp);
-  const nextSp = applyDynamicFields ? match.sp : toNumber(character.sp, match.sp);
-  const nextCp = applyDynamicFields ? match.cp : toNumber(character.cp, match.cp);
-  const nextStats = applyDynamicFields ? (keepLocalLevelProgress ? localStats : stats) : localStats;
-  const nextEquipment = applyDynamicFields ? match.equipment : parseJsonValue<Record<string, unknown>>(character.equipment, match.equipment);
-  const nextEffects = applyDynamicFields ? match.effects : parseJsonValue<LanSessionEffect[]>(character.active_effects_json, match.effects);
-  const nextSpells = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotSpells;
-  const nextSaveValues = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotSaveValues;
-  const nextSkillValues = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotSkillValues;
-  const nextProficiencies = keepLocalLevelProgress || !applyDynamicFields ? null : snapshotProficiencies;
+  const nextHpCurrent = keepLocalLevelProgress ? Math.max(toNumber(character.hp_current, match.hpCurrent), match.hpCurrent) : match.hpCurrent;
+  const nextHpMax = keepLocalLevelProgress ? Math.max(toNumber(character.hp_max, match.hpMax), match.hpMax) : match.hpMax;
+  const nextXp = keepLocalLevelProgress ? bestKnownXp : officialXp;
+  const nextStats = keepLocalLevelProgress ? localStats : stats;
+  const nextSpells = keepLocalLevelProgress ? null : snapshotSpells;
+  const nextSaveValues = keepLocalLevelProgress ? null : snapshotSaveValues;
+  const nextSkillValues = keepLocalLevelProgress ? null : snapshotSkillValues;
+  const nextProficiencies = keepLocalLevelProgress ? null : snapshotProficiencies;
 
   await db.runAsync(
     `UPDATE characters
@@ -2027,14 +2010,14 @@ export async function applyLanSessionStateToCharacter(
       nextRace,
       nextHpCurrent,
       nextHpMax,
-      nextTempHp,
+      match.tempHp,
       nextXp,
-      nextGp,
-      nextSp,
-      nextCp,
+      match.gp,
+      match.sp,
+      match.cp,
       JSON.stringify(nextStats),
-      JSON.stringify(nextEquipment),
-      JSON.stringify(nextEffects),
+      JSON.stringify(match.equipment),
+      JSON.stringify(match.effects),
       nextSpells == null ? null : normalizeJsonColumn(nextSpells),
       nextSaveValues == null ? null : normalizeJsonColumn(nextSaveValues),
       nextSkillValues == null ? null : normalizeJsonColumn(nextSkillValues),

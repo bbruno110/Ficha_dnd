@@ -17,6 +17,7 @@ import {
   resolveLanSessionUrlByInviteCode,
   saveLanSession,
   sendLanSessionEvent,
+  subscribeLanSessionClientUpdates,
   unlinkCharacterFromLanSession,
   type LanEffectTarget,
   type LanEffectUnit,
@@ -86,32 +87,11 @@ const getCategory = (spell: any): string => {
   return 'Habilidade';
 };
 
+
 const safeJsonParse = <T,>(value: unknown, fallback: T): T => {
   if (value == null || value === '') return fallback;
   if (typeof value !== 'string') return value as T;
-
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return fallback;
-  }
-};
-
-const normalizeSheetEquipment = (value: unknown) => {
-  const parsed = safeJsonParse<any>(value, {});
-  if (Array.isArray(parsed)) {
-    return { bag: parsed, slots: { ...DEFAULT_SLOTS } };
-  }
-
-  if (!parsed || typeof parsed !== 'object') {
-    return { bag: [], slots: { ...DEFAULT_SLOTS } };
-  }
-
-  return {
-    ...parsed,
-    bag: Array.isArray(parsed.bag) ? parsed.bag : [],
-    slots: { ...DEFAULT_SLOTS, ...(parsed.slots || {}) },
-  };
+  try { return JSON.parse(value) as T; } catch { return fallback; }
 };
 
 export default function CharacterSheetScreen() {
@@ -287,11 +267,16 @@ export default function CharacterSheetScreen() {
         setDbSaves(savesList);
 
         if (result) {
-          const parsedEquip = normalizeSheetEquipment((result as any).equipment);
+          let parsedEquip = JSON.parse((result as any).equipment || '{}');
+          if (Array.isArray(parsedEquip)) {
+             parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
+          } else {
+             parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
+          }
 
-          let loadedSaves = safeJsonParse<any[]>((result as any).save_values, []);
-          let loadedSkills = safeJsonParse<any[]>((result as any).skill_values, []);
-          const backupProfs = safeJsonParse<string[]>((result as any).proficiencies, []);
+          let loadedSaves = JSON.parse((result as any).save_values || '[]');
+          let loadedSkills = JSON.parse((result as any).skill_values || '[]');
+          const backupProfs = JSON.parse((result as any).proficiencies || '[]');
 
           if (!Array.isArray(loadedSaves) || (loadedSaves.length > 0 && typeof loadedSaves[0] !== 'string')) {
               loadedSaves = backupProfs.filter((p: string) => p.startsWith('save_'));
@@ -310,8 +295,8 @@ export default function CharacterSheetScreen() {
             save_values: loadedSaves,
             skill_values: loadedSkills,
             equipment: parsedEquip,
-            spells: safeJsonParse<any[]>((result as any).spells, []),
-            active_effects: safeJsonParse<any[]>((result as any).active_effects_json, []),
+            spells: JSON.parse((result as any).spells || '[]'),
+            active_effects: JSON.parse((result as any).active_effects_json || '[]'),
           };
           setCharacter(charData);
 
@@ -416,28 +401,33 @@ export default function CharacterSheetScreen() {
       [Number(currentCharacter.id)]
     );
 
-    let effects = safeJsonParse<any[]>(current?.active_effects_json, []);
-    const removeIds = new Set((patch.remove || []).map((id) => String(id)));
-    effects = effects.filter((effect) => !removeIds.has(String(effect?.id || '')));
+    const currentEffects = safeJsonParse<any[]>((current as any)?.active_effects_json, []);
+    const removeSet = new Set((patch.remove || []).map(String));
+    const byId = new Map<string, any>();
 
-    for (const updated of patch.update || []) {
-      const index = effects.findIndex((effect) => String(effect?.id || '') === String(updated.id));
-      if (index >= 0) effects[index] = { ...effects[index], ...updated };
-      else effects.push(updated);
+    for (const effect of currentEffects) {
+      const id = String(effect?.id || '');
+      if (id && !removeSet.has(id)) byId.set(id, effect);
     }
 
-    for (const added of patch.add || []) {
-      const index = effects.findIndex((effect) => String(effect?.id || '') === String(added.id));
-      if (index >= 0) effects[index] = { ...effects[index], ...added };
-      else effects.push(added);
+    for (const effect of patch.update || []) {
+      const id = String((effect as any)?.id || '');
+      if (id && !removeSet.has(id)) byId.set(id, effect);
     }
+
+    for (const effect of patch.add || []) {
+      const id = String((effect as any)?.id || '');
+      if (id && !removeSet.has(id)) byId.set(id, effect);
+    }
+
+    const nextEffects = Array.from(byId.values());
 
     await db.runAsync(
-      `UPDATE characters SET active_effects_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [JSON.stringify(effects), Number(currentCharacter.id)]
+      `UPDATE characters SET active_effects_json = ? WHERE id = ?`,
+      [JSON.stringify(nextEffects), Number(currentCharacter.id)]
     );
 
-    setCharacter((prev: any) => prev ? ({ ...prev, active_effects: effects }) : prev);
+    setCharacter((prev: any) => prev ? ({ ...prev, active_effects: nextEffects }) : prev);
   }, [db]);
 
   const syncLanFromHost = useCallback(async () => {
@@ -471,7 +461,6 @@ export default function CharacterSheetScreen() {
       await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id), {
         remoteKey: selfKey,
         characterName: character.name,
-        mode: 'structural',
       });
       await markLanSnapshotApplied(db, {
         sessionId: nextInfo.sessionId,
@@ -532,19 +521,6 @@ export default function CharacterSheetScreen() {
     characterName: character?.name,
     onNumberPatch: async (patch, event) => {
       await applyLanNumberPatchToCharacter(patch);
-      if (lanInfo?.sessionId && character) {
-        const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
-        await markLanEventsApplied(db, {
-          sessionId: lanInfo.sessionId,
-          deviceId: selfKey,
-          role: 'player',
-          playerKey: selfKey,
-          events: [event],
-        });
-      }
-    },
-    onEffectPatch: async (patch, event) => {
-      await applyLanEffectPatchToCharacter(patch);
       if (lanInfo?.sessionId && character) {
         const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
         await markLanEventsApplied(db, {
@@ -771,7 +747,8 @@ export default function CharacterSheetScreen() {
       }
 
       if (event.type === 'effect_patch' && event.effectPatch) {
-        await rememberLanSessionEvent(db, event);
+        const fresh = await rememberLanSessionEvent(db, event);
+        if (fresh) await applyLanEffectPatchToCharacter(event.effectPatch);
       }
 
       if (event.type === 'effect_catalog_patch' && event.effectCatalogPatch) {
@@ -797,6 +774,7 @@ export default function CharacterSheetScreen() {
     let active = true;
     let unsubscribeRealtime: (() => void) | undefined;
     let refreshRunning = false;
+    let eventRefreshRunning = false;
 
     const refreshLan = async () => {
       if (refreshRunning) return;
@@ -819,9 +797,27 @@ export default function CharacterSheetScreen() {
         joinUrl: decodeParam(storedInfo.joinUrl || ''),
       };
       const subscribeToRealtime = () => {
-        // O tempo real da ficha é tratado por useLanRealtimePlayerPatches.
-        // Não faça refresh completo a cada payload_update/evento, senão o snapshot
-        // antigo pode sobrescrever HP/XP/condições recém-aplicados e causar piscada.
+        if (nextInfo.joinUrl && !unsubscribeRealtime) {
+          unsubscribeRealtime = subscribeLanSessionClientUpdates(nextInfo.joinUrl, () => {
+            if (eventRefreshRunning) return;
+            eventRefreshRunning = true;
+            void (async () => {
+              try {
+                const events = await fetchLanSessionEvents(nextInfo.joinUrl, nextInfo.sessionId);
+                if (active) {
+                  await handleLanEvents(
+                    events.filter((event) => event.sessionId === nextInfo.sessionId),
+                    nextInfo.sessionId
+                  );
+                }
+              } catch {
+                // Evento em tempo real é best-effort; o fallback periódico continua existindo.
+              } finally {
+                eventRefreshRunning = false;
+              }
+            })();
+          });
+        }
       };
 
       if (active) setLanInfo(nextInfo);
@@ -857,10 +853,12 @@ export default function CharacterSheetScreen() {
         const expectedLocalLevel = getExpectedLevelForXp(Math.max(localXp, officialXp));
         const needsLevelReview = localLevel > officialLevel && localLevel <= expectedLocalLevel;
 
-        await notifyMasterReconnect(nextPayload, nextInfo, character, {
-          reviewSnapshot: needsLevelReview,
-          force: needsLevelReview,
-        });
+        if (!officialSelf || needsLevelReview) {
+          await notifyMasterReconnect(nextPayload, nextInfo, character, {
+            reviewSnapshot: needsLevelReview,
+            force: needsLevelReview,
+          });
+        }
       } catch {
         nextPayload = null;
       }
@@ -902,13 +900,10 @@ export default function CharacterSheetScreen() {
           role: 'player',
           snapshotSeq,
         });
-        const changedBySession = fetchedFreshPayload && canApplySnapshot
-          ? await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id), {
-            remoteKey: selfKey,
-            characterName: character.name,
-            mode: 'structural',
-          })
-          : false;
+        // Não aplique snapshot completo durante a sessão viva.
+        // HP/XP/moedas/efeitos/inventário chegam por eventos; snapshot é só hidratação inicial/status.
+        // Aplicar snapshot aqui é o que fazia a ficha piscar e voltar para valores antigos.
+        const changedBySession = false;
         if (fetchedFreshPayload && canApplySnapshot) {
           await markLanSnapshotApplied(db, {
             sessionId: nextInfo.sessionId,
@@ -925,17 +920,23 @@ export default function CharacterSheetScreen() {
           );
 
           if (updated && active) {
-            const parsedEquip = normalizeSheetEquipment((updated as any).equipment);
+            let parsedEquip = JSON.parse(String(updated.equipment || '{}'));
+
+            if (Array.isArray(parsedEquip)) {
+              parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
+            } else {
+              parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
+            }
 
             setCharacter((prev: any) => ({
               ...prev,
               ...(updated as any),
-              stats: safeJsonParse<Record<string, any>>((updated as any).stats, {}),
+              stats: JSON.parse(String(updated.stats || '{}')),
               equipment: parsedEquip,
-              spells: safeJsonParse<any[]>((updated as any).spells, []),
-              active_effects: safeJsonParse<any[]>((updated as any).active_effects_json, []),
-              save_values: safeJsonParse<any[]>((updated as any).save_values, []),
-              skill_values: safeJsonParse<any[]>((updated as any).skill_values, []),
+              spells: JSON.parse(String(updated.spells || '[]')),
+              active_effects: JSON.parse(String(updated.active_effects_json || '[]')),
+              save_values: JSON.parse(String(updated.save_values || '[]')),
+              skill_values: JSON.parse(String(updated.skill_values || '[]')),
             }));
           }
         }
@@ -961,7 +962,7 @@ export default function CharacterSheetScreen() {
     };
 
     refreshLan();
-    const timer = setInterval(refreshLan, 30000);
+    const timer = setInterval(refreshLan, 12000);
     return () => {
       active = false;
       clearInterval(timer);
