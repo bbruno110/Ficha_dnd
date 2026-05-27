@@ -5,7 +5,7 @@ const FALLBACK_COLOR = '#888888';
 export function getVisibleEffects(effects: LanActiveEffectSnapshot[] | unknown) {
   if (!Array.isArray(effects)) return [];
   return effects
-    .filter((effect) => effect && effect.visibleToPlayer !== false)
+    .filter((effect) => effect && effect.visibleToPlayer !== false && effect.status !== 'permanent_item_effect')
     .sort((a, b) => (Number(b.visualPriority || 0) - Number(a.visualPriority || 0)) || String(a.name).localeCompare(String(b.name)));
 }
 

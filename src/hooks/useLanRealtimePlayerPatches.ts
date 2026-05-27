@@ -30,6 +30,13 @@ export function useLanRealtimePlayerPatches({
 }: UseLanRealtimePlayerPatchesParams) {
   const lastSeqRef = useRef(0);
   const seenIdsRef = useRef(new Set<string>());
+  const onNumberPatchRef = useRef(onNumberPatch);
+  const onKickedRef = useRef(onKicked);
+
+  useEffect(() => {
+    onNumberPatchRef.current = onNumberPatch;
+    onKickedRef.current = onKicked;
+  }, [onKicked, onNumberPatch]);
 
   useEffect(() => {
     lastSeqRef.current = 0;
@@ -62,11 +69,11 @@ export function useLanRealtimePlayerPatches({
           if (event.seq) lastSeqRef.current = Math.max(lastSeqRef.current, event.seq);
 
           if (event.type === 'player_patch' && event.numberPatch) {
-            await onNumberPatch(event.numberPatch, event);
+            await onNumberPatchRef.current(event.numberPatch, event);
           }
 
           if (event.type === 'player_kicked') {
-            await onKicked?.(event);
+            await onKickedRef.current?.(event);
           }
         }
       } catch (error) {
@@ -89,5 +96,5 @@ export function useLanRealtimePlayerPatches({
       clearInterval(timer);
       unsubscribe();
     };
-  }, [characterName, enabled, joinUrl, onKicked, onNumberPatch, selfKey, sessionId]);
+  }, [characterName, enabled, joinUrl, selfKey, sessionId]);
 }

@@ -43,6 +43,13 @@ let clientPayload: LanSessionPayload | null = null;
 let clientEvents: LanSessionEvent[] = [];
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
 let clientUpdateListeners = new Set<() => void>();
+let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
+
+type ClientPayloadWaiter = {
+  sessionId?: string;
+  resolve: (payload: LanSessionPayload | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 export function isTcpLanUrl(url?: string) {
   return /^tcp:\/\//i.test(String(url || '').trim());
@@ -89,7 +96,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           return;
         }
 
-        upsertByKey(hostJoinedRows, message.entry, String(message.entry?.clientId || '') ? 'clientId' : 'remoteKey');
+        upsertByKey(hostJoinedRows, message.entry, String(message.entry?.remoteKey || '') ? 'remoteKey' : 'clientId');
         notifyHostUpdates();
         return;
       }
@@ -180,7 +187,7 @@ export function getLanTcpHostEvents() {
 
 export async function fetchLanTcpPayload(url: string) {
   if (isCurrentHostUrl(url)) return makeHostPayload();
-  return connectLanTcpClient(url);
+  return connectLanTcpClient(url, { requestFresh: true });
 }
 
 export async function resolveLanTcpUrlByInviteCode(inviteCode: string) {
@@ -222,11 +229,11 @@ export async function resolveLanTcpUrlByInviteCode(inviteCode: string) {
 
 export async function sendLanTcpJoin(url: string | undefined, entry: Record<string, unknown>) {
   if (!url) return false;
-  await connectLanTcpClient(url);
+  await connectLanTcpClient(url, { requestFresh: true });
   if (!clientSocket) return false;
   if (sendEnvelope(clientSocket, { type: 'join', entry })) return true;
 
-  await connectLanTcpClient(url);
+  await connectLanTcpClient(url, { forceReconnect: true });
   return Boolean(clientSocket && sendEnvelope(clientSocket, { type: 'join', entry }));
 }
 
@@ -265,10 +272,21 @@ function isCurrentHostUrl(url?: string) {
   }
 }
 
-async function connectLanTcpClient(url: string) {
+async function connectLanTcpClient(url: string, options?: { requestFresh?: boolean; forceReconnect?: boolean }) {
   if (!isTcpLanUrl(url)) throw new Error('URL TCP invalida.');
 
-  if (clientSocket && clientUrl === url && clientPayload) return clientPayload;
+  if (clientSocket && clientUrl === url && clientPayload && !options?.forceReconnect) {
+    if (!options?.requestFresh) return clientPayload;
+
+    const target = parseTcpUrl(url);
+    const freshPayload = await requestClientSnapshot(target.sessionId);
+    if (freshPayload) return freshPayload;
+
+    closeClientSocket();
+    clientPayload = null;
+    clientEvents = [];
+  }
+
   if (clientConnectPromise && clientUrl === url) return clientConnectPromise;
 
   closeClientSocket();
@@ -311,18 +329,22 @@ async function connectLanTcpClient(url: string) {
 
       clientPayload = null;
       clientEvents = [];
+      clearClientPayloadWaiters();
 
       if (resetUrl) {
         clientUrl = '';
       }
     };
 
-    const applyPayloadUpdate = (payload: LanSessionPayload) => {
+    const applyPayloadUpdate = (payload: LanSessionPayload, updateOptions?: { notify?: boolean }) => {
       if (target.sessionId && payload.session.id !== target.sessionId) return false;
       clientPayload = payload;
       clientSocket = socket;
       mergeClientPayloadEvents(payload, target.sessionId);
-      notifyClientUpdates();
+      resolveClientPayloadWaiters(payload);
+      if (updateOptions?.notify !== false) {
+        notifyClientUpdates();
+      }
       return true;
     };
 
@@ -347,7 +369,7 @@ async function connectLanTcpClient(url: string) {
         timeout = null;
       }
 
-      applyPayloadUpdate(payload);
+      applyPayloadUpdate(payload, { notify: false });
       resolve(payload);
     };
 
@@ -363,6 +385,7 @@ async function connectLanTcpClient(url: string) {
 
       if (clientSocket === socket) {
         clientSocket = null;
+        clearClientPayloadWaiters();
         notifyClientUpdates();
       }
 
@@ -376,6 +399,7 @@ async function connectLanTcpClient(url: string) {
     socket.on('close', () => {
       if (clientSocket === socket) {
         clientSocket = null;
+        clearClientPayloadWaiters();
         notifyClientUpdates();
       }
 
@@ -394,7 +418,7 @@ async function connectLanTcpClient(url: string) {
         if (!settled) {
           resolveOnce(message.payload);
         } else {
-          applyPayloadUpdate(message.payload);
+          applyPayloadUpdate(message.payload, { notify: message.type === 'payload_update' });
         }
         return;
       }
@@ -606,13 +630,17 @@ function getEventTimestamp(event: LanSessionEvent) {
 }
 
 function closeClientSocket() {
-  if (!clientSocket) return;
+  if (!clientSocket) {
+    clearClientPayloadWaiters();
+    return;
+  }
   try {
     clientSocket.destroy();
   } catch {
     // Socket already closed.
   }
   clientSocket = null;
+  clearClientPayloadWaiters();
 }
 
 export function resetLanTcpClient() {
@@ -621,6 +649,59 @@ export function resetLanTcpClient() {
   clientPayload = null;
   clientEvents = [];
   clientConnectPromise = null;
+  clearClientPayloadWaiters();
+}
+
+function requestClientSnapshot(sessionId?: string) {
+  if (!clientSocket) return Promise.resolve<LanSessionPayload | null>(null);
+
+  const socket = clientSocket;
+
+  return new Promise<LanSessionPayload | null>((resolve) => {
+    let settled = false;
+    let waiter: ClientPayloadWaiter | null = null;
+
+    const finish = (payload: LanSessionPayload | null) => {
+      if (settled) return;
+      settled = true;
+
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        clientPayloadWaiters.delete(waiter);
+      }
+
+      resolve(payload);
+    };
+
+    waiter = {
+      sessionId,
+      resolve: finish,
+      timer: setTimeout(() => finish(null), 1800),
+    };
+    clientPayloadWaiters.add(waiter);
+
+    if (!sendEnvelope(socket, { type: 'hello', sessionId })) {
+      finish(null);
+    }
+  });
+}
+
+function resolveClientPayloadWaiters(payload: LanSessionPayload) {
+  for (const waiter of [...clientPayloadWaiters]) {
+    if (waiter.sessionId && waiter.sessionId !== payload.session.id) continue;
+
+    clearTimeout(waiter.timer);
+    clientPayloadWaiters.delete(waiter);
+    waiter.resolve(payload);
+  }
+}
+
+function clearClientPayloadWaiters() {
+  for (const waiter of [...clientPayloadWaiters]) {
+    clearTimeout(waiter.timer);
+    clientPayloadWaiters.delete(waiter);
+    waiter.resolve(null);
+  }
 }
 
 async function getLocalIpAddress() {

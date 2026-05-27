@@ -388,8 +388,12 @@ useLanAppLifecycle({
 
       for (const entry of joinedPlayers) {
         if (entry?.sessionId === activeSessionId) {
-          await upsertLanSessionPlayerFromNetwork(db, entry);
-          changedPlayers = true;
+          try {
+            const playerId = await upsertLanSessionPlayerFromNetwork(db, entry);
+            if (playerId) changedPlayers = true;
+          } catch (error) {
+            console.warn('[LAN] Nao foi possivel registrar entrada do jogador:', error);
+          }
         }
       }
 

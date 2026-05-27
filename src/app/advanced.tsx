@@ -1840,16 +1840,19 @@ function toStructuredSpellEffect(effect: any, durationText: string, durationMeta
 
 function toStructuredItemEffect(effect: any) {
   const durationValue = effect.duration === 'Temp' && effect.turns ? Math.max(1, parseInt(effect.turns) || 1) : null;
+  const durationUnit = effect.duration === 'Perm' ? 'permanent' : durationValue ? 'turn' : null;
   const isStat = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(effect.type);
   const isTempHp = effect.type === 'PV_TEMP';
+  const isChooseStat = effect.type === 'Escolher Atributo';
   const isDamage = !isStat && !isTempHp && effect.type !== 'Cura' && effect.type !== 'Outro' && effect.type !== 'Escolher Atributo';
   const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
-  const condition = buildConditionPayload(effect, Boolean(save), durationValue, durationValue ? 'turn' : null);
+  const condition = buildConditionPayload(effect, Boolean(save), durationValue, durationUnit);
 
   return {
-    type: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',
-    kind: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : isStat ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',
-    target: isTempHp ? 'PV_TEMP' : isStat ? effect.type : undefined,
+    type: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : (isStat || isChooseStat) ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',
+    kind: condition && !effect.val ? 'condition' : isTempHp ? 'temp_hp' : (isStat || isChooseStat) ? 'stat' : effect.type === 'Cura' ? 'heal' : isDamage ? 'damage' : 'custom',
+    target: isTempHp ? 'PV_TEMP' : isChooseStat ? 'CHOOSE_STAT' : isStat ? effect.type : undefined,
+    chooseStat: isChooseStat,
     value: parseInt(String(effect.val).replace('+', '')) || 0,
     dice: /d\d+/i.test(String(effect.val)) ? String(effect.val) : '',
     damageDice: /d\d+/i.test(String(effect.val)) && isDamage ? String(effect.val) : undefined,
@@ -1860,7 +1863,7 @@ function toStructuredItemEffect(effect: any) {
       ? durationValue ? `${durationValue} turno(s)` : 'Temporario'
       : effect.duration === 'Perm' ? 'Permanente' : '',
     durationValue,
-    durationUnit: durationValue ? 'turn' : null,
+    durationUnit,
     save,
     condition,
   };

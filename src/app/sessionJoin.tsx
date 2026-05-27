@@ -157,11 +157,7 @@ export default function SessionJoinScreen() {
         await notifyMasterJoin(
           resolvedUrl || bound.joinUrl,
           nextPayload.session.id,
-          currentCharacter,
-          '',
-          {
-            reviewSnapshot: nextPayload.state?.status === 'paused',
-          }
+          currentCharacter
         );
 
         router.replace(

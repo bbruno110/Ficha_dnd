@@ -1,4 +1,3 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { DeviceEventEmitter, NativeModules, PermissionsAndroid, Platform } from 'react-native';
 
@@ -30,9 +29,10 @@ import {
 } from './lanTcpTransport';
 
 const LAN_START_TIMEOUT_MS = 4500;
-const LAN_CLIENT_ID_KEY = 'ficha_dnd_lan_client_id';
 const LAN_FOREGROUND_STOP_EVENT = 'LanSessionForegroundStop';
 const POST_NOTIFICATIONS_PERMISSION = 'android.permission.POST_NOTIFICATIONS' as Parameters<typeof PermissionsAndroid.check>[0];
+const LAN_XP_LEVEL_THRESHOLDS = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000, 85000, 100000, 120000, 140000, 165000, 195000, 225000, 265000, 305000, 355000];
+let lanClientId = '';
 
 const CUSTOM_TABLES = [
   'items',
@@ -731,12 +731,10 @@ export function resetLanClientConnection() {
 }
 
 export async function getLanClientId() {
-  let id = await AsyncStorage.getItem(LAN_CLIENT_ID_KEY);
-  if (!id) {
-    id = `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    await AsyncStorage.setItem(LAN_CLIENT_ID_KEY, id);
+  if (!lanClientId) {
+    lanClientId = `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   }
-  return id;
+  return lanClientId;
 }
 
 export async function closeAllLanSessionsBeforeCreate(db: SQLiteDatabase) {
@@ -1081,9 +1079,9 @@ export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId:
   await db.runAsync(
     `INSERT OR REPLACE INTO lan_session_players (
       session_id, remote_key, player_name, character_id, character_name, character_snapshot,
-      hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
+      level, class_name, race, hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
     [
       sessionId,
       makeLanCharacterKey(sessionId, { ...(character || {}), id: characterId }),
@@ -1091,6 +1089,9 @@ export async function joinLanSessionWithCharacter(db: SQLiteDatabase, sessionId:
       characterId,
       normalized.characterName,
       JSON.stringify(character || {}),
+      normalized.level,
+      normalized.className,
+      normalized.race,
       normalized.hpCurrent,
       normalized.hpMax,
       normalized.tempHp,
@@ -1143,17 +1144,19 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
   );
   if (kickedSameCharacter) return null;
 
-  const existing = clientId
+  const existingByClient = clientId
     ? await db.getFirstAsync<Record<string, unknown>>(
-        `SELECT * FROM lan_session_players
-         WHERE session_id = ? AND client_id = ? AND COALESCE(is_active, 1) = 1 AND kicked_at IS NULL
-         LIMIT 1`,
-        [sessionId, clientId]
-      )
-    : await db.getFirstAsync<Record<string, unknown>>(
-        `SELECT * FROM lan_session_players WHERE session_id = ? AND remote_key = ? LIMIT 1`,
-        [sessionId, remoteKey]
-      );
+      `SELECT * FROM lan_session_players
+       WHERE session_id = ? AND client_id = ? AND COALESCE(is_active, 1) = 1 AND kicked_at IS NULL
+       LIMIT 1`,
+      [sessionId, clientId]
+    )
+    : null;
+
+  const existing = existingByClient || await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_session_players WHERE session_id = ? AND remote_key = ? LIMIT 1`,
+    [sessionId, remoteKey]
+  );
 
   if (existing) {
     if (!toNumber(existing.is_active, 1) || existing.kicked_at) {
@@ -1162,6 +1165,22 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
 
     const pendingDiff = entry.reviewSnapshot ? describeCharacterDiff(existing, normalized) : [];
     if (pendingDiff.length > 0) {
+      if (canAutoAcceptLevelUpSnapshot(existing, normalized, pendingDiff)) {
+        await updateLanPlayerFromNormalizedSnapshot(db, Number(existing.id), character, normalized);
+        await rememberLanSessionEvent(db, {
+          id: makeLanEventId(),
+          sessionId,
+          type: 'character_update_review',
+          fromKey: 'master',
+          fromName: 'Mestre',
+          toKey: remoteKey,
+          toName: normalized.characterName,
+          message: `${normalized.characterName} subiu de nivel e a ficha foi sincronizada com a sessao.`,
+          createdAt: new Date().toISOString(),
+        });
+        return Number(existing.id);
+      }
+
       await db.runAsync(
         `UPDATE lan_session_players
          SET remote_key = ?, client_id = COALESCE(?, client_id), player_name = ?, character_name = ?,
@@ -1185,21 +1204,32 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
 
     await db.runAsync(
       `UPDATE lan_session_players
-       SET remote_key = ?, client_id = COALESCE(?, client_id), player_name = ?, character_name = ?, character_snapshot = ?,
+       SET remote_key = ?, client_id = COALESCE(?, client_id), player_name = ?,
            pending_character_snapshot = NULL, notes = NULL, is_connected = 1,
            last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [remoteKey, clientId || null, playerName, normalized.characterName, JSON.stringify(character), Number(existing.id)]
+      [remoteKey, clientId || null, playerName, Number(existing.id)]
     );
+
+    if (!existing.class_name || !existing.race) {
+      await db.runAsync(
+        `UPDATE lan_session_players
+         SET level = ?,
+             class_name = ?,
+             race = ?
+         WHERE id = ?`,
+        [normalized.level, normalized.className, normalized.race, Number(existing.id)]
+      );
+    }
     return Number(existing.id);
   }
 
   const result = await db.runAsync(
     `INSERT INTO lan_session_players (
       session_id, remote_key, client_id, player_name, character_id, character_name, character_snapshot,
-      hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
+      level, class_name, race, hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
     )
-    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
+    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
     [
       sessionId,
       remoteKey,
@@ -1207,6 +1237,9 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
       playerName,
       normalized.characterName,
       JSON.stringify(character),
+      normalized.level,
+      normalized.className,
+      normalized.race,
       normalized.hpCurrent,
       normalized.hpMax,
       normalized.tempHp,
@@ -1558,45 +1591,7 @@ export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerI
     const normalized = normalizeCharacterState(pending);
     toName = normalized.characterName;
 
-    await db.runAsync(
-      `UPDATE lan_session_players
-       SET character_name = ?,
-           character_snapshot = ?,
-           pending_character_snapshot = NULL,
-           notes = NULL,
-           level = ?,
-           class_name = ?,
-           race = ?,
-           hp_current = ?,
-           hp_max = ?,
-           temp_hp = ?,
-           xp = ?,
-           gp = ?,
-           sp = ?,
-           cp = ?,
-           stats_json = ?,
-           equipment_json = ?,
-           revision_seq = COALESCE(revision_seq, 0) + 1,
-           last_seen_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [
-        normalized.characterName,
-        JSON.stringify(pending),
-        normalized.level,
-        normalized.className,
-        normalized.race,
-        normalized.hpCurrent,
-        normalized.hpMax,
-        normalized.tempHp,
-        normalized.xp,
-        normalized.gp,
-        normalized.sp,
-        normalized.cp,
-        JSON.stringify(normalized.stats),
-        JSON.stringify(normalized.equipment),
-        playerId,
-      ]
-    );
+    await updateLanPlayerFromNormalizedSnapshot(db, playerId, pending, normalized);
 
     acceptedMessage =
       normalized.level > oldSnapshot.level
@@ -1770,7 +1765,8 @@ function normalizeJsonColumn(value: unknown) {
 export async function applyLanSessionStateToCharacter(
   db: SQLiteDatabase,
   payload: LanSessionPayload,
-  characterId: number
+  characterId: number,
+  options?: { remoteKey?: string; characterName?: string }
 ) {
   const character = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT id, name FROM characters WHERE id = ?`,
@@ -1778,10 +1774,18 @@ export async function applyLanSessionStateToCharacter(
   );
   if (!character || !payload.state?.players?.length) return false;
 
-  const match = payload.state.players.find((player) => {
-    if (player.sourceCharacterId && player.sourceCharacterId === characterId) return true;
-    return player.characterName === String(character.name || '');
-  });
+  const localName = String(options?.characterName || character.name || '');
+  const localKey = makeLanCharacterKey(payload.session.id, character);
+  const match = payload.state.players.find((player) => (
+    Boolean(options?.remoteKey) && player.remoteKey === options?.remoteKey
+  )) || payload.state.players.find((player) => (
+    player.remoteKey === localKey
+  )) || payload.state.players.find((player) => (
+    player.characterName === localName
+  )) || payload.state.players.find((player) => (
+    player.sourceCharacterId === characterId &&
+    payload.state!.players.filter((candidate) => candidate.sourceCharacterId === characterId).length === 1
+  ));
   if (!match) return false;
 
   const stats = applyEffectsToStats(match.stats, match.effects);
@@ -2182,6 +2186,83 @@ function normalizeCharacterState(character: Record<string, unknown>) {
     stats: parseJsonValue<Record<string, unknown>>(character.stats, {}),
     equipment: normalizeEquipment(character.equipment),
   };
+}
+
+async function updateLanPlayerFromNormalizedSnapshot(
+  db: SQLiteDatabase,
+  playerId: number,
+  snapshot: Record<string, unknown>,
+  normalized: ReturnType<typeof normalizeCharacterState>
+) {
+  await db.runAsync(
+    `UPDATE lan_session_players
+     SET character_name = ?,
+         character_snapshot = ?,
+         pending_character_snapshot = NULL,
+         notes = NULL,
+         level = ?,
+         class_name = ?,
+         race = ?,
+         hp_current = ?,
+         hp_max = ?,
+         temp_hp = ?,
+         xp = ?,
+         gp = ?,
+         sp = ?,
+         cp = ?,
+         stats_json = ?,
+         equipment_json = ?,
+         revision_seq = COALESCE(revision_seq, 0) + 1,
+         last_seen_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [
+      normalized.characterName,
+      JSON.stringify(snapshot),
+      normalized.level,
+      normalized.className,
+      normalized.race,
+      normalized.hpCurrent,
+      normalized.hpMax,
+      normalized.tempHp,
+      normalized.xp,
+      normalized.gp,
+      normalized.sp,
+      normalized.cp,
+      JSON.stringify(normalized.stats),
+      JSON.stringify(normalized.equipment),
+      playerId,
+    ]
+  );
+}
+
+function getLevelForXp(xp: number) {
+  let level = 1;
+  for (let index = LAN_XP_LEVEL_THRESHOLDS.length - 1; index >= 0; index -= 1) {
+    if (xp >= LAN_XP_LEVEL_THRESHOLDS[index]) {
+      level = index + 1;
+      break;
+    }
+  }
+  return level;
+}
+
+function canAutoAcceptLevelUpSnapshot(
+  current: Record<string, unknown>,
+  incoming: ReturnType<typeof normalizeCharacterState>,
+  diffs: string[]
+) {
+  const currentSnapshot = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(current.character_snapshot, {}));
+  const currentLevel = toNumber(current.level, currentSnapshot.level);
+  const currentXp = toNumber(current.xp, currentSnapshot.xp);
+  const levelIsAuthorizedByXp = incoming.level > currentLevel && incoming.level <= getLevelForXp(currentXp);
+  const sameOfficialXp = incoming.xp === currentXp;
+  const hasBlockedDiff = diffs.some((diff) => (
+    diff.startsWith('Invent') ||
+    diff.startsWith('Moedas') ||
+    diff.startsWith('Ra')
+  ));
+
+  return levelIsAuthorizedByXp && sameOfficialXp && !hasBlockedDiff;
 }
 
 function describeCharacterDiff(current: Record<string, unknown>, incoming: ReturnType<typeof normalizeCharacterState>) {

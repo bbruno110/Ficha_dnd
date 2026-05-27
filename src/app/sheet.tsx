@@ -11,7 +11,9 @@ import {
   getPublicLanPlayers,
   makeLanCharacterKey,
   makeLanEventId,
+  notifyMasterJoin,
   rememberLanSessionEvent,
+  saveLanSession,
   sendLanSessionEvent,
   subscribeLanSessionClientUpdates,
   unlinkCharacterFromLanSession,
@@ -46,6 +48,15 @@ const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 const COIN_RATES = { gp: 100, sp: 10, cp: 1 };
 const COIN_NAMES = { gp: 'Ouro', sp: 'Prata', cp: 'Cobre' };
 const COIN_COLORS = { gp: appColors.warning, sp: appColors.silver, cp: appColors.copper };
+const LAN_NUMBER_COLUMNS = `
+  hp_current,
+  hp_max,
+  temp_hp,
+  xp,
+  gp,
+  sp,
+  cp
+`;
 
 // Força a categoria correta para o agrupamento
 const getCategory = (spell: any): string => {
@@ -102,6 +113,8 @@ export default function CharacterSheetScreen() {
   const [lanInfo, setLanInfo] = useState<{ sessionId: string; joinUrl: string } | null>(null);
   const [lanSessionStatus, setLanSessionStatus] = useState<LanSessionStatus | null>(null);
   const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
+  const characterRef = useRef<any>(null);
+  const lastLanJoinNotifyRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
   const [incomingTrades, setIncomingTrades] = useState<LanSessionEvent[]>([]);
   const [targetPickerMode, setTargetPickerMode] = useState<'send' | 'trade' | null>(null);
   const [selectedTradeOffer, setSelectedTradeOffer] = useState<LanSessionEvent | null>(null);
@@ -136,6 +149,10 @@ export default function CharacterSheetScreen() {
     const timer = setInterval(() => setEffectFrame((frame) => (frame + 1) % 24), 1400);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    characterRef.current = character;
+  }, [character]);
 
   useEffect(() => {
     if (selectedSpell) {
@@ -228,6 +245,78 @@ export default function CharacterSheetScreen() {
     }, [id])
   );
 
+  const notifyMasterReconnect = useCallback(async (
+    nextPayload: LanSessionPayload,
+    nextInfo: { sessionId: string; joinUrl: string },
+    currentCharacter: Record<string, unknown>
+  ) => {
+    const selfKey = makeLanCharacterKey(nextInfo.sessionId, currentCharacter);
+    const isAlreadyInSession = Boolean(nextPayload.state?.players?.some((player) => (
+      player.remoteKey === selfKey ||
+      player.characterName === currentCharacter.name
+    )));
+    const key = `${nextInfo.sessionId}:${currentCharacter.id || ''}:${nextPayload.session.id}:${isAlreadyInSession ? 'joined' : 'joining'}`;
+    const now = Date.now();
+    const throttleMs = isAlreadyInSession ? 15000 : 3000;
+
+    if (lastLanJoinNotifyRef.current.key === key && now - lastLanJoinNotifyRef.current.at < throttleMs) {
+      return;
+    }
+
+    lastLanJoinNotifyRef.current = { key, at: now };
+
+    try {
+      await notifyMasterJoin(nextInfo.joinUrl, nextInfo.sessionId, currentCharacter);
+    } catch (error) {
+      console.warn('[LAN] Nao foi possivel reanunciar jogador ao mestre:', error);
+    }
+  }, []);
+
+  const applyLanNumberPatchToCharacter = useCallback(async (patch: LanSessionEvent['numberPatch']) => {
+    const currentCharacter = characterRef.current;
+    if (!currentCharacter?.id || !patch) return;
+
+    const current = await db.getFirstAsync<Record<string, unknown>>(
+      `SELECT ${LAN_NUMBER_COLUMNS} FROM characters WHERE id = ?`,
+      [Number(currentCharacter.id)]
+    );
+
+    const base = current || currentCharacter;
+    const nextValues = {
+      hp_current: patch.hpCurrent ?? base.hp_current,
+      hp_max: patch.hpMax ?? base.hp_max,
+      temp_hp: patch.tempHp ?? base.temp_hp,
+      xp: patch.xp ?? base.xp,
+      gp: patch.gp ?? base.gp,
+      sp: patch.sp ?? base.sp,
+      cp: patch.cp ?? base.cp,
+    };
+
+    await db.runAsync(
+      `UPDATE characters
+       SET hp_current = ?,
+           hp_max = ?,
+           temp_hp = ?,
+           xp = ?,
+           gp = ?,
+           sp = ?,
+           cp = ?
+       WHERE id = ?`,
+      [
+        nextValues.hp_current,
+        nextValues.hp_max,
+        nextValues.temp_hp,
+        nextValues.xp,
+        nextValues.gp,
+        nextValues.sp,
+        nextValues.cp,
+        Number(currentCharacter.id),
+      ]
+    );
+
+    setCharacter((prev: any) => prev ? ({ ...prev, ...nextValues }) : prev);
+  }, [db]);
+
   const syncLanFromHost = useCallback(async () => {
   if (!lanInfo?.joinUrl || !lanInfo?.sessionId || !character?.id) return;
 
@@ -238,7 +327,12 @@ export default function CharacterSheetScreen() {
       return;
     }
 
-    await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id));
+    await saveLanSession(db, nextPayload, lanInfo.joinUrl, { isMaster: false });
+    await notifyMasterReconnect(nextPayload, lanInfo, character);
+    await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id), {
+      remoteKey: makeLanCharacterKey(lanInfo.sessionId, character),
+      characterName: character.name,
+    });
 
     setLanSessionStatus(nextPayload.state?.status || null);
 
@@ -272,7 +366,7 @@ export default function CharacterSheetScreen() {
   } catch (error) {
     console.warn('[LAN] Não foi possível re-sincronizar com o mestre:', error);
   }
-}, [db, lanInfo?.joinUrl, lanInfo?.sessionId, character?.id]);
+}, [db, lanInfo, character, notifyMasterReconnect]);
 
   useLanRealtimePlayerPatches({
     enabled: Boolean(character && lanInfo?.sessionId && lanInfo?.joinUrl),
@@ -283,42 +377,7 @@ export default function CharacterSheetScreen() {
       : '',
     characterName: character?.name,
     onNumberPatch: async (patch) => {
-      if (!character) return;
-
-      const nextCharacter = {
-        ...character,
-        hp_current: patch.hpCurrent ?? character.hp_current,
-        hp_max: patch.hpMax ?? character.hp_max,
-        temp_hp: patch.tempHp ?? character.temp_hp,
-        xp: patch.xp ?? character.xp,
-        gp: patch.gp ?? character.gp,
-        sp: patch.sp ?? character.sp,
-        cp: patch.cp ?? character.cp,
-      };
-
-      setCharacter(nextCharacter);
-
-      await db.runAsync(
-        `UPDATE characters
-        SET hp_current = ?,
-            hp_max = ?,
-            temp_hp = ?,
-            xp = ?,
-            gp = ?,
-            sp = ?,
-            cp = ?
-        WHERE id = ?`,
-        [
-          nextCharacter.hp_current,
-          nextCharacter.hp_max,
-          nextCharacter.temp_hp,
-          nextCharacter.xp,
-          nextCharacter.gp,
-          nextCharacter.sp,
-          nextCharacter.cp,
-          character.id,
-        ]
-      );
+      await applyLanNumberPatchToCharacter(patch);
     },
     onKicked: async (event) => {
       if (!character || !lanInfo?.sessionId) return;
@@ -455,42 +514,7 @@ export default function CharacterSheetScreen() {
         const fresh = await rememberLanSessionEvent(db, event);
         if (!fresh) continue;
 
-        const patch = event.numberPatch;
-
-        const nextCharacter = {
-          ...character,
-          hp_current: patch.hpCurrent ?? character.hp_current,
-          hp_max: patch.hpMax ?? character.hp_max,
-          temp_hp: patch.tempHp ?? character.temp_hp,
-          xp: patch.xp ?? character.xp,
-          gp: patch.gp ?? character.gp,
-          sp: patch.sp ?? character.sp,
-          cp: patch.cp ?? character.cp,
-        };
-
-        setCharacter(nextCharacter);
-
-        await db.runAsync(
-          `UPDATE characters
-          SET hp_current = ?,
-              hp_max = ?,
-              temp_hp = ?,
-              xp = ?,
-              gp = ?,
-              sp = ?,
-              cp = ?
-          WHERE id = ?`,
-          [
-            nextCharacter.hp_current,
-            nextCharacter.hp_max,
-            nextCharacter.temp_hp,
-            nextCharacter.xp,
-            nextCharacter.gp,
-            nextCharacter.sp,
-            nextCharacter.cp,
-            character.id,
-          ]
-        );
+        await applyLanNumberPatchToCharacter(event.numberPatch);
 
         continue;
       }
@@ -579,8 +603,13 @@ export default function CharacterSheetScreen() {
     if (!character) return;
     let active = true;
     let unsubscribeRealtime: (() => void) | undefined;
+    let refreshRunning = false;
 
     const refreshLan = async () => {
+      if (refreshRunning) return;
+      refreshRunning = true;
+
+      try {
       const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
       const storedInfo = routeSessionId
         ? {
@@ -604,9 +633,13 @@ export default function CharacterSheetScreen() {
       }
 
       let nextPayload: LanSessionPayload | null = null;
+      let fetchedFreshPayload = false;
       if (nextInfo.joinUrl) {
         try {
           nextPayload = await fetchLanSessionPayload(nextInfo.joinUrl);
+          fetchedFreshPayload = true;
+          await saveLanSession(db, nextPayload, nextInfo.joinUrl, { isMaster: false });
+          await notifyMasterReconnect(nextPayload, nextInfo, character);
         } catch {
           nextPayload = null;
         }
@@ -632,7 +665,7 @@ export default function CharacterSheetScreen() {
           event.type === 'player_kicked' &&
           (event.toKey === selfKey || event.toName === character.name)
         ));
-        if (!isStillInSession && (wasKicked || nextPayload.state?.status === 'ended')) {
+        if (fetchedFreshPayload && !isStillInSession && (wasKicked || nextPayload.state?.status === 'ended')) {
           await unlinkCharacterFromLanSession(db, Number(character.id), nextInfo.sessionId);
           if (active) {
             setLanInfo(null);
@@ -642,7 +675,12 @@ export default function CharacterSheetScreen() {
           }
           return;
         }
-        const changedBySession = await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id));
+        const changedBySession = fetchedFreshPayload
+          ? await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id), {
+            remoteKey: selfKey,
+            characterName: character.name,
+          })
+          : false;
         if (changedBySession) {
           const updated = await db.getFirstAsync<Record<string, unknown>>(
             `SELECT * FROM characters WHERE id = ?`,
@@ -671,7 +709,7 @@ export default function CharacterSheetScreen() {
           }
         }
         setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
-        if (nextPayload.events?.length) {
+        if (fetchedFreshPayload && nextPayload.events?.length) {
           await handleLanEvents(nextPayload.events.filter((event) => event.sessionId === nextInfo.sessionId), nextInfo.sessionId);
         }
       }
@@ -684,6 +722,9 @@ export default function CharacterSheetScreen() {
           // A mesa pode estar pausada/offline; a ficha continua utilizavel localmente.
         }
       }
+      } finally {
+        refreshRunning = false;
+      }
     };
 
     refreshLan();
@@ -693,7 +734,7 @@ export default function CharacterSheetScreen() {
       clearInterval(timer);
       unsubscribeRealtime?.();
     };
-  }, [character, routeSessionId, routeJoinUrl]);
+  }, [character, routeSessionId, routeJoinUrl, notifyMasterReconnect]);
 
   useEffect(() => {
     if (!routeSessionId) return;
@@ -1351,7 +1392,7 @@ export default function CharacterSheetScreen() {
     await sendLanSessionEvent(lanInfo.joinUrl, event);
   };
 
-  const applyStructuredItemEffects = (bagIndex: number, item: any, qty: number, effects: any[]) => {
+  const applyStructuredItemEffects = async (bagIndex: number, item: any, qty: number, effects: any[], chosenAttr?: string) => {
     updateBagQty(bagIndex, -qty);
 
     const nextStats = { ...character.stats, temp_mods: { ...(character.stats?.temp_mods || {}) } };
@@ -1362,20 +1403,41 @@ export default function CharacterSheetScreen() {
 
     for (const effect of effects) {
       const kind = String(effect.kind || effect.type || '').toLowerCase();
-      const target = String(effect.target || '').toUpperCase();
+      const needsChosenStat = Boolean(effect.chooseStat) || String(effect.target || '').toUpperCase() === 'CHOOSE_STAT' || String(effect.effectType || '') === 'Escolher Atributo';
+      const target = String(needsChosenStat ? chosenAttr : effect.target || '').toUpperCase();
       const value = Number(effect.value || 0);
       const dice = effect.healDice || effect.damageDice || effect.dice || '';
       const duration = getItemEffectDuration(item, effect);
+      const isPermanent = duration.unit === 'permanent' || String(effect.durationText || '').toLowerCase().includes('permanente');
+
+      if (needsChosenStat && !target) {
+        continue;
+      }
 
       if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target) && value) {
         if (effect.mode === 'set') {
           const base = Number(nextStats[target] || 10);
           nextStats.temp_mods[target] = value - base;
           messages.push(`${target} definido como ${value}.`);
+        } else if (isPermanent && target !== 'CA') {
+          nextStats[target] = String((Number(nextStats[target]) || 10) + value * qty);
+          nextStats.extra_points = (Number(nextStats.extra_points) || 0) + value * qty;
+          messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty} permanente.`);
         } else {
           nextStats.temp_mods[target] = (Number(nextStats.temp_mods[target]) || 0) + value * qty;
-          messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty}.`);
+          messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty}${isPermanent ? ' permanente' : ''}.`);
         }
+
+        if (!isPermanent) {
+          nextActiveEffects.push(makeLocalItemEffect(item, {
+            name: `${item.name}: ${target} ${value > 0 ? '+' : ''}${value * qty}`,
+            target,
+            value: effect.mode === 'set' ? value : value * qty,
+            duration,
+            permanent: false,
+          }));
+        }
+
         lanEffects.push({
           spellName: item.name,
           mode: 'effect',
@@ -1392,6 +1454,13 @@ export default function CharacterSheetScreen() {
       if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
         dbUpdates.temp_hp = Math.max(Number(character.temp_hp || 0), Number(character.temp_hp || 0) + value * qty);
         messages.push(`PV temporario +${value * qty}.`);
+        nextActiveEffects.push(makeLocalItemEffect(item, {
+          name: `${item.name}: PV temporario +${value * qty}`,
+          target: 'PV_TEMP',
+          value: value * qty,
+          duration,
+          permanent: false,
+        }));
         lanEffects.push({
           spellName: item.name,
           mode: 'effect',
@@ -1460,7 +1529,7 @@ export default function CharacterSheetScreen() {
     if (nextActiveEffects.length !== (Array.isArray(character.active_effects) ? character.active_effects.length : 0)) {
       dbUpdates.active_effects_json = nextActiveEffects;
     }
-    updateDB(dbUpdates);
+    await updateDB(dbUpdates);
     setCharacter((prev: any) => ({ ...prev, active_effects: nextActiveEffects }));
     for (const lanEffect of lanEffects) {
       void notifySelfLanSpellEvent(lanEffect);
@@ -1494,6 +1563,31 @@ export default function CharacterSheetScreen() {
     if (!ensureLanWritable()) return;
     const structuredEffects = parseStructuredEffects(item.effect_json);
     if (structuredEffects.length > 0) {
+      const chooseEffect = structuredEffects.find((effect) => (
+        Boolean(effect.chooseStat) ||
+        String(effect.target || '').toUpperCase() === 'CHOOSE_STAT' ||
+        String(effect.effectType || '') === 'Escolher Atributo'
+      ));
+
+      if (chooseEffect) {
+        const value = Number(chooseEffect.value || 0);
+        const attrButtons: any[] = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].map(attr => ({
+          text: attr,
+          color: value >= 0 ? '#00fa9a' : '#ff6666',
+          onPress: () => void applyStructuredItemEffects(bagIndex, item, qty, structuredEffects, attr),
+        }));
+
+        showCustomAlert(
+          `Consumir ${qty}x ${item.name}`,
+          'Este item afeta um atributo de sua escolha. Qual atributo deseja alterar?',
+          [
+            { text: 'Cancelar', color: '#666' },
+            ...attrButtons,
+          ]
+        );
+        return;
+      }
+
       showCustomAlert(
         `Consumir ${qty}x ${item.name}`,
         'Confirmar uso deste item?',
@@ -1502,7 +1596,7 @@ export default function CharacterSheetScreen() {
           {
             text: 'Usar',
             color: '#00fa9a',
-            onPress: () => applyStructuredItemEffects(bagIndex, item, qty, structuredEffects),
+            onPress: () => void applyStructuredItemEffects(bagIndex, item, qty, structuredEffects),
           },
         ]
       );
@@ -3054,12 +3148,23 @@ function parseSpellDuration(duration?: string): { durationRemaining: number; dur
 
 function getItemEffectDuration(item: any, effect: any): { text: string; remaining: number; unit: LanEffectUnit } {
   const conditionDuration = effect?.condition?.duration || {};
+  const durationText = String(effect?.durationText || '').toLowerCase();
+  const durationUnit = effect?.durationUnit ?? effect?.duration_unit ?? conditionDuration.unit ?? item?.duration_unit;
+
+  if (durationUnit === 'permanent' || durationText.includes('permanente')) {
+    return {
+      text: 'Permanente',
+      remaining: 999999,
+      unit: 'permanent',
+    };
+  }
+
   const remaining = Math.max(
     1,
     Number(effect?.durationValue ?? effect?.duration_value ?? conditionDuration.value ?? item?.duration_value ?? 1) || 1
   );
   const unit = normalizeLanEffectUnit(
-    effect?.durationUnit ?? effect?.duration_unit ?? conditionDuration.unit ?? item?.duration_unit
+    durationUnit
   );
   return {
     text: `${remaining} ${unit}`,
@@ -3068,9 +3173,37 @@ function getItemEffectDuration(item: any, effect: any): { text: string; remainin
   };
 }
 
+function makeLocalItemEffect(
+  item: any,
+  input: {
+    name: string;
+    target: string;
+    value: number;
+    duration: { text: string; remaining: number; unit: LanEffectUnit };
+    permanent: boolean;
+  }
+) {
+  return {
+    id: `local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    name: input.name,
+    status: input.permanent ? 'permanent_item_effect' : 'item_effect',
+    target: normalizeLanEffectTarget(input.target),
+    value: input.value,
+    remaining: input.duration.remaining,
+    unit: input.duration.unit,
+    durationText: input.duration.text,
+    color: input.permanent ? '#00fa9a' : '#00bfff',
+    secondaryColor: '#8be9fd',
+    source: item.name,
+    visibleToPlayer: true,
+    visualPriority: input.permanent ? 70 : 50,
+  };
+}
+
 function normalizeLanEffectUnit(value: unknown): LanEffectUnit {
-  if (value === 'turn' || value === 'minute' || value === 'hour' || value === 'rest') return value;
+  if (value === 'turn' || value === 'minute' || value === 'hour' || value === 'rest' || value === 'permanent') return value;
   const raw = String(value || '').toLowerCase();
+  if (raw.includes('permanent') || raw.includes('permanente')) return 'permanent';
   if (raw.includes('turno') || raw.includes('rodada')) return 'turn';
   if (raw.includes('hora')) return 'hour';
   if (raw.includes('min')) return 'minute';
