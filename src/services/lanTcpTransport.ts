@@ -23,13 +23,17 @@ type TcpSocket = {
 };
 
 type TcpEnvelope =
-  | { type: 'hello'; sessionId?: string }
-  | { type: 'session_snapshot'; payload: LanSessionPayload }
+  | { type: 'hello'; sessionId?: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }
+  | { type: 'session_snapshot'; payload: LanSessionPayload; snapshotSeq?: number; structural?: boolean }
   | { type: 'join'; entry: Record<string, unknown> }
   | { type: 'join_ack'; sessionId: string; remoteKey?: string; clientId?: string; accepted: true }
   | { type: 'join_rejected'; sessionId?: string; reason: string }
   | { type: 'event'; event: LanSessionEvent }
-  | { type: 'payload_update'; payload: LanSessionPayload }
+  | { type: 'payload_update'; payload: LanSessionPayload; structural?: boolean; snapshotSeq?: number }
+  | { type: 'event_ack'; sessionId: string; eventId: string; clientMsgId?: string; playerKey?: string; lastAppliedSeq?: number; entityId?: string; entityRevision?: number }
+  | { type: 'event_nack'; sessionId: string; eventId?: string; clientMsgId?: string; playerKey?: string; reason: string }
+  | { type: 'resync_request'; sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }
+  | { type: 'resync_events'; sessionId: string; events: LanSessionEvent[]; payload?: LanSessionPayload }
   | { type: 'ack'; sessionId: string; playerKey?: string; lastAppliedSeq?: number; receivedEventIds?: string[] }
   | { type: 'heartbeat'; sessionId?: string; sentAt: string }
   | { type: 'heartbeat_ack'; sessionId?: string; sentAt: string }
@@ -42,6 +46,7 @@ let hostUrl = '';
 let hostSockets = new Set<TcpSocket>();
 let hostJoinedRows: Record<string, unknown>[] = [];
 let hostEvents: LanSessionEvent[] = [];
+let hostEventAcks: Record<string, unknown>[] = [];
 let hostUpdateListeners = new Set<() => void>();
 
 let clientSocket: TcpSocket | null = null;
@@ -115,7 +120,45 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         return;
       }
 
-      if (message.type === 'ack' || message.type === 'heartbeat_ack') {
+      if (message.type === 'heartbeat_ack') {
+        return;
+      }
+
+      if (message.type === 'ack') {
+        const sessionId = String(message.sessionId || hostPayload?.session.id || '');
+        rememberHostAck({
+          sessionId,
+          playerKey: message.playerKey,
+          lastAppliedSeq: message.lastAppliedSeq,
+          receivedEventIds: message.receivedEventIds || [],
+          receivedAt: new Date().toISOString(),
+        });
+        notifyHostUpdates();
+        return;
+      }
+
+      if (message.type === 'event_ack') {
+        rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
+        notifyHostUpdates();
+        return;
+      }
+
+      if (message.type === 'event_nack') {
+        rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
+        notifyHostUpdates();
+        return;
+      }
+
+      if (message.type === 'resync_request') {
+        if (!isEnvelopeForCurrentSession(message.sessionId)) return;
+        const lastAppliedSeq = Number(message.lastAppliedSeq || 0);
+        const events = getEventsAfterSeq(lastAppliedSeq, message.sessionId);
+        sendEnvelope(socket, {
+          type: 'resync_events',
+          sessionId: message.sessionId,
+          events,
+          payload: makeHostPayload(),
+        });
         return;
       }
 
@@ -200,8 +243,9 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
 
       if (message.type === 'event') {
         if (!isEnvelopeForCurrentSession(message.event?.sessionId)) return;
-        upsertByKey(hostEvents, message.event, 'id');
-        broadcastEnvelope({ type: 'event', event: message.event });
+        const event = normalizeWireEvent(message.event);
+        upsertByKey(hostEvents, event, 'id');
+        broadcastEnvelope({ type: 'event', event });
         notifyHostUpdates();
       }
     });
@@ -264,6 +308,7 @@ export async function stopLanTcpHost() {
   hostUrl = '';
   hostJoinedRows = [];
   hostEvents = [];
+  hostEventAcks = [];
 }
 
 export function updateLanTcpHostPayload(payload: LanSessionPayload, options?: { broadcast?: boolean }) {
@@ -283,6 +328,10 @@ export function getLanTcpHostJoinedRows() {
 
 export function getLanTcpHostEvents() {
   return [...hostEvents];
+}
+
+export function getLanTcpHostAcks() {
+  return [...hostEventAcks];
 }
 
 export async function fetchLanTcpPayload(url: string) {
@@ -343,20 +392,73 @@ export async function sendLanTcpJoin(url: string | undefined, entry: Record<stri
 
 export async function sendLanTcpEvent(url: string | undefined, event: LanSessionEvent) {
   if (!url) throw new Error('Sessao TCP sem URL ativa.');
+  const wireEvent = normalizeWireEvent(event);
+
   if (isCurrentHostUrl(url)) {
-    upsertByKey(hostEvents, event, 'id');
-    broadcastEnvelope({ type: 'event', event });
+    upsertByKey(hostEvents, wireEvent, 'id');
+    broadcastEnvelope({ type: 'event', event: wireEvent });
     notifyHostUpdates();
-    return;
+    return true;
   }
-  await connectLanTcpClient(url);
-  if (!clientSocket) throw new Error('Socket TCP indisponivel.');
-  if (sendEnvelope(clientSocket, { type: 'event', event })) return;
 
   await connectLanTcpClient(url);
-  if (!clientSocket || !sendEnvelope(clientSocket, { type: 'event', event })) {
+  if (!clientSocket) throw new Error('Socket TCP indisponivel.');
+  if (sendEnvelope(clientSocket, { type: 'event', event: wireEvent })) return true;
+
+  await connectLanTcpClient(url, { forceReconnect: true });
+  if (!clientSocket || !sendEnvelope(clientSocket, { type: 'event', event: wireEvent })) {
     throw new Error('Socket TCP indisponivel.');
   }
+  return true;
+}
+
+export async function sendLanTcpAck(url: string | undefined, ack: { sessionId: string; eventId: string; clientMsgId?: string; playerKey?: string; lastAppliedSeq?: number; entityId?: string; entityRevision?: number }) {
+  if (!url) return false;
+
+  if (isCurrentHostUrl(url)) {
+    rememberHostAck({ ...ack, type: 'event_ack', receivedAt: new Date().toISOString() });
+    notifyHostUpdates();
+    return true;
+  }
+
+  if (clientSocket && clientUrl === url) {
+    return sendEnvelope(clientSocket, { type: 'event_ack', ...ack });
+  }
+
+  await connectLanTcpClient(url, { forceReconnect: true });
+  if (!clientSocket) return false;
+  return sendEnvelope(clientSocket, { type: 'event_ack', ...ack });
+}
+
+
+export async function sendLanTcpNack(url: string | undefined, nack: { sessionId: string; eventId?: string; clientMsgId?: string; playerKey?: string; reason: string }) {
+  if (!url) return false;
+
+  if (isCurrentHostUrl(url)) {
+    rememberHostAck({ ...nack, type: 'event_nack', receivedAt: new Date().toISOString() });
+    notifyHostUpdates();
+    return true;
+  }
+
+  if (clientSocket && clientUrl === url) {
+    return sendEnvelope(clientSocket, { type: 'event_nack', ...nack });
+  }
+
+  await connectLanTcpClient(url, { forceReconnect: true });
+  if (!clientSocket) return false;
+  return sendEnvelope(clientSocket, { type: 'event_nack', ...nack });
+}
+
+export async function requestLanTcpResync(url: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
+  if (!url) return false;
+
+  if (clientSocket && clientUrl === url) {
+    return sendEnvelope(clientSocket, { type: 'resync_request', ...request });
+  }
+
+  await connectLanTcpClient(url, { forceReconnect: true });
+  if (!clientSocket) return false;
+  return sendEnvelope(clientSocket, { type: 'resync_request', ...request });
 }
 
 export async function getLanTcpClientEvents(url: string, sessionId?: string) {
@@ -551,8 +653,24 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         if (!settled) {
           resolveOnce(message.payload);
         } else {
-          applyPayloadUpdate(message.payload, { notify: message.type === 'payload_update' });
+          // payload_update/session_snapshot são cache estrutural.
+          // Não notifique a ficha como atualização viva, pois HP/XP/efeitos/inventário
+          // são aplicados por eventos versionados.
+          applyPayloadUpdate(message.payload, { notify: false });
         }
+        return;
+      }
+
+      if (message.type === 'resync_events') {
+        if (target.sessionId && message.sessionId !== target.sessionId) return;
+        for (const event of message.events || []) {
+          if (target.sessionId && event.sessionId !== target.sessionId) continue;
+          upsertByKey(clientEvents, normalizeWireEvent(event), 'id');
+        }
+        if (message.payload) {
+          applyPayloadUpdate(message.payload, { notify: false });
+        }
+        notifyClientUpdates();
         return;
       }
 
@@ -871,13 +989,62 @@ function mergeRecentEvents(...eventLists: LanSessionEvent[][]) {
   for (const events of eventLists) {
     for (const event of events) {
       if (!event?.id) continue;
-      eventsById.set(event.id, event);
+      eventsById.set(event.id, normalizeWireEvent(event));
     }
   }
 
   return [...eventsById.values()]
     .sort((a, b) => getEventTimestamp(b) - getEventTimestamp(a))
-    .slice(0, 50);
+    .slice(0, 80);
+}
+
+function normalizeWireEvent(event: LanSessionEvent): LanSessionEvent {
+  const entityType = (event as any).entityType || inferWireEventEntityType(event);
+  const entityId = String((event as any).entityId || inferWireEventEntityId(event) || event.sessionId);
+  const seq = Number.isFinite(Number(event.seq)) ? Number(event.seq) : undefined;
+  const entityRevision = Number.isFinite(Number((event as any).entityRevision))
+    ? Number((event as any).entityRevision)
+    : (seq || 0);
+
+  return {
+    ...event,
+    entityType,
+    entityId,
+    entityRevision,
+    ackRequired: (event as any).ackRequired ?? shouldWireEventRequireAck(event),
+  } as LanSessionEvent;
+}
+
+function inferWireEventEntityType(event: LanSessionEvent) {
+  if (event.type === 'session_patch' || event.type === 'timeline_event') return 'session';
+  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
+  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
+  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  return 'player';
+}
+
+function inferWireEventEntityId(event: LanSessionEvent) {
+  return event.toKey || event.fromKey || event.tradeId || event.sessionId;
+}
+
+function shouldWireEventRequireAck(event: LanSessionEvent) {
+  return event.toKey !== 'master' && event.toKey !== 'party' && event.toKey !== 'session';
+}
+
+function getEventsAfterSeq(seq: number, sessionId?: string) {
+  return mergeRecentEvents(hostPayload?.events || [], hostEvents)
+    .filter((event) => (!sessionId || event.sessionId === sessionId) && Number(event.seq || 0) > seq);
+}
+
+function rememberHostAck(ack: Record<string, unknown>) {
+  const eventId = String(ack.eventId || ack.clientMsgId || '');
+  const playerKey = String(ack.playerKey || '');
+  const key = `${String(ack.sessionId || '')}:${playerKey}:${eventId}:${String(ack.type || 'ack')}`;
+  const existingIndex = hostEventAcks.findIndex((item) => String(item.__key || '') === key);
+  const next = { ...ack, __key: key };
+  if (existingIndex >= 0) hostEventAcks[existingIndex] = next;
+  else hostEventAcks.unshift(next);
+  hostEventAcks = hostEventAcks.slice(0, 300);
 }
 
 function getEventTimestamp(event: LanSessionEvent) {

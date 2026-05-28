@@ -20,13 +20,16 @@ import {
   getBoundLanCharacter,
   importLanCatalog,
   joinLanSessionWithCharacter,
+  makeLanCharacterKey,
   notifyMasterJoin,
+  requestLanSessionResync,
   resolveLanSessionUrlByInviteCode,
   saveLanSession,
   switchLanRole,
   unlinkCharacterFromLanSession,
   type LanSessionPayload,
 } from '@/services/lanSession';
+import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, lanSessionStyles as styles } from '@/styles/globalStyles';
 
 type CharacterRow = {
@@ -88,6 +91,28 @@ export default function SessionJoinScreen() {
     }
 
     return message || 'Não foi possível entrar na sessão LAN.';
+  };
+
+  const requestRuntimeResync = async (url: string | undefined, sessionId: string, playerKey: string) => {
+    if (!url || !sessionId || !playerKey) return;
+
+    const runtime = useLanRealtimeStore.getState();
+    const knownRevisions = getKnownLanEntityRevisions(sessionId);
+
+    runtime.setConnection({
+      sessionId,
+      playerKey,
+      connected: true,
+    });
+
+    await requestLanSessionResync(url, {
+      sessionId,
+      playerKey,
+      lastAppliedSeq: runtime.sessionId === sessionId ? runtime.lastAppliedSeq : 0,
+      knownRevisions,
+    }).catch((error) => {
+      console.warn('[LAN] Nao foi possivel solicitar resync apos join:', error);
+    });
   };
 
   const loadSession = async (url?: string, data?: string) => {
@@ -163,11 +188,17 @@ export default function SessionJoinScreen() {
 
         await saveLanSession(db, nextPayload, resolvedUrl || bound.joinUrl, { isMaster: false });
 
+        const playerKey = bound.remoteKey || (currentCharacter
+          ? makeLanCharacterKey(nextPayload.session.id, currentCharacter)
+          : '');
+
         await notifyMasterJoin(
           resolvedUrl || bound.joinUrl,
           nextPayload.session.id,
           currentCharacter
         );
+
+        await requestRuntimeResync(resolvedUrl || bound.joinUrl, nextPayload.session.id, playerKey);
 
         router.replace(
           `/sheet?id=${bound.characterId}&sessionId=${nextPayload.session.id}&joinUrl=${encodeURIComponent(
@@ -279,6 +310,9 @@ export default function SessionJoinScreen() {
           'Sua ficha entrou neste aparelho, mas não consegui avisar o mestre. Para aparecer na tela do mestre, o QR precisa usar uma URL LAN ativa e os dois aparelhos precisam estar na mesma rede.'
         );
       }
+
+      const playerKey = makeLanCharacterKey(payload.session.id, currentCharacter || character || { id: characterId });
+      await requestRuntimeResync(joinUrl, payload.session.id, playerKey);
 
       router.replace(
         `/sheet?id=${characterId}&sessionId=${payload.session.id}&joinUrl=${encodeURIComponent(

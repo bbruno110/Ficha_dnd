@@ -14,12 +14,16 @@ import { ensureLanSyncSchema, saveLanSessionSnapshot } from './lanSyncEngine';
 import {
   fetchLanTcpPayload,
   getLanTcpClientEvents,
+  getLanTcpHostAcks,
   getLanTcpHostEvents,
   getLanTcpHostJoinedRows,
   isTcpLanUrl,
   LAN_TCP_PORT,
   resetLanTcpClient,
   resolveLanTcpUrlByInviteCode,
+  requestLanTcpResync,
+  sendLanTcpAck,
+  sendLanTcpNack,
   sendLanTcpEvent,
   sendLanTcpJoin,
   startLanTcpHost,
@@ -142,6 +146,7 @@ export type LanSessionPlayerState = {
   characterSnapshot?: Record<string, unknown>;
   pendingCharacter?: Record<string, unknown> | null;
   pendingDiff?: string[];
+  revisionSeq?: number;
 };
 
 export type LanSessionState = {
@@ -243,6 +248,11 @@ export type LanSessionEvent = {
   toKey: string;
   toName: string;
   clientMsgId?: string;
+  entityType?: string;
+  entityId?: string;
+  entityRevision?: number;
+  ackRequired?: boolean;
+  originClientId?: string;
   item?: LanTradeItem;
   offeredItem?: LanTradeItem;
   requestedItem?: LanTradeItem;
@@ -673,6 +683,11 @@ export async function getNativeSessionEvents(joinUrl?: string) {
   return [];
 }
 
+export async function getNativeSessionAcks(joinUrl?: string) {
+  if (!joinUrl || isTcpLanUrl(joinUrl)) return getLanTcpHostAcks();
+  return [];
+}
+
 export function subscribeLanSessionHostUpdates(joinUrl: string | undefined, listener: () => void) {
   if (!isTcpLanUrl(joinUrl)) return () => {};
   return subscribeLanTcpHostUpdates(listener);
@@ -729,6 +744,24 @@ export async function sendLanSessionEvent(joinUrl: string | undefined, event: La
   throw new Error('Sessao LAN sem socket TCP ativo.');
 }
 
+export async function ackLanSessionEvent(joinUrl: string | undefined, ack: { sessionId: string; eventId: string; clientMsgId?: string; playerKey?: string; lastAppliedSeq?: number; entityId?: string; entityRevision?: number }) {
+  if (!joinUrl) return false;
+  if (isTcpLanUrl(joinUrl)) return sendLanTcpAck(joinUrl, ack);
+  return false;
+}
+
+export async function requestLanSessionResync(joinUrl: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
+  if (!joinUrl) return false;
+  if (isTcpLanUrl(joinUrl)) return requestLanTcpResync(joinUrl, request);
+  return false;
+}
+
+export async function nackLanSessionEvent(joinUrl: string | undefined, nack: { sessionId: string; eventId?: string; clientMsgId?: string; playerKey?: string; reason: string }) {
+  if (!joinUrl) return false;
+  if (isTcpLanUrl(joinUrl)) return sendLanTcpNack(joinUrl, nack);
+  return false;
+}
+
 export async function rememberAndSendLanSessionEvent(
   db: SQLiteDatabase,
   joinUrl: string | undefined,
@@ -741,7 +774,7 @@ export async function rememberAndSendLanSessionEvent(
   );
   if (existing) return null;
 
-  const eventWithSeq = await withLanEventSeq(db, event);
+  const eventWithSeq = await withLanEventVersion(db, event);
   await db.runAsync(
     `INSERT INTO lan_session_events (
       id, session_id, seq, server_seq, type, from_key, to_key, client_msg_id,
@@ -758,10 +791,10 @@ export async function rememberAndSendLanSessionEvent(
       eventWithSeq.toKey || null,
       eventWithSeq.clientMsgId || null,
       JSON.stringify(eventWithSeq),
-      inferLanEventEntityType(eventWithSeq),
-      inferLanEventEntityId(eventWithSeq),
-      eventWithSeq.seq ?? 0,
-      shouldRequireLanAck(eventWithSeq) ? 1 : 0,
+      eventWithSeq.entityType || inferLanEventEntityType(eventWithSeq),
+      eventWithSeq.entityId || inferLanEventEntityId(eventWithSeq),
+      eventWithSeq.entityRevision ?? eventWithSeq.seq ?? 0,
+      (eventWithSeq.ackRequired ?? shouldRequireLanAck(eventWithSeq)) ? 1 : 0,
     ]
   );
 
@@ -816,7 +849,7 @@ export async function rememberLanSessionEvent(db: SQLiteDatabase, event: LanSess
     [event.id]
   );
   if (existing) return false;
-  const eventWithSeq = await withLanEventSeq(db, event);
+  const eventWithSeq = await withLanEventVersion(db, event);
 
   await db.runAsync(
     `INSERT INTO lan_session_events (
@@ -834,10 +867,10 @@ export async function rememberLanSessionEvent(db: SQLiteDatabase, event: LanSess
       eventWithSeq.toKey || null,
       eventWithSeq.clientMsgId || null,
       JSON.stringify(eventWithSeq),
-      inferLanEventEntityType(eventWithSeq),
-      inferLanEventEntityId(eventWithSeq),
-      eventWithSeq.seq ?? 0,
-      shouldRequireLanAck(eventWithSeq) ? 1 : 0,
+      eventWithSeq.entityType || inferLanEventEntityType(eventWithSeq),
+      eventWithSeq.entityId || inferLanEventEntityId(eventWithSeq),
+      eventWithSeq.entityRevision ?? eventWithSeq.seq ?? 0,
+      (eventWithSeq.ackRequired ?? shouldRequireLanAck(eventWithSeq)) ? 1 : 0,
     ]
   );
   return true;
@@ -873,6 +906,23 @@ async function withLanEventSeq(db: SQLiteDatabase, event: LanSessionEvent): Prom
   );
 
   return { ...event, seq: nextSeq };
+}
+
+async function withLanEventVersion(db: SQLiteDatabase, event: LanSessionEvent): Promise<LanSessionEvent> {
+  const eventWithSeq = await withLanEventSeq(db, event);
+  const entityType = eventWithSeq.entityType || inferLanEventEntityType(eventWithSeq);
+  const entityId = String(eventWithSeq.entityId || inferLanEventEntityId(eventWithSeq));
+  const entityRevision = Number.isFinite(Number(eventWithSeq.entityRevision))
+    ? Number(eventWithSeq.entityRevision)
+    : toNumber(eventWithSeq.seq, 0);
+
+  return {
+    ...eventWithSeq,
+    entityType,
+    entityId,
+    entityRevision,
+    ackRequired: eventWithSeq.ackRequired ?? shouldRequireLanAck(eventWithSeq),
+  };
 }
 
 function inferLanEventEntityType(event: LanSessionEvent) {
@@ -1094,7 +1144,10 @@ export async function syncLanSessionPayload(
     `SELECT join_url as joinUrl, is_master as isMaster FROM lan_sessions WHERE id = ?`,
     [sessionId]
   );
-  updateLanHostPayload(row?.joinUrl, payload, { broadcast: options?.broadcast !== false });
+  // Durante a sessao ativa, o estado vivo (HP/XP/condicoes/inventario) deve ser
+  // propagado por eventos versionados. Payload completo so deve ir para clientes
+  // quando o chamador pedir explicitamente broadcast estrutural.
+  updateLanHostPayload(row?.joinUrl, payload, { broadcast: options?.broadcast === true });
   if (toNumber(row?.isMaster) === 1) {
     await updateLanForegroundSession(payload, row?.joinUrl);
   }
@@ -1308,21 +1361,31 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
       return Number(existing.id);
     }
 
-    // Sem diff pendente: o JOIN atual deve consolidar/substituir qualquer
-    // registro provisório ou antigo no SQLite do mestre.
-    // Isso evita o bug do mestre mostrar HP 0/0, XP 0 e moedas zeradas
-    // quando o player foi criado antes como pendente/provisório.
-    await updateLanPlayerFromNormalizedSnapshot(db, Number(existing.id), character, normalized);
+    // Sem diff pendente, JOIN/reconnect e apenas presenca.
+    // Nao pode sobrescrever HP/XP/moedas/efeitos oficiais do mestre com
+    // snapshot local antigo do jogador. So hidratamos registro realmente
+    // provisório ou uma revisao explicita de ficha.
+    const existingLooksProvisional =
+      toNumber(existing.hp_max) <= 0 ||
+      !existing.character_snapshot ||
+      String(existing.character_snapshot || '').trim() === '{}' ||
+      String(existing.notes || '').includes('Jogador pendente');
+
+    if (entry.reviewSnapshot || existingLooksProvisional) {
+      await updateLanPlayerFromNormalizedSnapshot(db, Number(existing.id), character, normalized);
+    }
 
     await db.runAsync(
       `UPDATE lan_session_players
        SET remote_key = ?,
            client_id = COALESCE(?, client_id),
            player_name = ?,
+           character_name = COALESCE(character_name, ?),
+           character_snapshot = COALESCE(NULLIF(character_snapshot, '{}'), ?),
            is_connected = 1,
            last_seen_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [remoteKey, clientId || null, playerName, Number(existing.id)]
+      [remoteKey, clientId || null, playerName, normalized.characterName, JSON.stringify(character), Number(existing.id)]
     );
 
     return Number(existing.id);
@@ -1725,7 +1788,7 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
     createdAt: new Date().toISOString(),
   });
 
-  await syncLanSessionPayload(db, event.sessionId);
+  await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
   return true;
 }
 
@@ -1816,7 +1879,7 @@ export async function addLanPlayerEffect(
   if (!result) return;
 
   await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.snapshot.name} aplicado em ${result.targetName}.`);
-  await syncLanSessionPayload(db, result.sessionId);
+  await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
   return result;
 }
 
@@ -1826,7 +1889,7 @@ export async function removeLanPlayerEffect(db: SQLiteDatabase, playerId: number
   if (!result) return;
 
   await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.removed.name} removido de ${result.targetName}.`);
-  await syncLanSessionPayload(db, result.sessionId);
+  await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
   return result;
 }
 
@@ -2172,6 +2235,7 @@ async function getLanSessionPlayers(db: SQLiteDatabase, sessionId: string): Prom
       characterSnapshot: snapshot,
       pendingCharacter,
       pendingDiff: Array.isArray(pendingDiff) ? pendingDiff : [],
+      revisionSeq: toNumber(row.revision_seq),
     };
   });
 }

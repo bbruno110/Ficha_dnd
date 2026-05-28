@@ -14,7 +14,8 @@ import {
 // IMPORTAÇÃO DO NOVO COMPONENTE
 import SpellSelector, { SpellItem } from '../components/SpellSelector';
 
-import { joinLanSessionWithCharacter, notifyMasterJoin } from '@/services/lanSession';
+import { joinLanSessionWithCharacter, makeLanCharacterKey, notifyMasterJoin, requestLanSessionResync } from '@/services/lanSession';
+import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, createStyles as styles } from '@/styles/globalStyles';
 
 // ================= TIPAGENS =================
@@ -461,7 +462,7 @@ export default function CreateCharacterScreen() {
             CAR: String(companion.stats.CAR),
           });
 
-          const totalCompStats = Object.values(companion.stats).reduce((acc: number, val: any) => acc + parseInt(val as string), 0);
+          const totalCompStats = Object.values(companion.stats || {}).reduce<number>((acc, val) => acc + (parseInt(String(val)) || 0), 0);
           setMaxStatsSum(totalCompStats > 72 ? totalCompStats : 72);
 
           setPersonalityTraits(companion.personality); setIdeals(companion.ideals); setBonds(companion.bonds);
@@ -939,8 +940,22 @@ export default function CreateCharacterScreen() {
       const targetSessionLevel = Math.max(1, parseInt(String(sessionLevel || '1')) || 1);
 
       if (sessionId && newCharacterId) {
-        const character = await joinLanSessionWithCharacter(db, String(sessionId), newCharacterId);
-        await notifyMasterJoin(firstParam(joinUrl), String(sessionId), character);
+        const sessionValue = String(sessionId);
+        const joinUrlValue = firstParam(joinUrl) || '';
+        const character = await joinLanSessionWithCharacter(db, sessionValue, newCharacterId, '', {
+          joinUrl: joinUrlValue,
+        });
+        await notifyMasterJoin(joinUrlValue, sessionValue, character);
+
+        const playerKey = makeLanCharacterKey(sessionValue, character || { id: newCharacterId, name });
+        const runtime = useLanRealtimeStore.getState();
+        runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
+        await requestLanSessionResync(joinUrlValue, {
+          sessionId: sessionValue,
+          playerKey,
+          lastAppliedSeq: runtime.sessionId === sessionValue ? runtime.lastAppliedSeq : 0,
+          knownRevisions: getKnownLanEntityRevisions(sessionValue),
+        }).catch(() => false);
       }
 
       if (sessionId && targetSessionLevel > 1 && newCharacterId) {
@@ -978,7 +993,7 @@ export default function CreateCharacterScreen() {
   );
 
   const renderStep1 = () => {
-    const totalStats = Object.values(stats).reduce((acc, val) => acc + (parseInt(val) || 0), 0);
+    const totalStats = Object.values(stats).reduce<number>((acc, val) => acc + (parseInt(String(val)) || 0), 0);
     return (
       <View style={styles.stepContainer}>
         <View style={styles.formGroup}><Text style={styles.label}>NOME DO PERSONAGEM</Text><TextInput style={styles.input} placeholder="Ex: Kaelen" placeholderTextColor="rgba(255, 255, 255, 0.3)" value={name} onChangeText={setName} /></View>

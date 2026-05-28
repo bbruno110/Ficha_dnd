@@ -4,7 +4,13 @@ import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
 import { useLanRealtimePlayerPatches } from '@/hooks/useLanRealtimePlayerPatches';
 import { getCurrentBreathColor, getVisibleEffects } from '@/services/effects/effectVisualService';
 import {
-  applyLanSessionStateToCharacter,
+  debugLanFlow,
+  getSheetRuntimeMode,
+  hasLanBlockedUpdates,
+  isLanPlayerMode,
+  splitLanPlayerAuthoritativeUpdates,
+} from '@/services/lanRuntimeMode';
+import {
   fetchLanSessionEvents,
   fetchLanSessionPayload,
   getLocalLanSessionForCharacter,
@@ -14,10 +20,10 @@ import {
   notifyMasterJoin,
   rememberLanSessionEvent,
   resetLanClientConnection,
+  requestLanSessionResync,
   resolveLanSessionUrlByInviteCode,
   saveLanSession,
   sendLanSessionEvent,
-  subscribeLanSessionClientUpdates,
   unlinkCharacterFromLanSession,
   type LanEffectTarget,
   type LanEffectUnit,
@@ -35,6 +41,7 @@ import {
   markLanSnapshotApplied,
   shouldApplyLanSnapshot,
 } from '@/services/lanSyncEngine';
+import { useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -94,6 +101,25 @@ const safeJsonParse = <T,>(value: unknown, fallback: T): T => {
   try { return JSON.parse(value) as T; } catch { return fallback; }
 };
 
+
+const normalizeSheetEquipment = (value: unknown) => {
+  const parsed = safeJsonParse<any>(value, {});
+
+  if (Array.isArray(parsed)) {
+    return { bag: parsed, slots: { ...DEFAULT_SLOTS } };
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    return { bag: [], slots: { ...DEFAULT_SLOTS } };
+  }
+
+  return {
+    ...parsed,
+    bag: Array.isArray(parsed.bag) ? parsed.bag : [],
+    slots: { ...DEFAULT_SLOTS, ...(parsed.slots || {}) },
+  };
+};
+
 export default function CharacterSheetScreen() {
   const { id, sessionId, joinUrl } = useLocalSearchParams<{ id?: string; sessionId?: string; joinUrl?: string }>();
   const router = useRouter();
@@ -141,6 +167,12 @@ export default function CharacterSheetScreen() {
   const [lanInfo, setLanInfo] = useState<{ sessionId: string; joinUrl: string } | null>(null);
   const [lanSessionStatus, setLanSessionStatus] = useState<LanSessionStatus | null>(null);
   const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
+  const sheetRuntimeMode = getSheetRuntimeMode({
+    lanInfo,
+    routeSessionId,
+    routeJoinUrl,
+  });
+  const isLanPlayerRuntime = isLanPlayerMode(sheetRuntimeMode);
   const characterRef = useRef<any>(null);
   const lastLanJoinNotifyRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
   const [incomingTrades, setIncomingTrades] = useState<LanSessionEvent[]>([]);
@@ -181,6 +213,17 @@ export default function CharacterSheetScreen() {
   useEffect(() => {
     characterRef.current = character;
   }, [character]);
+
+  useEffect(() => {
+    if (!character?.id) return;
+    debugLanFlow('SHEET_RUNTIME_MODE', {
+      characterId: character.id,
+      characterName: character.name,
+      mode: sheetRuntimeMode,
+      sessionId: lanInfo?.sessionId || routeSessionId || '',
+      joinUrl: lanInfo?.joinUrl || routeJoinUrl || '',
+    });
+  }, [character?.id, character?.name, sheetRuntimeMode, lanInfo?.sessionId, lanInfo?.joinUrl, routeSessionId, routeJoinUrl]);
 
   useEffect(() => () => {
     resetLanClientConnection();
@@ -258,6 +301,7 @@ export default function CharacterSheetScreen() {
       if (!id) return;
       try {
         const result = await db.getFirstAsync(`SELECT * FROM characters WHERE id = ?`, [Number(id)]);
+        await ensureItemEffectHiddenColumn(db);
         const catalog = await db.getAllAsync(`SELECT * FROM items ORDER BY name ASC`);
         const skillsList = await db.getAllAsync(`SELECT * FROM skills ORDER BY name ASC`);
         const savesList = await db.getAllAsync(`SELECT * FROM saving_throws ORDER BY name ASC`);
@@ -267,16 +311,11 @@ export default function CharacterSheetScreen() {
         setDbSaves(savesList);
 
         if (result) {
-          let parsedEquip = JSON.parse((result as any).equipment || '{}');
-          if (Array.isArray(parsedEquip)) {
-             parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
-          } else {
-             parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
-          }
+          const parsedEquip = normalizeSheetEquipment((result as any).equipment);
 
-          let loadedSaves = JSON.parse((result as any).save_values || '[]');
-          let loadedSkills = JSON.parse((result as any).skill_values || '[]');
-          const backupProfs = JSON.parse((result as any).proficiencies || '[]');
+          let loadedSaves = safeJsonParse<any[]>((result as any).save_values, []);
+          let loadedSkills = safeJsonParse<any[]>((result as any).skill_values, []);
+          const backupProfs = safeJsonParse<string[]>((result as any).proficiencies, []);
 
           if (!Array.isArray(loadedSaves) || (loadedSaves.length > 0 && typeof loadedSaves[0] !== 'string')) {
               loadedSaves = backupProfs.filter((p: string) => p.startsWith('save_'));
@@ -285,7 +324,7 @@ export default function CharacterSheetScreen() {
               loadedSkills = backupProfs.filter((p: string) => p.startsWith('skill_'));
           }
 
-          const parsedStats = JSON.parse((result as any).stats || '{}');
+          const parsedStats = safeJsonParse<Record<string, any>>((result as any).stats, {});
           if(!parsedStats.temp_mods) parsedStats.temp_mods = {};
           if(!parsedStats.equip_mods) parsedStats.equip_mods = {};
 
@@ -295,8 +334,8 @@ export default function CharacterSheetScreen() {
             save_values: loadedSaves,
             skill_values: loadedSkills,
             equipment: parsedEquip,
-            spells: JSON.parse((result as any).spells || '[]'),
-            active_effects: JSON.parse((result as any).active_effects_json || '[]'),
+            spells: safeJsonParse<any[]>((result as any).spells, []),
+            active_effects: safeJsonParse<any[]>((result as any).active_effects_json, []),
           };
           setCharacter(charData);
 
@@ -367,6 +406,14 @@ export default function CharacterSheetScreen() {
       cp: patch.cp ?? base.cp,
     };
 
+    debugLanFlow('PLAYER_APPLY_NUMBER_PATCH_VALUES', {
+      mode: sheetRuntimeMode,
+      characterId: currentCharacter.id,
+      beforeHp: base.hp_current,
+      afterHp: nextValues.hp_current,
+      patch,
+    });
+
     await db.runAsync(
       `UPDATE characters
        SET hp_current = ?,
@@ -417,7 +464,21 @@ export default function CharacterSheetScreen() {
 
     for (const effect of patch.add || []) {
       const id = String((effect as any)?.id || '');
-      if (id && !removeSet.has(id)) byId.set(id, effect);
+      if (!id || removeSet.has(id)) continue;
+
+      // Se havia um efeito otimista local do mesmo item/alvo, substitui pelo efeito autoritativo do Host.
+      for (const [existingId, existing] of Array.from(byId.entries())) {
+        const isOptimisticLocal = String(existingId).startsWith('local_') || String(existingId).startsWith('pending_item_');
+        const sameEffect =
+          String(existing?.source || '') === String((effect as any)?.source || '') &&
+          String(existing?.name || '') === String((effect as any)?.name || '') &&
+          String(existing?.target || '') === String((effect as any)?.target || '') &&
+          Number(existing?.value || 0) === Number((effect as any)?.value || 0);
+
+        if (isOptimisticLocal && sameEffect) byId.delete(existingId);
+      }
+
+      byId.set(id, effect);
     }
 
     const nextEffects = Array.from(byId.values());
@@ -430,75 +491,76 @@ export default function CharacterSheetScreen() {
     setCharacter((prev: any) => prev ? ({ ...prev, active_effects: nextEffects }) : prev);
   }, [db]);
 
+  const applyLanInventoryPatchToCharacter = useCallback(async (patch: LanSessionEvent['inventoryPatch']) => {
+    const currentCharacter = characterRef.current;
+    if (!currentCharacter?.id || !patch?.equipment) return;
+
+    const nextEquipment = normalizeSheetEquipment(patch.equipment);
+
+    await db.runAsync(
+      `UPDATE characters SET equipment = ? WHERE id = ?`,
+      [JSON.stringify(nextEquipment), Number(currentCharacter.id)]
+    );
+
+    setCharacter((prev: any) => prev ? ({ ...prev, equipment: nextEquipment }) : prev);
+  }, [db]);
+
   const syncLanFromHost = useCallback(async () => {
-  if (!lanInfo?.sessionId || !character?.id) return;
+    if (!lanInfo?.sessionId || !character?.id) return;
 
-  try {
-    const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
-    const recovered = await fetchLanPayloadWithRecovery(lanInfo, localInfo?.payloadJson);
-    const nextPayload = recovered.payload;
-    const nextInfo = recovered.info;
+    const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
 
-    if (nextInfo.joinUrl !== lanInfo.joinUrl) {
-      setLanInfo(nextInfo);
-    }
+    try {
+      const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
+      const recovered = await fetchLanPayloadWithRecovery(lanInfo, localInfo?.payloadJson);
+      const nextPayload = recovered.payload;
+      const nextInfo = recovered.info;
 
-    await saveLanSession(db, nextPayload, nextInfo.joinUrl, { isMaster: false });
-    await notifyMasterReconnect(nextPayload, nextInfo, character, { force: true });
+      if (nextInfo.joinUrl !== lanInfo.joinUrl) {
+        setLanInfo(nextInfo);
+      }
 
-    setLanSessionStatus(nextPayload.state?.status || null);
+      // Payload completo é cache estrutural. Salva para entrada/resync, mas não aplica
+      // HP/XP/moedas/efeitos/inventário por snapshot durante sessão viva.
+      await saveLanSession(db, nextPayload, nextInfo.joinUrl, { isMaster: false });
 
-    const selfKey = makeLanCharacterKey(nextInfo.sessionId, character);
-    const snapshotSeq = getLanPayloadSnapshotSeq(nextPayload);
-    const canApplySnapshot = await shouldApplyLanSnapshot(db, {
-      sessionId: nextInfo.sessionId,
-      deviceId: selfKey,
-      role: 'player',
-      snapshotSeq,
-    });
+      const officialSelf = nextPayload.state?.players?.find((player) => (
+        player.remoteKey === selfKey ||
+        player.sourceCharacterId === Number(character.id) ||
+        player.characterName === character.name
+      ));
 
-    if (canApplySnapshot) {
-      await applyLanSessionStateToCharacter(db, nextPayload, Number(character.id), {
-        remoteKey: selfKey,
-        characterName: character.name,
-      });
-      await markLanSnapshotApplied(db, {
+      const localLevel = Number(character.level) || 1;
+      const officialLevel = Number(officialSelf?.level || 1);
+      const localXp = Number(character.xp) || 0;
+      const officialXp = Number(officialSelf?.xp || 0);
+      const expectedLocalLevel = getExpectedLevelForXp(Math.max(localXp, officialXp));
+      const needsLevelReview = localLevel > officialLevel && localLevel <= expectedLocalLevel;
+
+      if (!officialSelf || needsLevelReview) {
+        await notifyMasterReconnect(nextPayload, nextInfo, character, {
+          reviewSnapshot: needsLevelReview,
+          force: needsLevelReview,
+        });
+      }
+
+      setLanSessionStatus(nextPayload.state?.status || null);
+      setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+
+      await markLanConnectionStatus(db, {
         sessionId: nextInfo.sessionId,
         deviceId: selfKey,
         role: 'player',
         playerKey: selfKey,
-        snapshotSeq,
-      });
-      setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
-    }
+        status: 'online',
+      }).catch(() => {});
 
-    const freshCharacter = await db.getFirstAsync(
-      `SELECT * FROM characters WHERE id = ?`,
-      [Number(character.id)]
-    );
-
-    if (freshCharacter) {
-      let parsedEquip = JSON.parse((freshCharacter as any).equipment || '{}');
-
-      if (Array.isArray(parsedEquip)) {
-        parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
-      } else {
-        parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
-      }
-
-      setCharacter({
-        ...(freshCharacter as any),
-        stats: JSON.parse((freshCharacter as any).stats || '{}'),
-        equipment: parsedEquip,
-        spells: JSON.parse((freshCharacter as any).spells || '[]'),
-        active_effects: JSON.parse((freshCharacter as any).active_effects_json || '[]'),
-        save_values: JSON.parse((freshCharacter as any).save_values || '[]'),
-        skill_values: JSON.parse((freshCharacter as any).skill_values || '[]'),
-      });
-    }
-  } catch (error) {
-    if (lanInfo?.sessionId && character?.id) {
-      const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+      await requestLanSessionResync(nextInfo.joinUrl, {
+        sessionId: nextInfo.sessionId,
+        playerKey: selfKey,
+        lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+      }).catch(() => {});
+    } catch (error) {
       await markLanConnectionStatus(db, {
         sessionId: lanInfo.sessionId,
         deviceId: selfKey,
@@ -506,10 +568,9 @@ export default function CharacterSheetScreen() {
         playerKey: selfKey,
         status: 'offline',
       }).catch(() => {});
+      console.warn('[LAN] Não foi possível re-sincronizar com o mestre:', error);
     }
-    console.warn('[LAN] Não foi possível re-sincronizar com o mestre:', error);
-  }
-}, [db, lanInfo, character, fetchLanPayloadWithRecovery, notifyMasterReconnect]);
+  }, [db, lanInfo, character?.id, character?.name, character?.level, character?.xp, fetchLanPayloadWithRecovery, notifyMasterReconnect]);
 
   useLanRealtimePlayerPatches({
     enabled: Boolean(character && lanInfo?.sessionId && lanInfo?.joinUrl),
@@ -520,6 +581,8 @@ export default function CharacterSheetScreen() {
       : '',
     characterName: character?.name,
     onNumberPatch: async (patch, event) => {
+      const fresh = await rememberLanSessionEvent(db, event);
+      if (!fresh) return;
       await applyLanNumberPatchToCharacter(patch);
       if (lanInfo?.sessionId && character) {
         const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
@@ -532,9 +595,46 @@ export default function CharacterSheetScreen() {
         });
       }
     },
+    onEffectPatch: async (patch, event) => {
+      const fresh = await rememberLanSessionEvent(db, event);
+      if (!fresh) return;
+      await applyLanEffectPatchToCharacter(patch);
+      if (lanInfo?.sessionId && character) {
+        const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+        await markLanEventsApplied(db, {
+          sessionId: lanInfo.sessionId,
+          deviceId: selfKey,
+          role: 'player',
+          playerKey: selfKey,
+          events: [event],
+        });
+      }
+    },
+    onInventoryPatch: async (patch, event) => {
+      const fresh = await rememberLanSessionEvent(db, event);
+      if (!fresh) return;
+      await applyLanInventoryPatchToCharacter(patch);
+      if (lanInfo?.sessionId && character) {
+        const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+        await markLanEventsApplied(db, {
+          sessionId: lanInfo.sessionId,
+          deviceId: selfKey,
+          role: 'player',
+          playerKey: selfKey,
+          events: [event],
+        });
+      }
+    },
+    onEvent: async (event) => {
+      if (!lanInfo?.sessionId) return;
+      await handleLanEvents([event], lanInfo.sessionId);
+    },
     onKicked: async (event) => {
       if (!character || !lanInfo?.sessionId) return;
       const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+
+      const fresh = await rememberLanSessionEvent(db, event);
+      if (!fresh) return;
 
       await unlinkCharacterFromLanSession(db, Number(character.id), lanInfo.sessionId);
       await markLanEventsApplied(db, {
@@ -573,18 +673,24 @@ export default function CharacterSheetScreen() {
     return makeLanCharacterKey(sessionValue, character);
   };
 
-  const makeTradeItem = (item: any, qty: number): LanTradeItem => ({
-    name: String(item.name || 'Item'),
-    qty: Math.max(1, Math.min(Number(item.qty) || 1, qty)),
-    weight: Number(item.weight) || 0,
-    damage: item.damage,
-    damage_type: item.damage_type,
-    properties: item.properties,
-    descricao: item.descricao,
-    effect_json: item.effect_json,
-    duration_value: item.duration_value,
-    duration_unit: item.duration_unit,
-  });
+  const makeTradeItem = (item: any, qty: number): LanTradeItem => {
+    const hydrated = hydrateInventoryItemForEffects(item);
+    return {
+      name: String(hydrated.name || 'Item'),
+      qty: Math.max(1, Math.min(Number(hydrated.qty) || 1, qty)),
+      weight: Number(hydrated.weight) || 0,
+      damage: hydrated.damage,
+      damage_type: hydrated.damage_type,
+      properties: hydrated.properties,
+      descricao: hydrated.descricao,
+      effect_json: hydrated.effect_json,
+      duration_value: hydrated.duration_value,
+      duration_unit: hydrated.duration_unit,
+      effect_hidden: getItemEffectHidden(hydrated) ? 1 : 0,
+      effectHidden: getItemEffectHidden(hydrated),
+      hiddenEffect: getItemEffectHidden(hydrated),
+    } as LanTradeItem & { effect_hidden?: number; effectHidden?: boolean; hiddenEffect?: boolean };
+  };
 
   const updateCharacterEquipmentOnly = async (equipment: any) => {
     if (!character) return false;
@@ -603,9 +709,30 @@ export default function CharacterSheetScreen() {
     const nextBag = [...character.equipment.bag];
     const existingIndex = nextBag.findIndex((item: any) => item.name === tradeItem.name);
     if (existingIndex >= 0) {
-      nextBag[existingIndex].qty = (Number(nextBag[existingIndex].qty) || 0) + tradeItem.qty;
+      const hydratedTradeItem = hydrateInventoryItemForEffects(tradeItem);
+      nextBag[existingIndex] = {
+        ...hydratedTradeItem,
+        ...nextBag[existingIndex],
+        qty: (Number(nextBag[existingIndex].qty) || 0) + tradeItem.qty,
+        damage: nextBag[existingIndex].damage || hydratedTradeItem.damage,
+        damage_type: nextBag[existingIndex].damage_type || hydratedTradeItem.damage_type,
+        properties: nextBag[existingIndex].properties || hydratedTradeItem.properties,
+        descricao: nextBag[existingIndex].descricao || hydratedTradeItem.descricao,
+        effect_json: nextBag[existingIndex].effect_json || hydratedTradeItem.effect_json,
+        duration_value: nextBag[existingIndex].duration_value ?? hydratedTradeItem.duration_value,
+        duration_unit: nextBag[existingIndex].duration_unit ?? hydratedTradeItem.duration_unit,
+        effect_hidden: getItemEffectHidden(nextBag[existingIndex], hydratedTradeItem) ? 1 : 0,
+        effectHidden: getItemEffectHidden(nextBag[existingIndex], hydratedTradeItem),
+        hiddenEffect: getItemEffectHidden(nextBag[existingIndex], hydratedTradeItem),
+      };
     } else {
-      nextBag.push({ ...tradeItem });
+      const hydratedTradeItem = hydrateInventoryItemForEffects(tradeItem);
+      nextBag.push({
+        ...hydratedTradeItem,
+        effect_hidden: getItemEffectHidden(hydratedTradeItem) ? 1 : 0,
+        effectHidden: getItemEffectHidden(hydratedTradeItem),
+        hiddenEffect: getItemEffectHidden(hydratedTradeItem),
+      });
     }
     return updateCharacterEquipmentOnly({ ...character.equipment, bag: nextBag });
   };
@@ -630,6 +757,17 @@ export default function CharacterSheetScreen() {
   const applySpellHpToSelf = async (amount: number) => {
     if (!character) return;
     const nextHp = Math.max(0, Math.min(character.hp_max, Number(character.hp_current || 0) + amount));
+
+    if (isLanPlayerRuntime) {
+      debugLanFlow('LAN_PLAYER_BLOCKED_DIRECT_SELF_HP', {
+        characterId: character.id,
+        amount,
+        requestedHp: nextHp,
+      });
+      void notifyNumberPatch({ hpCurrent: nextHp }, `${character.name} solicitou alterar HP para ${nextHp}.`);
+      return;
+    }
+
     await db.runAsync(`UPDATE characters SET hp_current = ? WHERE id = ?`, [nextHp, character.id]);
     setCharacter((prev: any) => ({ ...prev, hp_current: nextHp }));
     notifyOwnLanStatus(nextHp, character.hp_max);
@@ -770,119 +908,66 @@ export default function CharacterSheetScreen() {
   };
 
   useEffect(() => {
-    if (!character) return;
+    if (!character?.id) return;
     let active = true;
-    let unsubscribeRealtime: (() => void) | undefined;
-    let refreshRunning = false;
-    let eventRefreshRunning = false;
 
-    const refreshLan = async () => {
-      if (refreshRunning) return;
-      refreshRunning = true;
-
+    const refreshLanMetadata = async () => {
       try {
-      const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
-      const storedInfo = routeSessionId
-        ? {
-          sessionId: routeSessionId,
-          joinUrl: routeJoinUrl || localInfo?.joinUrl || '',
-          payloadJson: localInfo?.payloadJson,
-        }
-        : localInfo;
+        const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
+        const storedInfo = routeSessionId
+          ? {
+            sessionId: routeSessionId,
+            joinUrl: routeJoinUrl || localInfo?.joinUrl || '',
+            payloadJson: localInfo?.payloadJson,
+          }
+          : localInfo;
 
-      if (!storedInfo?.sessionId) return;
+        if (!storedInfo?.sessionId) return;
 
-      let nextInfo = {
-        sessionId: storedInfo.sessionId,
-        joinUrl: decodeParam(storedInfo.joinUrl || ''),
-      };
-      const subscribeToRealtime = () => {
-        if (nextInfo.joinUrl && !unsubscribeRealtime) {
-          unsubscribeRealtime = subscribeLanSessionClientUpdates(nextInfo.joinUrl, () => {
-            if (eventRefreshRunning) return;
-            eventRefreshRunning = true;
-            void (async () => {
-              try {
-                const events = await fetchLanSessionEvents(nextInfo.joinUrl, nextInfo.sessionId);
-                if (active) {
-                  await handleLanEvents(
-                    events.filter((event) => event.sessionId === nextInfo.sessionId),
-                    nextInfo.sessionId
-                  );
-                }
-              } catch {
-                // Evento em tempo real é best-effort; o fallback periódico continua existindo.
-              } finally {
-                eventRefreshRunning = false;
-              }
-            })();
-          });
-        }
-      };
+        let nextInfo = {
+          sessionId: storedInfo.sessionId,
+          joinUrl: decodeParam(storedInfo.joinUrl || ''),
+        };
 
-      if (active) setLanInfo(nextInfo);
-      subscribeToRealtime();
+        if (active) setLanInfo(nextInfo);
 
-      let nextPayload: LanSessionPayload | null = null;
-      let fetchedFreshPayload = false;
-      try {
-        const recovered = await fetchLanPayloadWithRecovery(nextInfo, (storedInfo as any).payloadJson);
-        nextPayload = recovered.payload;
-        fetchedFreshPayload = true;
+        let nextPayload: LanSessionPayload | null = null;
+        let fetchedFreshPayload = false;
 
-        if (recovered.info.joinUrl !== nextInfo.joinUrl) {
-          unsubscribeRealtime?.();
-          unsubscribeRealtime = undefined;
-          nextInfo = recovered.info;
-          if (active) setLanInfo(nextInfo);
-          subscribeToRealtime();
-        }
-
-        await saveLanSession(db, nextPayload, nextInfo.joinUrl, { isMaster: false });
-
-        const selfKeyForJoin = makeLanCharacterKey(nextInfo.sessionId, character);
-        const officialSelf = nextPayload.state?.players?.find((player) => (
-          player.remoteKey === selfKeyForJoin ||
-          player.sourceCharacterId === Number(character.id) ||
-          player.characterName === character.name
-        ));
-        const localLevel = Number(character.level) || 1;
-        const officialLevel = Number(officialSelf?.level || 1);
-        const localXp = Number(character.xp) || 0;
-        const officialXp = Number(officialSelf?.xp || 0);
-        const expectedLocalLevel = getExpectedLevelForXp(Math.max(localXp, officialXp));
-        const needsLevelReview = localLevel > officialLevel && localLevel <= expectedLocalLevel;
-
-        if (!officialSelf || needsLevelReview) {
-          await notifyMasterReconnect(nextPayload, nextInfo, character, {
-            reviewSnapshot: needsLevelReview,
-            force: needsLevelReview,
-          });
-        }
-      } catch {
-        nextPayload = null;
-      }
-      if (!nextPayload && (storedInfo as any).payloadJson) {
         try {
-          nextPayload = JSON.parse((storedInfo as any).payloadJson);
+          const recovered = await fetchLanPayloadWithRecovery(nextInfo, (storedInfo as any).payloadJson);
+          nextPayload = recovered.payload;
+          fetchedFreshPayload = true;
+          nextInfo = recovered.info;
+
+          if (active) setLanInfo(nextInfo);
+          await saveLanSession(db, nextPayload, nextInfo.joinUrl, { isMaster: false });
         } catch {
           nextPayload = null;
         }
-      }
 
-      if (nextPayload && active) {
+        if (!nextPayload && (storedInfo as any).payloadJson) {
+          nextPayload = safeJsonParse<LanSessionPayload | null>((storedInfo as any).payloadJson, null);
+        }
+
+        if (!nextPayload || !active) return;
+
         const selfKey = makeLanCharacterKey(nextInfo.sessionId, character);
         setLanSessionStatus(nextPayload.state?.status || 'active');
+        setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+
         const isStillInSession = Boolean(nextPayload.state?.players?.some((player) => (
           player.remoteKey === selfKey ||
           player.sourceCharacterId === Number(character.id) ||
           player.characterId === Number(character.id) ||
           player.characterName === character.name
         )));
+
         const wasKicked = nextPayload.events?.some((event) => (
           event.type === 'player_kicked' &&
           (event.toKey === selfKey || event.toName === character.name)
         ));
+
         if (fetchedFreshPayload && !isStillInSession && (wasKicked || nextPayload.state?.status === 'ended')) {
           await unlinkCharacterFromLanSession(db, Number(character.id), nextInfo.sessionId);
           if (active) {
@@ -893,82 +978,38 @@ export default function CharacterSheetScreen() {
           }
           return;
         }
+
+        // Snapshot/payload completo é apenas estrutural. Não aplique aqui HP/XP/moedas/efeitos/inventário.
+        // Eventos vivos são aplicados por useLanRealtimePlayerPatches.
         const snapshotSeq = getLanPayloadSnapshotSeq(nextPayload);
-        const canApplySnapshot = !fetchedFreshPayload || await shouldApplyLanSnapshot(db, {
+        await markLanSnapshotApplied(db, {
           sessionId: nextInfo.sessionId,
           deviceId: selfKey,
           role: 'player',
+          playerKey: selfKey,
           snapshotSeq,
-        });
-        // Não aplique snapshot completo durante a sessão viva.
-        // HP/XP/moedas/efeitos/inventário chegam por eventos; snapshot é só hidratação inicial/status.
-        // Aplicar snapshot aqui é o que fazia a ficha piscar e voltar para valores antigos.
-        const changedBySession = false;
-        if (fetchedFreshPayload && canApplySnapshot) {
-          await markLanSnapshotApplied(db, {
+        }).catch(() => {});
+
+        if (fetchedFreshPayload && nextInfo.joinUrl) {
+          await requestLanSessionResync(nextInfo.joinUrl, {
             sessionId: nextInfo.sessionId,
-            deviceId: selfKey,
-            role: 'player',
             playerKey: selfKey,
-            snapshotSeq,
-          });
+            lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+          }).catch(() => {});
         }
-        if (changedBySession) {
-          const updated = await db.getFirstAsync<Record<string, unknown>>(
-            `SELECT * FROM characters WHERE id = ?`,
-            [Number(character.id)]
-          );
-
-          if (updated && active) {
-            let parsedEquip = JSON.parse(String(updated.equipment || '{}'));
-
-            if (Array.isArray(parsedEquip)) {
-              parsedEquip = { bag: parsedEquip, slots: { ...DEFAULT_SLOTS } };
-            } else {
-              parsedEquip.slots = { ...DEFAULT_SLOTS, ...(parsedEquip.slots || {}) };
-            }
-
-            setCharacter((prev: any) => ({
-              ...prev,
-              ...(updated as any),
-              stats: JSON.parse(String(updated.stats || '{}')),
-              equipment: parsedEquip,
-              spells: JSON.parse(String(updated.spells || '[]')),
-              active_effects: JSON.parse(String(updated.active_effects_json || '[]')),
-              save_values: JSON.parse(String(updated.save_values || '[]')),
-              skill_values: JSON.parse(String(updated.skill_values || '[]')),
-            }));
-          }
-        }
-        if (canApplySnapshot) {
-          setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
-        }
-        if (fetchedFreshPayload && nextPayload.events?.length) {
-          await handleLanEvents(nextPayload.events.filter((event) => event.sessionId === nextInfo.sessionId), nextInfo.sessionId);
-        }
-      }
-
-      if (nextInfo.joinUrl) {
-        try {
-          const events = await fetchLanSessionEvents(nextInfo.joinUrl, nextInfo.sessionId);
-          if (active) await handleLanEvents(events.filter((event) => event.sessionId === nextInfo.sessionId), nextInfo.sessionId);
-        } catch {
-          // A mesa pode estar pausada/offline; a ficha continua utilizavel localmente.
-        }
-      }
-      } finally {
-        refreshRunning = false;
+      } catch (error) {
+        console.warn('[LAN] Refresh estrutural da sessão falhou:', error);
       }
     };
 
-    refreshLan();
-    const timer = setInterval(refreshLan, 12000);
+    void refreshLanMetadata();
+    const timer = setInterval(refreshLanMetadata, 15000);
+
     return () => {
       active = false;
       clearInterval(timer);
-      unsubscribeRealtime?.();
     };
-  }, [character, routeSessionId, routeJoinUrl, fetchLanPayloadWithRecovery, notifyMasterReconnect]);
+  }, [db, character?.id, character?.name, character?.level, character?.xp, routeSessionId, routeJoinUrl, fetchLanPayloadWithRecovery]);
 
   useEffect(() => {
     if (!routeSessionId) return;
@@ -1059,14 +1100,43 @@ export default function CharacterSheetScreen() {
   // 2. FUNÇÕES DE AÇÃO QUE UTILIZAM AS VARIÁVEIS ACIMA
   // ==============================================================================
 
-  const updateDB = async (updates: Partial<any>) => {
+  const updateDB = async (
+    updates: Partial<any>,
+    options?: { allowLanAuthoritativeCache?: boolean; reason?: string }
+  ) => {
     try {
-      const entries = Object.entries(updates);
+      if (!character?.id) return false;
+
+      let nextUpdates = { ...updates };
+
+      if (isLanPlayerRuntime && !options?.allowLanAuthoritativeCache) {
+        const { safeUpdates, blockedUpdates } = splitLanPlayerAuthoritativeUpdates(nextUpdates);
+
+        if (hasLanBlockedUpdates(blockedUpdates)) {
+          debugLanFlow('LAN_PLAYER_BLOCKED_OFFLINE_UPDATE', {
+            reason: options?.reason || 'offline_mutation_in_lan_player',
+            blockedKeys: Object.keys(blockedUpdates),
+            safeKeys: Object.keys(safeUpdates),
+            characterId: character.id,
+            characterName: character.name,
+          });
+        }
+
+        nextUpdates = safeUpdates;
+      }
+
+      const entries = Object.entries(nextUpdates);
+      if (entries.length === 0) return false;
+
       const setString = entries.map(([key]) => `${key} = ?`).join(', ');
       const values = entries.map(([_, val]) => (typeof val === 'object' ? JSON.stringify(val) : val));
       await db.runAsync(`UPDATE characters SET ${setString} WHERE id = ?`, [...values, character.id]);
-      setCharacter((prev: any) => ({ ...prev, ...updates }));
-    } catch (e) { console.error(e); }
+      setCharacter((prev: any) => prev ? ({ ...prev, ...nextUpdates }) : prev);
+      return true;
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
   };
 
   const ensureLanWritable = () => {
@@ -1157,6 +1227,41 @@ export default function CharacterSheetScreen() {
       });
     } catch {
       showCustomAlert('Sincronizacao falhou', 'Nao consegui enviar esta alteracao ao mestre.');
+    }
+  };
+
+  const notifyEffectPatch = async (addEffects: any[], reason: string) => {
+    if (!lanInfo?.joinUrl || !character || addEffects.length === 0) return;
+    const selfKey = getSelfLanKey(lanInfo.sessionId);
+
+    try {
+      const event: LanSessionEvent = {
+        id: makeLanEventId(),
+        clientMsgId: makeLanEventId(),
+        sessionId: lanInfo.sessionId,
+        type: 'effect_patch',
+        fromKey: selfKey,
+        fromName: character.name,
+        toKey: 'master',
+        toName: 'Mestre',
+        entityType: 'character_effects',
+        entityId: selfKey,
+        entityRevision: Date.now(),
+        ackRequired: true,
+        effectPatch: {
+          targetKey: selfKey,
+          add: addEffects as any,
+          update: [],
+          remove: [],
+        },
+        message: reason,
+        createdAt: new Date().toISOString(),
+      };
+
+      await rememberLanSessionEvent(db, event).catch(() => false);
+      await sendLanSessionEvent(lanInfo.joinUrl, event);
+    } catch (error) {
+      console.warn('[LAN ITEM EFFECT PATCH FAILED]', error);
     }
   };
 
@@ -1345,29 +1450,93 @@ export default function CharacterSheetScreen() {
     showCustomAlert("Câmbio Realizado", `Você converteu ${sourceAmount} ${COIN_NAMES[convertFrom]} em ${targetAmount} ${COIN_NAMES[convertTo]}.`);
   };
 
-  const updateBagQty = (index: number, delta: number) => {
+  const isLanCharacter = () => isLanPlayerRuntime;
+
+  const normalizeInventoryItemFromCatalog = (item: any, qty = 1) => {
+    const effectHidden = getItemEffectHidden(item);
+
+    return {
+      name: String(item?.name || 'Item'),
+      qty,
+      weight: Number(item?.weight) || 0,
+      damage: item?.damage || '',
+      damage_type: item?.damage_type || '',
+      properties: item?.properties || '',
+      descricao: item?.descricao || '',
+      effect_json: item?.effect_json || '',
+      duration_value: item?.duration_value ?? null,
+      duration_unit: item?.duration_unit ?? null,
+      effect_hidden: effectHidden ? 1 : 0,
+      effectHidden,
+      hiddenEffect: effectHidden,
+      criador: item?.criador,
+    };
+  };
+
+  const hydrateInventoryItemForEffects = (item: any) => {
+    const catalogItem = dbItemsCatalog.find((cat: any) => String(cat.name || '') === String(item?.name || ''));
+    const effectHidden = getItemEffectHidden(item, catalogItem);
+    const hydrated = {
+      ...catalogItem,
+      ...item,
+      name: item?.name || catalogItem?.name || 'Item',
+      qty: Number(item?.qty ?? catalogItem?.qty ?? 1) || 1,
+      weight: Number(item?.weight ?? catalogItem?.weight ?? 0) || 0,
+      damage: item?.damage || catalogItem?.damage || '',
+      damage_type: item?.damage_type || catalogItem?.damage_type || '',
+      properties: item?.properties || catalogItem?.properties || '',
+      descricao: item?.descricao || catalogItem?.descricao || '',
+      effect_json: item?.effect_json || catalogItem?.effect_json || '',
+      duration_value: item?.duration_value ?? catalogItem?.duration_value ?? null,
+      duration_unit: item?.duration_unit ?? catalogItem?.duration_unit ?? null,
+      effect_hidden: effectHidden ? 1 : 0,
+      effectHidden,
+      hiddenEffect: effectHidden,
+    };
+
+    return hydrated;
+  };
+
+  const updateBagQty = (index: number, delta: number, overrideItem?: any) => {
     if (!ensureLanWritable()) return;
-    if (lanInfo?.sessionId && delta > 0) {
+    if (isLanCharacter() && delta > 0) {
       showCustomAlert('Inventario bloqueado', 'Durante a sessao LAN, apenas o mestre pode adicionar itens ao jogador.');
       return;
     }
 
     let newBag = [...character.equipment.bag];
-    const item = newBag[index];
+    const item = overrideItem ? hydrateInventoryItemForEffects(overrideItem) : hydrateInventoryItemForEffects(newBag[index]);
     if (!item) return;
 
-    newBag[index].qty += delta;
-    if (newBag[index].qty <= 0) newBag = newBag.filter((_, i) => i !== index);
-    const nextEquipment = { ...character.equipment, bag: newBag };
-    updateDB({ equipment: nextEquipment });
-    if (lanInfo?.sessionId && delta < 0) {
-      void notifyInventoryPatch(nextEquipment, `${character.name} reduziu ${Math.abs(delta)}x ${item.name} da mochila.`);
+    if (newBag[index]) {
+      newBag[index] = {
+        ...item,
+        qty: (Number(newBag[index].qty) || 0) + delta,
+      };
     }
+
+    if (newBag[index]?.qty <= 0) newBag = newBag.filter((_, i) => i !== index);
+    const nextEquipment = { ...character.equipment, bag: newBag };
+
+    if (isLanPlayerRuntime) {
+      if (delta < 0) {
+        debugLanFlow('LAN_PLAYER_REQUEST_INVENTORY_PATCH', {
+          characterId: character.id,
+          itemName: item.name,
+          delta,
+          nextQty: newBag.find((entry: any) => entry.name === item.name)?.qty || 0,
+        });
+        void notifyInventoryPatch(nextEquipment, `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`);
+      }
+      return;
+    }
+
+    void updateDB({ equipment: nextEquipment }, { reason: 'offline_inventory_update' });
   };
 
   const addItemToBag = (item: any) => {
     if (!ensureLanWritable()) return;
-    if (lanInfo?.sessionId) {
+    if (isLanCharacter()) {
       showCustomAlert('Inventario bloqueado', 'Durante a sessao LAN, peca ao mestre para entregar itens.');
       setItemModalVisible(false);
       setItemSearch('');
@@ -1376,8 +1545,29 @@ export default function CharacterSheetScreen() {
 
     let newBag = [...character.equipment.bag];
     const existingIndex = newBag.findIndex((i: any) => i.name === item.name);
-    if (existingIndex > -1) newBag[existingIndex].qty += 1;
-    else newBag.push({ name: item.name, qty: 1, weight: item.weight, damage: item.damage, damage_type: item.damage_type, properties: item.properties, descricao: item.descricao, effect_json: item.effect_json, duration_value: item.duration_value, duration_unit: item.duration_unit });
+    const catalogItem = normalizeInventoryItemFromCatalog(item, 1);
+
+    if (existingIndex > -1) {
+      const existing = newBag[existingIndex];
+      newBag[existingIndex] = {
+        ...catalogItem,
+        ...existing,
+        qty: (Number(existing.qty) || 0) + 1,
+        damage: existing.damage || catalogItem.damage,
+        damage_type: existing.damage_type || catalogItem.damage_type,
+        properties: existing.properties || catalogItem.properties,
+        descricao: existing.descricao || catalogItem.descricao,
+        effect_json: existing.effect_json || catalogItem.effect_json,
+        duration_value: existing.duration_value ?? catalogItem.duration_value,
+        duration_unit: existing.duration_unit ?? catalogItem.duration_unit,
+        effect_hidden: getItemEffectHidden(existing, catalogItem) ? 1 : 0,
+        effectHidden: getItemEffectHidden(existing, catalogItem),
+        hiddenEffect: getItemEffectHidden(existing, catalogItem),
+      };
+    } else {
+      newBag.push(catalogItem);
+    }
+
     updateDB({ equipment: { ...character.equipment, bag: newBag } });
     setItemModalVisible(false); setItemSearch('');
   };
@@ -1644,14 +1834,32 @@ export default function CharacterSheetScreen() {
     await sendLanSessionEvent(lanInfo.joinUrl, event);
   };
 
-  const applyStructuredItemEffects = async (bagIndex: number, item: any, qty: number, effects: any[], chosenAttr?: string) => {
-    updateBagQty(bagIndex, -qty);
+  const applyStructuredItemEffects = async (bagIndex: number, rawItem: any, qty: number, effects: any[], chosenAttr?: string) => {
+    const item = hydrateInventoryItemForEffects(rawItem);
+    const lanMode = isLanCharacter();
+
+    updateBagQty(bagIndex, -qty, item);
 
     const nextStats = { ...character.stats, temp_mods: { ...(character.stats?.temp_mods || {}) } };
     const dbUpdates: any = {};
+    const numberPatch: NonNullable<LanSessionEvent['numberPatch']> = {};
     const messages: string[] = [];
     let nextActiveEffects = Array.isArray(character.active_effects) ? [...character.active_effects] : [];
-    const lanEffects: NonNullable<LanSessionEvent['spellEffect']>[] = [];
+    const lanEffectsToNotify: any[] = [];
+
+    const pushLocalEffect = (effectInput: any) => {
+      const effect = {
+        ...effectInput,
+        id: effectInput.id || `pending_item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        source: effectInput.source || item.name,
+        sourceType: 'item',
+        sourceId: String(item.id || item.name || ''),
+        visibleToPlayer: true,
+      };
+
+      nextActiveEffects.push(effect);
+      lanEffectsToNotify.push(effect);
+    };
 
     for (const effect of effects) {
       const kind = String(effect.kind || effect.type || '').toLowerCase();
@@ -1662,80 +1870,71 @@ export default function CharacterSheetScreen() {
       const duration = getItemEffectDuration(item, effect);
       const isPermanent = duration.unit === 'permanent' || String(effect.durationText || '').toLowerCase().includes('permanente');
 
-      if (needsChosenStat && !target) {
-        continue;
-      }
+      if (needsChosenStat && !target) continue;
 
       if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target) && value) {
+        const totalValue = effect.mode === 'set' ? value : value * qty;
+
         if (effect.mode === 'set') {
           const base = Number(nextStats[target] || 10);
           nextStats.temp_mods[target] = value - base;
           messages.push(`${target} definido como ${value}.`);
         } else if (isPermanent && target !== 'CA') {
-          nextStats[target] = String((Number(nextStats[target]) || 10) + value * qty);
-          nextStats.extra_points = (Number(nextStats.extra_points) || 0) + value * qty;
-          messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty} permanente.`);
+          // Offline mantém o bônus permanente na própria ficha. Em LAN também aplica otimista localmente,
+          // mas envia effect_patch para o Host registrar a versão autoritativa sem payload/snapshot.
+          nextStats[target] = String((Number(nextStats[target]) || 10) + totalValue);
+          nextStats.extra_points = (Number(nextStats.extra_points) || 0) + totalValue;
+          messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue} permanente.`);
         } else {
-          nextStats.temp_mods[target] = (Number(nextStats.temp_mods[target]) || 0) + value * qty;
-          messages.push(`${target} ${value > 0 ? '+' : ''}${value * qty}${isPermanent ? ' permanente' : ''}.`);
+          nextStats.temp_mods[target] = (Number(nextStats.temp_mods[target]) || 0) + totalValue;
+          messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue}${isPermanent ? ' permanente' : ''}.`);
         }
 
-        if (!isPermanent) {
-          nextActiveEffects.push(makeLocalItemEffect(item, {
-            name: `${item.name}: ${target} ${value > 0 ? '+' : ''}${value * qty}`,
-            target,
-            value: effect.mode === 'set' ? value : value * qty,
-            duration,
-            permanent: false,
-          }));
-        }
-
-        lanEffects.push({
-          spellName: item.name,
-          mode: 'effect',
-          effectMode: effect.mode === 'set' ? 'set' : 'add',
-          target: target as LanEffectTarget,
-          value: effect.mode === 'set' ? value : value * qty,
+        pushLocalEffect({
+          name: `${item.name}: ${target} ${totalValue > 0 ? '+' : ''}${totalValue}`,
+          status: isPermanent ? 'permanent_item_effect' : 'item_effect',
+          statusKey: isPermanent ? 'permanent_item_effect' : 'item_effect',
+          target: normalizeLanEffectTarget(target),
+          value: totalValue,
+          remaining: duration.remaining,
+          unit: duration.unit,
           durationText: duration.text,
-          durationRemaining: duration.remaining,
-          durationUnit: duration.unit,
-          description: item.descricao || item.properties || '',
+          kind: target === 'CA' ? 'stat' : 'stat',
+          mode: effect.mode === 'set' ? 'set' : 'add',
+          color: isPermanent ? '#00fa9a' : '#00bfff',
+          secondaryColor: '#8be9fd',
+          visualPriority: isPermanent ? 70 : 50,
         });
       }
 
       if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
-        dbUpdates.temp_hp = Math.max(Number(character.temp_hp || 0), Number(character.temp_hp || 0) + value * qty);
+        const nextTempHp = Math.max(Number(character.temp_hp || 0), Number(character.temp_hp || 0) + value * qty);
+        dbUpdates.temp_hp = nextTempHp;
+        numberPatch.tempHp = nextTempHp;
         messages.push(`PV temporario +${value * qty}.`);
-        nextActiveEffects.push(makeLocalItemEffect(item, {
+        pushLocalEffect({
           name: `${item.name}: PV temporario +${value * qty}`,
+          status: 'item_effect',
+          statusKey: 'item_effect',
           target: 'PV_TEMP',
           value: value * qty,
-          duration,
-          permanent: false,
-        }));
-        lanEffects.push({
-          spellName: item.name,
-          mode: 'effect',
-          target: 'PV_TEMP',
-          value: value * qty,
+          remaining: duration.remaining,
+          unit: duration.unit,
           durationText: duration.text,
-          durationRemaining: duration.remaining,
-          durationUnit: duration.unit,
-          description: item.descricao || item.properties || '',
+          kind: 'temp_hp',
+          color: '#00bfff',
+          secondaryColor: '#8be9fd',
+          visualPriority: 50,
         });
       }
 
       if (kind === 'heal') {
         const fixedHeal = Number(value || String(dice).match(/^\d+$/)?.[0] || 0) * qty;
         if (fixedHeal > 0) {
-          dbUpdates.hp_current = Math.min(Number(character.hp_max || 0), Number(character.hp_current || 0) + fixedHeal);
+          const nextHp = Math.min(Number(character.hp_max || 0), Number(character.hp_current || 0) + fixedHeal);
+          dbUpdates.hp_current = nextHp;
+          numberPatch.hpCurrent = nextHp;
           messages.push(`Recuperou ${fixedHeal} PV.`);
-          lanEffects.push({
-            spellName: item.name,
-            mode: 'heal',
-            amount: fixedHeal,
-            description: item.descricao || item.properties || '',
-          });
         } else if (dice) {
           messages.push(`Role a cura: ${qty}x ${dice}.`);
         }
@@ -1747,31 +1946,23 @@ export default function CharacterSheetScreen() {
           messages.push(`Teste ${effect.save.ability}${effect.save.dc ? ` CD ${effect.save.dc}` : ''}; se falhar aplica ${condition.name || 'condicao'}.`);
           continue;
         }
-        const duration = condition.duration || {};
-        nextActiveEffects.push({
-          id: `local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+
+        const conditionDuration = condition.duration || {};
+        const remaining = Math.max(1, Number(conditionDuration.value || effect.durationValue || 1));
+        const unit = normalizeLanEffectUnit(conditionDuration.unit || effect.durationUnit || 'rest');
+        pushLocalEffect({
           name: condition.name || item.name,
           status: condition.key,
-          target: target && target !== 'UNDEFINED' ? target : 'custom',
+          statusKey: condition.key,
+          target: target && target !== 'UNDEFINED' ? normalizeLanEffectTarget(target) : 'custom',
           value,
-          remaining: Math.max(1, Number(duration.value || effect.durationValue || 1)),
-          unit: duration.unit || effect.durationUnit || 'rest',
-          durationText: effect.durationText || item.duration_unit || '',
-          color: condition.color,
-          source: item.name,
-        });
-        lanEffects.push({
-          spellName: condition.name || item.name,
-          mode: 'effect',
-          target: normalizeLanEffectTarget(target),
-          value,
-          durationText: duration.text,
-          durationRemaining: duration.remaining,
-          durationUnit: duration.unit,
-          status: condition.key,
+          remaining,
+          unit,
+          durationText: effect.durationText || conditionDuration.text || item.duration_unit || '',
+          kind: 'condition',
           color: condition.color,
           secondaryColor: condition.secondaryColor,
-          description: item.descricao || item.properties || '',
+          visualPriority: 80,
         });
         messages.push(`${condition.name || 'Condicao'} aplicada.`);
       }
@@ -1781,11 +1972,40 @@ export default function CharacterSheetScreen() {
     if (nextActiveEffects.length !== (Array.isArray(character.active_effects) ? character.active_effects.length : 0)) {
       dbUpdates.active_effects_json = nextActiveEffects;
     }
-    await updateDB(dbUpdates);
-    setCharacter((prev: any) => ({ ...prev, active_effects: nextActiveEffects }));
-    for (const lanEffect of lanEffects) {
-      void notifySelfLanSpellEvent(lanEffect);
+
+    if (lanMode) {
+      debugLanFlow('LAN_PLAYER_ITEM_CONSUME_REQUEST_ONLY', {
+        characterId: character.id,
+        itemName: item.name,
+        numberPatch,
+        effectCount: lanEffectsToNotify.length,
+        messageCount: messages.length,
+      });
+
+      if (Object.keys(numberPatch).length > 0) {
+        void notifyNumberPatch(numberPatch, `${character.name} consumiu ${item.name}.`);
+      }
+      if (lanEffectsToNotify.length > 0) {
+        void notifyEffectPatch(lanEffectsToNotify, `${character.name} consumiu ${item.name} e aplicou efeito(s).`);
+      }
+
+      showCustomAlert(
+        'Pedido enviado ao mestre',
+        messages.length
+          ? `O efeito foi revelado, mas sera confirmado pelo mestre:\n${messages.join('\n')}`
+          : `${item.name} foi usado. Aguardando confirmacao do mestre.`
+      );
+      return;
     }
+
+    await updateDB(dbUpdates, { reason: 'offline_item_consume' });
+    setCharacter((prev: any) => prev ? ({
+      ...prev,
+      ...dbUpdates,
+      stats: nextStats,
+      active_effects: nextActiveEffects,
+    }) : prev);
+
     showCustomAlert('Efeito aplicado', messages.length ? messages.join('\n') : `${item.name} foi usado.`);
   };
 
@@ -1813,6 +2033,11 @@ export default function CharacterSheetScreen() {
 
   const processConsumeItem = (bagIndex: number, item: any, qty: number) => {
     if (!ensureLanWritable()) return;
+
+    // Itens antigos na mochila podem estar sem effect_json/damage/duration.
+    // Antes de consumir, reidrata pelo catálogo sem perder metadados customizados já existentes.
+    item = hydrateInventoryItemForEffects(item);
+
     const structuredEffects = parseStructuredEffects(item.effect_json);
     if (structuredEffects.length > 0) {
       const chooseEffect = structuredEffects.find((effect) => (
@@ -1855,7 +2080,16 @@ export default function CharacterSheetScreen() {
       return;
     }
 
-    const effect = item.damage && item.damage !== '-' ? item.damage : 'Efeito oculto';
+    const effect = item.damage && item.damage !== '-' ? item.damage : '';
+
+    if (!effect) {
+      showCustomAlert(
+        `Consumir ${qty}x ${item.name}`,
+        'Este item nao possui efeito estruturado salvo nem efeito textual reconhecivel. Reabra o item no criador avancado e salve o efeito novamente.',
+        [{ text: 'OK', color: appColors.primary }]
+      );
+      return;
+    }
     
     // Parse da tag "Escolher"
     const hasEscolher = effect.toLowerCase().includes('escolher');
@@ -3050,17 +3284,23 @@ export default function CharacterSheetScreen() {
         <Pressable style={styles.modalOverlay} onPress={() => setSelectedBagItem(null)}>
           <View style={styles.actionModalBox}>
             {selectedBagItem && (() => {
-              const catItem = dbItemsCatalog.find(i => i.name === selectedBagItem.item.name);
-              const itemLore = catItem?.descricao || '';
-              const p = (selectedBagItem.item.properties || '').toLowerCase();
-              const d = (selectedBagItem.item.damage || '').toLowerCase();
-              const dt = (selectedBagItem.item.damage_type || '').toLowerCase();
-              const n = (selectedBagItem.item.name || '').toLowerCase();
-              const isConsumable = p.includes('consumível') || d.includes('cura') || dt.includes('cura') || d.includes('escolher') || n.includes('poção') || n.includes('pocao');
+              const hydratedSelectedItem = hydrateInventoryItemForEffects(selectedBagItem.item);
+              const itemLore = hydratedSelectedItem?.descricao || '';
+              const structuredSelectedEffects = parseStructuredEffects(hydratedSelectedItem.effect_json);
+              const structuredEffectLabel = summarizeStructuredItemEffects(structuredSelectedEffects);
+              const effectHidden = getItemEffectHidden(hydratedSelectedItem);
+              const visibleEffectLabel = effectHidden
+                ? 'Efeito desconhecido. O efeito será revelado ao consumir.'
+                : (structuredEffectLabel || hydratedSelectedItem.damage || 'Efeito nao configurado');
+              const p = (hydratedSelectedItem.properties || '').toLowerCase();
+              const d = (hydratedSelectedItem.damage || '').toLowerCase();
+              const dt = (hydratedSelectedItem.damage_type || '').toLowerCase();
+              const n = (hydratedSelectedItem.name || '').toLowerCase();
+              const isConsumable = p.includes('consumível') || d.includes('cura') || dt.includes('cura') || d.includes('escolher') || structuredSelectedEffects.length > 0 || n.includes('poção') || n.includes('pocao');
 
               return (
               <>
-                <Text style={styles.modalTitle}>{selectedBagItem.item.name}</Text>
+                <Text style={styles.modalTitle}>{hydratedSelectedItem.name}</Text>
                 
                 {/* LORE DO ITEM */}
                 {itemLore ? (
@@ -3077,11 +3317,11 @@ export default function CharacterSheetScreen() {
                 <View style={styles.itemStatsBox}>
                   {!isConsumable ? (
                     <>
-                      <Text style={styles.itemStatText}>⚔️ Dano/Efeito: <Text style={{color: '#00fa9a'}}>{selectedBagItem.item.damage || '-'}</Text></Text>
+                      <Text style={styles.itemStatText}>⚔️ Dano/Efeito: <Text style={{color: effectHidden ? '#ffd166' : '#00fa9a'}}>{effectHidden ? 'Efeito desconhecido' : (hydratedSelectedItem.damage || '-')}</Text></Text>
                       <Text style={styles.itemStatText}>🛡️ Propriedades: {selectedBagItem.item.properties || '-'}</Text>
                     </>
                   ) : (
-                    <Text style={styles.itemStatText}>🧪 Efeito: <Text style={{color: '#ff6666'}}>??? (Oculto até o consumo)</Text></Text>
+                    <Text style={styles.itemStatText}>🧪 Efeito: <Text style={{color: effectHidden ? '#ffd166' : '#00fa9a'}}>{visibleEffectLabel}</Text></Text>
                   )}
                 </View>
 
@@ -3481,15 +3721,119 @@ function normalizeLanEffectTarget(value: unknown): LanEffectTarget {
   return 'custom';
 }
 
-function parseStructuredEffects(value: unknown) {
-  if (!value) return [];
-  if (Array.isArray(value)) return value;
+function summarizeStructuredItemEffects(effects: any[]) {
+  if (!effects?.length) return '';
+
+  return effects.map((effect) => {
+    const type = String(effect.effectType || effect.type || effect.kind || '').toLowerCase();
+    const target = String(effect.target || '').toUpperCase();
+    const value = Number(effect.value || 0);
+    const condition = effect.condition;
+    const duration = String(effect.durationText || effect.durationUnit || '').toLowerCase();
+    const suffix = duration ? ` (${effect.durationText || effect.durationUnit})` : '';
+
+    if (effect.chooseStat || target === 'CHOOSE_STAT' || String(effect.effectType || '') === 'Escolher Atributo') {
+      return `Escolher atributo ${value >= 0 ? '+' : ''}${value}${suffix}`;
+    }
+
+    if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA', 'PV_TEMP'].includes(target)) {
+      return `${target} ${value >= 0 ? '+' : ''}${value}${suffix}`;
+    }
+
+    if (type === 'heal') return `Cura ${value || effect.healDice || effect.dice || ''}`.trim();
+    if (condition?.name) return condition.name;
+    if (effect.damageType) return `${effect.damageDice || effect.dice || value} ${effect.damageType}`.trim();
+    return effect.name || effect.label || 'Efeito configurado';
+  }).filter(Boolean).join(' + ');
+}
+
+
+async function ensureItemEffectHiddenColumn(db: any) {
   try {
-    const parsed = JSON.parse(String(value));
-    return Array.isArray(parsed) ? parsed : [];
+    await db.execAsync(`ALTER TABLE items ADD COLUMN effect_hidden INTEGER DEFAULT 0;`);
   } catch {
-    return [];
+    // Column already exists or the schema is not initialized yet.
   }
+}
+
+function toBooleanFlag(value: unknown) {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'sim' || normalized === 'yes';
+  }
+  return false;
+}
+
+function getEffectJsonHiddenFlag(value: unknown): boolean {
+  if (!value) return false;
+
+  const normalize = (input: unknown, depth = 0): boolean => {
+    if (!input || depth > 3) return false;
+    if (typeof input === 'string') {
+      const raw = input.trim();
+      if (!raw || raw === '-' || raw.toLowerCase() === 'null') return false;
+      try {
+        return normalize(JSON.parse(raw), depth + 1);
+      } catch {
+        return false;
+      }
+    }
+
+    if (typeof input === 'object' && !Array.isArray(input)) {
+      const obj = input as any;
+      if (toBooleanFlag(obj.effectHidden) || toBooleanFlag(obj.hiddenEffect) || toBooleanFlag(obj.effect_hidden)) return true;
+      if (obj.meta && normalize(obj.meta, depth + 1)) return true;
+      if (obj.effect_json && normalize(obj.effect_json, depth + 1)) return true;
+    }
+
+    return false;
+  };
+
+  return normalize(value);
+}
+
+function getItemEffectHidden(...items: any[]): boolean {
+  return items.some((item) => (
+    toBooleanFlag(item?.effect_hidden) ||
+    toBooleanFlag(item?.effectHidden) ||
+    toBooleanFlag(item?.hiddenEffect) ||
+    getEffectJsonHiddenFlag(item?.effect_json)
+  ));
+}
+
+function parseStructuredEffects(value: unknown): any[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.filter(Boolean);
+
+  const normalize = (input: unknown): any[] => {
+    if (!input) return [];
+    if (Array.isArray(input)) return input.filter(Boolean);
+
+    if (typeof input === 'string') {
+      const raw = input.trim();
+      if (!raw || raw === '-' || raw.toLowerCase() === 'null') return [];
+      try {
+        return normalize(JSON.parse(raw));
+      } catch {
+        return [];
+      }
+    }
+
+    if (typeof input === 'object') {
+      const obj = input as any;
+      if (Array.isArray(obj.effects)) return normalize(obj.effects);
+      if (Array.isArray(obj.effect)) return normalize(obj.effect);
+      if (Array.isArray(obj.items)) return normalize(obj.items);
+      if (Array.isArray(obj.data)) return normalize(obj.data);
+      if (obj.effect_json) return normalize(obj.effect_json);
+      if (obj.type || obj.kind || obj.effectType || obj.target || obj.chooseStat || obj.condition) return [obj];
+    }
+
+    return [];
+  };
+
+  return normalize(value);
 }
 
 function rollDiceExpression(expression: string) {

@@ -9,7 +9,8 @@ import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, Text, TextInput,
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
 import SpellSelector from '../components/SpellSelector';
 
-import { joinLanSessionWithCharacter, notifyMasterJoin } from '@/services/lanSession';
+import { joinLanSessionWithCharacter, makeLanCharacterKey, notifyMasterJoin, requestLanSessionResync } from '@/services/lanSession';
+import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, editStyles as styles } from '@/styles/globalStyles';
 
 // ADICIONADO O NOVO PASSO DE RESUMO FINAL
@@ -507,9 +508,19 @@ export default function EditCharacterScreen() {
     const statsToSave = { ...stats, temp_mods: tempMods, extra_points: extraPoints };
 
     try {
+      const liveCharacter = sessionId
+        ? await db.getFirstAsync<Record<string, unknown>>(
+          `SELECT hp_max, hp_current FROM characters WHERE id = ?`,
+          [character.id]
+        )
+        : null;
+
+      const baseHpMax = Number(liveCharacter?.hp_max ?? character.hp_max ?? 0);
+      const baseHpCurrent = Number(liveCharacter?.hp_current ?? character.hp_current ?? 0);
+
       await db.runAsync(
         `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=? WHERE id=?`,
-        [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
+        [targetLevel, finalClassStr, baseHpMax + addedHp, baseHpCurrent + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
       );
 
       if (sessionId) {
@@ -528,6 +539,18 @@ export default function EditCharacterScreen() {
           '',
           { reviewSnapshot: true }
         );
+
+        const sessionValue = String(sessionId);
+        const joinUrlValue = firstParam(joinUrl) || '';
+        const playerKey = makeLanCharacterKey(sessionValue, updatedCharacter || character);
+        const runtime = useLanRealtimeStore.getState();
+        runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
+        await requestLanSessionResync(joinUrlValue, {
+          sessionId: sessionValue,
+          playerKey,
+          lastAppliedSeq: runtime.sessionId === sessionValue ? runtime.lastAppliedSeq : 0,
+          knownRevisions: getKnownLanEntityRevisions(sessionValue),
+        }).catch(() => false);
       }
 
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!

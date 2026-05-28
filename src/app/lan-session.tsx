@@ -41,6 +41,7 @@ import {
   resumeLanSession,
   reviewLanPlayerPendingSnapshot,
   saveLanSession,
+  sendLanSessionEvent,
   selectionFromKeys,
   startLanServer,
   stopLanServer,
@@ -63,6 +64,7 @@ import {
   type LanSessionSummary,
   type LanTradeItem,
 } from '@/services/lanSession';
+import { debugLanFlow } from '@/services/lanRuntimeMode';
 import { appColors, appGradients, lanSessionStyles as styles } from '@/styles/globalStyles';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
@@ -125,6 +127,7 @@ export default function LanSessionScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const masterMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const silentPayloadRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const enqueueMasterMutation = useCallback((task: () => Promise<void>) => {
     const run = masterMutationQueueRef.current
@@ -207,6 +210,83 @@ export default function LanSessionScreen() {
     () => sessionState?.players.find((player) => player.id === selectedPlayerId) || sessionState?.players[0],
     [selectedPlayerId, sessionState?.players]
   );
+
+
+  const scheduleSilentPayloadRefresh = useCallback((sessionId: string) => {
+    if (!sessionId) return;
+    if (silentPayloadRefreshTimerRef.current) {
+      clearTimeout(silentPayloadRefreshTimerRef.current);
+    }
+
+    silentPayloadRefreshTimerRef.current = setTimeout(() => {
+      silentPayloadRefreshTimerRef.current = null;
+      void (async () => {
+        try {
+          const nextPayload = await syncLanSessionPayload(db, sessionId, { broadcast: false });
+          if (!nextPayload || activeSessionId !== sessionId) return;
+
+          setPayload(nextPayload);
+          setSessionState(nextPayload.state || null);
+        } catch (error) {
+          console.warn('[LAN MASTER] Falha ao recalcular payload silencioso:', error);
+        }
+      })();
+    }, 250);
+  }, [activeSessionId, db]);
+
+  useEffect(() => () => {
+    if (silentPayloadRefreshTimerRef.current) {
+      clearTimeout(silentPayloadRefreshTimerRef.current);
+      silentPayloadRefreshTimerRef.current = null;
+    }
+  }, []);
+
+  const getPlayerRevision = useCallback(async (playerId: number) => {
+    const row = await db.getFirstAsync<{ revisionSeq?: number }>(
+      `SELECT COALESCE(revision_seq, 0) as revisionSeq FROM lan_session_players WHERE id = ?`,
+      [playerId]
+    );
+    return Math.max(0, Math.floor(Number(row?.revisionSeq || 0)));
+  }, [db]);
+
+  const sendLiveEventToClients = useCallback(async (event: LanSessionEvent | null | undefined) => {
+    if (!event || !joinUrl) return false;
+
+    try {
+      await sendLanSessionEvent(joinUrl, event);
+      setSessionEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20));
+      return true;
+    } catch (error) {
+      console.warn('[LAN MASTER] Falha ao enviar evento vivo:', {
+        type: event.type,
+        id: event.id,
+        toKey: event.toKey,
+        error,
+      });
+      return false;
+    }
+  }, [joinUrl]);
+
+  const sendLatestLiveEvent = useCallback(async (
+    sessionId: string,
+    predicate: (event: LanSessionEvent) => boolean,
+  ) => {
+    const events = await getLanSessionEvents(db, sessionId, 40);
+    const event = events.find(predicate);
+    if (event) await sendLiveEventToClients(event);
+    return event || null;
+  }, [db, sendLiveEventToClients]);
+
+  const sendRecentLiveEvents = useCallback(async (
+    sessionId: string,
+    predicate: (event: LanSessionEvent) => boolean,
+  ) => {
+    const events = await getLanSessionEvents(db, sessionId, 40);
+    const selected = events.filter(predicate).slice(0, 20).reverse();
+    for (const event of selected) {
+      await sendLiveEventToClients(event);
+    }
+  }, [db, sendLiveEventToClients]);
   
   const filteredCatalogOptions = useMemo(() => {
     const search = catalogSearch.trim().toLowerCase();
@@ -351,7 +431,7 @@ export default function LanSessionScreen() {
     setPendingSaves(await listPendingSaves(db, sessionId));
 
     if (syncPayload) {
-      const nextPayload = await syncLanSessionPayload(db, sessionId);
+      const nextPayload = await syncLanSessionPayload(db, sessionId, { broadcast: false });
       if (nextPayload) setPayload(nextPayload);
     }
   }, [db]);
@@ -433,7 +513,7 @@ useLanAppLifecycle({
       }
 
       if (changedPlayers) {
-        const syncedPayload = await syncLanSessionPayload(db, activeSessionId);
+        const syncedPayload = await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
 
         if (syncedPayload) {
           setPayload(syncedPayload);
@@ -451,7 +531,7 @@ useLanAppLifecycle({
             const fresh = await rememberLanSessionEvent(db, event);
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
             if (fresh) {
-              await syncLanSessionPayload(db, activeSessionId);
+              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
             }
             continue;
           }
@@ -461,7 +541,7 @@ useLanAppLifecycle({
             // O evento de entrada também precisa criar um jogador pendente,
             // porque em algumas redes o evento chega antes do roster do join.
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
-            if (fresh) await syncLanSessionPayload(db, activeSessionId);
+            if (fresh) await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
             continue;
           }
 
@@ -530,14 +610,14 @@ useLanAppLifecycle({
 
           if (event.type === 'trade_offer' || event.type === 'trade_decline') {
             const fresh = await rememberLanSessionEvent(db, event);
-            if (fresh) await syncLanSessionPayload(db, activeSessionId);
+            if (fresh) await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
           }
 
           if (event.type === 'player_patch' && event.numberPatch) {
             const applied = await applyLanPlayerNumberPatch(db, activeSessionId, event.fromKey, event.numberPatch);
             if (applied) {
               await rememberLanSessionEvent(db, event);
-              await syncLanSessionPayload(db, activeSessionId);
+              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
             }
           }
 
@@ -551,8 +631,46 @@ useLanAppLifecycle({
             );
             if (applied) {
               await rememberLanSessionEvent(db, event);
-              await syncLanSessionPayload(db, activeSessionId);
+              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
             }
+          }
+
+
+          if (event.type === 'effect_patch' && event.effectPatch) {
+            const fresh = await rememberLanSessionEvent(db, event);
+            if (!fresh) continue;
+
+            const targetPlayer = currentState.players.find((entry) => (
+              entry.remoteKey === event.effectPatch?.targetKey ||
+              entry.remoteKey === event.fromKey ||
+              entry.characterName === event.fromName
+            ));
+
+            if (!targetPlayer) continue;
+
+            for (const effectId of event.effectPatch.remove || []) {
+              await removeLanPlayerEffect(db, targetPlayer.id, String(effectId));
+            }
+
+            for (const effect of [...(event.effectPatch.add || []), ...(event.effectPatch.update || [])]) {
+              await addLanPlayerEffect(db, targetPlayer.id, {
+                name: String((effect as any).name || event.message || 'Efeito de item'),
+                target: ((effect as any).target || 'custom') as LanEffectTarget,
+                value: Number((effect as any).value || 0),
+                remaining: Number((effect as any).remaining || 1),
+                unit: ((effect as any).unit || 'rest') as LanEffectUnit,
+                durationText: (effect as any).durationText,
+                kind: (effect as any).kind,
+                mode: (effect as any).mode,
+                status: (effect as any).status,
+                statusKey: (effect as any).statusKey || (effect as any).status,
+                color: (effect as any).color,
+                secondaryColor: (effect as any).secondaryColor,
+                source: (effect as any).source || event.fromName,
+              });
+            }
+
+            await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
           }
         }
       }
@@ -693,7 +811,7 @@ useLanAppLifecycle({
         message: 'Mestre finalizou a sessao LAN.',
         createdAt: new Date().toISOString(),
       });
-      await syncLanSessionPayload(db, payload.session.id);
+      await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
     }
     await stopLanServer();
     resetLanClientConnection();
@@ -792,7 +910,7 @@ useLanAppLifecycle({
     await recordMasterTimelineEvent(wasPaused ? 'Mestre continuou a sessao.' : 'Mestre pausou a sessao.');
 
     if (nextPayload) {
-      const syncedPayload = await syncLanSessionPayload(db, payload.session.id);
+      const syncedPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
       setPayload(syncedPayload || nextPayload);
       setSessionState((syncedPayload || nextPayload).state || null);
     }
@@ -803,7 +921,7 @@ useLanAppLifecycle({
     if (!payload) return;
     await advanceLanSessionTime(db, payload.session.id, unit);
     await recordMasterTimelineEvent(`Mestre avancou ${formatAdvanceUnit(unit)}.`);
-    const nextPayload = await syncLanSessionPayload(db, payload.session.id);
+    const nextPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
     if (nextPayload) {
       setPayload(nextPayload);
       setSessionState(nextPayload.state || null);
@@ -871,6 +989,14 @@ useLanAppLifecycle({
 
     if (Object.keys(cleanPatch).length === 0) return;
 
+    debugLanFlow('MASTER_MUTATION_PLAYER_PATCH_START', {
+      playerId: player.id,
+      remoteKey: player.remoteKey,
+      characterName: player.characterName,
+      patch: cleanPatch,
+      beforeHp: player.hpCurrent,
+    });
+
     // 1. Atualiza a tela do mestre imediatamente, mas sempre mantendo o patch mais recente.
     setSessionState((current) => {
       if (!current) return current;
@@ -904,8 +1030,9 @@ useLanAppLifecycle({
 
     // 3. Persiste no SQLite do mestre.
     await updateLanPlayerNumbers(db, player.id, cleanPatch, { syncPayload: false });
+    const entityRevision = await getPlayerRevision(player.id);
 
-    // 4. Envia o valor final oficial para o jogador imediatamente.
+    // 4. Envia o valor final oficial para o jogador imediatamente como evento vivo.
     // Não faça broadcast de payload/snapshot aqui. O estado vivo da ficha deve ir por evento.
     const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
       id: makeLanEventId(),
@@ -915,26 +1042,34 @@ useLanAppLifecycle({
       fromName: 'Mestre',
       toKey: player.remoteKey || '',
       toName: player.characterName,
+      entityType: 'player',
+      entityId: player.remoteKey || String(player.id),
+      entityRevision,
+      ackRequired: true,
+      originClientId: 'master',
       numberPatch: cleanPatch,
       message,
       createdAt: new Date().toISOString(),
     });
 
     if (event) {
+      debugLanFlow('MASTER_MUTATION_PLAYER_PATCH_SENT', {
+        eventId: event.id,
+        seq: event.seq,
+        entityType: event.entityType,
+        entityId: event.entityId,
+        entityRevision: event.entityRevision,
+        toKey: event.toKey,
+        numberPatch: event.numberPatch,
+      });
       setSessionEvents((current) =>
         [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
       );
     }
 
-    // 5. Recalcula o payload oficial para futuras entradas/QR/retomada,
-    // mas sem mandar payload_update para os jogadores atuais.
-    // Isso impede o efeito de piscar/voltar HP antigo depois do player_patch.
-    const syncedPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
-
-    if (syncedPayload) {
-      setPayload(syncedPayload);
-      setSessionState(syncedPayload.state || null);
-    }
+    // 5. Recalcula payload apenas para cache estrutural/futuro join, em debounce,
+    // sem mandar payload_update para os jogadores atuais.
+    scheduleSilentPayloadRefresh(payload.session.id);
   };
 
   const handleUpdatePlayerPatch = async (
@@ -1000,7 +1135,7 @@ useLanAppLifecycle({
             if (selectedPlayerId === player.id) setSelectedPlayerId(null);
             setExpandedPlayerIds((current) => current.filter((id) => id !== player.id));
             await kickLanSessionPlayer(db, player.id);
-            if (payload) await reloadSessionState(payload.session.id, true);
+            if (payload) await reloadSessionState(payload.session.id, false);
           },
         },
       ]
@@ -1009,7 +1144,7 @@ useLanAppLifecycle({
 
   const handleReviewPending = async (player: LanSessionPlayerState, accepted: boolean) => {
     await reviewLanPlayerPendingSnapshot(db, player.id, accepted);
-    if (payload?.session?.id) await reloadSessionState(payload!.session.id, true);
+    if (payload?.session?.id) await reloadSessionState(payload!.session.id, false);
   };
 
   const handleSelectEffectOption = (option: EffectOption) => {
@@ -1050,7 +1185,7 @@ useLanAppLifecycle({
       await handleUpdatePlayer(player, 'xp', player.xp + baseShare + (index < remainder ? 1 : 0));
     }
     await recordMasterTimelineEvent(`Mestre distribuiu ${totalXp} XP para a party.`);
-    await reloadSessionState(payload.session.id, true);
+    await reloadSessionState(payload.session.id, false);
   };
 
   const handleAcceptSpellEffect = async (event: LanSessionEvent, accepted: boolean) => {
@@ -1086,16 +1221,83 @@ useLanAppLifecycle({
         : `Mestre recusou ${event.spellEffect?.spellName || 'efeito'} de ${event.fromName}.`,
       createdAt: new Date().toISOString(),
     });
+
+    if (accepted && targetPlayer?.remoteKey) {
+      await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
+        latestEvent.type === 'effect_patch' && latestEvent.toKey === targetPlayer.remoteKey
+      ));
+    }
+    await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
+      latestEvent.type === 'character_update_review' && latestEvent.toKey === event.fromKey
+    ));
+
     setReviewedSpellEventIds((current) => Array.from(new Set([...current, event.id])));
-    await reloadSessionState(payload.session.id, true);
+    await reloadSessionState(payload.session.id, false);
+    scheduleSilentPayloadRefresh(payload.session.id);
   };
 
-  const handleReviewResourceRequest = async (event: LanSessionEvent, accepted: boolean) => {
-    if (!payload) return;
+  const handleReviewResourceRequest = async (event: LanSessionEvent, accepted: boolean) => enqueueMasterMutation(async () => {
+    if (!payload?.session?.id) return;
     await applyLanResourceRequest(db, event, accepted);
+
+    if (accepted) {
+      const nextState = await getLanSessionState(db, payload.session.id);
+      const targetPlayer = nextState.players.find((player) => player.remoteKey === event.fromKey || player.characterName === event.fromName);
+      const request = event.resourceRequest;
+
+      if (targetPlayer && request) {
+        const entityRevision = await getPlayerRevision(targetPlayer.id);
+
+        if (['xp', 'hp', 'temp_hp', 'coin'].includes(request.kind)) {
+          await rememberAndSendLanSessionEvent(db, joinUrl, {
+            id: makeLanEventId(),
+            sessionId: payload.session.id,
+            type: 'player_patch',
+            fromKey: 'master',
+            fromName: 'Mestre',
+            toKey: targetPlayer.remoteKey || '',
+            toName: targetPlayer.characterName,
+            entityType: 'player',
+            entityId: targetPlayer.remoteKey || String(targetPlayer.id),
+            entityRevision,
+            ackRequired: true,
+            originClientId: 'master',
+            numberPatch: {
+              hpCurrent: targetPlayer.hpCurrent,
+              hpMax: targetPlayer.hpMax,
+              tempHp: targetPlayer.tempHp,
+              xp: targetPlayer.xp,
+              gp: targetPlayer.gp,
+              sp: targetPlayer.sp,
+              cp: targetPlayer.cp,
+            },
+            message: `Mestre aceitou: ${event.message || request.message || request.kind}.`,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        if (['stat', 'buff', 'condition'].includes(request.kind)) {
+          await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
+            latestEvent.type === 'effect_patch' && latestEvent.toKey === targetPlayer.remoteKey
+          ));
+        }
+
+        if (request.kind === 'inventory') {
+          await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
+            latestEvent.type === 'inventory_patch' && latestEvent.toKey === targetPlayer.remoteKey
+          ));
+        }
+      }
+    }
+
+    await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
+      latestEvent.type === 'resource_review' && latestEvent.tradeId === event.id
+    ));
+
     setReviewedRequestEventIds((current) => Array.from(new Set([...current, event.id])));
-    await reloadSessionState(payload.session.id, true);
-  };
+    await reloadSessionState(payload.session.id, false);
+    scheduleSilentPayloadRefresh(payload.session.id);
+  });
 
   const handleResolvePendingSave = async (save: LanPendingSave, passed: boolean) => {
     if (!payload) return;
@@ -1123,7 +1325,9 @@ useLanAppLifecycle({
       message: `Mestre marcou ${save.sourceName || 'teste'} como ${passed ? 'sucesso' : 'falha'}.`,
       createdAt: new Date().toISOString(),
     });
-    await reloadSessionState(payload.session.id, true);
+    await sendRecentLiveEvents(payload.session.id, (event) => ['effect_patch', 'pending_save_patch'].includes(event.type));
+    await reloadSessionState(payload.session.id, false);
+    scheduleSilentPayloadRefresh(payload.session.id);
   };
 
   const handleGrantItemToPlayer = async (item: InventoryItemOption) => {
@@ -1157,10 +1361,17 @@ useLanAppLifecycle({
       { ...equipment, bag },
       `Mestre entregou ${qty}x ${item.name} para ${inventoryModalPlayer.characterName}.`
     );
-    await reloadSessionState(payload.session.id, true);
+
+    await sendLatestLiveEvent(payload.session.id, (event) => (
+      event.type === 'inventory_patch' &&
+      event.toKey === inventoryModalPlayer.remoteKey
+    ));
+
+    await reloadSessionState(payload.session.id, false);
     const nextState = await getLanSessionState(db, payload.session.id);
     const nextPlayer = nextState.players.find((player) => player.id === inventoryModalPlayer.id);
     if (nextPlayer) setInventoryModalPlayer(nextPlayer);
+    scheduleSilentPayloadRefresh(payload.session.id);
   };
 
   const toggleExpandedPlayer = (playerId: number) => {
@@ -1170,12 +1381,15 @@ useLanAppLifecycle({
   };
 
   // NOVO: Função para Aplicar Efeitos considerando o novo seletor (Toda a party ou Específico)
-  const handleApplyEffect = async () => {
-    if (!sessionState) return;
-    
+  const handleApplyEffect = async () => enqueueMasterMutation(async () => {
+    if (!sessionState || !payload?.session?.id) return;
+
     const targets = effectTargetPlayerId === 'ALL'
       ? sessionState.players
-      : sessionState.players.filter(p => p.id === effectTargetPlayerId);
+      : sessionState.players.filter((player) => player.id === effectTargetPlayerId);
+
+    if (targets.length === 0) return;
+
     const manualDuration = Math.max(1, parseInt(effectDuration, 10) || 1);
     const drafts: EffectDraft[] = selectedEffectOptions.length > 0
       ? selectedEffectOptions.map(makeEffectDraftFromOption)
@@ -1188,16 +1402,16 @@ useLanAppLifecycle({
         durationText: `${manualDuration} ${effectUnit}`,
         kind: effectTarget === 'PV_TEMP' ? 'temp_hp' : effectTarget === 'HP' ? 'hp' : effectTarget === 'custom' ? 'custom' : 'stat',
         mode: effectMode,
-        source: effectSource.trim() || undefined,
+        source: [effectSource.trim(), effectSaveInfo].filter(Boolean).join(' - ') || undefined,
         statusKey: effectTarget === 'custom' ? effectStatusKey || undefined : undefined,
         color: effectColor || undefined,
         secondaryColor: effectSecondaryColor || undefined,
       }];
 
-    for (const p of targets) {
+    for (const targetPlayer of targets) {
       for (const draft of drafts) {
         const usesStatusCatalog = draft.kind === 'status' || draft.target === 'custom';
-        await addLanPlayerEffect(db, p.id, {
+        const result = await addLanPlayerEffect(db, targetPlayer.id, {
           name: draft.name,
           target: draft.target,
           value: draft.value,
@@ -1206,48 +1420,41 @@ useLanAppLifecycle({
           durationText: draft.durationText,
           kind: draft.kind,
           mode: draft.mode,
-          source: draft.source,
+          source: draft.source || 'Mestre',
           status: usesStatusCatalog ? draft.statusKey : undefined,
           statusKey: usesStatusCatalog ? draft.statusKey : undefined,
           color: draft.color,
           secondaryColor: draft.secondaryColor,
         });
+
+        if (result?.targetKey) {
+          await sendLatestLiveEvent(payload.session.id, (event) => (
+            event.type === 'effect_patch' &&
+            event.toKey === result.targetKey
+          ));
+        }
       }
     }
 
     await recordMasterTimelineEvent(`Mestre aplicou ${drafts.length} efeito(s) em ${targets.length} alvo(s).`);
     setSelectedEffectKeys([]);
-    if (payload?.session?.id) await reloadSessionState(payload!.session.id, true);
-    if (drafts.length === 0) {
+    await reloadSessionState(payload.session.id, false);
+    scheduleSilentPayloadRefresh(payload.session.id);
+  });
 
-    for (const p of targets) {
-      await addLanPlayerEffect(db, p.id, {
-        name: effectName.trim() || 'Efeito temporário',
-        target: effectTarget,
-        value: parseInt(effectValue, 10) || 0,
-        remaining: Math.max(1, parseInt(effectDuration, 10) || 1),
-        unit: effectUnit,
-        durationText: `${Math.max(1, parseInt(effectDuration, 10) || 1)} ${effectUnit}`,
-        kind: effectTarget === 'PV_TEMP' ? 'temp_hp' : effectTarget === 'HP' ? 'hp' : effectTarget === 'custom' ? 'custom' : 'stat',
-        mode: effectMode,
-        source: [effectSource.trim(), effectSaveInfo].filter(Boolean).join(' - ') || undefined,
-        status: effectStatusKey || undefined,
-        statusKey: effectStatusKey || undefined,
-        color: effectColor || undefined,
-        secondaryColor: effectSecondaryColor || undefined,
-      });
+  const handleRemoveEffect = async (playerId: number, effectId: string) => enqueueMasterMutation(async () => {
+    if (!payload?.session?.id) return;
+    const result = await removeLanPlayerEffect(db, playerId, effectId);
+    if (result?.targetKey) {
+      await sendLatestLiveEvent(payload.session.id, (event) => (
+        event.type === 'effect_patch' &&
+        event.toKey === result.targetKey
+      ));
     }
-
-    await recordMasterTimelineEvent(`Mestre aplicou ${effectName.trim() || 'efeito temporario'} em ${targets.length} alvo(s).`);
-    if (payload?.session?.id) await reloadSessionState(payload!.session.id, true);
-    }
-  };
-
-  const handleRemoveEffect = async (playerId: number, effectId: string) => {
-    await removeLanPlayerEffect(db, playerId, effectId);
     await recordMasterTimelineEvent('Mestre removeu um efeito ativo.');
-    if (payload) await reloadSessionState(payload.session.id, true);
-  };
+    await reloadSessionState(payload.session.id, false);
+    scheduleSilentPayloadRefresh(payload.session.id);
+  });
 
   // NOVO: Funções para o Modal de Edição Rápida
   const openQuickEdit = (player: LanSessionPlayerState, type: 'STAT' | 'HP' | 'XP' | 'COIN' | 'PV_TEMP', stat?: string) => {
@@ -1306,7 +1513,7 @@ useLanAppLifecycle({
        const effName = type === 'PV_TEMP' ? 'PV Temporário' : type === 'HP' ? 'HP Máximo Temporário' : `Ajuste de ${stat}`;
        const effKind = type === 'PV_TEMP' ? 'temp_hp' : type === 'HP' ? 'hp' : 'stat';
 
-       await addLanPlayerEffect(db, player.id, {
+       const result = await addLanPlayerEffect(db, player.id, {
            name: effName,
            target: effTarget,
            value: val,
@@ -1316,8 +1523,16 @@ useLanAppLifecycle({
            kind: effKind,
            source: qeIsTemp ? 'Mestre' : 'Mestre (Permanente)',
        });
+       if (payload?.session?.id && result?.targetKey) {
+         await sendLatestLiveEvent(payload.session.id, (event) => (
+           event.type === 'effect_patch' && event.toKey === result.targetKey
+         ));
+       }
        await recordMasterTimelineEvent(`Mestre aplicou ${effName} em ${player.characterName}.`, player);
-       if (payload) await reloadSessionState(payload.session.id, true);
+       if (payload) {
+         await reloadSessionState(payload.session.id, false);
+         scheduleSilentPayloadRefresh(payload.session.id);
+       }
     }
     setQuickEdit(null);
   };

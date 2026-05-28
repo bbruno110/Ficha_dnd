@@ -73,6 +73,7 @@ export default function AdvancedCreatorScreen() {
   const [properties, setProperties] = useState<string[]>([]);
   const [itemEffects, setItemEffects] = useState<any[]>([]);
   const [itemDescription, setItemDescription] = useState(''); 
+  const [itemEffectHidden, setItemEffectHidden] = useState(false); 
   
   const [tempEffVal, setTempEffVal] = useState('');
   const [tempEffType, setTempEffType] = useState('Cortante');
@@ -193,6 +194,7 @@ export default function AdvancedCreatorScreen() {
     async function fetchData() {
       try {
         const classes = await db.getAllAsync<{name: string}>('SELECT name FROM classes ORDER BY name');
+        await ensureItemEffectHiddenColumn(db);
         const items = await db.getAllAsync('SELECT * FROM items ORDER BY name');
         const features = await db.getAllAsync<{name: string, description: string}>(
           "SELECT name, description FROM spells WHERE level = 'Passiva' OR casting_time = 'Passiva' ORDER BY name"
@@ -332,7 +334,7 @@ export default function AdvancedCreatorScreen() {
   // ================= FIM DO SISTEMA =================
 
   const resetForms = () => {
-    setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffVal(''); setTempEffType('Cortante'); setTempEffDuration(''); setTempEffTurns(''); setItemDescription('');
+    setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffVal(''); setTempEffType('Cortante'); setTempEffDuration(''); setTempEffTurns(''); setItemDescription(''); setItemEffectHidden(false);
     setItemEffectAmountMode('dice'); setItemDiceCount('1'); setItemDiceSides('6'); setItemFlatBonus('0'); setItemSaveAbility('Nenhum'); setItemSaveDc('10'); setItemSaveOnSuccess('none'); setItemConditionKey('none');
     setStats({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' }); setSpeed('9m'); setHitDice('8'); setGold('10'); setSubclassLevel('3'); setIsCaster(false); setSaves([]);
     setSubclassParents([]); setSubclassSearch(''); setTempSubclassLevel('3'); setBonusSkills('0');
@@ -579,6 +581,11 @@ export default function AdvancedCreatorScreen() {
         let damageTypeParts: string[] = [];
         let extraProps: string[] = [];
         const itemEffectJson = itemEffects.map((eff) => toStructuredItemEffect(eff));
+        const itemEffectPayload = {
+          effectHidden: itemEffectHidden,
+          hiddenEffect: itemEffectHidden,
+          effects: itemEffectJson,
+        };
         const itemDurationMeta = itemEffectJson.find((eff) => eff.durationValue && eff.durationUnit);
 
         itemEffects.forEach(eff => {
@@ -606,9 +613,10 @@ export default function AdvancedCreatorScreen() {
         const finalDamageType = damageTypeParts.length > 0 ? damageTypeParts.join(', ') : '-';
         const finalProps = [itemCategory, ...extraProps, ...properties].filter(Boolean).join(', ');
 
+        await ensureItemEffectHiddenColumn(db);
         await db.runAsync(
-          `INSERT INTO items (name, weight, damage, damage_type, properties, descricao, effect_json, duration_value, duration_unit, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, finalProps, itemDescription, JSON.stringify(itemEffectJson), itemDurationMeta?.durationValue || null, itemDurationMeta?.durationUnit || null]
+          `INSERT INTO items (name, weight, damage, damage_type, properties, descricao, effect_json, duration_value, duration_unit, effect_hidden, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
+          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, finalProps, itemDescription, JSON.stringify(itemEffectPayload), itemDurationMeta?.durationValue || null, itemDurationMeta?.durationUnit || null, itemEffectHidden ? 1 : 0]
         );
       } 
       else if (activeTab === 'Raça') {
@@ -897,6 +905,21 @@ export default function AdvancedCreatorScreen() {
             })}
           </View>
         )}
+
+        <View style={{marginBottom: 20, padding: 12, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.25)', borderWidth: 1, borderColor: itemEffectHidden ? '#00bfff' : 'rgba(255,255,255,0.08)'}}>
+          <TouchableOpacity
+            style={{flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12}}
+            onPress={() => setItemEffectHidden((current) => !current)}
+          >
+            <View style={{flex: 1}}>
+              <Text style={[styles.label, {marginBottom: 4}]}>EFEITO OCULTO</Text>
+              <Text style={{color: 'rgba(255,255,255,0.6)', fontSize: 12}}>
+                Se ativado, o jogador vê apenas que o efeito será revelado ao consumir. O efeito real continua salvo e será aplicado normalmente.
+              </Text>
+            </View>
+            <Ionicons name={itemEffectHidden ? 'eye-off' : 'eye'} size={24} color={itemEffectHidden ? '#00bfff' : 'rgba(255,255,255,0.45)'} />
+          </TouchableOpacity>
+        </View>
 
         <Text style={styles.label}>PROPRIEDADES EXTRAS (Opcional)</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 20}}>
@@ -1867,4 +1890,12 @@ function toStructuredItemEffect(effect: any) {
     save,
     condition,
   };
+}
+
+async function ensureItemEffectHiddenColumn(db: any) {
+  try {
+    await db.execAsync(`ALTER TABLE items ADD COLUMN effect_hidden INTEGER DEFAULT 0;`);
+  } catch {
+    // Column already exists or the table is not ready yet. Safe to ignore.
+  }
 }
