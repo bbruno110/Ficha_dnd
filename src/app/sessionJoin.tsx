@@ -29,6 +29,7 @@ import {
   unlinkCharacterFromLanSession,
   type LanSessionPayload,
 } from '@/services/lanSession';
+import { traceButton, traceError, traceFunctionCall, traceFunctionReturn, traceScreen, traceSqlite } from '@/services/debug/appTrace';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, lanSessionStyles as styles } from '@/styles/globalStyles';
 
@@ -54,6 +55,17 @@ export default function SessionJoinScreen() {
   const [scannerVisible, setScannerVisible] = useState(false);
   const [scanned, setScanned] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+
+  useEffect(() => {
+    traceScreen('sessionJoin', 'SESSION_JOIN_SCREEN_FOCUS', {
+      source: 'SessionJoinScreen',
+      args: {
+        url: params.url,
+        data: params.data,
+        code: params.code,
+      },
+    });
+  }, [params.url, params.data, params.code]);
 
   const getJoinErrorMessage = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error || '');
@@ -98,6 +110,18 @@ export default function SessionJoinScreen() {
 
     const runtime = useLanRealtimeStore.getState();
     const knownRevisions = getKnownLanEntityRevisions(sessionId);
+    traceFunctionCall('requestRuntimeResync', {
+      url,
+      sessionId,
+      playerKey,
+      lastAppliedSeq: runtime.lastAppliedSeq,
+      knownRevisions,
+    }, {
+      screen: 'sessionJoin',
+      sessionId,
+      playerKey,
+      source: 'join_flow',
+    });
 
     runtime.setConnection({
       sessionId,
@@ -111,11 +135,26 @@ export default function SessionJoinScreen() {
       lastAppliedSeq: runtime.sessionId === sessionId ? runtime.lastAppliedSeq : 0,
       knownRevisions,
     }).catch((error) => {
+      traceError('RESYNC_REQUEST', 'SESSION_JOIN_RESYNC_ERROR', error, {
+        screen: 'sessionJoin',
+        sessionId,
+        playerKey,
+      });
       console.warn('[LAN] Nao foi possivel solicitar resync apos join:', error);
+    });
+    traceFunctionReturn('requestRuntimeResync', { requested: true }, {
+      screen: 'sessionJoin',
+      sessionId,
+      playerKey,
     });
   };
 
   const loadSession = async (url?: string, data?: string) => {
+    const startedAt = Date.now();
+    traceFunctionCall('loadSession', { url, hasData: Boolean(data) }, {
+      screen: 'sessionJoin',
+      source: 'join_flow',
+    });
     if (!url && !data) {
       throw new Error('Informe o código da mesa, uma URL LAN ou escaneie o QR da sessão.');
     }
@@ -145,9 +184,26 @@ export default function SessionJoinScreen() {
       let nextPayload: LanSessionPayload;
 
       try {
+        traceFunctionCall('fetchLanSessionPayload', {
+          resolvedUrl,
+          hasInlineData: Boolean(resolvedData),
+          inviteCode,
+        }, {
+          screen: 'sessionJoin',
+          source: 'loadSession',
+        });
         nextPayload = resolvedData
           ? (JSON.parse(resolvedData) as LanSessionPayload)
           : await fetchLanSessionPayload(resolvedUrl);
+        traceFunctionReturn('fetchLanSessionPayload', {
+          sessionId: nextPayload?.session?.id,
+          sessionName: nextPayload?.session?.name,
+          playerCount: nextPayload?.state?.players?.length || 0,
+        }, {
+          screen: 'sessionJoin',
+          source: 'loadSession',
+          sessionId: nextPayload?.session?.id,
+        });
       } catch (error) {
         if (!resolvedData && inviteCode) {
           const codeResolvedUrl = await resolveLanSessionUrlByInviteCode(inviteCode);
@@ -167,12 +223,44 @@ export default function SessionJoinScreen() {
         throw new Error('Convite LAN inválido ou sessão sem identificador.');
       }
 
+      traceSqlite('SQLITE_WRITE_START', {
+        screen: 'sessionJoin',
+        source: 'loadSession',
+        functionName: 'importLanCatalog',
+        table: 'custom_catalog',
+        operation: 'IMPORT_LAN_CATALOG',
+        sessionId: nextPayload.session.id,
+      });
       await importLanCatalog(db, nextPayload);
+      traceSqlite('SQLITE_WRITE_DONE', {
+        screen: 'sessionJoin',
+        source: 'loadSession',
+        functionName: 'importLanCatalog',
+        table: 'custom_catalog',
+        operation: 'IMPORT_LAN_CATALOG',
+        sessionId: nextPayload.session.id,
+      });
 
       // IMPORTANTE:
       // Jogador sempre salva como jogador.
       // Nunca deixe virar mestre por padrão.
+      traceSqlite('SQLITE_WRITE_START', {
+        screen: 'sessionJoin',
+        source: 'loadSession',
+        functionName: 'saveLanSession',
+        table: 'lan_sessions',
+        operation: 'SAVE_PLAYER_SESSION',
+        sessionId: nextPayload.session.id,
+      });
       await saveLanSession(db, nextPayload, resolvedUrl, { isMaster: false });
+      traceSqlite('SQLITE_WRITE_DONE', {
+        screen: 'sessionJoin',
+        source: 'loadSession',
+        functionName: 'saveLanSession',
+        table: 'lan_sessions',
+        operation: 'SAVE_PLAYER_SESSION',
+        sessionId: nextPayload.session.id,
+      });
 
       setPayload(nextPayload);
       setJoinUrl(resolvedUrl || '');
@@ -199,6 +287,15 @@ export default function SessionJoinScreen() {
         );
 
         await requestRuntimeResync(resolvedUrl || bound.joinUrl, nextPayload.session.id, playerKey);
+        traceFunctionReturn('loadSession', {
+          sessionId: nextPayload.session.id,
+          characterId: bound.characterId,
+          restoredBinding: true,
+        }, {
+          screen: 'sessionJoin',
+          source: 'join_flow',
+          durationMs: Date.now() - startedAt,
+        });
 
         router.replace(
           `/sheet?id=${bound.characterId}&sessionId=${nextPayload.session.id}&joinUrl=${encodeURIComponent(
@@ -213,6 +310,14 @@ export default function SessionJoinScreen() {
       }
 
       await loadEligibleCharacters(nextPayload);
+      traceFunctionReturn('loadSession', {
+        sessionId: nextPayload.session.id,
+        imported: true,
+      }, {
+        screen: 'sessionJoin',
+        source: 'join_flow',
+        durationMs: Date.now() - startedAt,
+      });
     } finally {
       setLoading(false);
     }
@@ -223,6 +328,12 @@ export default function SessionJoinScreen() {
       await loadSession(url, data);
     } catch (error) {
       console.error('[LAN] Falha ao entrar na sessão:', error);
+
+      traceError('LAN_JOIN', 'SESSION_JOIN_LOAD_ERROR', error, {
+        screen: 'sessionJoin',
+        source: 'runLoadSessionSafely',
+        args: { url, hasData: Boolean(data) },
+      });
 
       setPayload(null);
       setImported(false);
@@ -258,6 +369,14 @@ export default function SessionJoinScreen() {
       return;
     }
 
+    traceSqlite('SQLITE_READ_START', {
+      screen: 'sessionJoin',
+      source: 'loadEligibleCharacters',
+      functionName: 'loadEligibleCharacters',
+      table: 'characters/lan_local_character_bindings',
+      operation: 'LOAD_ELIGIBLE_CHARACTERS',
+      sessionId: nextPayload.session.id,
+    });
     const rows = await db.getAllAsync<CharacterRow>(
       `SELECT id, name, level, class, race
        FROM characters c
@@ -274,10 +393,24 @@ export default function SessionJoinScreen() {
     );
 
     setCharacters(rows);
+    traceSqlite('SQLITE_READ_DONE', {
+      screen: 'sessionJoin',
+      source: 'loadEligibleCharacters',
+      functionName: 'loadEligibleCharacters',
+      table: 'characters/lan_local_character_bindings',
+      operation: 'LOAD_ELIGIBLE_CHARACTERS',
+      sessionId: nextPayload.session.id,
+      result: { count: rows.length },
+    });
   };
 
   const handleChooseCharacter = async (characterId: number) => {
     if (!payload) return;
+    traceButton('sessionJoin', 'CHOOSE_CHARACTER_FOR_LAN', {
+      sessionId: payload.session.id,
+      characterId,
+      joinUrl,
+    });
 
     try {
       setLoading(true);
@@ -313,6 +446,14 @@ export default function SessionJoinScreen() {
 
       const playerKey = makeLanCharacterKey(payload.session.id, currentCharacter || character || { id: characterId });
       await requestRuntimeResync(joinUrl, payload.session.id, playerKey);
+      traceFunctionReturn('handleChooseCharacter', {
+        sessionId: payload.session.id,
+        characterId,
+        playerKey,
+      }, {
+        screen: 'sessionJoin',
+        source: 'join_flow',
+      });
 
       router.replace(
         `/sheet?id=${characterId}&sessionId=${payload.session.id}&joinUrl=${encodeURIComponent(
@@ -321,6 +462,11 @@ export default function SessionJoinScreen() {
       );
     } catch (error) {
       console.error('[LAN] Falha ao escolher personagem:', error);
+      traceError('LAN_JOIN', 'CHOOSE_CHARACTER_FOR_LAN_ERROR', error, {
+        screen: 'sessionJoin',
+        sessionId: payload.session.id,
+        characterId,
+      });
 
       Alert.alert(
         'Falha ao entrar',
@@ -333,6 +479,10 @@ export default function SessionJoinScreen() {
 
   const handleCreateCharacter = () => {
     if (!payload) return;
+    traceButton('sessionJoin', 'CREATE_CHARACTER_FOR_LAN', {
+      sessionId: payload.session.id,
+      joinUrl,
+    });
 
     router.replace({
       pathname: '/create' as any,
@@ -345,6 +495,9 @@ export default function SessionJoinScreen() {
   };
 
   const handleOpenScanner = async () => {
+    traceButton('sessionJoin', 'OPEN_QR_SCANNER', {
+      hasCameraPermission: Boolean(cameraPermission?.granted),
+    });
     if (!cameraPermission?.granted) {
       const nextPermission = await requestCameraPermission();
 
@@ -362,6 +515,9 @@ export default function SessionJoinScreen() {
     if (scanned) return;
 
     setScanned(true);
+    traceButton('sessionJoin', 'QR_SCANNED', {
+      payload: { length: result.data?.length || 0 },
+    });
 
     try {
       const parsed = parseJoinQrCode(result.data);
@@ -399,6 +555,9 @@ export default function SessionJoinScreen() {
   };
 
   const handleManualJoin = () => {
+    traceButton('sessionJoin', 'MANUAL_JOIN', {
+      args: { valueLength: manualUrl.trim().length },
+    });
     try {
       const raw = manualUrl.trim();
       const parsed = parseJoinQrCode(raw);
@@ -434,7 +593,12 @@ export default function SessionJoinScreen() {
           <Text style={styles.topBarSub}>{params.code ? `Código ${params.code}` : 'Jogador'}</Text>
         </View>
 
-        <View style={styles.topBarSpacer} />
+        <TouchableOpacity onPress={() => {
+          traceButton('sessionJoin', 'OPEN_DEBUG_TRACE');
+          router.push('/debug-trace' as any);
+        }}>
+          <Text style={{ color: appColors.warning, fontWeight: 'bold' }}>Trace</Text>
+        </TouchableOpacity>
       </View>
 
       {loading ? (

@@ -1,12 +1,24 @@
 import { SQLiteDatabase } from 'expo-sqlite';
 
+import { traceApp, traceSqlite } from '@/services/debug/appTrace';
 import { migrateDatabaseV2 } from './migration_dnd_v2';
 
 export async function initializeDatabase(db: SQLiteDatabase) {
+  const startedAt = Date.now();
+  traceApp('APP', 'DATABASE_INIT_START', {
+    source: 'initializeDatabase',
+    functionName: 'initializeDatabase',
+  });
   await db.execAsync(`PRAGMA journal_mode = WAL;`);
   await db.execAsync(`PRAGMA foreign_keys = ON;`);
 
   // 1. CRIAÇÃO DE TABELAS
+  traceSqlite('SQLITE_WRITE_START', {
+    source: 'initializeDatabase',
+    functionName: 'initializeDatabase',
+    table: 'base_schema',
+    operation: 'CREATE_TABLES',
+  });
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS items (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
@@ -209,10 +221,29 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
+  traceSqlite('SQLITE_WRITE_DONE', {
+    source: 'initializeDatabase',
+    functionName: 'initializeDatabase',
+    table: 'base_schema',
+    operation: 'CREATE_TABLES',
+  });
 
   await migrateLanTables(db);
 
+  traceSqlite('SQLITE_READ_START', {
+    source: 'initializeDatabase',
+    functionName: 'initializeDatabase',
+    table: 'items',
+    operation: 'COUNT_BASE_DATA',
+  });
   const checkDb = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM items');
+  traceSqlite('SQLITE_READ_DONE', {
+    source: 'initializeDatabase',
+    functionName: 'initializeDatabase',
+    table: 'items',
+    operation: 'COUNT_BASE_DATA',
+    result: checkDb,
+  });
   
   if (checkDb && checkDb.count === 0) {
     console.log('Banco de dados vazio. Populando dados base com integração de features e magia categorizada...');
@@ -775,10 +806,27 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   } else {
     console.log('Banco de dados já populado. Pulando inserção.');
   }
+  traceApp('APP', 'DATABASE_MIGRATION_START', {
+    source: 'initializeDatabase',
+    functionName: 'migrateDatabaseV2',
+  });
   await migrateDatabaseV2(db);
+  traceApp('APP', 'DATABASE_MIGRATION_DONE', {
+    source: 'initializeDatabase',
+    functionName: 'migrateDatabaseV2',
+  });
+  traceApp('APP', 'DATABASE_INIT_DONE', {
+    source: 'initializeDatabase',
+    functionName: 'initializeDatabase',
+    durationMs: Date.now() - startedAt,
+  });
 }
 
 async function migrateLanTables(db: SQLiteDatabase) {
+  traceApp('APP', 'DATABASE_MIGRATION_START', {
+    source: 'migrateLanTables',
+    functionName: 'migrateLanTables',
+  });
   const columns: [string, string, string][] = [
     ['lan_sessions', 'status', "TEXT NOT NULL DEFAULT 'active'"],
     ['lan_sessions', 'current_turn', 'INTEGER NOT NULL DEFAULT 1'],
@@ -825,4 +873,8 @@ async function migrateLanTables(db: SQLiteDatabase) {
   } catch {
     // Bancos muito antigos podem ainda estar criando a tabela na primeira abertura.
   }
+  traceApp('APP', 'DATABASE_MIGRATION_DONE', {
+    source: 'migrateLanTables',
+    functionName: 'migrateLanTables',
+  });
 }

@@ -1,3 +1,5 @@
+import { traceApp } from './debug/appTrace';
+
 export type SheetRuntimeMode = 'OFFLINE' | 'LAN_PLAYER' | 'LAN_HOST';
 
 export type SheetRuntimeModeInput = {
@@ -66,7 +68,40 @@ export function debugLanFlow(label: string, payload?: Record<string, unknown>) {
   // Log temporario para diagnostico LAN. Remova depois que o fluxo estiver estabilizado.
   try {
     console.log(`[LAN DEBUG] ${label}`, payload || {});
+    traceApp(inferLanDebugCategory(label), label, {
+      ...(payload || {}),
+      source: 'debugLanFlow',
+      tags: ['lan'],
+    });
   } catch {
     // noop
   }
+}
+
+function inferLanDebugCategory(label: string) {
+  const value = label.toUpperCase();
+  if (value.includes('SQLITE') && value.includes('DONE')) return 'SQLITE_WRITE_DONE';
+  if (value.includes('SQLITE')) return 'SQLITE_WRITE_START';
+  if (value.includes('SOCKET') && value.includes('RECEIVE')) return 'SOCKET_RECEIVE';
+  if (value.includes('SOCKET') && value.includes('DONE')) return 'SOCKET_SEND_DONE';
+  if (value.includes('SOCKET')) return 'SOCKET_SEND_START';
+  if (value.includes('EVENT_CREATED')) return 'EVENT_CREATED';
+  if (value.includes('EVENT_RECEIVED') || value.includes('PATCH_RECEIVED')) return 'EVENT_RECEIVED';
+  if (value.includes('EVENT_DECISION')) return 'EVENT_DECISION';
+  if (value.includes('IGNORE') || value.includes('SKIPPED')) return 'EVENT_IGNORED';
+  if (value.includes('APPLY') || value.includes('APPLIED')) return 'EVENT_APPLIED';
+  if (value.includes('SENT')) return 'SOCKET_SEND_DONE';
+  if (value.includes('PAYLOAD') && value.includes('IGNORE')) return 'PAYLOAD_IGNORED';
+  if (value.includes('PAYLOAD')) return 'PAYLOAD_APPLIED';
+  if (value.includes('SNAPSHOT') && value.includes('SKIP')) return 'SNAPSHOT_IGNORED';
+  if (value.includes('SNAPSHOT')) return 'SNAPSHOT_RECEIVED';
+  if (value.includes('PUBLIC_STATUS') && value.includes('IGNORE')) return 'PUBLIC_STATUS_IGNORED';
+  if (value.includes('PUBLIC_STATUS')) return 'PUBLIC_STATUS_RECEIVED';
+  if (value.includes('RESYNC') && value.includes('DONE')) return 'RESYNC_RECEIVED';
+  if (value.includes('RESYNC')) return 'RESYNC_REQUEST';
+  if (value.includes('POLL')) return 'POLLING_TICK';
+  if (value.includes('KICK')) return 'LAN_KICK';
+  if (value.includes('JOIN')) return 'LAN_JOIN';
+  if (value.includes('RUNTIME') || value.includes('STATE')) return 'STATE_CHANGE';
+  return 'APP';
 }

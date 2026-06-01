@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 
+import { traceApp } from '@/services/debug/appTrace';
 import type { LanSessionEvent, LanSessionPlayerState } from '@/services/lanSession';
 
 export type NumberPatch = Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
@@ -19,11 +20,13 @@ export type PendingEvent = {
 
 export type LanEventApplyDecision = {
   apply: boolean;
-  reason?: 'duplicate_id' | 'old_seq' | 'old_entity_revision' | 'missing_id';
+  reason?: 'duplicate_id' | 'old_seq' | 'old_entity_revision' | 'entity_revision_gap' | 'missing_id';
   entityKey?: string;
   currentRevision?: number;
   nextRevision?: number;
   lastAppliedSeq?: number;
+  expectedSeq?: number;
+  receivedSeq?: number;
 };
 
 export type LanRealtimeState = {
@@ -69,7 +72,15 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
   entityVersions: {},
   pendingEvents: {},
 
-  setConnection: (next) => set((state) => ({ ...state, ...next })),
+  setConnection: (next) => {
+    traceApp('STATE_CHANGE', 'LAN_REALTIME_CONNECTION_SET', {
+      source: 'lanRealtimeStore',
+      sessionId: next.sessionId,
+      playerKey: next.playerKey,
+      after: next,
+    });
+    set((state) => ({ ...state, ...next }));
+  },
 
   getEventApplyDecision: (event) => {
     const state = get();
@@ -79,7 +90,7 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
     const entityKey = getEntityKey(event);
     const current = state.entityVersions[entityKey];
     const nextRevision = getRevision(event);
-    const eventSeq = Number(event.seq || 0);
+    const eventSeq = Number(event.seq || event.serverSeq || 0);
 
     if (current && nextRevision > 0 && nextRevision <= current.revision) {
       return {
@@ -92,9 +103,18 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
       };
     }
 
-    // Seq global antigo sozinho nao deve bloquear um evento vivo se a revisao da entidade e nova.
-    // Isso evita perder patches validos quando um evento de outra entidade/sessao-wide chegou antes.
-    if (eventSeq > 0 && eventSeq <= state.lastAppliedSeq && (!nextRevision || !current || nextRevision <= current.revision)) {
+    if (current && nextRevision > 0 && nextRevision > current.revision + 1) {
+      return {
+        apply: false,
+        reason: 'entity_revision_gap',
+        entityKey,
+        currentRevision: current.revision,
+        nextRevision,
+        lastAppliedSeq: state.lastAppliedSeq,
+      };
+    }
+
+    if (current && eventSeq > 0 && eventSeq <= current.lastSeq) {
       return {
         apply: false,
         reason: 'old_seq',
@@ -120,20 +140,42 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
     const entityKey = getEntityKey(event);
     const current = state.entityVersions[entityKey];
     const nextRevision = Math.max(current?.revision || 0, getRevision(event));
-    const nextSeq = Math.max(state.lastAppliedSeq, Number(event.seq || 0));
+    const eventSeq = Number(event.seq || event.serverSeq || 0);
+    const nextAppliedSeq = Math.max(state.lastAppliedSeq, eventSeq);
+    const nextEntitySeq = Math.max(current?.lastSeq || 0, eventSeq);
 
-    return {
-      appliedEventIds: { ...state.appliedEventIds, [event.id]: true },
-      lastAppliedSeq: nextSeq,
+    const nextState: Pick<LanRealtimeState, 'appliedEventIds' | 'lastAppliedSeq' | 'entityVersions'> = {
+      appliedEventIds: { ...state.appliedEventIds, [event.id]: true as true },
+      lastAppliedSeq: nextAppliedSeq,
       entityVersions: {
         ...state.entityVersions,
         [entityKey]: {
           revision: nextRevision,
-          lastSeq: nextSeq,
+          lastSeq: nextEntitySeq,
           updatedAt: Date.now(),
         },
       },
     };
+    traceApp('EVENT_APPLIED', 'LAN_REALTIME_EVENT_MARKED_APPLIED', {
+      source: 'lanRealtimeStore',
+      sessionId: event.sessionId,
+      eventId: event.id,
+      eventType: event.type,
+      seq: event.seq,
+      serverSeq: event.serverSeq,
+      entityType: event.entityType,
+      entityId: event.entityId,
+      entityRevision: event.entityRevision,
+      before: {
+        lastAppliedSeq: state.lastAppliedSeq,
+        entity: current,
+      },
+      after: {
+        lastAppliedSeq: nextAppliedSeq,
+        entity: nextState.entityVersions[entityKey],
+      },
+    });
+    return nextState;
   }),
 
   applyOptimisticEvent: (event) => set((state) => ({
@@ -169,14 +211,20 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
     };
   }),
 
-  resetSession: (sessionId) => set({
-    sessionId,
-    connected: false,
-    lastAppliedSeq: 0,
-    appliedEventIds: {},
-    entityVersions: {},
-    pendingEvents: {},
-  }),
+  resetSession: (sessionId) => {
+    traceApp('STATE_CHANGE', 'LAN_REALTIME_SESSION_RESET', {
+      source: 'lanRealtimeStore',
+      sessionId,
+    });
+    set({
+      sessionId,
+      connected: false,
+      lastAppliedSeq: 0,
+      appliedEventIds: {},
+      entityVersions: {},
+      pendingEvents: {},
+    });
+  },
 }));
 
 export const applyNumberPatchToCharacter = <T extends Record<string, unknown>>(character: T, patch: NumberPatch): T => ({

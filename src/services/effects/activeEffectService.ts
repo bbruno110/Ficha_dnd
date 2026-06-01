@@ -1,5 +1,7 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 
+import { traceFunctionCall, traceFunctionReturn, traceSqlite, traceStateChange } from '../debug/appTrace';
+import { debugLanFlow } from '../lanRuntimeMode';
 import { getEffectByStatusKey, normalizeStatusKey } from './effectCatalogService';
 import { ensureEffectSchema } from './effectSchema';
 import type {
@@ -60,6 +62,11 @@ export async function applyEffectToPlayer(
   playerId: number,
   input: ApplyActiveEffectInput,
 ): Promise<ApplyEffectResult | null> {
+  const startedAt = Date.now();
+  traceFunctionCall('applyEffectToPlayer', { playerId, input }, {
+    source: 'activeEffectService',
+    playerId,
+  });
   await ensureEffectSchema(db);
   const player = await getPlayerRow(db, playerId);
   if (!player) return null;
@@ -94,6 +101,17 @@ export async function applyEffectToPlayer(
     status: normalizedStatusKey,
   };
 
+  traceSqlite('SQLITE_WRITE_START', {
+    source: 'activeEffectService',
+    functionName: 'applyEffectToPlayer',
+    table: 'lan_active_effects',
+    operation: 'INSERT_EFFECT',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    payload: finalSnapshot,
+  });
   await db.runAsync(
     `INSERT INTO lan_active_effects (
       id, session_id, target_key, status_key, source_type, source_id, source_name,
@@ -126,11 +144,22 @@ export async function applyEffectToPlayer(
       JSON.stringify(finalSnapshot),
     ],
   );
+  traceSqlite('SQLITE_WRITE_DONE', {
+    source: 'activeEffectService',
+    functionName: 'applyEffectToPlayer',
+    table: 'lan_active_effects',
+    operation: 'INSERT_EFFECT',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    entityId: id,
+  });
 
   const tempDelta = getTempHpDelta(finalSnapshot) - removed.reduce((sum, effect) => sum + getTempHpDelta(effect), 0);
   await rebuildPlayerEffectsCache(db, player, tempDelta);
 
-  return {
+  const result = {
     playerId,
     sessionId: player.session_id,
     targetKey: player.target_key,
@@ -144,6 +173,16 @@ export async function applyEffectToPlayer(
       remove: removed.map((effect) => effect.id),
     },
   };
+  traceFunctionReturn('applyEffectToPlayer', result, {
+    source: 'activeEffectService',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    entityId: id,
+    durationMs: Date.now() - startedAt,
+  });
+  return result;
 }
 
 export async function removeEffectFromPlayer(
@@ -151,6 +190,12 @@ export async function removeEffectFromPlayer(
   playerId: number,
   effectId: string,
 ): Promise<RemoveEffectResult | null> {
+  const startedAt = Date.now();
+  traceFunctionCall('removeEffectFromPlayer', { playerId, effectId }, {
+    source: 'activeEffectService',
+    playerId,
+    entityId: effectId,
+  });
   await ensureEffectSchema(db);
   const player = await getPlayerRow(db, playerId);
   if (!player) return null;
@@ -160,13 +205,25 @@ export async function removeEffectFromPlayer(
   if (!row || String(row.session_id) !== player.session_id || String(row.target_key) !== player.target_key) return null;
   const removed = mapActiveEffectRow(row);
 
+  traceSqlite('SQLITE_WRITE_START', {
+    source: 'activeEffectService',
+    functionName: 'removeEffectFromPlayer',
+    table: 'lan_active_effects',
+    operation: 'DEACTIVATE_EFFECT',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    entityId: effectId,
+    before: removed,
+  });
   await db.runAsync(
     `UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [effectId],
   );
   await rebuildPlayerEffectsCache(db, player, -getTempHpDelta(removed));
 
-  return {
+  const result = {
     playerId,
     sessionId: player.session_id,
     targetKey: player.target_key,
@@ -179,6 +236,16 @@ export async function removeEffectFromPlayer(
       remove: [removed.id],
     },
   };
+  traceFunctionReturn('removeEffectFromPlayer', result, {
+    source: 'activeEffectService',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    entityId: effectId,
+    durationMs: Date.now() - startedAt,
+  });
+  return result;
 }
 
 export async function reduceEffectDuration(
@@ -264,6 +331,11 @@ export async function tickTurnEffects(
   sessionId: string,
   unit: 'turn' | 'minute' | 'hour' | 'shortRest' | 'longRest',
 ): Promise<TickEffectsResult> {
+  const startedAt = Date.now();
+  traceFunctionCall('tickTurnEffects', { sessionId, unit }, {
+    source: 'activeEffectService',
+    sessionId,
+  });
   await ensureEffectSchema(db);
   const players = await db.getAllAsync<PlayerRow>(
     `SELECT *,
@@ -336,6 +408,17 @@ export async function tickTurnEffects(
     await rebuildPlayerEffectsCache(db, player, tempDelta);
   }
 
+  traceFunctionReturn('tickTurnEffects', {
+    patchCount: result.patches.length,
+    expiredCount: result.expired.length,
+    pendingSaveCount: result.pendingSaves.length,
+    restoredCount: result.restored.length,
+  }, {
+    source: 'activeEffectService',
+    sessionId,
+    args: { unit },
+    durationMs: Date.now() - startedAt,
+  });
   return result;
 }
 
@@ -349,12 +432,28 @@ export async function getActiveEffectsByPlayer(db: SQLiteDatabase, playerId: num
 }
 
 export async function rebuildPlayerEffectsCache(db: SQLiteDatabase, player: PlayerRow, tempHpDelta = 0) {
+  const before = {
+    tempHp: player.temp_hp,
+    effectsJson: player.effects_json,
+  };
   const rows = await getActiveRowsForTarget(db, player.session_id, player.target_key);
   const effects = rows
     .map(mapActiveEffectRow)
     .sort((a, b) => (b.visualPriority || 0) - (a.visualPriority || 0) || a.name.localeCompare(b.name));
   const nextTempHp = Math.max(0, toNumber(player.temp_hp) + tempHpDelta);
 
+  traceSqlite('SQLITE_WRITE_START', {
+    source: 'activeEffectService',
+    functionName: 'rebuildPlayerEffectsCache',
+    table: 'lan_session_players/characters',
+    operation: 'REBUILD_EFFECTS_CACHE',
+    sessionId: player.session_id,
+    playerId: player.id,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    before,
+    after: { tempHp: nextTempHp, effectCount: effects.length },
+  });
   await db.runAsync(
     `UPDATE lan_session_players
      SET effects_json = ?, temp_hp = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
@@ -374,6 +473,17 @@ export async function rebuildPlayerEffectsCache(db: SQLiteDatabase, player: Play
 
   player.temp_hp = nextTempHp;
   player.effects_json = JSON.stringify(effects);
+  traceStateChange('STATE_CHANGE', 'PLAYER_EFFECTS_CACHE_REBUILT', before, {
+    tempHp: nextTempHp,
+    effectsJson: player.effects_json,
+    effectCount: effects.length,
+  }, {
+    source: 'activeEffectService',
+    sessionId: player.session_id,
+    playerId: player.id,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+  });
   return effects;
 }
 
@@ -385,9 +495,25 @@ async function maybeCreateRepeatSave(
   unit: 'turn' | 'minute' | 'hour' | 'shortRest' | 'longRest',
 ) {
   if (unit !== 'turn') return null;
-  if (snapshot.removableBySave !== true && !snapshot.saveAbility) return null;
   const repeatSave = String(snapshot.repeatSave || '').toLowerCase();
-  if (repeatSave !== 'start_of_turn' && repeatSave !== 'end_of_turn') return null;
+  const hasRepeatSave = repeatSave === 'start_of_turn' || repeatSave === 'end_of_turn';
+  const hasSaveAbility = Boolean(String(snapshot.saveAbility || '').trim());
+  const hasSaveDc = Number(snapshot.saveDc || 0) > 0;
+  const canRequestSave = snapshot.removableBySave === true || hasRepeatSave;
+
+  if (!canRequestSave || !hasSaveAbility || !hasSaveDc || !hasRepeatSave) {
+    debugLanFlow('MASTER_PENDING_SAVE_SKIPPED_NO_SAVE_CONFIG', {
+      sessionId,
+      targetKey,
+      effectId: snapshot.id,
+      effectName: snapshot.name,
+      removableBySave: snapshot.removableBySave,
+      repeatSave: snapshot.repeatSave,
+      saveAbility: snapshot.saveAbility,
+      saveDc: snapshot.saveDc,
+    });
+    return null;
+  }
 
   const pending: LanPendingSave = {
     id: `save_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -397,9 +523,9 @@ async function maybeCreateRepeatSave(
     sourceId: snapshot.id,
     sourceName: snapshot.name,
     effectPayload: snapshot as unknown as Record<string, unknown>,
-    ability: String(snapshot.saveAbility || 'CON'),
+    ability: String(snapshot.saveAbility),
     dc: snapshot.saveDc ?? null,
-    dcMode: snapshot.saveDc ? 'fixed' : 'manual_master',
+    dcMode: 'fixed',
     status: 'pending',
     result: {},
   };

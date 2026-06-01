@@ -8,6 +8,7 @@ import React, { useCallback, useState } from 'react';
 import { Alert, FlatList, Text, TouchableOpacity, View } from 'react-native';
 import CharacterCard, { Character } from '../components/CharacterCard';
 
+import { traceButton, traceError, traceScreen, traceSqlite } from '@/services/debug/appTrace';
 import { prepareLanSessionStorage, unlinkCharacterFromLanSession } from '@/services/lanSession';
 import { appColors, appGradients, homeStyles as styles } from '@/styles/globalStyles';
 
@@ -19,6 +20,13 @@ export default function HomeScreen() {
   const appVersion = Constants.expoConfig?.version || '1.0.0';
 
   const loadCharacters = async () => {
+    traceSqlite('SQLITE_READ_START', {
+      screen: 'home',
+      source: 'loadCharacters',
+      functionName: 'loadCharacters',
+      table: 'characters/lan_sessions/lan_local_character_bindings',
+      operation: 'HOME_CHARACTERS_LOAD',
+    });
     try {
       await prepareLanSessionStorage(db);
       const result = await db.getAllAsync<Character>(
@@ -34,18 +42,33 @@ export default function HomeScreen() {
          ORDER BY c.created_at DESC`
       );
       setCharactersList(result);
+      traceSqlite('SQLITE_READ_DONE', {
+        screen: 'home',
+        source: 'loadCharacters',
+        functionName: 'loadCharacters',
+        table: 'characters/lan_sessions/lan_local_character_bindings',
+        operation: 'HOME_CHARACTERS_LOAD',
+        result: { count: result.length },
+      });
     } catch (error) {
       console.error("Erro ao carregar: ", error);
+      traceError('SQLITE_READ_DONE', 'HOME_CHARACTERS_LOAD_ERROR', error, {
+        screen: 'home',
+        source: 'loadCharacters',
+        functionName: 'loadCharacters',
+      });
     }
   };
 
   useFocusEffect(
     useCallback(() => {
+      traceScreen('home', 'HOME_SCREEN_FOCUS');
       loadCharacters();
     }, [db])
   );
 
   const handleDeleteCharacter = async (id: number) => {
+    traceButton('home', 'DELETE_CHARACTER', { characterId: id });
     try {
       await db.runAsync(`DELETE FROM characters WHERE id = ?`, [id]);
       loadCharacters();
@@ -55,6 +78,7 @@ export default function HomeScreen() {
   };
 
   const handleEditCharacter = (id: number) => {
+    traceButton('home', 'EDIT_CHARACTER', { characterId: id });
     router.push({
       pathname: '/edit' as any,
       params: { id: id }
@@ -62,6 +86,7 @@ export default function HomeScreen() {
   };
 
   const handleUnlinkSession = async (id: number) => {
+    traceButton('home', 'UNLINK_SESSION', { characterId: id });
     try {
       await unlinkCharacterFromLanSession(db, id);
       await loadCharacters();
@@ -71,6 +96,12 @@ export default function HomeScreen() {
   };
 
   const handleOpenSheet = (character: Character) => {
+    traceButton('home', 'OPEN_CHARACTER_SHEET', {
+      characterId: character.id,
+      characterName: character.name,
+      sessionId: character.sessionId,
+      source: character.sessionId ? 'lan_binding' : 'offline',
+    });
     if (character.sessionId) {
       router.push(`/sheet?id=${character.id}&sessionId=${character.sessionId}&joinUrl=${encodeURIComponent(character.joinUrl || '')}` as any);
       return;
@@ -109,17 +140,38 @@ export default function HomeScreen() {
       )}
 
       <View style={styles.footer}>
-        <TouchableOpacity style={styles.advancedButton} activeOpacity={0.8} onPress={() => router.push('/advanced')}>
+        <TouchableOpacity style={styles.advancedButton} activeOpacity={0.8} onPress={() => {
+          traceButton('home', 'OPEN_MASTER_TOOLS');
+          router.push('/advanced');
+        }}>
           <Ionicons name="construct-outline" size={20} color={appColors.primary} style={styles.buttonIconGap} />
           <Text style={styles.advancedButtonText}>FERRAMENTAS DO MESTRE</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => router.push('/lan-session' as any)}>
+        <TouchableOpacity
+          style={styles.advancedButton}
+          activeOpacity={0.8}
+          onPress={() => {
+            traceButton('home', 'OPEN_DEBUG_TRACE');
+            router.push('/debug-trace' as any);
+          }}
+        >
+          <Ionicons name="bug-outline" size={20} color={appColors.warning} style={styles.buttonIconGap} />
+          <Text style={styles.advancedButtonText}>TRACE</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => {
+          traceButton('home', 'OPEN_LAN_SESSION');
+          router.push('/lan-session' as any);
+        }}>
           <Ionicons name="wifi-outline" size={20} color={appColors.success} style={styles.buttonIconGap} />
           <Text style={styles.lanButtonText}>SESSAO LAN</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => router.push('/create')}>
+        <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => {
+          traceButton('home', 'CREATE_CHARACTER');
+          router.push('/create');
+        }}>
           <Text style={styles.createButtonIcon}>+</Text>
           <Text style={styles.createButtonText}>NOVO PERSONAGEM</Text>
         </TouchableOpacity>

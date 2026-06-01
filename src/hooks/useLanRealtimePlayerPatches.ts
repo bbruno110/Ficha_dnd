@@ -9,6 +9,12 @@ import {
   type LanSessionEvent,
   type LanSessionPlayerState,
 } from '@/services/lanSession';
+import { traceApp, traceFunctionCall, traceFunctionReturn } from '@/services/debug/appTrace';
+import {
+  isLanEventTargetedToPlayer,
+  isLanLiveCommittedEvent,
+  shouldRequestLanResync,
+} from '@/services/lan/lanClientEngine';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
 import { useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 
@@ -27,33 +33,6 @@ type UseLanRealtimePlayerPatchesParams = {
   onEvent?: (event: LanSessionEvent) => void | Promise<void>;
   onKicked?: (event: LanSessionEvent) => void | Promise<void>;
 };
-
-const LIVE_EVENT_TYPES = new Set<LanSessionEvent['type']>([
-  'player_patch',
-  'effect_patch',
-  'inventory_patch',
-  'session_patch',
-  'player_kicked',
-  'resource_review',
-  'send_item',
-  'trade_offer',
-  'trade_accept',
-  'trade_decline',
-  'spell_hp',
-  'spell_effect',
-  'effect_expired',
-  'pending_save_patch',
-  'public_status',
-]);
-
-function isSessionWideEvent(event: LanSessionEvent) {
-  return event.toKey === 'session' ||
-    event.toKey === 'party' ||
-    event.toKey === 'all' ||
-    event.type === 'session_patch' ||
-    event.type === 'timeline_event' ||
-    event.type === 'public_status';
-}
 
 export function useLanRealtimePlayerPatches({
   joinUrl,
@@ -107,6 +86,7 @@ export function useLanRealtimePlayerPatches({
   useEffect(() => {
     if (!enabled || !joinUrl || !sessionId) return;
     let disposed = false;
+    const getEventSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
 
     const isForMe = (event: LanSessionEvent) => {
       if (event.sessionId !== sessionId) {
@@ -118,7 +98,7 @@ export function useLanRealtimePlayerPatches({
         });
         return false;
       }
-      if (!LIVE_EVENT_TYPES.has(event.type)) return false;
+      if (!isLanLiveCommittedEvent(event)) return false;
       if (event.toKey === 'master') {
         debugLanFlow('PLAYER_IGNORE_EVENT_TO_MASTER', {
           eventId: event.id,
@@ -128,9 +108,8 @@ export function useLanRealtimePlayerPatches({
         });
         return false;
       }
-      if (isSessionWideEvent(event)) return true;
-      if (selfKey && event.toKey === selfKey) return true;
-      if (characterName && event.toName === characterName) return true;
+
+      if (isLanEventTargetedToPlayer(event, { sessionId, selfKey, characterName })) return true;
 
       debugLanFlow('PLAYER_IGNORE_EVENT_WRONG_TARGET', {
         eventId: event.id,
@@ -166,25 +145,76 @@ export function useLanRealtimePlayerPatches({
       }
     };
 
-    const requestResyncIfNeeded = async () => {
+    const requestResyncIfNeeded = async (reason = 'manual') => {
       const now = Date.now();
       if (now - lastResyncRequestAtRef.current < 2500) return;
       lastResyncRequestAtRef.current = now;
 
       try {
+        const runtime = useLanRealtimeStore.getState();
+        const lastAppliedSeq = reason === 'entity_revision_gap' ? 0 : runtime.lastAppliedSeq;
+        debugLanFlow('PLAYER_SEQ_GAP_RESYNC_START', {
+          reason,
+          sessionId,
+          selfKey,
+          lastAppliedSeq,
+        });
         await requestLanSessionResync(joinUrl, {
           sessionId,
           playerKey: selfKey,
-          lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+          lastAppliedSeq,
         });
+        debugLanFlow('PLAYER_SEQ_GAP_RESYNC_DONE', {
+          reason,
+          sessionId,
+          selfKey,
+        });
+        setTimeout(() => {
+          if (!disposed) void applyEvents();
+        }, 300);
       } catch (error) {
         console.warn('[LAN] Não foi possível solicitar resync ao host:', error);
       }
     };
 
     const applyOneEvent = async (event: LanSessionEvent) => {
+      const startedAt = Date.now();
+      traceFunctionCall('useLanRealtimePlayerPatches.applyOneEvent', { event }, {
+        screen: 'sheet',
+        source: 'useLanRealtimePlayerPatches',
+        sessionId,
+        playerKey: selfKey,
+        characterName,
+        eventId: event.id,
+        eventType: event.type,
+        seq: event.seq,
+        serverSeq: event.serverSeq,
+        entityType: event.entityType,
+        entityId: event.entityId,
+        entityRevision: event.entityRevision,
+        fromKey: event.fromKey,
+        toKey: event.toKey,
+      });
       const runtime = useLanRealtimeStore.getState();
       const decision = runtime.getEventApplyDecision(event);
+
+      debugLanFlow('PLAYER_EVENT_DECISION', {
+        eventId: event.id,
+        type: event.type,
+        seq: event.seq,
+        serverSeq: event.serverSeq,
+        toKey: event.toKey,
+        toName: event.toName,
+        selfKey,
+        characterName,
+        apply: decision.apply,
+        reason: decision.reason,
+        entityType: event.entityType,
+        entityId: event.entityId,
+        entityRevision: event.entityRevision,
+        currentRevision: decision.currentRevision,
+        lastAppliedSeq: decision.lastAppliedSeq,
+      });
 
       if (!decision.apply) {
         debugLanFlow('PLAYER_IGNORE_EVENT_DECISION', {
@@ -197,6 +227,25 @@ export function useLanRealtimePlayerPatches({
           entityRevision: event.entityRevision,
           currentRevision: decision.currentRevision,
           lastAppliedSeq: decision.lastAppliedSeq,
+          expectedSeq: decision.expectedSeq,
+          receivedSeq: decision.receivedSeq,
+        });
+        if (shouldRequestLanResync(decision)) {
+          await requestResyncIfNeeded(decision.reason);
+        }
+        traceFunctionReturn('useLanRealtimePlayerPatches.applyOneEvent', {
+          applied: false,
+          decision,
+        }, {
+          screen: 'sheet',
+          source: 'useLanRealtimePlayerPatches',
+          sessionId,
+          playerKey: selfKey,
+          eventId: event.id,
+          eventType: event.type,
+          decision,
+          reason: decision.reason,
+          durationMs: Date.now() - startedAt,
         });
         return;
       }
@@ -213,20 +262,72 @@ export function useLanRealtimePlayerPatches({
         });
 
         if (event.type === 'player_patch' && event.numberPatch) {
+          debugLanFlow('PLAYER_PATCH_RECEIVED', {
+            eventId: event.id,
+            seq: event.seq,
+            serverSeq: event.serverSeq,
+            entityRevision: event.entityRevision,
+            toKey: event.toKey,
+            toName: event.toName,
+            patch: event.numberPatch,
+          });
+          debugLanFlow('PLAYER_NUMBER_PATCH_APPLY_START', {
+            eventId: event.id,
+            seq: event.seq,
+            toKey: event.toKey,
+            selfKey,
+            patch: event.numberPatch,
+          });
           await onNumberPatchRef.current(event.numberPatch, event);
+          debugLanFlow('PLAYER_NUMBER_PATCH_APPLY_DONE', {
+            eventId: event.id,
+            seq: event.seq,
+            toKey: event.toKey,
+            selfKey,
+          });
         } else if (event.type === 'effect_patch' && event.effectPatch) {
+          debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_START', {
+            eventId: event.id,
+            seq: event.seq,
+            toKey: event.toKey,
+            selfKey,
+            addCount: event.effectPatch.add?.length || 0,
+            updateCount: event.effectPatch.update?.length || 0,
+            removeCount: event.effectPatch.remove?.length || 0,
+          });
           await onEffectPatchRef.current?.(event.effectPatch, event);
+          debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_DONE', {
+            eventId: event.id,
+            seq: event.seq,
+            toKey: event.toKey,
+            selfKey,
+          });
         } else if (event.type === 'inventory_patch' && event.inventoryPatch) {
           await onInventoryPatchRef.current?.(event.inventoryPatch, event);
         } else if (event.type === 'session_patch') {
           await onSessionPatchRef.current?.(event);
         } else if (event.type === 'player_kicked') {
+          debugLanFlow('PLAYER_KICKED_RECEIVED', {
+            eventId: event.id,
+            seq: event.seq,
+            serverSeq: event.serverSeq,
+            toKey: event.toKey,
+            toName: event.toName,
+            selfKey,
+            characterName,
+          });
           await onKickedRef.current?.(event);
         } else {
           await onEventRef.current?.(event);
         }
 
         useLanRealtimeStore.getState().markEventApplied(event);
+        debugLanFlow('PLAYER_RUNTIME_PATCH_APPLIED', {
+          eventId: event.id,
+          type: event.type,
+          seq: event.seq,
+          entityRevision: event.entityRevision,
+        });
         debugLanFlow('PLAYER_APPLY_EVENT_OK', {
           eventId: event.id,
           type: event.type,
@@ -235,6 +336,21 @@ export function useLanRealtimePlayerPatches({
           lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
         });
         await ackEvent(event);
+        traceFunctionReturn('useLanRealtimePlayerPatches.applyOneEvent', {
+          applied: true,
+          eventId: event.id,
+          type: event.type,
+        }, {
+          screen: 'sheet',
+          source: 'useLanRealtimePlayerPatches',
+          sessionId,
+          playerKey: selfKey,
+          eventId: event.id,
+          eventType: event.type,
+          seq: event.seq,
+          entityRevision: event.entityRevision,
+          durationMs: Date.now() - startedAt,
+        });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         useLanRealtimeStore.getState().nackEvent(event.clientMsgId || event.id, reason);
@@ -252,20 +368,58 @@ export function useLanRealtimePlayerPatches({
           entityRevision: event.entityRevision,
           error,
         });
-        await requestResyncIfNeeded();
+        await requestResyncIfNeeded('apply_error');
       }
     };
 
     const applyEvents = async () => {
       if (applyRunningRef.current) return;
       applyRunningRef.current = true;
+      const startedAt = Date.now();
+      traceFunctionCall('useLanRealtimePlayerPatches.applyEvents', {
+        joinUrl,
+        sessionId,
+        selfKey,
+        characterName,
+      }, {
+        screen: 'sheet',
+        source: 'useLanRealtimePlayerPatches',
+        sessionId,
+        playerKey: selfKey,
+        characterName,
+      });
 
       try {
         const events = await fetchLanSessionEvents(joinUrl, sessionId);
         const ordered = [...events]
+          .map((event) => {
+            debugLanFlow('PLAYER_EVENT_RECEIVED', {
+              eventId: event.id,
+              type: event.type,
+              seq: event.seq,
+              serverSeq: event.serverSeq,
+              toKey: event.toKey,
+              toName: event.toName,
+              fromKey: event.fromKey,
+              selfKey,
+              characterName,
+              entityType: event.entityType,
+              entityId: event.entityId,
+              entityRevision: event.entityRevision,
+            });
+            debugLanFlow('PLAYER_EVENT_RECEIVED_IMMEDIATE', {
+              eventId: event.id,
+              type: event.type,
+              seq: event.seq,
+              serverSeq: event.serverSeq,
+              toKey: event.toKey,
+              selfKey,
+            });
+            return event;
+          })
           .filter(isForMe)
           .sort((a, b) => {
-            const seqDiff = (Number(a.seq || 0) - Number(b.seq || 0));
+            const seqDiff = getEventSeq(a) - getEventSeq(b);
             if (seqDiff !== 0) return seqDiff;
             return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
           });
@@ -274,6 +428,16 @@ export function useLanRealtimePlayerPatches({
           if (disposed) return;
           await applyOneEvent(event);
         }
+        traceFunctionReturn('useLanRealtimePlayerPatches.applyEvents', {
+          fetchedCount: events.length,
+          targetedCount: ordered.length,
+        }, {
+          screen: 'sheet',
+          source: 'useLanRealtimePlayerPatches',
+          sessionId,
+          playerKey: selfKey,
+          durationMs: Date.now() - startedAt,
+        });
       } catch (error) {
         useLanRealtimeStore.getState().setConnection({
           sessionId,
@@ -281,7 +445,7 @@ export function useLanRealtimePlayerPatches({
           connected: false,
         });
         console.warn('[LAN] Não foi possível buscar eventos em tempo real:', error);
-        await requestResyncIfNeeded();
+        await requestResyncIfNeeded('fetch_error');
       } finally {
         applyRunningRef.current = false;
       }
@@ -290,12 +454,24 @@ export function useLanRealtimePlayerPatches({
     void applyEvents();
 
     const timer = setInterval(() => {
+      traceApp('POLLING_TICK', 'PLAYER_EVENT_POLLING_TICK', {
+        screen: 'sheet',
+        source: 'useLanRealtimePlayerPatches',
+        sessionId,
+        playerKey: selfKey,
+      });
       void applyEvents();
-    }, 1000);
+    }, 750);
 
     const unsubscribe = subscribeLanSessionClientUpdates(joinUrl, () => {
       // O transporte agora trata payload_update como cache estrutural.
       // Aqui buscamos/aplicamos apenas eventos vivos para evitar rollback por snapshot antigo.
+      traceApp('SUBSCRIPTION_UPDATE', 'PLAYER_CLIENT_SUBSCRIPTION_UPDATE', {
+        screen: 'sheet',
+        source: 'useLanRealtimePlayerPatches',
+        sessionId,
+        playerKey: selfKey,
+      });
       void applyEvents();
     });
 

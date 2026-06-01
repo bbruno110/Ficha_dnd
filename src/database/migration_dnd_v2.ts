@@ -1,6 +1,7 @@
 import { SQLiteDatabase } from 'expo-sqlite';
 
 import { ensureEffectSchema } from '../services/effects/effectSchema';
+import { seedDefaultXpProgression } from '../services/xpProgressionService';
 
 type ColumnDefinition = [table: string, column: string, definition: string];
 
@@ -47,6 +48,7 @@ async function addColumnsIfMissing(db: SQLiteDatabase, columns: ColumnDefinition
 
 export async function migrateDatabaseV2(db: SQLiteDatabase) {
   await db.execAsync(`PRAGMA foreign_keys = ON;`);
+  await seedDefaultXpProgression(db);
 
   await addColumnsIfMissing(db, [
     ['races', 'effect_json', "TEXT NOT NULL DEFAULT '[]'"],
