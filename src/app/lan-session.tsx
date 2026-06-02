@@ -8,6 +8,7 @@ import {
   traceFunctionCall,
   traceFunctionReturn,
   traceScreen,
+  traceSocket,
   traceSqlite,
   traceStateChange,
 } from '@/services/debug/appTrace';
@@ -26,7 +27,6 @@ import {
   buildLanSessionPayload,
   consumeLanForegroundStopRequest,
   deleteLanSession,
-  endLanSession,
   ensurePendingRemotePlayerFromEvent,
   formatElapsedTime,
   getBoundLanCharacter,
@@ -44,7 +44,6 @@ import {
   makeSessionId,
   pauseLanSession,
   rebuildLanSessionCatalog,
-  refreshLanSessionPayload,
   rememberAndSendLanSessionEvent,
   rememberLanSessionEvent,
   removeLanPlayerEffect,
@@ -69,6 +68,7 @@ import {
   type LanEffectTarget,
   type LanEffectUnit,
   type LanSessionEvent,
+  type LanSessionHostUpdate,
   type LanSessionPayload,
   type LanSessionPlayerState,
   type LanSessionState,
@@ -76,6 +76,7 @@ import {
   type LanTradeItem,
 } from '@/services/lanSession';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
+import { commitHostPlayerNumberDelta } from '@/services/lan/lanHostEngine';
 import {
   applyHostEffectPatchRuntime,
   applyHostNumberDeltaRuntime,
@@ -274,6 +275,15 @@ export default function LanSessionScreen() {
       decision: 'merge_preserving_live_fields',
     });
     const merged = mergeSessionStatePreservingLiveFields(sessionStateRef.current, incomingState, sessionId, source);
+    if (merged === sessionStateRef.current) {
+      traceStateChange('STATE_CHANGE', 'MASTER_EXTERNAL_STATE_MERGE_NOOP', incomingState, merged, {
+        screen: 'lan-session',
+        source,
+        sessionId,
+        decision: 'no_real_change',
+      });
+      return merged;
+    }
     sessionStateRef.current = merged;
     setSessionState(merged);
     traceStateChange('STATE_CHANGE', 'MASTER_EXTERNAL_STATE_MERGE_DONE', incomingState, merged, {
@@ -303,7 +313,18 @@ export default function LanSessionScreen() {
     });
     const mergedState = applyExternalSessionState(nextPayload.session.id, nextPayload.state || null, source);
     const mergedPayload = mergedState ? { ...nextPayload, state: mergedState } : nextPayload;
-    setPayload(mergedPayload);
+    setPayload((current) => {
+      const currentFirstEventId = current?.events?.[0]?.id || '';
+      const nextFirstEventId = mergedPayload.events?.[0]?.id || '';
+      const sameStructuralPayload = Boolean(
+        current &&
+        current.session.id === mergedPayload.session.id &&
+        current.state === mergedPayload.state &&
+        (current.events?.length || 0) === (mergedPayload.events?.length || 0) &&
+        currentFirstEventId === nextFirstEventId
+      );
+      return sameStructuralPayload ? current : mergedPayload;
+    });
     traceApp(source === 'snapshot' ? 'SNAPSHOT_APPLIED' : 'PAYLOAD_APPLIED', 'MASTER_EXTERNAL_PAYLOAD_APPLIED', {
       screen: 'lan-session',
       source,
@@ -581,9 +602,7 @@ export default function LanSessionScreen() {
   if (!payload?.session?.id) return;
 
   try {
-    const nextPayload = await refreshLanSessionPayload(db, payload.session.id);
-    if (!nextPayload) return;
-
+    const nextPayload = payload;
     const nextJoinUrl = await startLanServer(nextPayload);
 
     await saveLanSession(db, nextPayload, nextJoinUrl, { isMaster: true });
@@ -592,12 +611,11 @@ export default function LanSessionScreen() {
     setJoinUrl(nextJoinUrl);
     setJoinLink(buildJoinDeepLink(nextJoinUrl, nextPayload));
 
-    await reloadSessionState(nextPayload.session.id, false);
     await loadSavedSessions();
   } catch (error) {
     console.warn('[LAN] Não foi possível retomar o host LAN automaticamente:', error);
   }
-}, [applyExternalPayload, buildJoinDeepLink, db, loadSavedSessions, payload?.session?.id, refreshLanSessionPayload, reloadSessionState, saveLanSession, startLanServer]);
+}, [applyExternalPayload, buildJoinDeepLink, db, loadSavedSessions, payload, saveLanSession, startLanServer]);
 
 useLanAppLifecycle({
   enabled: Boolean(payload?.session?.id && joinUrl),
@@ -626,13 +644,18 @@ useLanAppLifecycle({
       });
       const joinedPlayers = await getMasterJoinedPlayers(joinUrl);
       let changedPlayers = false;
+      let shouldReloadSessionState = false;
 
       for (const entry of joinedPlayers) {
         const entrySessionId = String(entry?.sessionId || '');
         if (entrySessionId === activeSessionId) {
           try {
-            const playerId = await upsertLanSessionPlayerFromNetwork(db, entry);
-            if (playerId) changedPlayers = true;
+            const upsertResult = await upsertLanSessionPlayerFromNetwork(db, entry);
+            const upsertChanged = Boolean(
+              upsertResult &&
+              (typeof upsertResult !== 'object' || (upsertResult as any).changed !== false)
+            );
+            if (upsertChanged) changedPlayers = true;
           } catch (error) {
             const entryCharacter =
               entry?.character && typeof entry.character === 'object'
@@ -660,6 +683,7 @@ useLanAppLifecycle({
 
       if (changedPlayers) {
         const syncedPayload = await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+        shouldReloadSessionState = true;
 
         if (syncedPayload) {
           applyExternalPayload(syncedPayload, 'sqlite');
@@ -689,16 +713,37 @@ useLanAppLifecycle({
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
             if (fresh) {
               await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+              shouldReloadSessionState = true;
             }
             continue;
           }
 
           if (event.type === 'player_joined') {
+            const alreadyPresent = currentState.players.some((entry) => (
+              (event.fromKey && entry.remoteKey === event.fromKey) ||
+              (event.fromName && entry.characterName === event.fromName)
+            ));
+            if (alreadyPresent) {
+              traceApp('EVENT_IGNORED', 'MASTER_PLAYER_JOINED_DUPLICATE_NOOP', {
+                screen: 'lan-session',
+                source: 'pollJoinedPlayers',
+                sessionId: activeSessionId,
+                eventId: event.id,
+                eventType: event.type,
+                fromKey: event.fromKey,
+                playerName: event.fromName,
+                decision: 'player_already_present',
+              });
+              continue;
+            }
             const fresh = await rememberLanSessionEvent(db, event);
             // O evento de entrada também precisa criar um jogador pendente,
             // porque em algumas redes o evento chega antes do roster do join.
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
-            if (fresh) await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+            if (fresh) {
+              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+              shouldReloadSessionState = true;
+            }
             continue;
           }
 
@@ -735,6 +780,7 @@ useLanAppLifecycle({
             await updateLanPlayerNumbers(db, targetPlayer.id, {
               hpCurrent: Math.max(0, Math.min(targetPlayer.hpMax, targetPlayer.hpCurrent + event.spellEffect.amount)),
             });
+            shouldReloadSessionState = true;
           }
 
           if (event.type === 'spell_effect' && event.spellEffect) {
@@ -757,17 +803,22 @@ useLanAppLifecycle({
               secondaryColor: event.spellEffect.secondaryColor,
               source: event.fromName,
             });
+            shouldReloadSessionState = true;
           }
 
           if (event.type === 'send_item' || event.type === 'trade_accept') {
             const fresh = await rememberLanSessionEvent(db, event);
             if (!fresh) continue;
             await applyLanInventoryTransferEvent(db, event);
+            shouldReloadSessionState = true;
           }
 
           if (event.type === 'trade_offer' || event.type === 'trade_decline') {
             const fresh = await rememberLanSessionEvent(db, event);
-            if (fresh) await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+            if (fresh) {
+              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+              shouldReloadSessionState = true;
+            }
           }
 
           if (event.type === 'player_patch' && event.numberPatch) {
@@ -816,6 +867,7 @@ useLanAppLifecycle({
               }
 
               await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+              shouldReloadSessionState = true;
             }
           }
 
@@ -830,6 +882,7 @@ useLanAppLifecycle({
             if (applied) {
               await rememberLanSessionEvent(db, event);
               await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+              shouldReloadSessionState = true;
             }
           }
 
@@ -869,27 +922,75 @@ useLanAppLifecycle({
             }
 
             await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+            shouldReloadSessionState = true;
           }
         }
       }
 
-      await reloadSessionState(activeSessionId, false);
-      debugLanFlow('MASTER_PLAYER_STATE_RELOADED', {
-        source: 'poll_or_realtime',
-        sessionId: activeSessionId,
-      });
+      if (shouldReloadSessionState) {
+        await reloadSessionState(activeSessionId, false);
+        debugLanFlow('MASTER_PLAYER_STATE_RELOADED', {
+          source: 'poll_or_realtime',
+          sessionId: activeSessionId,
+        });
+      } else {
+        traceApp('POLLING_TICK', 'MASTER_POLL_NO_CHANGE_SKIPPED', {
+          screen: 'lan-session',
+          source: 'pollJoinedPlayers',
+          sessionId: activeSessionId,
+          decision: 'no_relevant_change',
+        });
+      }
     };
 
     pollJoinedPlayers();
     const timer = setInterval(pollJoinedPlayers, 2500);
-    const unsubscribeRealtime = subscribeLanSessionHostUpdates(joinUrl, () => {
+    const unsubscribeRealtime = subscribeLanSessionHostUpdates(joinUrl, (update?: LanSessionHostUpdate) => {
       traceApp('SUBSCRIPTION_UPDATE', 'MASTER_HOST_SUBSCRIPTION_UPDATE', {
         screen: 'lan-session',
         source: 'subscribeLanSessionHostUpdates',
         sessionId: activeSessionId,
         joinUrl,
+        eventId: update?.event?.id,
+        eventType: update?.event?.type,
+        envelopeType: update?.envelopeType,
+        reason: update?.reason,
       });
-      void pollJoinedPlayers();
+      if (update?.event?.sessionId === activeSessionId && update.event.type === 'resource_request') {
+        void (async () => {
+          const event = update.event!;
+          traceApp('EVENT_RECEIVED', 'MASTER_REQUEST_RECEIVED_IMMEDIATE', {
+            screen: 'lan-session',
+            source: 'subscribeLanSessionHostUpdates',
+            sessionId: activeSessionId,
+            eventId: event.id,
+            eventType: event.type,
+            fromKey: event.fromKey,
+            playerName: event.fromName,
+            payload: event.resourceRequest,
+          });
+          const fresh = await rememberLanSessionEvent(db, event);
+          await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+          setSessionEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20));
+          traceApp('UI_UPDATE', 'MASTER_RESOURCE_REQUEST_VISIBLE', {
+            screen: 'lan-session',
+            source: 'subscribeLanSessionHostUpdates',
+            sessionId: activeSessionId,
+            eventId: event.id,
+            eventType: event.type,
+            playerName: event.fromName,
+            decision: fresh ? 'stored_and_visible' : 'already_stored_visible',
+          });
+        })();
+        return;
+      }
+      traceApp('SUBSCRIPTION_UPDATE', 'MASTER_SUBSCRIPTION_NO_CHANGE_SKIPPED', {
+        screen: 'lan-session',
+        source: 'subscribeLanSessionHostUpdates',
+        sessionId: activeSessionId,
+        joinUrl,
+        decision: 'host_update_notification_is_not_state_change',
+      });
     });
     return () => {
       clearInterval(timer);
@@ -991,9 +1092,35 @@ useLanAppLifecycle({
 
     setLoading(true);
     try {
+      traceApp('LAN_JOIN', 'RESUME_SESSION_FAST_START', {
+        screen: 'lan-session',
+        source: 'handleResumeSavedSession',
+        sessionId: session.id,
+        joinUrl: session.joinUrl,
+      });
       await switchLanRole('master');
-      await resumeLanSession(db, session.id);
-      const nextPayload = await refreshLanSessionPayload(db, session.id);
+      await db.runAsync(
+        `UPDATE lan_sessions SET status = 'active', active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [session.id]
+      );
+      const savedRow = await db.getFirstAsync<{ payloadJson?: string }>(
+        `SELECT payload_json as payloadJson FROM lan_sessions WHERE id = ? LIMIT 1`,
+        [session.id]
+      );
+      let nextPayload = parsePayloadJson(savedRow?.payloadJson);
+      if (!nextPayload) {
+        nextPayload = await buildLanSessionPayload(db, {
+          id: session.id,
+          name: session.name,
+          masterName: session.masterName,
+          level: session.level,
+          allowExisting: session.allowExisting,
+          inviteCode: session.inviteCode || makeInviteCode(),
+        }, session.selectedCatalog);
+        nextPayload.state = await getLanSessionState(db, session.id);
+      } else if (!nextPayload.state) {
+        nextPayload = { ...nextPayload, state: await getLanSessionState(db, session.id) };
+      }
       if (!nextPayload) throw new Error('Sessão não encontrada.');
 
       const nextJoinUrl = await startLanServer(nextPayload);
@@ -1003,15 +1130,53 @@ useLanAppLifecycle({
       }
 
       await saveLanSession(db, nextPayload, nextJoinUrl, { isMaster: true });
-      applyExternalPayload(
-        nextPayload.state ? nextPayload : { ...nextPayload, state: await getLanSessionState(db, session.id) },
-        'sqlite'
-      );
-      setSessionEvents(await getLanSessionEvents(db, session.id, 20));
-      setPendingSaves(await listPendingSaves(db, session.id));
+      applyExternalPayload(nextPayload, 'sqlite');
       setJoinUrl(nextJoinUrl);
       setJoinLink(buildJoinDeepLink(nextJoinUrl, nextPayload));
       setSelectedCatalogKeys(keysFromSelection(nextPayload.selectedCatalog));
+      traceApp('LAN_JOIN', 'RESUME_SESSION_UI_READY', {
+        screen: 'lan-session',
+        source: 'handleResumeSavedSession',
+        sessionId: session.id,
+        joinUrl: nextJoinUrl,
+        payload: {
+          playerCount: nextPayload.state?.players?.length || 0,
+          eventCount: nextPayload.events?.length || 0,
+        },
+      });
+      void (async () => {
+        try {
+          traceApp('LAN_JOIN', 'RESUME_SESSION_BACKGROUND_LOAD_START', {
+            screen: 'lan-session',
+            source: 'handleResumeSavedSession',
+            sessionId: session.id,
+          });
+          const [events, pendingSaves, nextState] = await Promise.all([
+            getLanSessionEvents(db, session.id, 20),
+            listPendingSaves(db, session.id),
+            getLanSessionState(db, session.id),
+          ]);
+          applyExternalSessionState(session.id, nextState, 'sqlite');
+          setSessionEvents(events);
+          setPendingSaves(pendingSaves);
+          traceApp('LAN_JOIN', 'RESUME_SESSION_BACKGROUND_LOAD_DONE', {
+            screen: 'lan-session',
+            source: 'handleResumeSavedSession',
+            sessionId: session.id,
+            result: {
+              eventCount: events.length,
+              pendingSaveCount: pendingSaves.length,
+              playerCount: nextState.players.length,
+            },
+          });
+        } catch (error) {
+          traceError('LAN_JOIN', 'RESUME_SESSION_BACKGROUND_LOAD_ERROR', error, {
+            screen: 'lan-session',
+            source: 'handleResumeSavedSession',
+            sessionId: session.id,
+          });
+        }
+      })();
       await loadSavedSessions();
       traceFunctionReturn('handleResumeSavedSession', {
         sessionId: session.id,
@@ -1044,22 +1209,72 @@ useLanAppLifecycle({
 
   const handleStopSession = useCallback(async () => {
     if (payload) {
-      await endLanSession(db, payload.session.id);
-      await rememberLanSessionEvent(db, {
+      traceApp('LAN_JOIN', 'MASTER_END_SESSION_START', {
+        screen: 'lan-session',
+        source: 'handleStopSession',
+        sessionId: payload.session.id,
+        joinUrl,
+      });
+      const endedEvent: LanSessionEvent = {
         id: makeLanEventId(),
         sessionId: payload.session.id,
-        type: 'timeline_event',
+        type: 'session_ended',
         fromKey: 'master',
         fromName: 'Mestre',
-        toKey: 'party',
-        toName: 'Party',
-        message: 'Mestre finalizou a sessao LAN.',
+        toKey: 'all',
+        toName: 'Todos',
+        entityType: 'session',
+        entityId: payload.session.id,
+        entityRevision: Date.now(),
+        ackRequired: false,
+        originClientId: 'master',
+        message: 'Sessao encerrada pelo mestre.',
         createdAt: new Date().toISOString(),
+      };
+      await rememberLanSessionEvent(db, endedEvent).catch(() => false);
+      if (joinUrl) {
+        await sendLanSessionEvent(joinUrl, endedEvent).catch((error) => {
+          traceError('SOCKET_SEND_START', 'MASTER_SESSION_ENDED_EVENT_SEND_ERROR', error, {
+            screen: 'lan-session',
+            source: 'handleStopSession',
+            sessionId: payload.session.id,
+            eventId: endedEvent.id,
+          });
+        });
+        traceApp('EVENT_CREATED', 'MASTER_SESSION_ENDED_EVENT_SENT', {
+          screen: 'lan-session',
+          source: 'handleStopSession',
+          sessionId: payload.session.id,
+          eventId: endedEvent.id,
+          eventType: endedEvent.type,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      await db.runAsync(
+        `UPDATE lan_sessions SET status = 'ended', active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [payload.session.id]
+      );
+      traceApp('SQLITE_WRITE_DONE', 'MASTER_SESSION_MARKED_ENDED_DB', {
+        screen: 'lan-session',
+        source: 'handleStopSession',
+        sessionId: payload.session.id,
       });
-      await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
     }
     await stopLanServer();
+    traceApp('SOCKET_SEND_DONE', 'MASTER_TCP_STOP_DONE', {
+      screen: 'lan-session',
+      source: 'handleStopSession',
+      sessionId: payload?.session.id,
+    });
     resetLanClientConnection();
+    if (payload?.session.id) {
+      replaceLanRuntimeStateFromBootstrap(payload.session.id, null);
+    }
+    traceApp('STATE_CHANGE', 'MASTER_RUNTIME_CLEARED', {
+      screen: 'lan-session',
+      source: 'handleStopSession',
+      sessionId: payload?.session.id,
+    });
     setPayload(null);
     setSessionState(null);
     setSessionEvents([]);
@@ -1067,7 +1282,7 @@ useLanAppLifecycle({
     setJoinLink('');
     setSelectedPlayerId(null);
     await loadSavedSessions();
-  }, [db, loadSavedSessions, payload]);
+  }, [db, joinUrl, loadSavedSessions, payload]);
 
   useEffect(() => {
     if (!payload?.session?.id) return;
@@ -1326,12 +1541,40 @@ useLanAppLifecycle({
       patch: liveEvent.numberPatch,
     });
 
+    traceSocket('SOCKET_SEND_START', {
+      screen: 'lan-session',
+      source: 'persistHostNumberPatch',
+      functionName: 'persistHostNumberPatch',
+      sessionId,
+      playerId,
+      playerKey: targetPlayer.remoteKey,
+      playerName: targetPlayer.characterName,
+      eventId: liveEvent.id,
+      eventType: liveEvent.type,
+      envelopeType: 'event_commit',
+      toKey: liveEvent.toKey,
+      patch: liveEvent.numberPatch,
+    });
     void sendLanSessionEvent(joinUrl, liveEvent)
       .then(() => {
         debugLanFlow('MASTER_EVENT_SENT', {
           eventId: liveEvent.id,
           toKey: liveEvent.toKey,
           numberPatch: liveEvent.numberPatch,
+        });
+        traceSocket('SOCKET_SEND_DONE', {
+          screen: 'lan-session',
+          source: 'persistHostNumberPatch',
+          functionName: 'persistHostNumberPatch',
+          sessionId,
+          playerId,
+          playerKey: targetPlayer.remoteKey,
+          playerName: targetPlayer.characterName,
+          eventId: liveEvent.id,
+          eventType: liveEvent.type,
+          envelopeType: 'event_commit',
+          toKey: liveEvent.toKey,
+          patch: liveEvent.numberPatch,
         });
         traceFunctionReturn('persistHostNumberPatch', {
           sent: true,
@@ -1351,6 +1594,18 @@ useLanAppLifecycle({
         );
       })
       .catch((error) => {
+        traceError('SOCKET_SEND_START', 'MASTER_PLAYER_PATCH_SOCKET_SEND_ERROR', error, {
+          screen: 'lan-session',
+          source: 'persistHostNumberPatch',
+          functionName: 'persistHostNumberPatch',
+          sessionId,
+          playerId,
+          playerKey: targetPlayer.remoteKey,
+          playerName: targetPlayer.characterName,
+          eventId: liveEvent.id,
+          eventType: liveEvent.type,
+          envelopeType: 'event_commit',
+        });
         console.warn('[LAN MASTER] Falha ao enviar evento vivo imediato:', error);
       });
 
@@ -1392,6 +1647,43 @@ useLanAppLifecycle({
         console.warn('[LAN MASTER] Falha ao persistir patch vivo no SQLite:', error);
       }
     })();
+  }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh]);
+
+  const persistHostNumberDelta = useCallback((
+    playerId: number,
+    field: 'hpCurrent' | 'xp' | 'gp' | 'sp' | 'cp' | 'tempHp',
+    delta: number,
+    message: string,
+  ) => {
+    if (!payload?.session?.id) return;
+    const sessionId = payload.session.id;
+
+    void commitHostPlayerNumberDelta(db, {
+      sessionId,
+      joinUrl,
+      playerId,
+      field,
+      delta,
+      message,
+    }).then((result) => {
+      if (!result) return;
+      if (result.event) {
+        setSessionEvents((current) =>
+          [result.event!, ...current.filter((item) => item.id !== result.event!.id)].slice(0, 20)
+        );
+      }
+      scheduleSilentPayloadRefresh(sessionId);
+    }).catch((error) => {
+      traceError('FUNCTION_CALL', 'commitHostPlayerNumberDelta_ERROR', error, {
+        screen: 'lan-session',
+        source: 'persistHostNumberDelta',
+        functionName: 'commitHostPlayerNumberDelta',
+        sessionId,
+        playerId,
+        args: { field, delta },
+      });
+      console.warn('[LAN MASTER] Falha ao persistir delta vivo no SQLite:', error);
+    });
   }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh]);
 
   const applyMasterPlayerPatchInternal = async (
@@ -1550,13 +1842,37 @@ useLanAppLifecycle({
     messagePrefix?: string
   ) => {
     if (!payload) return;
-    traceButton('lan-session', `MASTER_CLICK_${field}_${delta}`, {
+    const buttonName = field === 'hpCurrent' && delta < 0
+      ? 'MASTER_CLICK_HP_MINUS'
+      : field === 'hpCurrent' && delta > 0
+        ? 'MASTER_CLICK_HP_PLUS'
+        : `MASTER_CLICK_${field}_${delta}`;
+    traceButton('lan-session', buttonName, {
       source: 'master_click',
       sessionId: payload.session.id,
       playerId: player.id,
       playerKey: player.remoteKey,
       playerName: player.characterName,
       args: { field, delta, messagePrefix },
+      before: {
+        hpCurrent: player.hpCurrent,
+        hpMax: player.hpMax,
+        tempHp: player.tempHp,
+        xp: player.xp,
+        gp: player.gp,
+        sp: player.sp,
+        cp: player.cp,
+        revisionSeq: player.revisionSeq,
+      },
+    });
+    traceApp('STATE_BEFORE', `${buttonName}_STATE_BEFORE`, {
+      screen: 'lan-session',
+      source: 'master_click',
+      sessionId: payload.session.id,
+      playerId: player.id,
+      playerKey: player.remoteKey,
+      playerName: player.characterName,
+      args: { field, delta },
       before: {
         hpCurrent: player.hpCurrent,
         hpMax: player.hpMax,
@@ -1583,6 +1899,26 @@ useLanAppLifecycle({
     sessionStateRef.current = runtimeResult.state;
     setSessionState(runtimeResult.state);
     setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
+    traceApp('STATE_AFTER', `${buttonName}_STATE_AFTER`, {
+      screen: 'lan-session',
+      source: 'runtime/master',
+      sessionId: payload.session.id,
+      playerId: player.id,
+      playerKey: player.remoteKey,
+      playerName: player.characterName,
+      args: { field, delta },
+      after: {
+        hpCurrent: runtimeResult.player.hpCurrent,
+        hpMax: runtimeResult.player.hpMax,
+        tempHp: runtimeResult.player.tempHp,
+        xp: runtimeResult.player.xp,
+        gp: runtimeResult.player.gp,
+        sp: runtimeResult.player.sp,
+        cp: runtimeResult.player.cp,
+        revisionSeq: runtimeResult.player.revisionSeq,
+      },
+      patch: runtimeResult.patch,
+    });
     traceStateChange('STATE_CHANGE', 'MASTER_RUNTIME_PLAYER_DELTA_APPLIED', player, runtimeResult.player, {
       screen: 'lan-session',
       source: 'runtime/master',
@@ -1605,9 +1941,10 @@ useLanAppLifecycle({
       revision: runtimeResult.revision,
     });
 
-    void persistHostNumberPatch(
+    persistHostNumberDelta(
       player.id,
-      runtimeResult.patch,
+      field,
+      delta,
       messagePrefix || `Mestre ajustou ${formatPlayerField(field as any)} de ${runtimeResult.player.characterName}.`
     );
     traceFunctionReturn('handleUpdatePlayerDelta', {
@@ -3236,14 +3573,31 @@ useLanAppLifecycle({
 
 // === FUNÇÕES UTILITÁRIAS ===
 
+type LanPlayerEffectForUi = {
+  id?: string;
+  target?: string;
+  value?: number | string | null;
+  [key: string]: unknown;
+};
+
 function getEffectiveStat(player: LanSessionPlayerState, stat: string) {
   const baseValue = Number(player.stats?.[stat]) || 0;
-  const effectValue = player.effects
-    .filter((effect) => effect.target === stat)
-    .reduce((total, effect) => total + effect.value, 0);
+
+  const effects: LanPlayerEffectForUi[] = Array.isArray(player.effects)
+    ? (player.effects as LanPlayerEffectForUi[])
+    : [];
+
+  const effectValue = effects
+    .filter((effect: LanPlayerEffectForUi) => String(effect.target || '').toUpperCase() === stat)
+    .reduce<number>((total: number, effect: LanPlayerEffectForUi) => {
+      return total + (Number(effect.value) || 0);
+    }, 0);
 
   const total = baseValue + effectValue;
-  return effectValue === 0 ? String(total) : `${total} (${effectValue > 0 ? '+' : ''}${effectValue})`;
+
+  return effectValue === 0
+    ? String(total)
+    : `${total} (${effectValue > 0 ? '+' : ''}${effectValue})`;
 }
 
 function getBagPreview(equipment: Record<string, unknown>) {
@@ -3414,6 +3768,19 @@ function formatAdvanceUnit(unit: LanAdvanceUnit) {
     longRest: 'um descanso longo',
   };
   return labels[unit];
+}
+
+function parsePayloadJson(value?: string | null): LanSessionPayload | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && parsed.session?.id) {
+      return parsed as LanSessionPayload;
+    }
+  } catch {
+    // Payload legado/corrompido cai para refresh como fallback.
+  }
+  return null;
 }
 
 function parseOptionEffects(value: unknown) {

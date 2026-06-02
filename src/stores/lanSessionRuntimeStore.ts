@@ -102,7 +102,12 @@ export function mergeSessionStatePreservingLiveFields(
   }
 
   const sessionMeta = runtime.entities[getSessionKey(sessionId)];
-  const preserveSession = Boolean(sessionMeta && sessionMeta.revision >= getSessionRevision(incomingState));
+  const incomingSessionRevision = getSessionRevision(incomingState);
+  const currentSessionRevision = getSessionRevision(currentState);
+  const preserveSession = Boolean(
+    (sessionMeta && sessionMeta.revision >= incomingSessionRevision) ||
+    ((source === 'sqlite' || source === 'snapshot') && incomingSessionRevision < currentSessionRevision)
+  );
   const merged: LanSessionState = {
     ...incomingState,
     status: preserveSession ? currentState.status : incomingState.status,
@@ -110,6 +115,17 @@ export function mergeSessionStatePreservingLiveFields(
     elapsedMinutes: preserveSession ? currentState.elapsedMinutes : incomingState.elapsedMinutes,
     players: nextPlayers,
   };
+
+  if (areLanSessionStatesEqual(currentState, merged)) {
+    debugLanFlow('MASTER_RELOAD_NO_REAL_CHANGE', {
+      sessionId,
+      source,
+      playerCount: currentState.players.length,
+      currentTurn: currentState.currentTurn,
+      elapsedMinutes: currentState.elapsedMinutes,
+    });
+    return currentState;
+  }
 
   if (preservedLiveField || preserveSession) {
     debugLanFlow('MASTER_RELOAD_SKIPPED_DURING_LIVE_STATE', {
@@ -123,6 +139,12 @@ export function mergeSessionStatePreservingLiveFields(
 
   useLanSessionRuntimeStore.getState().setSessionState(sessionId, merged);
   return merged;
+}
+
+function areLanSessionStatesEqual(left: LanSessionState | null | undefined, right: LanSessionState | null | undefined) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 export function applyHostNumberPatchRuntime(

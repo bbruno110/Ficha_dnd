@@ -60,5 +60,5 @@ export function shouldObserveLanEventSeq(
 }
 
 export function shouldRequestLanResync(decision: LanEventApplyDecision) {
-  return decision.reason === 'entity_revision_gap';
+  return decision.reason === 'seq_gap';
 }

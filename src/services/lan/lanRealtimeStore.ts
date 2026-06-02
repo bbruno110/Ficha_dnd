@@ -17,27 +17,13 @@ export type PendingEvent = {
   reason?: string;
 };
 
-export type LanEventApplyDecisionReason =
-  | 'duplicate_id'
-  | 'old_seq'
-  | 'seq_gap'
-  | 'old_entity_revision'
-  | 'entity_revision_gap'
-  | 'missing_id'
-  | 'stored_duplicate_but_apply_needed'
-  | 'stored_duplicate_and_already_applied'
-  | 'new_event'
-  | 'revision_checkpoint';
-
 export type LanEventApplyDecision = {
   apply: boolean;
-  reason?: LanEventApplyDecisionReason;
-  recoverable?: boolean;
+  reason?: 'duplicate_id' | 'old_seq' | 'seq_gap' | 'old_entity_revision' | 'missing_id';
   entityKey?: string;
   currentRevision?: number;
   nextRevision?: number;
   lastAppliedSeq?: number;
-  lastSeenSeq?: number;
   expectedSeq?: number;
   receivedSeq?: number;
 };
@@ -47,14 +33,7 @@ export type LanRealtimeState = {
   clientId?: string;
   playerKey?: string;
   connected: boolean;
-
-  /** Maior seq recebido/observado. Não significa que foi aplicado na ficha. */
-  lastSeenSeq: number;
-
-  /** Maior seq aplicado com sucesso na ficha/runtime local. */
   lastAppliedSeq: number;
-
-  seenEventIds: Record<string, true>;
   appliedEventIds: Record<string, true>;
   entityVersions: Record<string, RuntimeEntityState>;
   pendingEvents: Record<string, PendingEvent>;
@@ -71,27 +50,24 @@ export type LanRealtimeState = {
 };
 
 const inferEntityType = (event: LanSessionEvent) => {
-  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
+  if (event.type === 'session_patch' || event.type === 'timeline_event') return 'session';
   if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
   if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
   return 'player';
 };
 
-export const getLanRuntimeEntityKey = (event: LanSessionEvent) => {
+const getEntityKey = (event: LanSessionEvent) => {
   const entityType = event.entityType || inferEntityType(event);
   const entityId = event.entityId || event.toKey || event.fromKey || event.tradeId || event.sessionId;
   return `${event.sessionId}:${entityType}:${entityId}`;
 };
 
 const getRevision = (event: LanSessionEvent) => Number(event.entityRevision ?? event.seq ?? 0) || 0;
-const getSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
 
 export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
   connected: false,
-  lastSeenSeq: 0,
   lastAppliedSeq: 0,
-  seenEventIds: {},
   appliedEventIds: {},
   entityVersions: {},
   pendingEvents: {},
@@ -101,26 +77,13 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
   getEventApplyDecision: (event) => {
     const state = get();
     if (!event?.id) return { apply: false, reason: 'missing_id' };
+    if (state.appliedEventIds[event.id]) return { apply: false, reason: 'duplicate_id' };
 
-    const entityKey = getLanRuntimeEntityKey(event);
+    const entityKey = getEntityKey(event);
     const current = state.entityVersions[entityKey];
     const nextRevision = getRevision(event);
-    const eventSeq = getSeq(event);
+    const eventSeq = Number(event.seq || event.serverSeq || 0);
 
-    // Aplicado de verdade: não reaplique.
-    if (state.appliedEventIds[event.id]) {
-      return {
-        apply: false,
-        reason: 'duplicate_id',
-        entityKey,
-        currentRevision: current?.revision,
-        nextRevision,
-        lastAppliedSeq: state.lastAppliedSeq,
-        lastSeenSeq: state.lastSeenSeq,
-      };
-    }
-
-    // Revisão antiga da mesma entidade: evento velho, não precisa resync.
     if (current && nextRevision > 0 && nextRevision <= current.revision) {
       return {
         apply: false,
@@ -129,76 +92,58 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
         currentRevision: current.revision,
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
-        lastSeenSeq: state.lastSeenSeq,
       };
     }
 
-    // O seq global não pode bloquear evento de entidade mais nova. Isso era a causa
-    // do jogador ficar preso no tempo quando lastAppliedSeq/lastSeenSeq avançavam por
-    // evento estrutural ou por evento só observado. Só bloqueie seq antigo se também
-    // não houver revisão nova para aplicar.
-    if (eventSeq > 0 && current?.lastSeq && eventSeq <= current.lastSeq && nextRevision <= (current.revision || 0)) {
+    if (eventSeq > 0 && eventSeq <= state.lastAppliedSeq) {
       return {
         apply: false,
         reason: 'old_seq',
         entityKey,
-        currentRevision: current.revision,
+        currentRevision: current?.revision,
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
-        lastSeenSeq: state.lastSeenSeq,
-        receivedSeq: eventSeq,
       };
     }
 
-    // Gap de revisão agora é recuperável e NÃO bloqueia automaticamente.
-    // Patches de HP/XP/moedas/tempHP são valores absolutos; aplicar o checkpoint
-    // autoritativo é melhor do que entrar em loop infinito de resync.
-    if (current && nextRevision > current.revision + 1) {
+    if (eventSeq > 0 && state.lastAppliedSeq > 0 && eventSeq !== state.lastAppliedSeq + 1) {
       return {
-        apply: true,
-        reason: 'entity_revision_gap',
-        recoverable: true,
+        apply: false,
+        reason: 'seq_gap',
         entityKey,
-        currentRevision: current.revision,
+        currentRevision: current?.revision,
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
-        lastSeenSeq: state.lastSeenSeq,
+        expectedSeq: state.lastAppliedSeq + 1,
+        receivedSeq: eventSeq,
       };
     }
 
     return {
       apply: true,
-      reason: state.seenEventIds[event.id] ? 'stored_duplicate_but_apply_needed' : 'new_event',
       entityKey,
       currentRevision: current?.revision,
       nextRevision,
       lastAppliedSeq: state.lastAppliedSeq,
-      lastSeenSeq: state.lastSeenSeq,
     };
   },
 
   shouldApplyEvent: (event) => get().getEventApplyDecision(event).apply,
 
   markEventApplied: (event) => set((state) => {
-    if (!event?.id) return state;
-
-    const entityKey = getLanRuntimeEntityKey(event);
+    const entityKey = getEntityKey(event);
     const current = state.entityVersions[entityKey];
-    const eventSeq = getSeq(event);
     const nextRevision = Math.max(current?.revision || 0, getRevision(event));
-    const nextSeenSeq = Math.max(state.lastSeenSeq, eventSeq);
-    const nextAppliedSeq = Math.max(state.lastAppliedSeq, eventSeq);
+    const nextSeq = Math.max(state.lastAppliedSeq, Number(event.seq || event.serverSeq || 0));
 
     return {
-      seenEventIds: { ...state.seenEventIds, [event.id]: true },
       appliedEventIds: { ...state.appliedEventIds, [event.id]: true },
-      lastSeenSeq: nextSeenSeq,
-      lastAppliedSeq: nextAppliedSeq,
+      lastAppliedSeq: nextSeq,
       entityVersions: {
         ...state.entityVersions,
         [entityKey]: {
           revision: nextRevision,
-          lastSeq: Math.max(current?.lastSeq || 0, eventSeq),
+          lastSeq: nextSeq,
           updatedAt: Date.now(),
         },
       },
@@ -207,10 +152,10 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
 
   markEventObserved: (event) => set((state) => {
     if (!event?.id) return state;
-    const eventSeq = getSeq(event);
+    const eventSeq = Number(event.seq || event.serverSeq || 0);
     return {
-      seenEventIds: { ...state.seenEventIds, [event.id]: true },
-      lastSeenSeq: Math.max(state.lastSeenSeq, eventSeq),
+      appliedEventIds: { ...state.appliedEventIds, [event.id]: true },
+      lastAppliedSeq: Math.max(state.lastAppliedSeq, eventSeq),
     };
   }),
 
@@ -250,9 +195,7 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
   resetSession: (sessionId) => set({
     sessionId,
     connected: false,
-    lastSeenSeq: 0,
     lastAppliedSeq: 0,
-    seenEventIds: {},
     appliedEventIds: {},
     entityVersions: {},
     pendingEvents: {},

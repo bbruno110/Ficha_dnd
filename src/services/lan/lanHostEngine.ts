@@ -155,6 +155,16 @@ async function applyHostPlayerNumberPatch(
     patch: cleanPatch,
   });
 
+  const authoritativePatch: LanHostNumberPatch = {
+    hpCurrent: updatedPlayer?.hpCurrent ?? latestPlayer.hpCurrent,
+    hpMax: updatedPlayer?.hpMax ?? latestPlayer.hpMax,
+    tempHp: updatedPlayer?.tempHp ?? latestPlayer.tempHp,
+    xp: updatedPlayer?.xp ?? latestPlayer.xp,
+    gp: updatedPlayer?.gp ?? latestPlayer.gp,
+    sp: updatedPlayer?.sp ?? latestPlayer.sp,
+    cp: updatedPlayer?.cp ?? latestPlayer.cp,
+  };
+
   const event = await rememberAndSendLanSessionEvent(db, input.joinUrl, {
     id: makeLanEventId(),
     sessionId: input.sessionId,
@@ -168,7 +178,7 @@ async function applyHostPlayerNumberPatch(
     entityRevision,
     ackRequired: true,
     originClientId: 'master',
-    numberPatch: cleanPatch,
+    numberPatch: authoritativePatch,
     message: input.message,
     createdAt: new Date().toISOString(),
   });
@@ -178,13 +188,14 @@ async function applyHostPlayerNumberPatch(
       functionName: 'applyHostPlayerNumberPatch',
       sessionId: input.sessionId,
       playerId: input.playerId,
-      patch: cleanPatch,
+      patch: authoritativePatch,
+      changedPatch: cleanPatch,
     });
   }
 
   const result = {
     player: updatedPlayer || latestPlayer,
-    patch: cleanPatch,
+    patch: authoritativePatch,
     event,
   } satisfies LanHostPlayerPatchResult;
   traceFunctionReturn('applyHostPlayerNumberPatch', result, {

@@ -51,7 +51,8 @@ let hostSockets = new Set<TcpSocket>();
 let hostJoinedRows: Record<string, unknown>[] = [];
 let hostEvents: LanSessionEvent[] = [];
 let hostEventAcks: Record<string, unknown>[] = [];
-let hostUpdateListeners = new Set<() => void>();
+export type HostUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string };
+let hostUpdateListeners = new Set<(update?: HostUpdate) => void>();
 let hostKickedJoinKeys = new Set<string>();
 
 let clientSocket: TcpSocket | null = null;
@@ -59,10 +60,12 @@ let clientUrl = '';
 let clientPayload: LanSessionPayload | null = null;
 let clientEvents: LanSessionEvent[] = [];
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
-let clientUpdateListeners = new Set<() => void>();
+type ClientUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string; payload?: LanSessionPayload };
+let clientUpdateListeners = new Set<(update?: ClientUpdate) => void>();
 let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
 let clientJoinAckWaiters = new Set<ClientJoinAckWaiter>();
 let clientHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+const closedSockets = new WeakSet<TcpSocket>();
 
 type ClientPayloadWaiter = {
   sessionId?: string;
@@ -95,7 +98,12 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
   });
   const TcpSocket = loadTcpSocket();
 
-  if (hostServer && hostPayload?.session.id === payload.session.id && hostUrl) {
+  if (
+    hostServer &&
+    hostPayload?.session.id === payload.session.id &&
+    hostPayload?.session.hostInstanceId === payload.session.hostInstanceId &&
+    hostUrl
+  ) {
     hostPayload = payload;
     try {
       const hostIp = await getLocalIpAddress({ allowHotspotFallback: true });
@@ -157,26 +165,29 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           receivedEventIds: message.receivedEventIds || [],
           receivedAt: new Date().toISOString(),
         });
-        notifyHostUpdates();
+        notifyHostUpdates({ reason: 'ack' });
         return;
       }
 
       if (message.type === 'event_ack') {
         rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
-        notifyHostUpdates();
+        notifyHostUpdates({ reason: 'event_ack' });
         return;
       }
 
       if (message.type === 'event_nack') {
         rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
-        notifyHostUpdates();
+        notifyHostUpdates({ reason: 'event_nack' });
         return;
       }
 
       if (message.type === 'resync_request') {
         if (!isEnvelopeForCurrentSession(message.sessionId)) return;
         const lastAppliedSeq = Number(message.lastAppliedSeq || 0);
-        const events = getEventsAfterSeq(lastAppliedSeq, message.sessionId);
+        const events = mergeEventsById(
+          getEventsAfterSeq(lastAppliedSeq, message.sessionId),
+          getEventsForRevisionGaps(message.sessionId, message.knownRevisions || {})
+        );
         sendEnvelope(socket, {
           type: 'resync_events',
           sessionId: message.sessionId,
@@ -275,7 +286,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         });
         broadcastHostPayload();
         updateHostForegroundSession();
-        notifyHostUpdates();
+        notifyHostUpdates({ reason: 'join', event: joinedEvent, envelopeType: 'join' });
         return;
       }
 
@@ -284,7 +295,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         const event = normalizeWireEvent(message.event);
         upsertByKey(hostEvents, event, 'id');
         broadcastEnvelope({ type: 'event_commit', event });
-        notifyHostUpdates();
+        notifyHostUpdates({ reason: 'event_commit', event, envelopeType: message.type });
       }
     });
 
@@ -344,6 +355,7 @@ export async function stopLanTcpHost() {
     } catch {
       // Socket already closed.
     }
+    closedSockets.add(socket);
   }
   hostSockets.clear();
 
@@ -518,7 +530,7 @@ export async function sendLanTcpEvent(url: string | undefined, event: LanSession
   if (isCurrentHostUrl(url)) {
     upsertByKey(hostEvents, wireEvent, 'id');
     broadcastEnvelope({ type: 'event_commit', event: wireEvent });
-    notifyHostUpdates();
+    notifyHostUpdates({ reason: 'event_commit', event: wireEvent, envelopeType: 'event_commit' });
     traceFunctionReturn('sendLanTcpEvent', { result: true, mode: 'host_broadcast' }, {
       source: 'lanTcpTransport',
       sessionId: wireEvent.sessionId,
@@ -676,15 +688,16 @@ export async function requestLanTcpResync(url: string | undefined, request: { se
   return result;
 }
 
-export async function getLanTcpClientEvents(url: string, sessionId?: string) {
+export async function getLanTcpClientEvents(url: string, sessionId?: string, afterSeq = 0) {
+  const minSeq = Math.max(0, Math.floor(Number(afterSeq) || 0));
   if (isCurrentHostUrl(url)) {
     return getLanTcpHostEvents()
-      .filter((event) => !sessionId || event.sessionId === sessionId)
+      .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) > minSeq))
       .sort(compareEventsAscending);
   }
   await connectLanTcpClient(url);
   return clientEvents
-    .filter((event) => !sessionId || event.sessionId === sessionId)
+    .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) > minSeq))
     .sort(compareEventsAscending);
 }
 
@@ -780,7 +793,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       mergeClientPayloadEvents(payload, target.sessionId);
       resolveClientPayloadWaiters(payload);
       if (updateOptions?.notify !== false) {
-        notifyClientUpdates();
+        notifyClientUpdates({ reason: 'payload_update', payload });
       }
       traceApp('PAYLOAD_APPLIED', 'PAYLOAD_STRUCTURAL_CACHE_APPLIED', {
         source: 'lanTcpTransport.applyPayloadUpdate',
@@ -912,14 +925,15 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         if (message.payload) {
           applyPayloadUpdate(message.payload, { notify: false });
         }
-        notifyClientUpdates();
+        notifyClientUpdates({ reason: 'resync_events', envelopeType: 'resync_events' });
         return;
       }
 
       if (message.type === 'event' || message.type === 'event_commit') {
         if (target.sessionId && message.event.sessionId !== target.sessionId) return;
-        upsertByKey(clientEvents, normalizeWireEvent(message.event), 'id');
-        notifyClientUpdates();
+        const normalizedEvent = normalizeWireEvent(message.event);
+        upsertByKey(clientEvents, normalizedEvent, 'id');
+        notifyClientUpdates({ reason: 'event_commit', event: normalizedEvent, envelopeType: message.type });
       }
     });
   }).finally(() => {
@@ -1022,29 +1036,29 @@ function makeHostPayload() {
   };
 }
 
-export function subscribeLanTcpHostUpdates(listener: () => void) {
+export function subscribeLanTcpHostUpdates(listener: (update?: HostUpdate) => void) {
   hostUpdateListeners.add(listener);
   return () => {
     hostUpdateListeners.delete(listener);
   };
 }
 
-export function subscribeLanTcpClientUpdates(listener: () => void) {
+export function subscribeLanTcpClientUpdates(listener: (update?: ClientUpdate) => void) {
   clientUpdateListeners.add(listener);
   return () => {
     clientUpdateListeners.delete(listener);
   };
 }
 
-function notifyHostUpdates() {
+function notifyHostUpdates(update?: HostUpdate) {
   for (const listener of hostUpdateListeners) {
-    listener();
+    listener(update);
   }
 }
 
-function notifyClientUpdates() {
+function notifyClientUpdates(update?: ClientUpdate) {
   for (const listener of clientUpdateListeners) {
-    listener();
+    listener(update);
   }
 }
 
@@ -1078,6 +1092,14 @@ function broadcastEnvelope(message: TcpEnvelope) {
 function sendEnvelope(socket: TcpSocket, message: TcpEnvelope) {
   const startedAt = Date.now();
   const traceFields = getEnvelopeTraceFields(message);
+  if (closedSockets.has(socket)) {
+    traceSocket('SOCKET_SEND_SKIPPED_CLOSED', {
+      source: 'lanTcpTransport.sendEnvelope',
+      decision: 'socket_already_closed',
+      ...traceFields,
+    });
+    return false;
+  }
   traceSocket('SOCKET_SEND_START', {
     source: 'lanTcpTransport.sendEnvelope',
     ...traceFields,
@@ -1103,6 +1125,7 @@ function sendEnvelope(socket: TcpSocket, message: TcpEnvelope) {
       // socket já estava morto
     }
 
+    closedSockets.add(socket);
     hostSockets.delete(socket);
 
     if (clientSocket === socket) {
@@ -1283,6 +1306,23 @@ function summarizeEnvelopePayload(message: TcpEnvelope, event?: LanSessionEvent,
 function configureSocket(socket: TcpSocket) {
   socket.setNoDelay?.(true);
   socket.setKeepAlive?.(true, 1000);
+  socket.on('close', () => {
+    closedSockets.add(socket);
+    if (clientSocket === socket) {
+      clientSocket = null;
+      clearClientPayloadWaiters();
+      stopClientHeartbeat();
+      traceApp('SOCKET_RECEIVE', 'TCP_CLIENT_SOCKET_CLOSED_CLEANUP', {
+        source: 'lanTcpTransport.configureSocket',
+        sessionId: clientPayload?.session.id || '',
+        decision: 'client_socket_closed',
+      });
+      notifyClientUpdates({ reason: 'socket_closed' });
+    }
+  });
+  socket.on('error', () => {
+    closedSockets.add(socket);
+  });
 }
 
 function mergeClientPayloadEvents(payload: LanSessionPayload, sessionId?: string) {
@@ -1429,7 +1469,7 @@ function normalizeWireEvent(event: LanSessionEvent): LanSessionEvent {
 }
 
 function inferWireEventEntityType(event: LanSessionEvent) {
-  if (event.type === 'session_patch' || event.type === 'timeline_event') return 'session';
+  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
   if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
   if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
@@ -1465,6 +1505,66 @@ function getEventsAfterSeq(seq: number, sessionId?: string) {
   return mergeRecentEvents(hostPayload?.events || [], hostEvents)
     .filter((event) => (!sessionId || event.sessionId === sessionId) && getEventSeq(event) > seq)
     .sort(compareEventsAscending);
+}
+
+function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions: Record<string, number>) {
+  const events = mergeRecentEvents(hostPayload?.events || [], hostEvents)
+    .filter((event) => !sessionId || event.sessionId === sessionId);
+  const replay: LanSessionEvent[] = [];
+  for (const event of events) {
+    const revision = Number(event.entityRevision || 0);
+    if (revision <= 0) continue;
+    const entityKey = getRuntimeEntityKey(event);
+    const knownRevision = Number(knownRevisions[entityKey] || 0);
+    if (knownRevision < revision) {
+      traceApp('RESYNC_RECEIVED', 'RESYNC_ENTITY_REVISION_MISMATCH', {
+        source: 'lanTcpTransport.getEventsForRevisionGaps',
+        sessionId: event.sessionId,
+        eventId: event.id,
+        eventType: event.type,
+        seq: event.seq,
+        entityType: event.entityType,
+        entityId: event.entityId,
+        entityRevision: revision,
+        before: { knownRevision },
+        decision: 'replay_entity_event',
+      });
+      traceApp('RESYNC_RECEIVED', 'RESYNC_ENTITY_EVENT_REPLAYED', {
+        source: 'lanTcpTransport.getEventsForRevisionGaps',
+        sessionId: event.sessionId,
+        eventId: event.id,
+        eventType: event.type,
+        seq: event.seq,
+        entityType: event.entityType,
+        entityId: event.entityId,
+        entityRevision: revision,
+      });
+      replay.push(event);
+    }
+  }
+  return replay.sort(compareEventsAscending);
+}
+
+function mergeEventsById(...groups: LanSessionEvent[][]) {
+  const byId = new Map<string, LanSessionEvent>();
+  for (const event of groups.flat()) {
+    byId.set(event.id, event);
+  }
+  return Array.from(byId.values()).sort(compareEventsAscending);
+}
+
+function getRuntimeEntityKey(event: LanSessionEvent) {
+  const entityType = event.entityType || inferEventEntityType(event);
+  const entityId = event.entityId || event.toKey || event.fromKey || event.tradeId || event.sessionId;
+  return `${event.sessionId}:${entityType}:${entityId}`;
+}
+
+function inferEventEntityType(event: LanSessionEvent) {
+  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
+  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
+  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
+  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  return 'player';
 }
 
 function rememberHostAck(ack: Record<string, unknown>) {
@@ -1505,6 +1605,7 @@ function closeClientSocket() {
   } catch {
     // Socket already closed.
   }
+  closedSockets.add(clientSocket);
   clientSocket = null;
   clearClientPayloadWaiters();
   stopClientHeartbeat();

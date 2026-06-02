@@ -1,6 +1,5 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 
-import { traceLanEvent, traceSqlite } from '../debug/appTrace';
 import type { LanSessionEvent } from '../lanSession';
 
 export type LanEventCommitResult = {
@@ -9,12 +8,6 @@ export type LanEventCommitResult = {
 };
 
 export async function ensureLanEventStoreSchema(db: SQLiteDatabase) {
-  traceSqlite('SQLITE_WRITE_START', {
-    source: 'lanEventStore',
-    functionName: 'ensureLanEventStoreSchema',
-    table: 'lan_session_events/lan_sessions',
-    operation: 'ENSURE_EVENT_STORE_SCHEMA',
-  });
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS lan_session_events (
       id TEXT PRIMARY KEY,
@@ -68,22 +61,12 @@ export async function ensureLanEventStoreSchema(db: SQLiteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_lan_events_entity_revision ON lan_session_events(session_id, entity_type, entity_id, entity_revision);
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_created ON lan_session_events(session_id, created_at);
   `);
-  traceSqlite('SQLITE_WRITE_DONE', {
-    source: 'lanEventStore',
-    functionName: 'ensureLanEventStoreSchema',
-    table: 'lan_session_events/lan_sessions',
-    operation: 'ENSURE_EVENT_STORE_SCHEMA',
-  });
 }
 
 export async function commitLanEvent(
   db: SQLiteDatabase,
   event: LanSessionEvent,
 ): Promise<LanEventCommitResult> {
-  traceLanEvent('COMMIT_LAN_EVENT_START', event, {
-    source: 'lanEventStore',
-    functionName: 'commitLanEvent',
-  });
   await ensureLanEventStoreSchema(db);
 
   const existingById = await db.getFirstAsync<{ payload_json: string }>(
@@ -91,13 +74,7 @@ export async function commitLanEvent(
     [event.id]
   );
   if (existingById) {
-    const existingEvent = parseLanEvent(existingById.payload_json, event) || event;
-    traceLanEvent('COMMIT_LAN_EVENT_DUPLICATE_ID', existingEvent, {
-      source: 'lanEventStore',
-      functionName: 'commitLanEvent',
-      decision: 'duplicate_id',
-    });
-    return { event: existingEvent, inserted: false };
+    return { event: parseLanEvent(existingById.payload_json, event) || event, inserted: false };
   }
 
   if (event.clientMsgId) {
@@ -109,13 +86,7 @@ export async function commitLanEvent(
       [event.sessionId, event.clientMsgId]
     );
     if (existingByClientMsg) {
-      const existingEvent = parseLanEvent(existingByClientMsg.payload_json, event) || event;
-      traceLanEvent('COMMIT_LAN_EVENT_DUPLICATE_CLIENT_MSG', existingEvent, {
-        source: 'lanEventStore',
-        functionName: 'commitLanEvent',
-        decision: 'duplicate_client_msg',
-      });
-      return { event: existingEvent, inserted: false };
+      return { event: parseLanEvent(existingByClientMsg.payload_json, event) || event, inserted: false };
     }
   }
 
@@ -134,23 +105,6 @@ export async function commitLanEvent(
     ackRequired: event.ackRequired ?? shouldRequireLanAck(event),
   };
 
-  traceSqlite('SQLITE_WRITE_START', {
-    source: 'lanEventStore',
-    functionName: 'commitLanEvent',
-    table: 'lan_session_events',
-    operation: 'INSERT_EVENT',
-    sessionId: committedEvent.sessionId,
-    eventId: committedEvent.id,
-    eventType: committedEvent.type,
-    seq: committedEvent.seq,
-    serverSeq: committedEvent.serverSeq,
-    entityType: committedEvent.entityType,
-    entityId: committedEvent.entityId,
-    entityRevision: committedEvent.entityRevision,
-    fromKey: committedEvent.fromKey,
-    toKey: committedEvent.toKey,
-    payload: committedEvent,
-  });
   await db.runAsync(
     `INSERT INTO lan_session_events (
        id, session_id, seq, server_seq, type, from_key, to_key, client_msg_id,
@@ -175,25 +129,6 @@ export async function commitLanEvent(
     ]
   );
 
-  traceSqlite('SQLITE_WRITE_DONE', {
-    source: 'lanEventStore',
-    functionName: 'commitLanEvent',
-    table: 'lan_session_events',
-    operation: 'INSERT_EVENT',
-    sessionId: committedEvent.sessionId,
-    eventId: committedEvent.id,
-    eventType: committedEvent.type,
-    seq: committedEvent.seq,
-    serverSeq: committedEvent.serverSeq,
-    entityType: committedEvent.entityType,
-    entityId: committedEvent.entityId,
-    entityRevision: committedEvent.entityRevision,
-  });
-  traceLanEvent('COMMIT_LAN_EVENT_DONE', committedEvent, {
-    source: 'lanEventStore',
-    functionName: 'commitLanEvent',
-    decision: 'inserted',
-  });
   return { event: committedEvent, inserted: true };
 }
 
@@ -203,14 +138,6 @@ export async function listLanEvents(
   limit = 30,
 ): Promise<LanSessionEvent[]> {
   await ensureLanEventStoreSchema(db);
-  traceSqlite('SQLITE_READ_START', {
-    source: 'lanEventStore',
-    functionName: 'listLanEvents',
-    table: 'lan_session_events',
-    operation: 'LIST_EVENTS_DESC',
-    sessionId,
-    args: { limit },
-  });
   const rows = await db.getAllAsync<{ payload_json: string }>(
     `SELECT payload_json
      FROM lan_session_events
@@ -220,19 +147,7 @@ export async function listLanEvents(
     [sessionId, limit]
   );
 
-  const events = rows.map((row) => parseLanEvent(row.payload_json, null)).filter(Boolean) as LanSessionEvent[];
-  traceSqlite('SQLITE_READ_DONE', {
-    source: 'lanEventStore',
-    functionName: 'listLanEvents',
-    table: 'lan_session_events',
-    operation: 'LIST_EVENTS_DESC',
-    sessionId,
-    result: {
-      count: events.length,
-      seqs: events.map((event) => event.seq ?? event.serverSeq).slice(0, 40),
-    },
-  });
-  return events;
+  return rows.map((row) => parseLanEvent(row.payload_json, null)).filter(Boolean) as LanSessionEvent[];
 }
 
 export async function listLanEventsAfterSeq(
@@ -242,14 +157,6 @@ export async function listLanEventsAfterSeq(
   limit = 100,
 ): Promise<LanSessionEvent[]> {
   await ensureLanEventStoreSchema(db);
-  traceSqlite('SQLITE_READ_START', {
-    source: 'lanEventStore',
-    functionName: 'listLanEventsAfterSeq',
-    table: 'lan_session_events',
-    operation: 'LIST_EVENTS_AFTER_SEQ_ASC',
-    sessionId,
-    args: { afterSeq, limit },
-  });
   const rows = await db.getAllAsync<{ payload_json: string }>(
     `SELECT payload_json
      FROM lan_session_events
@@ -259,19 +166,7 @@ export async function listLanEventsAfterSeq(
     [sessionId, Math.max(0, Math.floor(Number(afterSeq) || 0)), limit]
   );
 
-  const events = rows.map((row) => parseLanEvent(row.payload_json, null)).filter(Boolean) as LanSessionEvent[];
-  traceSqlite('SQLITE_READ_DONE', {
-    source: 'lanEventStore',
-    functionName: 'listLanEventsAfterSeq',
-    table: 'lan_session_events',
-    operation: 'LIST_EVENTS_AFTER_SEQ_ASC',
-    sessionId,
-    result: {
-      count: events.length,
-      seqs: events.map((event) => event.seq ?? event.serverSeq).slice(0, 60),
-    },
-  });
-  return events;
+  return rows.map((row) => parseLanEvent(row.payload_json, null)).filter(Boolean) as LanSessionEvent[];
 }
 
 export async function markLanEventDelivered(db: SQLiteDatabase, eventId: string) {
