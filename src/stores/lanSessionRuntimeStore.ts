@@ -316,7 +316,14 @@ function tickRuntimeEffects(effects: LanSessionPlayerState['effects'], unit: Lan
     if (delta <= 0) return effect;
     changed = true;
     return { ...effect, remaining: Math.max(0, Number(effect.remaining || 0) - delta) };
-  }).filter((effect) => Number(effect.remaining || 0) > 0);
+  }).filter((effect) => (
+    effect.isPermanent ||
+    effect.unit === 'permanent' ||
+    effect.unit === 'manual' ||
+    effect.unit === 'while_equipped' ||
+    effect.unit === 'concentration' ||
+    Number(effect.remaining || 0) > 0
+  ));
   return changed ? next : effects;
 }
 
@@ -369,7 +376,7 @@ function markRuntimeEntity(
 }
 
 function getPlayerKey(sessionId: string, player: LanSessionPlayerState) {
-  return `${sessionId}:player:${player.remoteKey || player.clientId || player.id || player.characterName}`;
+  return `${sessionId}:player:${player.remoteKey || player.clientId || player.sourceCharacterId || player.characterId || player.id || player.characterName}`;
 }
 
 function getSessionKey(sessionId: string) {

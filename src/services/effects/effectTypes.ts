@@ -60,6 +60,7 @@ export type LanActiveEffectSnapshot = {
   value: number;
   remaining: number;
   unit: DurationUnit | 'rest';
+  isPermanent?: boolean;
   kind?: EffectKind | 'stat' | 'hp' | 'temp_hp';
   mode?: 'add' | 'set';
   durationText?: string;

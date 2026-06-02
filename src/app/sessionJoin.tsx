@@ -4,7 +4,7 @@ import { BarcodeScanningResult, CameraView, useCameraPermissions } from 'expo-ca
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -26,10 +26,9 @@ import {
   resolveLanSessionUrlByInviteCode,
   saveLanSession,
   switchLanRole,
-  unlinkCharacterFromLanSession,
   type LanSessionPayload,
 } from '@/services/lanSession';
-import { traceButton, traceError, traceFunctionCall, traceFunctionReturn, traceScreen, traceSqlite } from '@/services/debug/appTrace';
+import { traceApp, traceButton, traceError, traceFunctionCall, traceFunctionReturn, traceScreen, traceSqlite } from '@/services/debug/appTrace';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, lanSessionStyles as styles } from '@/styles/globalStyles';
 
@@ -51,10 +50,12 @@ export default function SessionJoinScreen() {
   const [payload, setPayload] = useState<LanSessionPayload | null>(null);
   const [characters, setCharacters] = useState<CharacterRow[]>([]);
   const [loading, setLoading] = useState(false);
+  const [joinInFlight, setJoinInFlight] = useState(false);
   const [imported, setImported] = useState(false);
   const [scannerVisible, setScannerVisible] = useState(false);
   const [scanned, setScanned] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const joiningRef = useRef(false);
 
   useEffect(() => {
     traceScreen('sessionJoin', 'SESSION_JOIN_SCREEN_FOCUS', {
@@ -305,10 +306,6 @@ export default function SessionJoinScreen() {
         return;
       }
 
-      if (bound && !isBoundCharacterStillInSession(nextPayload, bound.characterId, bound.remoteKey)) {
-        await unlinkCharacterFromLanSession(db, bound.characterId, nextPayload.session.id);
-      }
-
       await loadEligibleCharacters(nextPayload);
       traceFunctionReturn('loadSession', {
         sessionId: nextPayload.session.id,
@@ -406,6 +403,23 @@ export default function SessionJoinScreen() {
 
   const handleChooseCharacter = async (characterId: number) => {
     if (!payload) return;
+    if (joiningRef.current) {
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_CLICK_IGNORED_IN_FLIGHT', {
+        screen: 'sessionJoin',
+        source: 'handleChooseCharacter',
+        sessionId: payload.session.id,
+        characterId,
+      });
+      return;
+    }
+    joiningRef.current = true;
+    setJoinInFlight(true);
+    traceApp('LAN_JOIN', 'PLAYER_JOIN_START', {
+      screen: 'sessionJoin',
+      source: 'handleChooseCharacter',
+      sessionId: payload.session.id,
+      characterId,
+    });
     traceButton('sessionJoin', 'CHOOSE_CHARACTER_FOR_LAN', {
       sessionId: payload.session.id,
       characterId,
@@ -433,6 +447,13 @@ export default function SessionJoinScreen() {
         payload.session.id,
         currentCharacter || character
       );
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_ACK_RECEIVED', {
+        screen: 'sessionJoin',
+        source: 'handleChooseCharacter',
+        sessionId: payload.session.id,
+        characterId,
+        masterNotified,
+      });
 
       // Nao aplique o payload inicial da sessão aqui.
       // Nesse momento o mestre ainda pode nao ter persistido o jogador no SQLite oficial.
@@ -461,6 +482,13 @@ export default function SessionJoinScreen() {
         )}` as any
       );
     } catch (error) {
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_REJECTED', {
+        screen: 'sessionJoin',
+        source: 'handleChooseCharacter',
+        sessionId: payload.session.id,
+        characterId,
+        reason: error instanceof Error ? error.message : String(error || ''),
+      });
       console.error('[LAN] Falha ao escolher personagem:', error);
       traceError('LAN_JOIN', 'CHOOSE_CHARACTER_FOR_LAN_ERROR', error, {
         screen: 'sessionJoin',
@@ -473,12 +501,35 @@ export default function SessionJoinScreen() {
         getJoinErrorMessage(error)
       );
     } finally {
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_FINISHED', {
+        screen: 'sessionJoin',
+        source: 'handleChooseCharacter',
+        sessionId: payload.session.id,
+        characterId,
+      });
+      joiningRef.current = false;
+      setJoinInFlight(false);
       setLoading(false);
     }
   };
 
   const handleCreateCharacter = () => {
     if (!payload) return;
+    if (joiningRef.current) {
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_CLICK_IGNORED_IN_FLIGHT', {
+        screen: 'sessionJoin',
+        source: 'handleCreateCharacter',
+        sessionId: payload.session.id,
+      });
+      return;
+    }
+    joiningRef.current = true;
+    setJoinInFlight(true);
+    traceApp('LAN_JOIN', 'PLAYER_JOIN_START', {
+      screen: 'sessionJoin',
+      source: 'handleCreateCharacter',
+      sessionId: payload.session.id,
+    });
     traceButton('sessionJoin', 'CREATE_CHARACTER_FOR_LAN', {
       sessionId: payload.session.id,
       joinUrl,
@@ -640,6 +691,7 @@ export default function SessionJoinScreen() {
                   renderItem={({ item }) => (
                     <TouchableOpacity
                       style={styles.characterRow}
+                      disabled={joinInFlight}
                       onPress={() => handleChooseCharacter(item.id)}
                     >
                       <Text style={styles.characterName}>{item.name}</Text>
@@ -656,7 +708,7 @@ export default function SessionJoinScreen() {
               </Text>
             )}
 
-            <TouchableOpacity style={styles.primaryButton} onPress={handleCreateCharacter}>
+            <TouchableOpacity style={styles.primaryButton} disabled={joinInFlight} onPress={handleCreateCharacter}>
               <Text style={styles.primaryButtonText}>
                 CRIAR PERSONAGEM PARA A SESSÃO
               </Text>

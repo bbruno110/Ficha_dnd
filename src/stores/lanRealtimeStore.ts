@@ -1,6 +1,14 @@
 import { create } from 'zustand';
 
+import { traceApp } from '@/services/debug/appTrace';
 import type { LanSessionEvent, LanSessionPlayerState } from '@/services/lanSession';
+
+export const LAN_REALTIME_STORE_VERSION = 'gap-checkpoint-v3';
+
+traceApp('EVENT_DECISION', 'LAN_REALTIME_STORE_VERSION', {
+  source: 'src/stores/lanRealtimeStore.ts',
+  version: LAN_REALTIME_STORE_VERSION,
+});
 
 export type NumberPatch = Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
 
@@ -74,6 +82,8 @@ const inferEntityType = (event: LanSessionEvent) => {
   if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
   if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
+  if (event.type === 'effect_save_request' || event.type === 'effect_save_result') return 'save';
+  if (event.type.includes('action') || event.type.includes('skill') || event.type.includes('spell') || event.type.includes('ability')) return 'action';
   if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
   return 'player';
 };
@@ -100,7 +110,29 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
 
   getEventApplyDecision: (event) => {
     const state = get();
-    if (!event?.id) return { apply: false, reason: 'missing_id' };
+    const traceDecision = (decision: LanEventApplyDecision) => {
+      traceApp('EVENT_DECISION', 'LAN_REALTIME_STORE_DECISION_SOURCE', {
+        source: 'src/stores/lanRealtimeStore.ts',
+        version: LAN_REALTIME_STORE_VERSION,
+        eventId: event?.id,
+        type: event?.type,
+        seq: event?.seq,
+        serverSeq: event?.serverSeq,
+        entityType: event?.entityType,
+        entityId: event?.entityId,
+        entityRevision: event?.entityRevision,
+        reason: decision.reason,
+        apply: decision.apply,
+        recoverable: decision.recoverable,
+        currentRevision: decision.currentRevision,
+        nextRevision: decision.nextRevision,
+        lastAppliedSeq: decision.lastAppliedSeq,
+        lastSeenSeq: decision.lastSeenSeq,
+      });
+      return decision;
+    };
+
+    if (!event?.id) return traceDecision({ apply: false, reason: 'missing_id' });
 
     const entityKey = getLanRuntimeEntityKey(event);
     const current = state.entityVersions[entityKey];
@@ -109,7 +141,7 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
 
     // Aplicado de verdade: não reaplique.
     if (state.appliedEventIds[event.id]) {
-      return {
+      return traceDecision({
         apply: false,
         reason: 'duplicate_id',
         entityKey,
@@ -117,12 +149,12 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
         lastSeenSeq: state.lastSeenSeq,
-      };
+      });
     }
 
     // Revisão antiga da mesma entidade: evento velho, não precisa resync.
     if (current && nextRevision > 0 && nextRevision <= current.revision) {
-      return {
+      return traceDecision({
         apply: false,
         reason: 'old_entity_revision',
         entityKey,
@@ -130,7 +162,7 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
         lastSeenSeq: state.lastSeenSeq,
-      };
+      });
     }
 
     // O seq global não pode bloquear evento de entidade mais nova. Isso era a causa
@@ -138,7 +170,7 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
     // evento estrutural ou por evento só observado. Só bloqueie seq antigo se também
     // não houver revisão nova para aplicar.
     if (eventSeq > 0 && current?.lastSeq && eventSeq <= current.lastSeq && nextRevision <= (current.revision || 0)) {
-      return {
+      return traceDecision({
         apply: false,
         reason: 'old_seq',
         entityKey,
@@ -147,14 +179,14 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
         lastAppliedSeq: state.lastAppliedSeq,
         lastSeenSeq: state.lastSeenSeq,
         receivedSeq: eventSeq,
-      };
+      });
     }
 
     // Gap de revisão agora é recuperável e NÃO bloqueia automaticamente.
     // Patches de HP/XP/moedas/tempHP são valores absolutos; aplicar o checkpoint
     // autoritativo é melhor do que entrar em loop infinito de resync.
     if (current && nextRevision > current.revision + 1) {
-      return {
+      return traceDecision({
         apply: true,
         reason: 'entity_revision_gap',
         recoverable: true,
@@ -163,10 +195,10 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
         lastSeenSeq: state.lastSeenSeq,
-      };
+      });
     }
 
-    return {
+    return traceDecision({
       apply: true,
       reason: state.seenEventIds[event.id] ? 'stored_duplicate_but_apply_needed' : 'new_event',
       entityKey,
@@ -174,7 +206,7 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
       nextRevision,
       lastAppliedSeq: state.lastAppliedSeq,
       lastSeenSeq: state.lastSeenSeq,
-    };
+    });
   },
 
   shouldApplyEvent: (event) => get().getEventApplyDecision(event).apply,
@@ -272,7 +304,7 @@ export const applyNumberPatchToCharacter = <T extends Record<string, unknown>>(c
 
 export const getKnownLanEntityRevisions = (sessionId?: string) => {
   const runtime = useLanRealtimeStore.getState();
-  const entries = Object.entries(runtime.entityVersions || {}) as Array<[string, RuntimeEntityState]>;
+  const entries = Object.entries(runtime.entityVersions || {}) as [string, RuntimeEntityState][];
 
   return Object.fromEntries(
     entries

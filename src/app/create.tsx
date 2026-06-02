@@ -14,6 +14,7 @@ import {
 // IMPORTAÇÃO DO NOVO COMPONENTE
 import SpellSelector, { SpellItem } from '../components/SpellSelector';
 
+import { traceApp } from '@/services/debug/appTrace';
 import { joinLanSessionWithCharacter, makeLanCharacterKey, notifyMasterJoin, requestLanSessionResync } from '@/services/lanSession';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, createStyles as styles } from '@/styles/globalStyles';
@@ -56,6 +57,8 @@ export default function CreateCharacterScreen() {
   const { sessionId, sessionLevel, joinUrl } = useLocalSearchParams<{ sessionId?: string; sessionLevel?: string; joinUrl?: string }>();
   const db = useSQLiteContext();
   const isRandomizing = useRef(false);
+  const saveInFlightRef = useRef(false);
+  const createdLanCharacterIdRef = useRef<number | null>(null);
 
   const hasConfirmedRandomize = useRef(false);
 
@@ -913,14 +916,33 @@ export default function CreateCharacterScreen() {
   };
 
   const handleSave = async () => {
+    if (saveInFlightRef.current) {
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_CLICK_IGNORED_IN_FLIGHT', {
+        screen: 'create',
+        source: 'handleSave',
+        sessionId,
+        characterId: createdLanCharacterIdRef.current,
+      });
+      return;
+    }
+    saveInFlightRef.current = true;
+    traceApp('LAN_JOIN', 'PLAYER_JOIN_START', {
+      screen: 'create',
+      source: 'handleSave',
+      sessionId,
+      characterId: createdLanCharacterIdRef.current,
+    });
     if (!name || race.includes('Selecione') || charClass.includes('Selecione')) {
+      saveInFlightRef.current = false;
       showCustomAlert("Atenção", "Preencha o Nome, Raça e Classe no Passo 1."); return;
     }
     const cleanInventory = inventory.filter(item => item.qty > 0);
     const activeSavesToSave = proficiencies.filter(p => p.startsWith('save_'));
     const activeSkillsToSave = proficiencies.filter(p => p.startsWith('skill_'));
+    let newCharacterId = createdLanCharacterIdRef.current || 0;
 
     try {
+      if (!newCharacterId) {
       const result = await db.runAsync(
         `INSERT INTO characters (
           name, race, class, stats, prof_bonus, inspiration, proficiencies, 
@@ -936,7 +958,9 @@ export default function CreateCharacterScreen() {
           JSON.stringify(selectedSpells), '{}', JSON.stringify(cleanInventory), gp, sp, cp, hpMax, hpMax, 1, 0 
         ]
       );
-      const newCharacterId = Number(result.lastInsertRowId);
+      newCharacterId = Number(result.lastInsertRowId);
+      createdLanCharacterIdRef.current = newCharacterId;
+      }
       const targetSessionLevel = Math.max(1, parseInt(String(sessionLevel || '1')) || 1);
 
       if (sessionId && newCharacterId) {
@@ -945,9 +969,17 @@ export default function CreateCharacterScreen() {
         const character = await joinLanSessionWithCharacter(db, sessionValue, newCharacterId, '', {
           joinUrl: joinUrlValue,
         });
-        await notifyMasterJoin(joinUrlValue, sessionValue, character);
+        const masterNotified = await notifyMasterJoin(joinUrlValue, sessionValue, character);
+        if (!masterNotified) throw new Error('JOIN_REJECTED');
 
         const playerKey = makeLanCharacterKey(sessionValue, character || { id: newCharacterId, name });
+        traceApp('LAN_JOIN', 'PLAYER_JOIN_ACK_RECEIVED', {
+          screen: 'create',
+          source: 'handleSave',
+          sessionId: sessionValue,
+          characterId: newCharacterId,
+          playerKey,
+        });
         const runtime = useLanRealtimeStore.getState();
         runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
         await requestLanSessionResync(joinUrlValue, {
@@ -965,7 +997,27 @@ export default function CreateCharacterScreen() {
       } else {
         router.back();
       }
-    } catch (error) {}
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_FINISHED', {
+        screen: 'create',
+        source: 'handleSave',
+        sessionId,
+        characterId: newCharacterId,
+      });
+    } catch (error) {
+      traceApp('LAN_JOIN', 'PLAYER_JOIN_REJECTED', {
+        screen: 'create',
+        source: 'handleSave',
+        sessionId,
+        characterId: createdLanCharacterIdRef.current,
+        reason: error instanceof Error ? error.message : String(error || ''),
+      });
+      showCustomAlert(
+        "Ficha criada",
+        "A ficha local foi mantida, mas o mestre ainda nÃ£o confirmou a entrada. Toque em salvar novamente para tentar com a mesma ficha."
+      );
+    } finally {
+      saveInFlightRef.current = false;
+    }
   };
 
   // ================= RENDERIZAÇÕES =================

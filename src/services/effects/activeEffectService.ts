@@ -101,6 +101,19 @@ export async function applyEffectToPlayer(
     status: normalizedStatusKey,
   };
 
+  if (finalSnapshot.unit === 'concentration') {
+    const concentrationRows = await getActiveRowsForTarget(db, player.session_id, player.target_key);
+    for (const row of concentrationRows) {
+      const existingSnapshot = mapActiveEffectRow(row);
+      if (existingSnapshot.unit !== 'concentration') continue;
+      removed.push(existingSnapshot);
+      await db.runAsync(
+        `UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [existingSnapshot.id],
+      );
+    }
+  }
+
   traceSqlite('SQLITE_WRITE_START', {
     source: 'activeEffectService',
     functionName: 'applyEffectToPlayer',
@@ -358,6 +371,7 @@ export async function tickTurnEffects(
       const snapshot = mapActiveEffectRow(row);
       const save = await maybeCreateRepeatSave(db, sessionId, player.target_key, snapshot, unit);
       if (save) result.pendingSaves.push(save);
+      if (snapshot.isPermanent || snapshot.unit === 'permanent') continue;
 
       const delta = getDurationDelta(snapshot.unit, unit);
       if (delta <= 0) continue;
@@ -576,8 +590,11 @@ async function backfillPlayerActiveEffectsFromCache(db: SQLiteDatabase, player: 
       name: effect.name || 'Efeito',
       target: normalizeTarget(effect.target),
       value: toNumber(effect.value),
-      remaining: Math.max(1, toNumber(effect.remaining, 1)),
       unit: normalizeDurationUnit(effect.unit) || 'rest',
+      remaining: effect.isPermanent || effect.unit === 'permanent'
+        ? 0
+        : Math.max(1, toNumber(effect.remaining, 1)),
+      isPermanent: Boolean(effect.isPermanent || effect.unit === 'permanent'),
       status: statusKey,
       statusKey,
     };
@@ -688,9 +705,12 @@ function buildInputSnapshot(
   currentTurn: number,
 ): LanActiveEffectSnapshot {
   const unit = normalizeDurationUnit(input.unit || catalog?.defaultDurationUnit) || 'rest';
-  const remaining = input.remaining == null
-    ? Math.max(1, Number(catalog?.defaultDurationValue || 1))
-    : Math.max(1, Math.floor(Number(input.remaining) || 1));
+  const isPermanent = unit === 'permanent';
+  const remaining = isPermanent
+    ? 0
+    : input.remaining == null
+      ? Math.max(1, Number(catalog?.defaultDurationValue || 1))
+      : Math.max(1, Math.floor(Number(input.remaining) || 1));
   const target = normalizeTarget(input.target || catalog?.target);
   const value = Math.floor(Number(input.value ?? catalog?.value ?? 0) || 0);
   const name = input.name || catalog?.name || 'Efeito';
@@ -702,6 +722,7 @@ function buildInputSnapshot(
     value,
     remaining,
     unit,
+    isPermanent,
     kind: (input.kind || catalog?.kind || inferKindFromTarget(target)) as LanActiveEffectSnapshot['kind'],
     mode: input.mode || 'add',
     durationText: input.durationText || formatDurationText(remaining, unit),
@@ -730,17 +751,20 @@ function mapActiveEffectRow(row: Record<string, unknown>): LanActiveEffectSnapsh
   const statusKey = normalizeStatusKey(row.status_key || stored.statusKey || stored.status || row.catalog_name);
   const target = normalizeTarget(stored.target || row.catalog_target);
   const unit = normalizeDurationUnit(row.remaining_unit || stored.unit) || 'rest';
+  const isPermanent = Boolean(stored.isPermanent || unit === 'permanent');
+  const remaining = isPermanent ? 0 : Math.max(0, toNumber(row.remaining_value ?? stored.remaining, 1));
 
   return {
     id: String(row.id || stored.id || ''),
     name: String(stored.name || row.catalog_name || row.source_name || 'Efeito'),
     target,
     value: toNumber(stored.value ?? row.catalog_value),
-    remaining: Math.max(0, toNumber(row.remaining_value ?? stored.remaining, 1)),
+    remaining,
     unit,
+    isPermanent,
     kind: (stored.kind || row.catalog_kind || inferKindFromTarget(target)) as LanActiveEffectSnapshot['kind'],
     mode: stored.mode === 'set' ? 'set' : 'add',
-    durationText: stored.durationText || formatDurationText(toNumber(row.remaining_value ?? stored.remaining, 1), unit),
+    durationText: stored.durationText || formatDurationText(remaining, unit),
     status: statusKey,
     statusKey,
     source: stored.source || optionalString(row.source_name),

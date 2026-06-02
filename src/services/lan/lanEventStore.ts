@@ -226,8 +226,17 @@ async function nextEntityRevision(
 }
 
 function inferLanEventEntityType(event: LanSessionEvent) {
-  if (event.type === 'session_patch' || event.type === 'timeline_event') return 'session';
-  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
+  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
+  if (event.type.includes('save')) return 'save';
+  if (event.type.includes('action') || event.type.includes('skill') || event.type.includes('spell') || event.type.includes('ability')) return 'action';
+  if (
+    event.type === 'inventory_patch' ||
+    event.type === 'send_item' ||
+    event.type === 'send_item_request' ||
+    event.type === 'send_item_result' ||
+    event.type.startsWith('trade_')
+  ) return 'inventory';
+  if (event.type === 'coin_self_patch_request') return 'player';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
   if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
   return 'player';

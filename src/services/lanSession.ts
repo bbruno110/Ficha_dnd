@@ -113,6 +113,7 @@ export type LanSessionEffect = {
   value: number;
   remaining: number;
   unit: LanEffectUnit;
+  isPermanent?: boolean;
   kind?: LanEffectKind;
   mode?: 'add' | 'set';
   durationText?: string;
@@ -219,6 +220,7 @@ export type LanTradeItem = {
 export type LanResourceRequest = {
   kind: 'xp' | 'hp' | 'temp_hp' | 'coin' | 'stat' | 'buff' | 'condition' | 'inventory';
   action?: 'add' | 'remove' | 'heal' | 'damage' | 'set' | 'temp';
+  operation?: string;
   amount?: number;
   field?: string;
   value?: number;
@@ -229,11 +231,30 @@ export type LanResourceRequest = {
 };
 
 export type LanSpellEventMode = 'heal' | 'damage' | 'effect';
+export type LanActionRollMode = 'virtual' | 'manual';
+export type LanActionKind = 'heal' | 'damage' | 'effect' | 'attack' | 'save' | 'item' | 'skill' | 'ability' | 'spell';
 export type LanSessionEventType =
+  | 'skill_cast_request'
+  | 'ability_use_request'
+  | 'spell_cast_request'
+  | 'item_use_request'
+  | 'action_result'
+  | 'skill_result'
+  | 'spell_cast_result'
+  | 'ability_use_result'
+  | 'public_action_result'
+  | 'effect_save_request'
+  | 'effect_save_result'
   | 'send_item'
+  | 'send_item_request'
+  | 'send_item_result'
   | 'trade_offer'
   | 'trade_accept'
   | 'trade_decline'
+  | 'trade_result'
+  | 'coin_self_patch_request'
+  | 'master_grant_item'
+  | 'quest_reward_granted'
   | 'public_status'
   | 'spell_hp'
   | 'spell_effect'
@@ -273,6 +294,122 @@ export type LanSessionEvent = {
   item?: LanTradeItem;
   offeredItem?: LanTradeItem;
   requestedItem?: LanTradeItem;
+  actionRequest?: {
+    actionId?: string;
+    actionName?: string;
+    actionKind?: LanActionKind | string;
+    sourceType?: 'spell' | 'item' | 'skill' | 'ability' | 'manual' | string;
+    targetKind?: 'self' | 'player' | 'party' | 'manual' | 'enemy' | string;
+    targetKey?: string;
+    targetName?: string;
+    rollMode?: LanActionRollMode;
+    rolls?: Array<{
+      rollMode?: LanActionRollMode;
+      formula?: string;
+      dice?: string;
+      rawRoll?: number;
+      manualValue?: number;
+      modifier?: number;
+      total?: number;
+      rollId?: string;
+      timestamp?: string;
+    }>;
+    declaredValue?: number;
+    spellEffect?: LanSessionEvent['spellEffect'];
+    item?: LanTradeItem;
+    itemQty?: number;
+    effects?: Record<string, unknown>[];
+    chosenAttr?: string;
+    save?: {
+      enabled?: boolean;
+      saveAbility?: string;
+      fallbackAbilities?: string[];
+      dc?: number;
+      rollMode?: LanActionRollMode | 'target_choice';
+      saveOnSuccess?: 'none' | 'half' | 'negates' | 'reduces_duration' | 'removes_condition' | 'custom' | string;
+      saveOnFailure?: 'apply_full' | 'apply_half' | 'custom' | string;
+      pendingEffectPayload?: Record<string, unknown>;
+    };
+    attack?: {
+      attackRoll?: number;
+      attackModifier?: number;
+      attackTotal?: number;
+      rollMode?: LanActionRollMode;
+      targetAC?: number;
+      isCritical?: boolean;
+      isFumble?: boolean;
+      hit?: boolean;
+      damageRoll?: number;
+      damageType?: string;
+    };
+    createdAt?: string;
+  };
+  actionResult?: {
+    actionId?: string;
+    requestId?: string;
+    status: 'accepted' | 'rejected';
+    reason?: string;
+    targetKey?: string;
+    amount?: number;
+    hpCurrent?: number;
+    tempHp?: number;
+    attack?: Record<string, unknown>;
+    roll?: Record<string, unknown>;
+  };
+  saveRequest?: {
+    id: string;
+    sourceEffectId?: string;
+    sourceEffectName?: string;
+    targetKey: string;
+    saveAbility: string;
+    fallbackAbilities?: string[];
+    dc?: number | null;
+    rollMode?: LanActionRollMode | 'target_choice';
+    saveOnSuccess?: string;
+    saveOnFailure?: string;
+    pendingEffectPayload?: Record<string, unknown>;
+  };
+  saveResult?: {
+    requestId: string;
+    rollMode: LanActionRollMode;
+    dice?: string;
+    rawRoll?: number;
+    manualValue?: number;
+    modifier?: number;
+    total?: number;
+    dc?: number | null;
+    passed?: boolean;
+  };
+  coinPatchRequest?: {
+    targetKey?: string;
+    current?: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>>;
+    next?: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>>;
+    currentTotalCopper?: number;
+    nextTotalCopper?: number;
+    reason?: string;
+  };
+  sendItemRequest?: {
+    requestId?: string;
+    fromKey?: string;
+    toKey?: string;
+    item?: LanTradeItem;
+    qty?: number;
+  };
+  sendItemResult?: {
+    requestId?: string;
+    status: 'accepted' | 'rejected';
+    reason?: string;
+  };
+  tradeAccept?: {
+    tradeId?: string;
+    fromKey?: string;
+    toKey?: string;
+  };
+  tradeResult?: {
+    tradeId?: string;
+    status: 'accepted' | 'rejected';
+    reason?: string;
+  };
   publicState?: {
     hpCurrent: number;
     hpMax: number;
@@ -307,13 +444,35 @@ export type LanSessionEvent = {
     id?: string;
     result?: Record<string, unknown>;
   };
+  sessionPatch?: {
+    status?: LanSessionStatus;
+    hostInstanceId?: string;
+    sessionEpoch?: number;
+    pausedAt?: string;
+    resumedAt?: string;
+    reason?: string;
+    keepPlayersLinked?: boolean;
+    readOnlyForPlayers?: boolean;
+  };
+  sessionEnded?: {
+    endedAt?: string;
+    reason?: string;
+    unlinkPlayers?: boolean;
+    allowOfflineAfterEnd?: boolean;
+    preserveOfficialRewards?: boolean;
+    clearTemporarySessionEffects?: boolean;
+  };
   resourceRequest?: LanResourceRequest;
   inventoryPatch?: {
+    targetKey?: string;
     equipment: Record<string, unknown>;
     reason?: string;
+    action?: 'grant' | 'remove' | 'set_quantity' | 'replace' | 'self_update' | 'transfer_in' | 'transfer_out' | string;
+    grantId?: string;
   };
   numberPatch?: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
   tradeId?: string;
+  visibility?: 'public' | 'party' | 'private' | string;
   message?: string;
   createdAt: string;
 };
@@ -767,6 +926,8 @@ export async function resolveLanSessionUrlByInviteCode(code: string) {
 
 export type FetchLanSessionEventsOptions = {
   afterSeq?: number;
+  playerKey?: string;
+  includeGlobal?: boolean;
 };
 
 export async function fetchLanSessionEvents(
@@ -776,7 +937,11 @@ export async function fetchLanSessionEvents(
 ): Promise<LanSessionEvent[]> {
   if (!joinUrl) return [];
   const afterSeq = Math.max(0, Math.floor(Number(options?.afterSeq || 0)));
-  if (isTcpLanUrl(joinUrl)) return getLanTcpClientEvents(joinUrl, sessionId, afterSeq);
+  if (isTcpLanUrl(joinUrl)) return getLanTcpClientEvents(joinUrl, sessionId, {
+    afterSeq,
+    playerKey: options?.playerKey,
+    includeGlobal: options?.includeGlobal !== false,
+  });
   return [];
 }
 
@@ -791,7 +956,7 @@ export async function ackLanSessionEvent(joinUrl: string | undefined, ack: { ses
   return false;
 }
 
-export async function requestLanSessionResync(joinUrl: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
+export async function requestLanSessionResync(joinUrl: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean }) {
   if (!joinUrl) return false;
   if (isTcpLanUrl(joinUrl)) return requestLanTcpResync(joinUrl, request);
   return false;
@@ -1167,7 +1332,7 @@ export async function rebuildLanSessionCatalog(
 export async function pauseLanSession(db: SQLiteDatabase, sessionId: string) {
   await ensureLanSchema(db);
   await db.runAsync(
-    `UPDATE lan_sessions SET status = 'paused', active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    `UPDATE lan_sessions SET status = 'paused', active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [sessionId]
   );
   return syncLanSessionPayload(db, sessionId);
@@ -1244,6 +1409,7 @@ export async function notifyMasterJoin(joinUrl: string | undefined, sessionId: s
       clientId,
       playerName: playerName || character.name,
       remoteKey: makeLanCharacterKey(sessionId, character),
+      sourceCharacterId: character.id,
       character,
       reviewSnapshot: Boolean(options?.reviewSnapshot),
     });
@@ -1261,6 +1427,23 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
   const normalized = normalizeCharacterState(character);
   const remoteKey = String(entry.remoteKey || `${sessionId}:${entry.playerName || normalized.playerName}:${normalized.sourceCharacterId || normalized.characterName}`);
   const playerName = String(entry.playerName || normalized.playerName || normalized.characterName);
+
+  if (!hasMinimumLanJoinSnapshot(character, normalized)) {
+    debugLanFlow('MASTER_JOIN_SNAPSHOT_INCOMPLETE_REJECTED', {
+      sessionId,
+      remoteKey,
+      clientId,
+      playerName,
+      sourceCharacterId: normalized.sourceCharacterId,
+      characterName: normalized.characterName,
+      className: normalized.className,
+      race: normalized.race,
+      hpCurrent: normalized.hpCurrent,
+      hpMax: normalized.hpMax,
+      statsKeys: Object.keys(normalized.stats || {}),
+    });
+    return null;
+  }
 
   const blockedSameJoin = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT id FROM lan_session_players
@@ -1314,6 +1497,22 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
 
     const pendingDiff = entry.reviewSnapshot ? describeCharacterDiff(existing, normalized) : [];
     if (pendingDiff.length > 0) {
+      const existingPendingSnapshot = String(existing.pending_character_snapshot || '');
+      const existingPendingDiff = String(existing.notes || '');
+      const nextPendingSnapshot = JSON.stringify(character);
+      const nextPendingDiff = JSON.stringify(pendingDiff);
+      if (existingPendingSnapshot === nextPendingSnapshot && existingPendingDiff === nextPendingDiff) {
+        debugLanFlow('MASTER_PENDING_SNAPSHOT_DUPLICATE_SKIPPED', {
+          sessionId,
+          remoteKey,
+          clientId,
+          playerName,
+          characterName: normalized.characterName,
+          pendingDiff,
+        });
+        return Number(existing.id);
+      }
+
       if (await canAutoAcceptLevelUpSnapshot(db, existing, normalized, pendingDiff)) {
         await updateLanPlayerFromNormalizedSnapshot(db, Number(existing.id), character, normalized);
         await rememberLanSessionEvent(db, {
@@ -1386,7 +1585,7 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
       session_id, remote_key, client_id, player_name, character_id, character_name, character_snapshot,
       level, class_name, race, hp_current, hp_max, temp_hp, xp, gp, sp, cp, stats_json, equipment_json, effects_json, last_seen_at
     )
-    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
+    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)`,
     [
       sessionId,
       remoteKey,
@@ -1539,7 +1738,16 @@ export async function updateLanPlayerEquipment(
       fromName: 'Mestre',
       toKey: String(player.remote_key || ''),
       toName: String(player.character_name || 'Personagem'),
-      inventoryPatch: { equipment: normalizeEquipment(equipment), reason: message },
+      entityType: 'inventory',
+      entityId: String(player.remote_key || ''),
+      ackRequired: true,
+      originClientId: 'master',
+      inventoryPatch: {
+        targetKey: String(player.remote_key || ''),
+        equipment: normalizeEquipment(equipment),
+        reason: message,
+        action: 'grant',
+      },
       message,
       createdAt: new Date().toISOString(),
     });
@@ -1569,6 +1777,146 @@ export async function applyLanPlayerInventoryPatch(
   if (!allowIncreases && hasInventoryIncrease(currentEquipment, nextEquipment)) return false;
 
   return updateLanPlayerEquipment(db, Number(player.id), nextEquipment);
+}
+
+type LanInventoryMutationResult = {
+  accepted: boolean;
+  reason?: string;
+  targetKeys: string[];
+};
+
+export async function applyLanCoinSelfPatchRequest(db: SQLiteDatabase, event: LanSessionEvent) {
+  await ensureLanSchema(db);
+  const request = event.coinPatchRequest;
+  const targetKey = String(request?.targetKey || event.fromKey || '');
+  if (!request?.next || !targetKey || targetKey !== event.fromKey) {
+    return { accepted: false, reason: 'Pedido de moedas invalido.' };
+  }
+
+  const session = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT status FROM lan_sessions WHERE id = ?`,
+    [event.sessionId]
+  );
+  if (String(session?.status || 'active') !== 'active') {
+    return { accepted: false, reason: 'Sessao em leitura.' };
+  }
+
+  const player = await getActiveLanPlayerByRemoteKey(db, event.sessionId, targetKey);
+  if (!player) return { accepted: false, reason: 'Jogador nao encontrado.' };
+
+  const current = {
+    gp: Math.max(0, toNumber(player.gp)),
+    sp: Math.max(0, toNumber(player.sp)),
+    cp: Math.max(0, toNumber(player.cp)),
+  };
+  const next = {
+    gp: request.next.gp == null ? current.gp : Math.max(0, Math.floor(toNumber(request.next.gp))),
+    sp: request.next.sp == null ? current.sp : Math.max(0, Math.floor(toNumber(request.next.sp))),
+    cp: request.next.cp == null ? current.cp : Math.max(0, Math.floor(toNumber(request.next.cp))),
+  };
+  const currentTotalCopper = coinsToCopper(current);
+  const nextTotalCopper = coinsToCopper(next);
+
+  if (nextTotalCopper > currentTotalCopper) {
+    return { accepted: false, reason: 'Jogador nao pode aumentar moedas sem aprovacao do mestre.' };
+  }
+
+  await updateLanPlayerNumbers(db, Number(player.id), next, { syncPayload: false });
+  await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
+
+  return {
+    accepted: true,
+    targetKey,
+    patch: next,
+    currentTotalCopper,
+    nextTotalCopper,
+    reason: request.reason || event.message,
+  };
+}
+
+export async function applyLanSendItemRequest(db: SQLiteDatabase, event: LanSessionEvent): Promise<LanInventoryMutationResult> {
+  await ensureLanSchema(db);
+  const request = event.sendItemRequest;
+  const item = request?.item || event.item;
+  const fromKey = String(request?.fromKey || event.fromKey || '');
+  const toKey = String(request?.toKey || event.toKey || '');
+
+  if (!item || !fromKey || !toKey || toKey === 'master' || fromKey !== event.fromKey) {
+    return { accepted: false, reason: 'Pedido de envio invalido.', targetKeys: [fromKey].filter(Boolean) };
+  }
+
+  const result = await runLanDbTransaction(db, async () => {
+    const status = await getLanSessionStatus(db, event.sessionId);
+    if (status !== 'active') return { accepted: false, reason: 'Sessao em leitura.', targetKeys: [fromKey] };
+
+    const fromPlayer = await getActiveLanPlayerForMutation(db, event.sessionId, fromKey);
+    const toPlayer = await getActiveLanPlayerForMutation(db, event.sessionId, toKey);
+    if (!fromPlayer || !toPlayer) return { accepted: false, reason: 'Jogador de origem ou destino nao encontrado.', targetKeys: [fromKey] };
+
+    const transferItem = normalizeTradeItemForMutation(item);
+    if (!transferItem) return { accepted: false, reason: 'Item invalido.', targetKeys: [fromKey] };
+
+    const fromEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(fromPlayer.equipment_json, {}));
+    const toEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(toPlayer.equipment_json, {}));
+    if (!removeTradeItemFromEquipment(fromEquipment, transferItem)) {
+      return { accepted: false, reason: 'Quantidade insuficiente no inventario de origem.', targetKeys: [fromKey] };
+    }
+
+    const nextToEquipment = addTradeItemToEquipment(toEquipment, transferItem);
+    await writeLanPlayerEquipmentSnapshot(db, fromPlayer, fromEquipment);
+    await writeLanPlayerEquipmentSnapshot(db, toPlayer, nextToEquipment);
+
+    return { accepted: true, targetKeys: [fromKey, toKey], reason: event.message };
+  });
+
+  if (result.accepted) await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
+  return result;
+}
+
+export async function applyLanTradeAcceptRequest(db: SQLiteDatabase, event: LanSessionEvent): Promise<LanInventoryMutationResult> {
+  await ensureLanSchema(db);
+  if (!event.offeredItem || !event.requestedItem) {
+    return { accepted: false, reason: 'Troca sem itens suficientes.', targetKeys: [event.fromKey].filter(Boolean) };
+  }
+
+  const offerEvent = event.tradeId ? await getStoredLanTradeOffer(db, event.sessionId, event.tradeId) : null;
+  const offeringKey = String(event.tradeAccept?.fromKey || offerEvent?.fromKey || (event.toKey !== 'master' ? event.toKey : '') || '');
+  const acceptingKey = String(event.tradeAccept?.toKey || event.fromKey || '');
+  if (!offeringKey || !acceptingKey || offeringKey === acceptingKey) {
+    return { accepted: false, reason: 'Participantes da troca invalidos.', targetKeys: [acceptingKey].filter(Boolean) };
+  }
+
+  const result = await runLanDbTransaction(db, async () => {
+    const status = await getLanSessionStatus(db, event.sessionId);
+    if (status !== 'active') return { accepted: false, reason: 'Sessao em leitura.', targetKeys: [offeringKey, acceptingKey] };
+
+    const offeringPlayer = await getActiveLanPlayerForMutation(db, event.sessionId, offeringKey);
+    const acceptingPlayer = await getActiveLanPlayerForMutation(db, event.sessionId, acceptingKey);
+    if (!offeringPlayer || !acceptingPlayer) {
+      return { accepted: false, reason: 'Jogador da troca nao encontrado.', targetKeys: [offeringKey, acceptingKey] };
+    }
+
+    const offeredItem = normalizeTradeItemForMutation(event.offeredItem);
+    const requestedItem = normalizeTradeItemForMutation(event.requestedItem);
+    if (!offeredItem || !requestedItem) return { accepted: false, reason: 'Item de troca invalido.', targetKeys: [offeringKey, acceptingKey] };
+
+    const offeringEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(offeringPlayer.equipment_json, {}));
+    const acceptingEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(acceptingPlayer.equipment_json, {}));
+    if (!removeTradeItemFromEquipment(offeringEquipment, offeredItem)) {
+      return { accepted: false, reason: 'O item oferecido nao esta mais disponivel.', targetKeys: [offeringKey, acceptingKey] };
+    }
+    if (!removeTradeItemFromEquipment(acceptingEquipment, requestedItem)) {
+      return { accepted: false, reason: 'O item solicitado nao esta mais disponivel.', targetKeys: [offeringKey, acceptingKey] };
+    }
+
+    await writeLanPlayerEquipmentSnapshot(db, offeringPlayer, addTradeItemToEquipment(offeringEquipment, requestedItem));
+    await writeLanPlayerEquipmentSnapshot(db, acceptingPlayer, addTradeItemToEquipment(acceptingEquipment, offeredItem));
+
+    return { accepted: true, targetKeys: [offeringKey, acceptingKey], reason: event.message };
+  });
+
+  if (result.accepted) await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
+  return result;
 }
 
 export async function applyLanInventoryTransferEvent(db: SQLiteDatabase, event: LanSessionEvent) {
@@ -2178,6 +2526,9 @@ export function summarizeEffect(effect: LanSessionEffect) {
   const unitLabel = formatEffectUnitLabel(effect.unit);
   const targetLabel = effect.target === 'PV_TEMP' ? 'PV temp.' : effect.target;
   const valueText = effect.target === 'custom' || effect.value === 0 ? '' : ` ${targetLabel} ${sign}${effect.value}`;
+  if (effect.isPermanent || effect.unit === 'permanent') {
+    return `${effect.name}:${valueText} (permanente)`;
+  }
   return `${effect.name}:${valueText} (${effect.remaining} ${unitLabel})`;
 }
 
@@ -2582,6 +2933,19 @@ function normalizeCharacterState(character: Record<string, unknown>) {
   };
 }
 
+function hasMinimumLanJoinSnapshot(
+  character: Record<string, unknown>,
+  normalized: ReturnType<typeof normalizeCharacterState>
+) {
+  const hasName = Boolean(String(character.name || normalized.characterName || '').trim());
+  const hasRace = Boolean(String(normalized.race || '').trim()) && normalized.race !== '-';
+  const hasClass = Boolean(String(normalized.className || '').trim()) && normalized.className !== '-';
+  const hasHp = normalized.hpMax > 0;
+  const hasStats = Boolean(normalized.stats && Object.keys(normalized.stats).length > 0);
+  const hasSourceCharacter = normalized.sourceCharacterId != null && normalized.sourceCharacterId > 0;
+  return hasName && hasRace && hasClass && hasHp && hasStats && hasSourceCharacter;
+}
+
 async function updateLanPlayerFromNormalizedSnapshot(
   db: SQLiteDatabase,
   playerId: number,
@@ -2665,13 +3029,6 @@ function describeCharacterDiff(current: Record<string, unknown>, incoming: Retur
     level: toNumber(current.level, currentSnapshot.level),
     className: String(current.class_name || currentSnapshot.className || '-'),
     race: String(current.race || currentSnapshot.race || '-'),
-    hpCurrent: toNumber(current.hp_current, currentSnapshot.hpCurrent),
-    hpMax: toNumber(current.hp_max, currentSnapshot.hpMax),
-    tempHp: toNumber(current.temp_hp, currentSnapshot.tempHp),
-    xp: toNumber(current.xp, currentSnapshot.xp),
-    gp: toNumber(current.gp, currentSnapshot.gp),
-    sp: toNumber(current.sp, currentSnapshot.sp),
-    cp: toNumber(current.cp, currentSnapshot.cp),
     stats: parseJsonValue<Record<string, unknown>>(current.stats_json, currentSnapshot.stats),
     equipment: parseJsonValue<Record<string, unknown>>(current.equipment_json, currentSnapshot.equipment),
   };
@@ -2690,26 +3047,6 @@ function describeCharacterDiff(current: Record<string, unknown>, incoming: Retur
 
   if (incoming.race !== currentValues.race) {
     diffs.push(`Raça alterada: ${currentValues.race} -> ${incoming.race}`);
-  }
-
-  if (
-    incoming.hpCurrent !== currentValues.hpCurrent ||
-    incoming.hpMax !== currentValues.hpMax ||
-    incoming.tempHp !== currentValues.tempHp
-  ) {
-    diffs.push(
-      `HP ${currentValues.hpCurrent}/${currentValues.hpMax} (+${currentValues.tempHp}) -> ${incoming.hpCurrent}/${incoming.hpMax} (+${incoming.tempHp})`
-    );
-  }
-
-  if (incoming.xp !== currentValues.xp) {
-    diffs.push(`XP ${currentValues.xp} -> ${incoming.xp}`);
-  }
-
-  if (incoming.gp !== currentValues.gp || incoming.sp !== currentValues.sp || incoming.cp !== currentValues.cp) {
-    diffs.push(
-      `Moedas ${currentValues.gp} PO, ${currentValues.sp} PP, ${currentValues.cp} PC -> ${incoming.gp} PO, ${incoming.sp} PP, ${incoming.cp} PC`
-    );
   }
 
   if (JSON.stringify(incoming.stats) !== JSON.stringify(currentValues.stats)) {
@@ -2736,11 +3073,98 @@ function normalizeEquipment(value: unknown): Record<string, unknown> {
 
 async function getActiveLanPlayerByRemoteKey(db: SQLiteDatabase, sessionId: string, remoteKey: string) {
   return db.getFirstAsync<Record<string, unknown>>(
-    `SELECT id, equipment_json, gp, sp, cp
+    `SELECT id, remote_key, character_name, character_id, equipment_json, revision_seq, gp, sp, cp
      FROM lan_session_players
      WHERE session_id = ? AND remote_key = ? AND COALESCE(is_active, 1) = 1`,
     [sessionId, remoteKey]
   );
+}
+
+async function getActiveLanPlayerForMutation(db: SQLiteDatabase, sessionId: string, remoteKey: string) {
+  return db.getFirstAsync<Record<string, unknown>>(
+    `SELECT id, remote_key, character_name, character_id, equipment_json, revision_seq
+     FROM lan_session_players
+     WHERE session_id = ? AND remote_key = ? AND COALESCE(is_active, 1) = 1`,
+    [sessionId, remoteKey]
+  );
+}
+
+async function getLanSessionStatus(db: SQLiteDatabase, sessionId: string) {
+  const row = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT status FROM lan_sessions WHERE id = ?`,
+    [sessionId]
+  );
+  return normalizeSessionStatus(row?.status);
+}
+
+async function runLanDbTransaction<T>(db: SQLiteDatabase, task: () => Promise<T>) {
+  const transactional = db as SQLiteDatabase & { withTransactionAsync?: (task: () => Promise<T>) => Promise<T> };
+  if (typeof transactional.withTransactionAsync === 'function') {
+    return transactional.withTransactionAsync(task);
+  }
+
+  await db.execAsync('BEGIN IMMEDIATE TRANSACTION');
+  try {
+    const result = await task();
+    await db.execAsync('COMMIT');
+    return result;
+  } catch (error) {
+    await db.execAsync('ROLLBACK').catch(() => undefined);
+    throw error;
+  }
+}
+
+async function writeLanPlayerEquipmentSnapshot(
+  db: SQLiteDatabase,
+  player: Record<string, unknown>,
+  equipment: Record<string, unknown>
+) {
+  const normalized = normalizeEquipment(equipment);
+  const playerId = Number(player.id);
+
+  await db.runAsync(
+    `UPDATE lan_session_players
+     SET equipment_json = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
+         last_seen_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [JSON.stringify(normalized), playerId]
+  );
+
+  if (player.character_id) {
+    await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [
+      JSON.stringify(normalized),
+      Number(player.character_id),
+    ]);
+  }
+
+  return normalized;
+}
+
+async function getStoredLanTradeOffer(db: SQLiteDatabase, sessionId: string, tradeId: string) {
+  const row = await db.getFirstAsync<{ payload_json: string }>(
+    `SELECT payload_json
+     FROM lan_session_events
+     WHERE session_id = ? AND id = ? AND type = 'trade_offer'
+     LIMIT 1`,
+    [sessionId, tradeId]
+  );
+  return parseJsonValue<LanSessionEvent | null>(row?.payload_json, null);
+}
+
+function normalizeTradeItemForMutation(item?: LanTradeItem | null): LanTradeItem | null {
+  const name = String(item?.name || '').trim();
+  if (!name) return null;
+  return {
+    ...item,
+    name,
+    qty: Math.max(1, Math.floor(toNumber(item?.qty, 1))),
+  };
+}
+
+function coinsToCopper(coins: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>>) {
+  return Math.max(0, Math.floor(toNumber(coins.gp))) * 100 +
+    Math.max(0, Math.floor(toNumber(coins.sp))) * 10 +
+    Math.max(0, Math.floor(toNumber(coins.cp)));
 }
 
 function addTradeItemToEquipment(equipment: Record<string, unknown>, tradeItem: LanTradeItem) {

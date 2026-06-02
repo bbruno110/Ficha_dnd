@@ -2,8 +2,9 @@ import * as Network from 'expo-network';
 import { NativeModules } from 'react-native';
 
 import { traceApp, traceError, traceFunctionCall, traceFunctionReturn, traceSocket } from './debug/appTrace';
+import { shouldPlayerProcessLanEvent } from './lan/lanClientEngine';
 import { debugLanFlow } from './lanRuntimeMode';
-import type { LanSessionEvent, LanSessionPayload, LanSessionPlayerState } from './lanSession';
+import type { LanSessionEvent, LanSessionPayload } from './lanSession';
 
 declare const require: any;
 
@@ -36,7 +37,7 @@ type TcpEnvelope =
   | { type: 'payload_update'; payload: LanSessionPayload; structural?: boolean; snapshotSeq?: number }
   | { type: 'event_ack'; sessionId: string; eventId: string; clientMsgId?: string; playerKey?: string; lastAppliedSeq?: number; entityId?: string; entityRevision?: number }
   | { type: 'event_nack'; sessionId: string; eventId?: string; clientMsgId?: string; playerKey?: string; reason: string }
-  | { type: 'resync_request'; sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }
+  | { type: 'resync_request'; sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean }
   | { type: 'resync_events'; sessionId: string; events: LanSessionEvent[]; payload?: LanSessionPayload }
   | { type: 'ack'; sessionId: string; playerKey?: string; lastAppliedSeq?: number; receivedEventIds?: string[] }
   | { type: 'heartbeat'; sessionId?: string; sentAt: string }
@@ -51,7 +52,14 @@ let hostSockets = new Set<TcpSocket>();
 let hostJoinedRows: Record<string, unknown>[] = [];
 let hostEvents: LanSessionEvent[] = [];
 let hostEventAcks: Record<string, unknown>[] = [];
-export type HostUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string };
+export type HostUpdate = {
+  reason?: string;
+  event?: LanSessionEvent;
+  envelopeType?: string;
+  joinEntry?: Record<string, unknown>;
+  completeJoin?: (payload?: LanSessionPayload | null) => void;
+  rejectJoin?: (reason: string) => void;
+};
 let hostUpdateListeners = new Set<(update?: HostUpdate) => void>();
 let hostKickedJoinKeys = new Set<string>();
 
@@ -184,9 +192,16 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
       if (message.type === 'resync_request') {
         if (!isEnvelopeForCurrentSession(message.sessionId)) return;
         const lastAppliedSeq = Number(message.lastAppliedSeq || 0);
-        const events = mergeEventsById(
-          getEventsAfterSeq(lastAppliedSeq, message.sessionId),
-          getEventsForRevisionGaps(message.sessionId, message.knownRevisions || {})
+        const events = filterEventsForPlayer(
+          mergeEventsById(
+            getEventsAfterSeq(lastAppliedSeq, message.sessionId),
+            getEventsForRevisionGaps(message.sessionId, message.knownRevisions || {})
+          ),
+          {
+            sessionId: message.sessionId,
+            playerKey: message.playerKey,
+            includeGlobal: message.includeGlobal !== false,
+          }
         );
         sendEnvelope(socket, {
           type: 'resync_events',
@@ -260,8 +275,6 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           receivedAt: now,
         };
 
-        upsertByKey(hostJoinedRows, normalizedEntry, remoteKey ? 'remoteKey' : 'clientId');
-
         const character = normalizeJoinCharacter(incomingEntry.character);
         const playerName = String(incomingEntry.playerName || character.name || 'Jogador');
         const joinedEvent: LanSessionEvent = {
@@ -275,18 +288,98 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           message: `${playerName} entrou na sessao.`,
           createdAt: now,
         };
+        upsertByKey(hostJoinedRows, normalizedEntry, remoteKey ? 'remoteKey' : 'clientId');
         upsertByKey(hostEvents, joinedEvent, 'id');
 
-        sendEnvelope(socket, {
-          type: 'join_ack',
-          sessionId: hostPayload?.session.id || entrySessionId,
-          remoteKey: remoteKey || undefined,
-          clientId: clientId || undefined,
-          accepted: true,
+        traceApp('LAN_JOIN', 'MASTER_JOIN_UPSERT_START', {
+          source: 'lanTcpTransport.join',
+          sessionId: entrySessionId,
+          remoteKey,
+          clientId,
+          playerName,
         });
-        broadcastHostPayload();
-        updateHostForegroundSession();
-        notifyHostUpdates({ reason: 'join', event: joinedEvent, envelopeType: 'join' });
+
+        let joinCompleted = false;
+        const finishJoin = (payload?: LanSessionPayload | null) => {
+          if (joinCompleted) return;
+          joinCompleted = true;
+          clearTimeout(joinTimer);
+          if (payload?.session?.id === entrySessionId) {
+            hostPayload = payload;
+          }
+
+          const bootstrapPayload = makeHostPayload();
+          traceApp('LAN_JOIN', 'MASTER_JOIN_ACK_SENT_AFTER_UPSERT', {
+            source: 'lanTcpTransport.join',
+            sessionId: entrySessionId,
+            remoteKey,
+            clientId,
+            playerName,
+            playerCount: bootstrapPayload.state?.players?.length || 0,
+          });
+          sendEnvelope(socket, {
+            type: 'join_ack',
+            sessionId: hostPayload?.session.id || entrySessionId,
+            remoteKey: remoteKey || undefined,
+            clientId: clientId || undefined,
+            accepted: true,
+          });
+          sendEnvelope(socket, {
+            type: 'session_snapshot',
+            payload: bootstrapPayload,
+            structural: true,
+          });
+          broadcastEnvelope({
+            type: 'payload_update',
+            payload: bootstrapPayload,
+            structural: true,
+          });
+          traceApp('LAN_JOIN', 'MASTER_JOIN_BOOTSTRAP_PAYLOAD_WITH_PLAYER', {
+            source: 'lanTcpTransport.join',
+            sessionId: entrySessionId,
+            remoteKey,
+            clientId,
+            playerName,
+            playerCount: bootstrapPayload.state?.players?.length || 0,
+            hasOfficialPlayer: Boolean((bootstrapPayload.state?.players || []).some((player) => (
+              player.remoteKey === remoteKey ||
+              (clientId && player.clientId === clientId) ||
+              player.characterName === playerName
+            ))),
+          });
+          updateHostForegroundSession();
+        };
+
+        const rejectJoin = (reason: string) => {
+          if (joinCompleted) return;
+          joinCompleted = true;
+          clearTimeout(joinTimer);
+          sendEnvelope(socket, {
+            type: 'join_rejected',
+            sessionId: entrySessionId,
+            reason,
+          });
+        };
+
+        const joinTimer = setTimeout(() => {
+          traceApp('LAN_JOIN', 'MASTER_JOIN_UPSERT_TIMEOUT', {
+            source: 'lanTcpTransport.join',
+            sessionId: entrySessionId,
+            remoteKey,
+            clientId,
+            playerName,
+          });
+          rejectJoin('JOIN_UPSERT_TIMEOUT');
+        }, 3000);
+
+        notifyHostUpdates({
+          reason: 'join',
+          event: joinedEvent,
+          envelopeType: 'join',
+          joinEntry: normalizedEntry,
+          completeJoin: finishJoin,
+          rejectJoin,
+        });
         return;
       }
 
@@ -494,7 +587,7 @@ export async function sendLanTcpJoin(url: string | undefined, entry: Record<stri
       durationMs: Date.now() - startedAt,
     });
     return result;
-  } catch (error) {
+  } catch {
     await connectLanTcpClient(url, { forceReconnect: true });
     const result = await sendJoinAndWaitAck();
     traceFunctionReturn('sendLanTcpJoin', { result, retried: true }, {
@@ -659,7 +752,7 @@ export async function sendLanTcpNack(url: string | undefined, nack: { sessionId:
   return result;
 }
 
-export async function requestLanTcpResync(url: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
+export async function requestLanTcpResync(url: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean }) {
   if (!url) return false;
   traceFunctionCall('requestLanTcpResync', request, {
     source: 'lanTcpTransport',
@@ -688,16 +781,25 @@ export async function requestLanTcpResync(url: string | undefined, request: { se
   return result;
 }
 
-export async function getLanTcpClientEvents(url: string, sessionId?: string, afterSeq = 0) {
-  const minSeq = Math.max(0, Math.floor(Number(afterSeq) || 0));
+export async function getLanTcpClientEvents(
+  url: string,
+  sessionId?: string,
+  options?: number | { afterSeq?: number; playerKey?: string; includeGlobal?: boolean },
+) {
+  const minSeq = Math.max(0, Math.floor(Number(typeof options === 'number' ? options : options?.afterSeq || 0)) || 0);
+  const playerKey = typeof options === 'number' ? undefined : options?.playerKey;
+  const includeGlobal = typeof options === 'number' ? true : options?.includeGlobal !== false;
+  const filterOptions = { sessionId, playerKey, includeGlobal };
   if (isCurrentHostUrl(url)) {
     return getLanTcpHostEvents()
       .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) > minSeq))
+      .filter((event) => shouldReturnEventToClient(event, filterOptions))
       .sort(compareEventsAscending);
   }
   await connectLanTcpClient(url);
   return clientEvents
     .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) > minSeq))
+    .filter((event) => shouldReturnEventToClient(event, filterOptions))
     .sort(compareEventsAscending);
 }
 
@@ -954,7 +1056,6 @@ function loadTcpSocket() {
       throw new Error('Modulo TCP nativo indisponivel. Recompile e reinstale o dev build Android.');
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const loaded = require('react-native-tcp-socket');
     tcpModule = (loaded.default || loaded) as TcpSocketModule;
     if (!tcpModule?.createServer || !tcpModule?.createConnection) {
@@ -1332,102 +1433,9 @@ function mergeClientPayloadEvents(payload: LanSessionPayload, sessionId?: string
   }
 }
 
-function mergeJoinedPlayersIntoPayload(payload: LanSessionPayload): LanSessionPayload {
-  const state = payload.state || {
-    status: 'active' as const,
-    currentTurn: 1,
-    elapsedMinutes: 0,
-    players: [],
-  };
-  const players = [...(state.players || [])];
-
-  for (const entry of hostJoinedRows) {
-    const player = makeProvisionalPlayerFromJoin(entry, payload.session.id, players.length + 1);
-    if (!player) continue;
-
-    const index = players.findIndex((current) => (
-      Boolean(player.remoteKey && current.remoteKey === player.remoteKey) ||
-      Boolean(player.clientId && current.clientId === player.clientId) ||
-      (
-        current.characterName === player.characterName &&
-        current.playerName === player.playerName
-      )
-    ));
-
-    if (index >= 0) {
-      players[index] = {
-        ...player,
-        ...players[index],
-        remoteKey: players[index].remoteKey || player.remoteKey,
-        clientId: players[index].clientId || player.clientId,
-      };
-    } else {
-      players.push(player);
-    }
-  }
-
-  return {
-    ...payload,
-    state: {
-      ...state,
-      players,
-    },
-  };
-}
-
-function makeProvisionalPlayerFromJoin(
-  entry: Record<string, unknown>,
-  sessionId: string,
-  fallbackIndex: number
-): LanSessionPlayerState | null {
-  const character = normalizeJoinCharacter(entry.character);
-  const characterName = String(character.name || entry.playerName || 'Personagem');
-  const remoteKey = String(
-    entry.remoteKey ||
-    `${sessionId}:${character.id || entry.clientId || characterName}:${characterName}`
-  );
-  const stats = parseJsonValue<Record<string, unknown>>(character.stats, {});
-
-  return {
-    id: -Math.abs(hashString(remoteKey || characterName || String(fallbackIndex))),
-    sessionId,
-    remoteKey,
-    clientId: entry.clientId ? String(entry.clientId) : undefined,
-    playerName: String(entry.playerName || characterName),
-    characterId: null,
-    sourceCharacterId: character.id == null ? null : toNumber(character.id),
-    characterName,
-    level: toNumber(character.level, 1),
-    className: String(character.class || '-'),
-    race: String(character.race || '-'),
-    hpCurrent: toNumber(character.hp_current),
-    hpMax: toNumber(character.hp_max),
-    tempHp: toNumber(character.temp_hp),
-    xp: toNumber(character.xp),
-    gp: toNumber(character.gp),
-    sp: toNumber(character.sp),
-    cp: toNumber(character.cp),
-    stats,
-    equipment: normalizeEquipment(character.equipment),
-    effects: [],
-    characterSnapshot: character,
-  };
-}
-
 function normalizeJoinCharacter(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
-}
-
-function normalizeEquipment(value: unknown): Record<string, unknown> {
-  const equipment = parseJsonValue<any>(value, {});
-  if (Array.isArray(equipment)) return { bag: equipment, slots: {} };
-  if (!equipment || typeof equipment !== 'object') return { bag: [], slots: {} };
-  return {
-    ...equipment,
-    bag: Array.isArray(equipment.bag) ? equipment.bag : [],
-    slots: equipment.slots || {},
-  };
 }
 
 function mergeRecentEvents(...eventLists: LanSessionEvent[][]) {
@@ -1551,6 +1559,26 @@ function mergeEventsById(...groups: LanSessionEvent[][]) {
     byId.set(event.id, event);
   }
   return Array.from(byId.values()).sort(compareEventsAscending);
+}
+
+function filterEventsForPlayer(
+  events: LanSessionEvent[],
+  options: { sessionId?: string; playerKey?: string; includeGlobal?: boolean },
+) {
+  return events.filter((event) => shouldReturnEventToClient(event, options));
+}
+
+function shouldReturnEventToClient(
+  event: LanSessionEvent,
+  options: { sessionId?: string; playerKey?: string; includeGlobal?: boolean },
+) {
+  if (options.sessionId && event.sessionId !== options.sessionId) return false;
+  if (!options.playerKey) return true;
+  return shouldPlayerProcessLanEvent(event, {
+    sessionId: event.sessionId,
+    selfKey: options.playerKey,
+    includeGlobal: options.includeGlobal !== false,
+  });
 }
 
 function getRuntimeEntityKey(event: LanSessionEvent) {
@@ -1899,31 +1927,6 @@ function isUsableLanIp(ip?: string | null) {
 function isEnvelopeForCurrentSession(sessionId?: string) {
   if (!sessionId) return true;
   return Boolean(hostPayload?.session.id && sessionId === hostPayload.session.id);
-}
-
-function parseJsonValue<T>(value: unknown, fallback: T): T {
-  if (value == null) return fallback;
-  if (typeof value !== 'string') return value as T;
-
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function toNumber(value: unknown, fallback = 0) {
-  const numberValue = Number(value);
-  return Number.isFinite(numberValue) ? numberValue : fallback;
-}
-
-function hashString(value: string) {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = ((hash << 5) - hash) + value.charCodeAt(index);
-    hash |= 0;
-  }
-  return hash || 1;
 }
 
 function parseTcpUrl(url: string) {
