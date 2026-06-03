@@ -6,10 +6,12 @@ import {
   ensureEffectSchema,
   listEffects,
   removeEffectFromPlayer,
+  removeTempHpEffectsFromPlayer,
   tickTurnEffects,
   type LanEffectPatch,
   type LanPendingSave,
 } from './effects';
+import { applyDamageWithTempHp } from './combat/hpDamageService';
 import {
   commitLanEvent,
   ensureLanEventStoreSchema,
@@ -218,6 +220,7 @@ export type LanTradeItem = {
 };
 
 export type LanResourceRequest = {
+  clientRequestId?: string;
   kind: 'xp' | 'hp' | 'temp_hp' | 'coin' | 'stat' | 'buff' | 'condition' | 'inventory';
   action?: 'add' | 'remove' | 'heal' | 'damage' | 'set' | 'temp';
   operation?: string;
@@ -1765,6 +1768,9 @@ export async function applyLanPlayerInventoryPatch(
   allowIncreases = false
 ) {
   await ensureLanSchema(db);
+  const status = await getLanSessionStatus(db, sessionId);
+  if (status !== 'active') return false;
+
   const player = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT id, equipment_json FROM lan_session_players
      WHERE session_id = ? AND remote_key = ? AND COALESCE(is_active, 1) = 1`,
@@ -2068,9 +2074,26 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
     }
 
     if (request.kind === 'hp') {
-      await updateLanPlayerNumbers(db, playerId, {
-        hpCurrent: Math.max(0, Math.min(toNumber(player.hp_max), toNumber(player.hp_current) + toNumber(request.amount))),
-      });
+      const amount = toNumber(request.amount);
+      if (amount < 0) {
+        const damage = applyDamageWithTempHp({
+          hpCurrent: toNumber(player.hp_current),
+          hpMax: toNumber(player.hp_max),
+          tempHp: toNumber(player.temp_hp),
+          damage: Math.abs(amount),
+        });
+        await updateLanPlayerNumbers(db, playerId, {
+          hpCurrent: damage.nextHpCurrent,
+          tempHp: damage.nextTempHp,
+        });
+        if (damage.tempHpWasDepleted) {
+          await removeLanPlayerTempHpEffects(db, playerId);
+        }
+      } else {
+        await updateLanPlayerNumbers(db, playerId, {
+          hpCurrent: Math.max(0, Math.min(toNumber(player.hp_max), toNumber(player.hp_current) + amount)),
+        });
+      }
     }
 
     if (request.kind === 'temp_hp') {
@@ -2294,6 +2317,16 @@ export async function removeLanPlayerEffect(db: SQLiteDatabase, playerId: number
   if (!result) return;
 
   await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.removed.name} removido de ${result.targetName}.`);
+  await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
+  return result;
+}
+
+export async function removeLanPlayerTempHpEffects(db: SQLiteDatabase, playerId: number) {
+  await ensureLanSchema(db);
+  const result = await removeTempHpEffectsFromPlayer(db, playerId);
+  if (!result) return;
+
+  await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `PV temporario consumido de ${result.targetName}.`);
   await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
   return result;
 }

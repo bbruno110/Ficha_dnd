@@ -12,6 +12,8 @@ import {
   traceSqlite,
   traceStateChange,
 } from '@/services/debug/appTrace';
+import { applyDamageWithTempHp } from '@/services/combat/hpDamageService';
+import { resolveSavingThrow } from '@/services/combat/saveResolverService';
 import { getCurrentBreathColor, getVisibleEffects } from '@/services/effects/effectVisualService';
 import {
   debugLanFlow,
@@ -204,6 +206,8 @@ export default function CharacterSheetScreen() {
   const [spellEffectValue, setSpellEffectValue] = useState('0');
   const [pendingEffectSave, setPendingEffectSave] = useState<NonNullable<LanSessionEvent['saveRequest']> | null>(null);
   const [saveManualValue, setSaveManualValue] = useState('');
+  const [submittingSheetActions, setSubmittingSheetActions] = useState<string[]>([]);
+  const submittingSheetActionsRef = useRef<Set<string>>(new Set());
 
   // Sistema de Buffs Temporários
   const [tempBuffModalVisible, setTempBuffModalVisible] = useState(false);
@@ -2672,6 +2676,50 @@ export default function CharacterSheetScreen() {
     return false;
   };
 
+  const isSheetActionSubmitting = (actionId: string) => submittingSheetActions.includes(actionId);
+  const runSheetAction = async <T,>(actionId: string, task: () => Promise<T>): Promise<T | undefined> => {
+    if (submittingSheetActionsRef.current.has(actionId)) {
+      debugLanFlow('ACTION_SUBMIT_IGNORED_ALREADY_PENDING', {
+        screen: 'sheet',
+        sessionId: lanInfo?.sessionId,
+        characterId: character?.id,
+        actionId,
+      });
+      return;
+    }
+
+    submittingSheetActionsRef.current.add(actionId);
+    setSubmittingSheetActions((current) => current.includes(actionId) ? current : [...current, actionId]);
+    debugLanFlow('ACTION_SUBMIT_STARTED', {
+      screen: 'sheet',
+      sessionId: lanInfo?.sessionId,
+      characterId: character?.id,
+      actionId,
+    });
+    try {
+      const result = await task();
+      debugLanFlow('ACTION_SUBMIT_DONE', {
+        screen: 'sheet',
+        sessionId: lanInfo?.sessionId,
+        characterId: character?.id,
+        actionId,
+      });
+      return result;
+    } catch (error) {
+      debugLanFlow('ACTION_SUBMIT_FAILED', {
+        screen: 'sheet',
+        sessionId: lanInfo?.sessionId,
+        characterId: character?.id,
+        actionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    } finally {
+      submittingSheetActionsRef.current.delete(actionId);
+      setSubmittingSheetActions((current) => current.filter((id) => id !== actionId));
+    }
+  };
+
   const sendResourceRequest = async (request: LanResourceRequest) => {
     if (!character) return false;
     traceFunctionCall('sendResourceRequest', request, {
@@ -2689,16 +2737,17 @@ export default function CharacterSheetScreen() {
     }
 
     const selfKey = getSelfLanKey(lanInfo.sessionId);
+    const clientRequestId = request.clientRequestId || makeLanEventId();
     const event: LanSessionEvent = {
       id: makeLanEventId(),
-      clientMsgId: makeLanEventId(),
+      clientMsgId: clientRequestId,
       sessionId: lanInfo.sessionId,
       type: 'resource_request',
       fromKey: selfKey,
       fromName: character.name,
       toKey: 'master',
       toName: 'Mestre',
-      resourceRequest: request,
+      resourceRequest: { ...request, clientRequestId },
       message: request.message,
       createdAt: new Date().toISOString(),
     };
@@ -2749,13 +2798,13 @@ export default function CharacterSheetScreen() {
     }
   };
 
-  const notifyInventoryPatch = async (equipment: any, reason: string) => {
+  const notifyInventoryPatch = async (equipment: any, reason: string, clientRequestId = makeLanEventId()) => {
     if (!lanInfo?.joinUrl || !character) return;
     try {
       const selfKey = getSelfLanKey(lanInfo.sessionId);
       const event: LanSessionEvent = {
-        id: makeLanEventId(),
-        clientMsgId: makeLanEventId(),
+        id: clientRequestId,
+        clientMsgId: clientRequestId,
         sessionId: lanInfo.sessionId,
         type: 'inventory_patch',
         fromKey: selfKey,
@@ -2781,8 +2830,11 @@ export default function CharacterSheetScreen() {
         toKey: event.toKey,
       });
       await sendLanSessionEvent(lanInfo.joinUrl, event);
+      await rememberLanSessionEvent(db, event).catch(() => false);
+      return true;
     } catch {
       // A alteracao local continua valida; o mestre sincroniza quando receber o proximo snapshot aceito.
+      return false;
     }
   };
 
@@ -2944,14 +2996,21 @@ export default function CharacterSheetScreen() {
     rawRoll: number,
     rollMode: 'virtual' | 'manual',
   ) => {
+    return runSheetAction(`save:${save.id}`, async () => {
     if (!lanInfo?.joinUrl || !character) return false;
     const modifier = getSaveModifierForAbility(save.saveAbility);
-    const total = Math.max(0, Math.floor(Number(rawRoll) || 0)) + modifier;
-    const passed = save.dc == null ? false : total >= Number(save.dc || 0);
+    const resolvedSave = resolveSavingThrow({
+      ability: save.saveAbility,
+      dc: Number(save.dc || 1),
+      modifier,
+      rollMode,
+      manualRoll: rawRoll,
+    });
     const selfKey = getSelfLanKey(lanInfo.sessionId);
+    const eventId = makeLanEventId();
     const event: LanSessionEvent = {
-      id: makeLanEventId(),
-      clientMsgId: makeLanEventId(),
+      id: eventId,
+      clientMsgId: eventId,
       sessionId: lanInfo.sessionId,
       type: 'effect_save_result',
       fromKey: selfKey,
@@ -2965,14 +3024,14 @@ export default function CharacterSheetScreen() {
         requestId: save.id,
         rollMode,
         dice: '1d20',
-        rawRoll,
-        manualValue: rollMode === 'manual' ? rawRoll : undefined,
-        modifier,
-        total,
+        rawRoll: resolvedSave.rawRoll,
+        manualValue: rollMode === 'manual' ? resolvedSave.rawRoll : undefined,
+        modifier: resolvedSave.modifier,
+        total: resolvedSave.total,
         dc: save.dc ?? null,
-        passed,
+        passed: resolvedSave.passed,
       },
-      message: `${character.name} rolou ${total} em ${save.saveAbility}${save.dc ? ` CD ${save.dc}` : ''}.`,
+      message: `${character.name} rolou ${resolvedSave.total} em ${resolvedSave.ability}${save.dc ? ` CD ${save.dc}` : ''}.`,
       createdAt: new Date().toISOString(),
     };
 
@@ -2980,32 +3039,36 @@ export default function CharacterSheetScreen() {
       debugLanFlow('PLAYER_EFFECT_SAVE_ROLLED', {
         eventId: event.id,
         requestId: save.id,
-        saveAbility: save.saveAbility,
-        rawRoll,
-        modifier,
-        total,
-        dc: save.dc,
-        passed,
+        saveAbility: resolvedSave.ability,
+        rawRoll: resolvedSave.rawRoll,
+        modifier: resolvedSave.modifier,
+        total: resolvedSave.total,
+        dc: resolvedSave.dc,
+        passed: resolvedSave.passed,
         rollMode,
       });
       await sendLanSessionEvent(lanInfo.joinUrl, event);
       await rememberLanSessionEvent(db, event).catch(() => false);
       setPendingEffectSave(null);
       setSaveManualValue('');
+      showCustomAlert(
+        resolvedSave.passed ? 'Salvaguarda passou' : 'Salvaguarda falhou',
+        `${resolvedSave.ability}: d20 ${resolvedSave.rawRoll} ${resolvedSave.modifier >= 0 ? '+' : ''}${resolvedSave.modifier} = ${resolvedSave.total}. CD ${resolvedSave.dc}.`
+      );
       return true;
     } catch {
       showCustomAlert('Teste falhou', 'Nao consegui enviar a salvaguarda ao mestre.');
       return false;
     }
+    });
   };
 
   const rollVirtualEffectSave = (save: NonNullable<LanSessionEvent['saveRequest']>) => {
-    const roll = rollDiceExpression('1d20');
-    const rawRoll = Math.max(1, Math.min(20, Number(roll?.total || 1)));
-    void sendEffectSaveResult(save, rawRoll, 'virtual');
+    void sendEffectSaveResult(save, 1, 'virtual');
   };
 
   const handleXP = async (action: 'add' | 'remove') => {
+    await runSheetAction(`xp:${action}`, async () => {
     traceButton('sheet', action === 'add' ? 'REQUEST_OR_APPLY_XP_ADD' : 'REQUEST_OR_APPLY_XP_REMOVE', {
       mode: sheetRuntimeMode,
       sessionId: lanInfo?.sessionId,
@@ -3017,7 +3080,7 @@ export default function CharacterSheetScreen() {
     if (!ensureLanWritable()) return;
     const amount = parseInt(inputValue) || 0;
     if (lanInfo?.sessionId && amount > 0) {
-      sendResourceRequest({
+      await sendResourceRequest({
         kind: 'xp',
         action,
         amount: action === 'add' ? amount : -amount,
@@ -3037,12 +3100,14 @@ export default function CharacterSheetScreen() {
       setLevelUpModalVisible(true); 
     }
     
-    updateDB({ xp: newXp });
+    await updateDB({ xp: newXp });
     setXpModalVisible(false); 
     setInputValue('');
+    });
   };
 
   const handleHP = (action: 'damage' | 'heal') => {
+    void runSheetAction(`hp:${action}`, async () => {
     traceButton('sheet', action === 'damage' ? 'REQUEST_OR_APPLY_HP_DAMAGE' : 'REQUEST_OR_APPLY_HP_HEAL', {
       mode: sheetRuntimeMode,
       sessionId: lanInfo?.sessionId,
@@ -3054,7 +3119,7 @@ export default function CharacterSheetScreen() {
     if (!ensureLanWritable()) return;
     const amount = parseInt(inputValue) || 0;
     if (lanInfo?.sessionId && amount > 0) {
-      sendResourceRequest({
+      await sendResourceRequest({
         kind: 'hp',
         action,
         amount: action === 'heal' ? amount : -amount,
@@ -3064,26 +3129,67 @@ export default function CharacterSheetScreen() {
       setInputValue('');
       return;
     }
-    
-    let newDisplayCurrent = action === 'damage' 
-      ? Math.max(0, displayHpCurrent - amount) 
+
+    let newDisplayCurrent = action === 'damage'
+      ? Math.max(0, displayHpCurrent - amount)
       : Math.min(displayHpMax, displayHpCurrent + amount);
-      
-    let newDbCurrent = newDisplayCurrent - hpBonusFromCon;
-    
-    updateDB({ hp_current: newDbCurrent });
+    let nextTempHp = Number(character.temp_hp || 0);
+    let nextActiveEffects: any[] | null = null;
+
+    if (action === 'damage') {
+      const damageResult = applyDamageWithTempHp({
+        hpCurrent: displayHpCurrent,
+        hpMax: displayHpMax,
+        tempHp: Number(character.temp_hp || 0),
+        damage: amount,
+      });
+      newDisplayCurrent = damageResult.nextHpCurrent;
+      nextTempHp = damageResult.nextTempHp;
+      debugLanFlow('DAMAGE_WITH_TEMP_HP_CALCULATED', {
+        screen: 'sheet',
+        characterId: character.id,
+        damage: amount,
+        result: damageResult,
+      });
+      if (damageResult.tempHpWasDepleted) {
+        const currentEffects: any[] = Array.isArray(character.active_effects)
+          ? character.active_effects
+          : safeJsonParse<any[]>(character.active_effects_json, []);
+        const filteredEffects = currentEffects.filter((effect: any) => (
+          String(effect?.target || '').toUpperCase() !== 'PV_TEMP' &&
+          String(effect?.kind || '').toLowerCase() !== 'temp_hp'
+        ));
+        nextActiveEffects = filteredEffects;
+        debugLanFlow(filteredEffects.length === currentEffects.length ? 'TEMP_HP_DEPLETED_NO_EFFECT_FOUND' : 'PLAYER_TEMP_HP_EFFECT_REMOVED', {
+          screen: 'sheet',
+          characterId: character.id,
+          removedCount: currentEffects.length - filteredEffects.length,
+        });
+      }
+    }
+
+    const newDbCurrent = newDisplayCurrent - hpBonusFromCon;
+    const dbUpdates: Record<string, unknown> = { hp_current: newDbCurrent, temp_hp: nextTempHp };
+    if (nextActiveEffects) dbUpdates.active_effects_json = JSON.stringify(nextActiveEffects);
+
+    await updateDB(dbUpdates, { reason: 'hp_damage_with_temp_hp' });
+    if (nextActiveEffects) {
+      setCharacter((prev: any) => prev ? ({ ...prev, active_effects: nextActiveEffects }) : prev);
+    }
     notifyOwnLanStatus(newDbCurrent, character.hp_max);
     setHpModalVisible(false); 
     setInputValue('');
+    });
   };
 
   const handleTempHP = () => {
+    void runSheetAction('temp_hp', async () => {
     if (!ensureLanWritable()) return;
     const amount = Math.max(0, parseInt(inputValue) || 0);
     if (amount <= 0) return;
 
     if (lanInfo?.sessionId) {
-      sendResourceRequest({
+      await sendResourceRequest({
         kind: 'temp_hp',
         action: 'add',
         amount,
@@ -3094,17 +3200,19 @@ export default function CharacterSheetScreen() {
       return;
     }
 
-    updateDB({ temp_hp: Math.max(0, Number(character.temp_hp || 0) + amount) });
+    await updateDB({ temp_hp: Math.max(0, Number(character.temp_hp || 0) + amount) });
     setHpModalVisible(false);
     setInputValue('');
+    });
   };
 
   const handleTempBuffSubmit = () => {
+    void runSheetAction('temp_buff', async () => {
     if (!ensureLanWritable()) return;
     let newStats = { ...character.stats };
     const val = parseInt(tempBuffValue) || 0;
     if (lanInfo?.sessionId) {
-      sendResourceRequest({
+      await sendResourceRequest({
         kind: 'buff',
         action: 'temp',
         field: activeBuffStat,
@@ -3120,9 +3228,10 @@ export default function CharacterSheetScreen() {
 
     if (val === 0) delete newStats.temp_mods[activeBuffStat];
     else newStats.temp_mods[activeBuffStat] = val;
-    updateDB({ stats: newStats });
+    await updateDB({ stats: newStats });
     setTempBuffModalVisible(false);
     setTempBuffValue('');
+    });
   };
 
   const clearTempBuff = () => {
@@ -3147,6 +3256,7 @@ export default function CharacterSheetScreen() {
   };
 
   const handleCoinSubmit = () => {
+    void runSheetAction(`coin:set:${activeCoinType}`, async () => {
     traceButton('sheet', 'REQUEST_OR_APPLY_COIN_SET', {
       mode: sheetRuntimeMode,
       sessionId: lanInfo?.sessionId,
@@ -3162,7 +3272,7 @@ export default function CharacterSheetScreen() {
       const nextCoins = { ...currentCoins, [activeCoinType]: nextValue };
       if (getCoinTotalCopper(nextCoins) > getCoinTotalCopper(currentCoins)) {
         const amount = nextValue - Number(character[activeCoinType] || 0);
-        sendResourceRequest({
+        await sendResourceRequest({
           kind: 'coin',
           action: 'add',
           operation: 'master_approval',
@@ -3171,7 +3281,7 @@ export default function CharacterSheetScreen() {
           message: `+${amount} ${COIN_NAMES[activeCoinType]}`,
         });
       } else {
-        void sendCoinSelfPatchRequest(
+        await sendCoinSelfPatchRequest(
           nextCoins,
           `${character.name} ajustou ${COIN_NAMES[activeCoinType]} para ${nextValue}.`
         );
@@ -3180,11 +3290,13 @@ export default function CharacterSheetScreen() {
       setInputValue('');
       return;
     }
-    updateDB({ [activeCoinType]: nextValue });
+    await updateDB({ [activeCoinType]: nextValue });
     setCoinModalVisible(false); setInputValue('');
+    });
   };
 
   const updateCoins = (type: 'gp' | 'sp' | 'cp', delta: number) => {
+    void runSheetAction(`coin:delta:${type}`, async () => {
     traceButton('sheet', 'REQUEST_OR_APPLY_COIN_DELTA', {
       mode: sheetRuntimeMode,
       sessionId: lanInfo?.sessionId,
@@ -3200,7 +3312,7 @@ export default function CharacterSheetScreen() {
       const nextCoins = { ...currentCoins, [type]: nextValue };
       if (getCoinTotalCopper(nextCoins) > getCoinTotalCopper(currentCoins)) {
         const amount = nextValue - Number(character[type] || 0);
-        sendResourceRequest({
+        await sendResourceRequest({
           kind: 'coin',
           action: 'add',
           operation: 'master_approval',
@@ -3209,14 +3321,16 @@ export default function CharacterSheetScreen() {
           message: `+${amount} ${COIN_NAMES[type]}`,
         });
       } else {
-        void sendCoinSelfPatchRequest(nextCoins, `${character.name} reduziu ${COIN_NAMES[type]} para ${nextValue}.`);
+        await sendCoinSelfPatchRequest(nextCoins, `${character.name} reduziu ${COIN_NAMES[type]} para ${nextValue}.`);
       }
       return;
     }
-    updateDB({ [type]: nextValue });
+    await updateDB({ [type]: nextValue });
+    });
   };
 
   const executeCoinConversion = (sourceAmount: number, targetAmount: number) => {
+    void runSheetAction('coin:convert', async () => {
     if (!ensureLanWritable()) return;
     const nextCoins = {
       ...getCurrentCoinPatch(),
@@ -3224,7 +3338,7 @@ export default function CharacterSheetScreen() {
       [convertTo]: character[convertTo] + targetAmount
     };
     if (lanInfo?.sessionId) {
-      void sendCoinSelfPatchRequest(
+      await sendCoinSelfPatchRequest(
         nextCoins,
         `${character.name} converteu ${sourceAmount} ${COIN_NAMES[convertFrom]} em ${targetAmount} ${COIN_NAMES[convertTo]}.`
       );
@@ -3232,10 +3346,11 @@ export default function CharacterSheetScreen() {
       setConvertAmount('');
       return;
     }
-    updateDB(nextCoins);
+    await updateDB(nextCoins);
     setConvertModalVisible(false);
     setConvertAmount('');
     showCustomAlert("Câmbio Realizado", `Você converteu ${sourceAmount} ${COIN_NAMES[convertFrom]} em ${targetAmount} ${COIN_NAMES[convertTo]}.`);
+    });
   };
 
   const isLanCharacter = () => isLanPlayerRuntime;
@@ -3308,13 +3423,16 @@ export default function CharacterSheetScreen() {
 
     if (isLanPlayerRuntime) {
       if (delta < 0) {
+        const actionId = `inventory:${String(item.name || index)}:${Math.abs(delta)}`;
         debugLanFlow('LAN_PLAYER_REQUEST_INVENTORY_PATCH', {
           characterId: character.id,
           itemName: item.name,
           delta,
           nextQty: newBag.find((entry: any) => entry.name === item.name)?.qty || 0,
         });
-        void notifyInventoryPatch(nextEquipment, `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`);
+        void runSheetAction(actionId, async () => {
+          await notifyInventoryPatch(nextEquipment, `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`, makeLanEventId());
+        });
       }
       return;
     }
@@ -3361,6 +3479,7 @@ export default function CharacterSheetScreen() {
   };
 
   const handleSendItemToPlayer = async (target: PublicLanPlayer) => {
+    await runSheetAction(`send_item:${target.key}`, async () => {
     if (!ensureLanWritable()) return;
     if (!selectedBagItem || !lanInfo || !character) return;
     const tradeItem = makeTradeItem(selectedBagItem.item, actionQty);
@@ -3373,7 +3492,7 @@ export default function CharacterSheetScreen() {
     try {
       const selfKey = getSelfLanKey(lanInfo.sessionId);
       const requestId = makeLanEventId();
-      await sendLanSessionEvent(lanInfo.joinUrl, {
+      const event: LanSessionEvent = {
         id: requestId,
         clientMsgId: requestId,
         sessionId: lanInfo.sessionId,
@@ -3395,7 +3514,9 @@ export default function CharacterSheetScreen() {
         item: tradeItem,
         message: `${character.name} pediu para enviar ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
         createdAt: new Date().toISOString(),
-      });
+      };
+      await sendLanSessionEvent(lanInfo.joinUrl, event);
+      await rememberLanSessionEvent(db, event).catch(() => false);
       showCustomAlert('Pedido enviado', `O mestre vai confirmar o envio de ${tradeItem.qty}x ${tradeItem.name}.`);
     } catch {
       showCustomAlert('Envio falhou', 'Nao consegui avisar a sessao LAN. O inventario local nao foi alterado.');
@@ -3403,17 +3524,20 @@ export default function CharacterSheetScreen() {
       setTargetPickerMode(null);
       setSelectedBagItem(null);
     }
+    });
   };
 
   const handleOfferTradeToPlayer = async (target: PublicLanPlayer) => {
+    await runSheetAction(`trade_offer:${target.key}`, async () => {
     if (!ensureLanWritable()) return;
     if (!selectedBagItem || !lanInfo || !character) return;
     const offeredItem = makeTradeItem(selectedBagItem.item, actionQty);
 
     try {
+      const tradeId = makeLanEventId();
       await sendLanSessionEvent(lanInfo.joinUrl, {
-        id: makeLanEventId(),
-        clientMsgId: makeLanEventId(),
+        id: tradeId,
+        clientMsgId: tradeId,
         sessionId: lanInfo.sessionId,
         type: 'trade_offer',
         fromKey: getSelfLanKey(lanInfo.sessionId),
@@ -3423,9 +3547,26 @@ export default function CharacterSheetScreen() {
         entityType: 'inventory',
         entityId: target.key,
         ackRequired: true,
+        tradeId,
         offeredItem,
         createdAt: new Date().toISOString(),
       });
+      await rememberLanSessionEvent(db, {
+        id: tradeId,
+        clientMsgId: tradeId,
+        sessionId: lanInfo.sessionId,
+        type: 'trade_offer',
+        fromKey: getSelfLanKey(lanInfo.sessionId),
+        fromName: character.name,
+        toKey: target.key,
+        toName: target.characterName,
+        entityType: 'inventory',
+        entityId: target.key,
+        ackRequired: true,
+        tradeId,
+        offeredItem,
+        createdAt: new Date().toISOString(),
+      }).catch(() => false);
       showCustomAlert('Troca enviada', `${target.characterName} recebeu sua proposta de troca.`);
     } catch {
       showCustomAlert('Troca falhou', 'Nao consegui enviar a proposta para a sessao LAN.');
@@ -3433,9 +3574,11 @@ export default function CharacterSheetScreen() {
       setTargetPickerMode(null);
       setSelectedBagItem(null);
     }
+    });
   };
 
   const handleAcceptTrade = async () => {
+    await runSheetAction(`trade_accept:${selectedTradeOffer?.id || ''}`, async () => {
     if (!ensureLanWritable()) return;
     if (!selectedTradeOffer || !tradeCounterItem || !lanInfo || !character) return;
     const requestedItem = makeTradeItem(tradeCounterItem.item, tradeCounterQty);
@@ -3478,9 +3621,11 @@ export default function CharacterSheetScreen() {
     } catch {
       showCustomAlert('Troca falhou', 'Nao consegui confirmar a troca na sessao LAN. O inventario local nao foi alterado.');
     }
+    });
   };
 
   const handleDeclineTrade = async (event: LanSessionEvent) => {
+    await runSheetAction(`trade_decline:${event.id}`, async () => {
     if (!ensureLanWritable()) return;
     if (!lanInfo || !character) return;
     try {
@@ -3510,6 +3655,7 @@ export default function CharacterSheetScreen() {
     } catch {
       showCustomAlert('Resposta falhou', 'Nao consegui recusar a troca na sessao LAN.');
     }
+    });
   };
 
   const notifyOwnLanStatus = async (hpCurrent: number, hpMax: number) => {
@@ -3959,6 +4105,7 @@ export default function CharacterSheetScreen() {
   };
 
   const applySpellCast = async () => {
+    await runSheetAction(`spell_cast:${selectedSpell?.id || selectedSpell?.name || 'unknown'}`, async () => {
     if (!ensureLanWritable()) return;
     if (!selectedSpell || !lanInfo) return;
     const targets = lanPlayers.filter((player) => spellTargetKeys.includes(player.key));
@@ -3989,6 +4136,7 @@ export default function CharacterSheetScreen() {
     } catch {
       showCustomAlert('Magia falhou', 'Nao consegui sincronizar a magia na sessao LAN.');
     }
+    });
   };
 
   const processConsumeItem = (bagIndex: number, item: any, qty: number) => {
@@ -5213,8 +5361,14 @@ export default function CharacterSheetScreen() {
                   </TouchableOpacity>
                 )}
 
-                <TouchableOpacity style={styles.lvlUpBtnPrimary} onPress={applySpellCast}>
-                  <Text style={styles.lvlUpBtnPrimaryText}>Aplicar magia</Text>
+                <TouchableOpacity
+                  style={[styles.lvlUpBtnPrimary, isSheetActionSubmitting(`spell_cast:${selectedSpell?.id || selectedSpell?.name || 'unknown'}`) && { opacity: 0.5 }]}
+                  disabled={isSheetActionSubmitting(`spell_cast:${selectedSpell?.id || selectedSpell?.name || 'unknown'}`)}
+                  onPress={applySpellCast}
+                >
+                  <Text style={styles.lvlUpBtnPrimaryText}>
+                    {isSheetActionSubmitting(`spell_cast:${selectedSpell?.id || selectedSpell?.name || 'unknown'}`) ? 'Enviando...' : 'Aplicar magia'}
+                  </Text>
                 </TouchableOpacity>
               </>
             )}
@@ -5266,6 +5420,7 @@ export default function CharacterSheetScreen() {
                 let isValid = false;
                 let msg = "Aguardando valor...";
                 let color = "rgba(255,255,255,0.2)";
+                const isConvertingCoins = isSheetActionSubmitting('coin:convert');
 
                 if (sourceAmount > 0) {
                   if (convertFrom === convertTo) {
@@ -5292,8 +5447,8 @@ export default function CharacterSheetScreen() {
 
                     <View style={styles.modalRowButtons}>
                       <TouchableOpacity style={styles.modalBtn} onPress={() => {setConvertModalVisible(false); setConvertAmount('');}}><Text style={{color:'#ff6666', fontWeight:'bold'}}>Cancelar</Text></TouchableOpacity>
-                      <TouchableOpacity style={[styles.modalBtn, {opacity: isValid ? 1 : 0.5}]} disabled={!isValid} onPress={() => executeCoinConversion(sourceAmount, targetAmount)}>
-                        <Text style={{color:'#00fa9a', fontWeight:'bold'}}>Converter</Text>
+                      <TouchableOpacity style={[styles.modalBtn, {opacity: isValid && !isConvertingCoins ? 1 : 0.5}]} disabled={!isValid || isConvertingCoins} onPress={() => executeCoinConversion(sourceAmount, targetAmount)}>
+                        <Text style={{color:'#00fa9a', fontWeight:'bold'}}>{isConvertingCoins ? 'Convertendo...' : 'Converter'}</Text>
                       </TouchableOpacity>
                     </View>
                   </>
@@ -5312,7 +5467,7 @@ export default function CharacterSheetScreen() {
             <TextInput style={styles.modalInputLarge} keyboardType="numeric" placeholder="Ex: +2" placeholderTextColor="rgba(255,255,255,0.2)" value={tempBuffValue} onChangeText={setTempBuffValue} autoFocus />
             <View style={styles.modalRowButtons}>
               <TouchableOpacity style={styles.modalBtn} onPress={clearTempBuff}><Text style={{color:'#ff6666', fontWeight:'bold'}}>Limpar (0)</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.modalBtn} onPress={handleTempBuffSubmit}><Text style={{color:'#00fa9a', fontWeight:'bold'}}>Aplicar Buff</Text></TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, isSheetActionSubmitting('temp_buff') && { opacity: 0.5 }]} disabled={isSheetActionSubmitting('temp_buff')} onPress={handleTempBuffSubmit}><Text style={{color:'#00fa9a', fontWeight:'bold'}}>{isSheetActionSubmitting('temp_buff') ? 'Aplicando...' : 'Aplicar Buff'}</Text></TouchableOpacity>
             </View>
           </View>
         </Pressable>
@@ -5434,13 +5589,20 @@ export default function CharacterSheetScreen() {
               style={styles.tradeList}
               ListEmptyComponent={<Text style={styles.emptyText}>Nenhum outro jogador ativo na sessao.</Text>}
               renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={styles.tradeItemChoice}
-                  onPress={() => targetPickerMode === 'send' ? handleSendItemToPlayer(item) : handleOfferTradeToPlayer(item)}
-                >
-                  <Text style={styles.tradeSlotName}>{item.characterName}</Text>
-                  <Text style={styles.tradeSlotMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}{item.tempHp > 0 ? ` +${item.tempHp}` : ''}</Text>
-                </TouchableOpacity>
+                (() => {
+                  const targetActionId = targetPickerMode === 'send' ? `send_item:${item.key}` : `trade_offer:${item.key}`;
+                  const isTargetActionPending = isSheetActionSubmitting(targetActionId);
+                  return (
+                    <TouchableOpacity
+                      style={[styles.tradeItemChoice, isTargetActionPending && { opacity: 0.5 }]}
+                      disabled={isTargetActionPending}
+                      onPress={() => targetPickerMode === 'send' ? handleSendItemToPlayer(item) : handleOfferTradeToPlayer(item)}
+                    >
+                      <Text style={styles.tradeSlotName}>{item.characterName}</Text>
+                      <Text style={styles.tradeSlotMeta}>Nivel {item.level} - HP {item.hpCurrent}/{item.hpMax}{item.tempHp > 0 ? ` +${item.tempHp}` : ''}</Text>
+                    </TouchableOpacity>
+                  );
+                })()
               )}
             />
 
@@ -5511,11 +5673,19 @@ export default function CharacterSheetScreen() {
                 />
 
                 <View style={styles.modalRowButtons}>
-                  <TouchableOpacity style={styles.modalBtn} onPress={() => handleDeclineTrade(selectedTradeOffer)}>
-                    <Text style={{color:'#ff6666', fontWeight:'bold'}}>Recusar</Text>
+                  <TouchableOpacity
+                    style={[styles.modalBtn, isSheetActionSubmitting(`trade_decline:${selectedTradeOffer.id}`) && { opacity: 0.5 }]}
+                    disabled={isSheetActionSubmitting(`trade_decline:${selectedTradeOffer.id}`)}
+                    onPress={() => handleDeclineTrade(selectedTradeOffer)}
+                  >
+                    <Text style={{color:'#ff6666', fontWeight:'bold'}}>{isSheetActionSubmitting(`trade_decline:${selectedTradeOffer.id}`) ? 'Recusando...' : 'Recusar'}</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={[styles.modalBtn, {opacity: tradeCounterItem ? 1 : 0.5}]} disabled={!tradeCounterItem} onPress={handleAcceptTrade}>
-                    <Text style={{color:'#00fa9a', fontWeight:'bold'}}>Aceitar</Text>
+                  <TouchableOpacity
+                    style={[styles.modalBtn, {opacity: tradeCounterItem && !isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`) ? 1 : 0.5}]}
+                    disabled={!tradeCounterItem || isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`)}
+                    onPress={handleAcceptTrade}
+                  >
+                    <Text style={{color:'#00fa9a', fontWeight:'bold'}}>{isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`) ? 'Aceitando...' : 'Aceitar'}</Text>
                   </TouchableOpacity>
                 </View>
               </>
@@ -5586,7 +5756,9 @@ export default function CharacterSheetScreen() {
             <TextInput style={styles.modalInputLarge} keyboardType="numeric" value={inputValue} onChangeText={setInputValue} autoFocus />
             <View style={styles.modalRowButtons}>
               <TouchableOpacity style={styles.modalBtn} onPress={() => setCoinModalVisible(false)}><Text style={{color:'#ff6666', fontWeight:'bold'}}>Cancelar</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.modalBtn} onPress={handleCoinSubmit}><Text style={{color:'#00fa9a', fontWeight:'bold'}}>Confirmar</Text></TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, isSheetActionSubmitting(`coin:set:${activeCoinType}`) && { opacity: 0.5 }]} disabled={isSheetActionSubmitting(`coin:set:${activeCoinType}`)} onPress={handleCoinSubmit}>
+                <Text style={{color:'#00fa9a', fontWeight:'bold'}}>{isSheetActionSubmitting(`coin:set:${activeCoinType}`) ? 'Enviando...' : 'Confirmar'}</Text>
+              </TouchableOpacity>
             </View>
           </View>
         </Pressable>
@@ -5599,10 +5771,10 @@ export default function CharacterSheetScreen() {
             <TextInput style={styles.modalInputLarge} keyboardType="numeric" value={inputValue} onChangeText={setInputValue} autoFocus />
             <View style={styles.modalRowButtons}>
               {!xpModalVisible && (
-                <TouchableOpacity style={styles.modalBtn} onPress={handleTempHP}><Text style={{color:'#00bfff', fontWeight:'bold'}}>PV Temp</Text></TouchableOpacity>
+                <TouchableOpacity style={[styles.modalBtn, isSheetActionSubmitting('temp_hp') && { opacity: 0.5 }]} disabled={isSheetActionSubmitting('temp_hp')} onPress={handleTempHP}><Text style={{color:'#00bfff', fontWeight:'bold'}}>PV Temp</Text></TouchableOpacity>
               )}
-              <TouchableOpacity style={styles.modalBtn} onPress={() => xpModalVisible ? handleXP('remove') : handleHP('damage')}><Text style={{color:'#ff6666', fontWeight:'bold'}}>{xpModalVisible ? '- Remover' : '⚔️ Dano'}</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.modalBtn} onPress={() => xpModalVisible ? handleXP('add') : handleHP('heal')}><Text style={{color:'#00fa9a', fontWeight:'bold'}}>{xpModalVisible ? '+ Adicionar' : '💖 Cura'}</Text></TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, isSheetActionSubmitting(xpModalVisible ? 'xp:remove' : 'hp:damage') && { opacity: 0.5 }]} disabled={isSheetActionSubmitting(xpModalVisible ? 'xp:remove' : 'hp:damage')} onPress={() => xpModalVisible ? handleXP('remove') : handleHP('damage')}><Text style={{color:'#ff6666', fontWeight:'bold'}}>{xpModalVisible ? '- Remover' : '⚔️ Dano'}</Text></TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, isSheetActionSubmitting(xpModalVisible ? 'xp:add' : 'hp:heal') && { opacity: 0.5 }]} disabled={isSheetActionSubmitting(xpModalVisible ? 'xp:add' : 'hp:heal')} onPress={() => xpModalVisible ? handleXP('add') : handleHP('heal')}><Text style={{color:'#00fa9a', fontWeight:'bold'}}>{xpModalVisible ? '+ Adicionar' : '💖 Cura'}</Text></TouchableOpacity>
             </View>
           </View>
         </Pressable>
@@ -5640,14 +5812,15 @@ export default function CharacterSheetScreen() {
             />
             <View style={styles.customAlertBtnRow}>
               <TouchableOpacity
-                style={[styles.customAlertBtn, { borderColor: '#00bfff', borderWidth: 1 }]}
+                style={[styles.customAlertBtn, { borderColor: '#00bfff', borderWidth: 1 }, pendingEffectSave && isSheetActionSubmitting(`save:${pendingEffectSave.id}`) && { opacity: 0.5 }]}
+                disabled={Boolean(pendingEffectSave && isSheetActionSubmitting(`save:${pendingEffectSave.id}`))}
                 onPress={() => pendingEffectSave && rollVirtualEffectSave(pendingEffectSave)}
               >
                 <Text style={[styles.customAlertBtnText, { color: '#00bfff' }]}>Rolar d20</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.customAlertBtn, { borderColor: '#00fa9a', borderWidth: 1, opacity: parseInt(saveManualValue, 10) > 0 ? 1 : 0.5 }]}
-                disabled={!(parseInt(saveManualValue, 10) > 0)}
+                style={[styles.customAlertBtn, { borderColor: '#00fa9a', borderWidth: 1, opacity: parseInt(saveManualValue, 10) > 0 && !(pendingEffectSave && isSheetActionSubmitting(`save:${pendingEffectSave.id}`)) ? 1 : 0.5 }]}
+                disabled={!(parseInt(saveManualValue, 10) > 0) || Boolean(pendingEffectSave && isSheetActionSubmitting(`save:${pendingEffectSave.id}`))}
                 onPress={() => {
                   if (!pendingEffectSave) return;
                   void sendEffectSaveResult(pendingEffectSave, Math.max(1, Math.min(20, parseInt(saveManualValue, 10) || 1)), 'manual');
@@ -5997,36 +6170,6 @@ function parseStructuredEffects(value: unknown): any[] {
   };
 
   return normalize(value);
-}
-
-function rollDiceExpression(expression: string) {
-  const tokens = expression.match(/[+-]?\s*(?:\d*)d\d+|[+-]?\s*\d+/gi);
-  if (!tokens?.length) return null;
-
-  let total = 0;
-  const parts: string[] = [];
-
-  for (const token of tokens) {
-    const clean = token.replace(/\s/g, '');
-    const sign = clean.startsWith('-') ? -1 : 1;
-    const unsigned = clean.replace(/^[+-]/, '');
-
-    if (unsigned.toLowerCase().includes('d')) {
-      const [countRaw, sidesRaw] = unsigned.toLowerCase().split('d');
-      const count = Math.max(1, parseInt(countRaw || '1') || 1);
-      const sides = Math.max(1, parseInt(sidesRaw) || 1);
-      const rolls = Array.from({ length: count }, () => Math.floor(Math.random() * sides) + 1);
-      const subtotal = rolls.reduce((sum, roll) => sum + roll, 0) * sign;
-      total += subtotal;
-      parts.push(`${sign < 0 ? '-' : ''}${count}d${sides}[${rolls.join(',')}]`);
-    } else {
-      const value = (parseInt(unsigned) || 0) * sign;
-      total += value;
-      parts.push(`${value >= 0 ? '+' : ''}${value}`);
-    }
-  }
-
-  return { total: Math.max(0, total), breakdown: parts.join(' ') };
 }
 
 function getDiceParts(expression: string) {

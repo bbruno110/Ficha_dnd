@@ -3,6 +3,7 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 import { traceFunctionCall, traceFunctionReturn, traceSqlite, traceStateChange } from '../debug/appTrace';
 import { debugLanFlow } from '../lanRuntimeMode';
 import { getEffectByStatusKey, normalizeStatusKey } from './effectCatalogService';
+import { normalizeEffectDurationUnit } from './effectDurationService';
 import { ensureEffectSchema } from './effectSchema';
 import type {
   ApplyActiveEffectInput,
@@ -256,6 +257,81 @@ export async function removeEffectFromPlayer(
     playerKey: player.target_key,
     playerName: player.target_name,
     entityId: effectId,
+    durationMs: Date.now() - startedAt,
+  });
+  return result;
+}
+
+export async function removeTempHpEffectsFromPlayer(
+  db: SQLiteDatabase,
+  playerId: number,
+): Promise<RemoveEffectResult | null> {
+  const startedAt = Date.now();
+  traceFunctionCall('removeTempHpEffectsFromPlayer', { playerId }, {
+    source: 'activeEffectService',
+    playerId,
+  });
+  await ensureEffectSchema(db);
+  const player = await getPlayerRow(db, playerId);
+  if (!player) return null;
+  await backfillPlayerActiveEffectsFromCache(db, player);
+
+  const rows = await getActiveRowsForTarget(db, player.session_id, player.target_key);
+  const tempHpEffects = rows
+    .map(mapActiveEffectRow)
+    .filter((effect) => effect.target === 'PV_TEMP' || effect.kind === 'temp_hp');
+
+  if (tempHpEffects.length === 0) {
+    debugLanFlow('TEMP_HP_DEPLETED_NO_EFFECT_FOUND', {
+      sessionId: player.session_id,
+      playerId,
+      targetKey: player.target_key,
+    });
+    return null;
+  }
+
+  debugLanFlow('TEMP_HP_EFFECT_FOUND', {
+    sessionId: player.session_id,
+    playerId,
+    targetKey: player.target_key,
+    effectIds: tempHpEffects.map((effect) => effect.id),
+  });
+
+  for (const effect of tempHpEffects) {
+    await db.runAsync(
+      `UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [effect.id],
+    );
+  }
+
+  await rebuildPlayerEffectsCache(db, player, 0);
+  const removed = tempHpEffects[0];
+  const result = {
+    playerId,
+    sessionId: player.session_id,
+    targetKey: player.target_key,
+    targetName: player.target_name,
+    removed,
+    patch: {
+      targetKey: player.target_key,
+      add: [],
+      update: [],
+      remove: tempHpEffects.map((effect) => effect.id),
+    },
+  };
+
+  debugLanFlow('TEMP_HP_EFFECT_EXPIRED', {
+    sessionId: player.session_id,
+    playerId,
+    targetKey: player.target_key,
+    removedCount: tempHpEffects.length,
+  });
+  traceFunctionReturn('removeTempHpEffectsFromPlayer', result, {
+    source: 'activeEffectService',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
     durationMs: Date.now() - startedAt,
   });
   return result;
@@ -834,7 +910,7 @@ function normalizeTarget(value: unknown): EffectTarget {
 }
 
 function normalizeDurationUnit(value: unknown): DurationUnit | 'rest' | null {
-  const raw = String(value || '').toLowerCase();
+  const raw = normalizeEffectDurationUnit(value);
   if (
     raw === 'instant' ||
     raw === 'turn' ||
