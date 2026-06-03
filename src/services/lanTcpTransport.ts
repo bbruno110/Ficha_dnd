@@ -3,6 +3,15 @@ import { NativeModules } from 'react-native';
 
 import { traceApp, traceError, traceFunctionCall, traceFunctionReturn, traceSocket } from './debug/appTrace';
 import { shouldPlayerProcessLanEvent } from './lan/lanClientEngine';
+import {
+  getHeartbeatIntervalForSessionStatus,
+  getLanEventAudience,
+  getLanEventRoutingKeys,
+  isBroadcastLanEvent,
+  LAN_NETWORK_LIMITS,
+  shouldLanEventRequireAck,
+  shouldTraceLanEnvelope,
+} from './lan/lanNetworkPolicy';
 import { debugLanFlow } from './lanRuntimeMode';
 import type { LanSessionEvent, LanSessionPayload } from './lanSession';
 
@@ -52,6 +61,22 @@ let hostSockets = new Set<TcpSocket>();
 let hostJoinedRows: Record<string, unknown>[] = [];
 let hostEvents: LanSessionEvent[] = [];
 let hostEventAcks: Record<string, unknown>[] = [];
+
+type HostConnection = {
+  socket: TcpSocket;
+  playerKey?: string;
+  clientId?: string;
+  playerName?: string;
+  connectedAt: number;
+  lastSeenAt: number;
+  lastAckSeq: number;
+  queue: TcpEnvelope[];
+  sending: boolean;
+};
+
+let hostConnections = new Map<TcpSocket, HostConnection>();
+let hostSocketsByPlayerKey = new Map<string, Set<TcpSocket>>();
+let hostSocketsByClientId = new Map<string, Set<TcpSocket>>();
 export type HostUpdate = {
   reason?: string;
   event?: LanSessionEvent;
@@ -62,13 +87,15 @@ export type HostUpdate = {
 };
 let hostUpdateListeners = new Set<(update?: HostUpdate) => void>();
 let hostKickedJoinKeys = new Set<string>();
+let lastHostPayloadBroadcastAt = 0;
+let lastHostPayloadBroadcastSignature = '';
 
 let clientSocket: TcpSocket | null = null;
 let clientUrl = '';
 let clientPayload: LanSessionPayload | null = null;
 let clientEvents: LanSessionEvent[] = [];
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
-type ClientUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string; payload?: LanSessionPayload };
+export type ClientUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string; payload?: LanSessionPayload };
 let clientUpdateListeners = new Set<(update?: ClientUpdate) => void>();
 let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
 let clientJoinAckWaiters = new Set<ClientJoinAckWaiter>();
@@ -149,9 +176,11 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
   const server = TcpSocket.createServer((socket) => {
     configureSocket(socket);
     hostSockets.add(socket);
+    registerHostConnection(socket);
 
     createLineReader(socket, (message) => {
       if (message.type === 'heartbeat') {
+        touchHostConnection(socket);
         sendEnvelope(socket, {
           type: 'heartbeat_ack',
           sessionId: hostPayload?.session.id,
@@ -165,6 +194,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
       }
 
       if (message.type === 'ack') {
+        bindHostConnection(socket, { playerKey: message.playerKey });
         const sessionId = String(message.sessionId || hostPayload?.session.id || '');
         rememberHostAck({
           sessionId,
@@ -178,18 +208,21 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
       }
 
       if (message.type === 'event_ack') {
+        bindHostConnection(socket, { playerKey: message.playerKey });
         rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
         notifyHostUpdates({ reason: 'event_ack' });
         return;
       }
 
       if (message.type === 'event_nack') {
+        bindHostConnection(socket, { playerKey: message.playerKey });
         rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
         notifyHostUpdates({ reason: 'event_nack' });
         return;
       }
 
       if (message.type === 'resync_request') {
+        bindHostConnection(socket, { playerKey: message.playerKey });
         if (!isEnvelopeForCurrentSession(message.sessionId)) return;
         const lastAppliedSeq = Number(message.lastAppliedSeq || 0);
         const events = filterEventsForPlayer(
@@ -206,13 +239,14 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         sendEnvelope(socket, {
           type: 'resync_events',
           sessionId: message.sessionId,
-          events,
+          events: events.slice(-LAN_NETWORK_LIMITS.maxEventsPerResync),
           payload: makeHostPayload(),
         });
         return;
       }
 
       if (message.type === 'hello') {
+        bindHostConnection(socket, { playerKey: message.playerKey });
         if (!isEnvelopeForCurrentSession(message.sessionId)) {
           sendEnvelope(socket, {
             type: 'session_rejected',
@@ -248,6 +282,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         const incomingEntry = message.entry as Record<string, unknown>;
         const remoteKey = String(incomingEntry.remoteKey || '');
         const clientId = String(incomingEntry.clientId || '');
+        bindHostConnection(socket, { playerKey: remoteKey || undefined, clientId: clientId || undefined, playerName: String(incomingEntry.playerName || '') || undefined });
         if (isHostJoinBlocked(entrySessionId, remoteKey, clientId)) {
           debugLanFlow('MASTER_JOIN_ROW_IGNORED_KICKED', {
             sessionId: entrySessionId,
@@ -386,6 +421,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
       if (message.type === 'event' || message.type === 'event_propose' || message.type === 'event_commit') {
         if (!isEnvelopeForCurrentSession(message.event?.sessionId)) return;
         const event = normalizeWireEvent(message.event);
+        bindHostConnection(socket, { playerKey: event.fromKey, clientId: (message.event as any)?.clientId });
         upsertByKey(hostEvents, event, 'id');
         broadcastEnvelope({ type: 'event_commit', event });
         notifyHostUpdates({ reason: 'event_commit', event, envelopeType: message.type });
@@ -393,10 +429,10 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
     });
 
     socket.on('close', () => {
-      hostSockets.delete(socket);
+      unregisterHostConnection(socket);
     });
     socket.on('error', () => {
-      hostSockets.delete(socket);
+      unregisterHostConnection(socket);
     });
   });
 
@@ -451,6 +487,9 @@ export async function stopLanTcpHost() {
     closedSockets.add(socket);
   }
   hostSockets.clear();
+  hostConnections = new Map();
+  hostSocketsByPlayerKey = new Map();
+  hostSocketsByClientId = new Map();
 
   if (hostServer) {
     await new Promise<void>((resolve) => {
@@ -469,6 +508,8 @@ export async function stopLanTcpHost() {
   hostEvents = [];
   hostEventAcks = [];
   hostKickedJoinKeys = new Set();
+  lastHostPayloadBroadcastAt = 0;
+  lastHostPayloadBroadcastSignature = '';
   traceFunctionReturn('stopLanTcpHost', {
     stopped: true,
   }, {
@@ -624,7 +665,7 @@ export async function sendLanTcpEvent(url: string | undefined, event: LanSession
     upsertByKey(hostEvents, wireEvent, 'id');
     broadcastEnvelope({ type: 'event_commit', event: wireEvent });
     notifyHostUpdates({ reason: 'event_commit', event: wireEvent, envelopeType: 'event_commit' });
-    traceFunctionReturn('sendLanTcpEvent', { result: true, mode: 'host_broadcast' }, {
+    traceFunctionReturn('sendLanTcpEvent', { result: true, mode: 'host_routed_event' }, {
       source: 'lanTcpTransport',
       sessionId: wireEvent.sessionId,
       eventId: wireEvent.id,
@@ -792,13 +833,13 @@ export async function getLanTcpClientEvents(
   const filterOptions = { sessionId, playerKey, includeGlobal };
   if (isCurrentHostUrl(url)) {
     return getLanTcpHostEvents()
-      .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) > minSeq))
+      .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) <= 0 || getEventSeq(event) > minSeq))
       .filter((event) => shouldReturnEventToClient(event, filterOptions))
       .sort(compareEventsAscending);
   }
   await connectLanTcpClient(url);
   return clientEvents
-    .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) > minSeq))
+    .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) <= 0 || getEventSeq(event) > minSeq))
     .filter((event) => shouldReturnEventToClient(event, filterOptions))
     .sort(compareEventsAscending);
 }
@@ -972,6 +1013,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
 
     createLineReader(socket, (message) => {
       if (message.type === 'heartbeat') {
+        touchHostConnection(socket);
         sendEnvelope(socket, {
           type: 'heartbeat_ack',
           sessionId: target.sessionId,
@@ -1165,14 +1207,34 @@ function notifyClientUpdates(update?: ClientUpdate) {
 
 function broadcastHostPayload() {
   if (!hostPayload) return;
-  broadcastEnvelope({ type: 'payload_update', payload: makeHostPayload() });
+  const payload = makeHostPayload();
+  const signature = [
+    payload.session.id,
+    payload.state?.status || 'active',
+    payload.state?.players?.length || 0,
+    payload.state?.currentTurn || 0,
+    payload.state?.elapsedMinutes || 0,
+  ].join(':');
+  const now = Date.now();
+  const lifecycleChanged = signature !== lastHostPayloadBroadcastSignature;
+  if (!lifecycleChanged && now - lastHostPayloadBroadcastAt < 3000) return;
+  lastHostPayloadBroadcastAt = now;
+  lastHostPayloadBroadcastSignature = signature;
+  broadcastEnvelope({ type: 'payload_update', payload });
 }
 
 function updateHostForegroundSession() {
-  if (!hostPayload || !hostUrl || !LanNative?.updateForegroundSession) return;
+  if (!hostPayload || !hostUrl) return;
 
   try {
     const payload = makeHostPayload();
+    const status = payload.state?.status || 'active';
+    if (status !== 'active') {
+      void LanNative?.stopForegroundSession?.().catch(() => {});
+      return;
+    }
+
+    if (!LanNative?.updateForegroundSession) return;
     void LanNative.updateForegroundSession(
       payload.session.name || 'Mesa LAN',
       payload.session.inviteCode || '',
@@ -1185,41 +1247,206 @@ function updateHostForegroundSession() {
 }
 
 function broadcastEnvelope(message: TcpEnvelope) {
-  for (const socket of hostSockets) {
-    sendEnvelope(socket, message);
+  const sockets = getHostSocketsForEnvelope(message);
+  for (const socket of sockets) {
+    enqueueHostEnvelope(socket, message);
   }
+}
+
+
+function registerHostConnection(socket: TcpSocket) {
+  if (hostConnections.has(socket)) return hostConnections.get(socket)!;
+  const connection: HostConnection = {
+    socket,
+    connectedAt: Date.now(),
+    lastSeenAt: Date.now(),
+    lastAckSeq: 0,
+    queue: [],
+    sending: false,
+  };
+  hostConnections.set(socket, connection);
+  return connection;
+}
+
+function touchHostConnection(socket: TcpSocket) {
+  const connection = registerHostConnection(socket);
+  connection.lastSeenAt = Date.now();
+  return connection;
+}
+
+function bindHostConnection(socket: TcpSocket, info?: { playerKey?: string; clientId?: string; playerName?: string }) {
+  const connection = touchHostConnection(socket);
+  if (info?.playerName) connection.playerName = info.playerName;
+
+  if (info?.playerKey && info.playerKey !== 'master' && info.playerKey !== 'party' && info.playerKey !== 'session' && info.playerKey !== 'all') {
+    if (connection.playerKey && connection.playerKey !== info.playerKey) {
+      removeSocketFromIndex(hostSocketsByPlayerKey, connection.playerKey, socket);
+    }
+    connection.playerKey = info.playerKey;
+    addSocketToIndex(hostSocketsByPlayerKey, info.playerKey, socket);
+  }
+
+  if (info?.clientId) {
+    if (connection.clientId && connection.clientId !== info.clientId) {
+      removeSocketFromIndex(hostSocketsByClientId, connection.clientId, socket);
+    }
+    connection.clientId = info.clientId;
+    addSocketToIndex(hostSocketsByClientId, info.clientId, socket);
+  }
+
+  return connection;
+}
+
+function unregisterHostConnection(socket: TcpSocket) {
+  const connection = hostConnections.get(socket);
+  if (!connection) return;
+  if (connection.playerKey) removeSocketFromIndex(hostSocketsByPlayerKey, connection.playerKey, socket);
+  if (connection.clientId) removeSocketFromIndex(hostSocketsByClientId, connection.clientId, socket);
+  hostConnections.delete(socket);
+  hostSockets.delete(socket);
+}
+
+function addSocketToIndex(index: Map<string, Set<TcpSocket>>, key: string, socket: TcpSocket) {
+  const existing = index.get(key) || new Set<TcpSocket>();
+  existing.add(socket);
+  index.set(key, existing);
+}
+
+function removeSocketFromIndex(index: Map<string, Set<TcpSocket>>, key: string, socket: TcpSocket) {
+  const existing = index.get(key);
+  if (!existing) return;
+  existing.delete(socket);
+  if (existing.size <= 0) index.delete(key);
+}
+
+function getHostSocketsForEnvelope(message: TcpEnvelope) {
+  if (message.type !== 'event_commit' && message.type !== 'event') {
+    return [...hostSockets];
+  }
+
+  const event = message.event;
+  if (!event) return [...hostSockets];
+  const audience = getLanEventAudience(event);
+  if (audience === 'none' || audience === 'master') return [];
+  if (isBroadcastLanEvent(event)) return [...hostSockets];
+
+  const targets = new Set<TcpSocket>();
+  for (const key of getLanEventRoutingKeys(event)) {
+    for (const socket of hostSocketsByPlayerKey.get(key) || []) targets.add(socket);
+  }
+
+  if (targets.size <= 0 && audience === 'participants') {
+    // Safety net for trade/send-item during reconnect: do not leak private patches,
+    // but allow participant events to be picked up by the right client on resync.
+    return [];
+  }
+
+  return [...targets];
+}
+
+
+function getEnvelopePriority(message: TcpEnvelope) {
+  if (message.type === 'event_commit' || message.type === 'event') {
+    const eventType = message.event?.type;
+    if (eventType === 'session_ended') return 100;
+    if (eventType === 'session_patch' || eventType === 'player_kicked') return 95;
+    if (eventType === 'player_patch' || eventType === 'effect_patch' || eventType === 'inventory_patch' || eventType === 'pending_save_patch') return 90;
+    if (eventType === 'send_item_result' || eventType === 'trade_result' || eventType === 'send_item_request' || String(eventType || '').startsWith('trade_')) return 80;
+    return 40;
+  }
+  if (message.type === 'resync_events') return 30;
+  if (message.type === 'session_snapshot' || message.type === 'payload_update') return 10;
+  return 0;
+}
+
+function enqueueHostEnvelope(socket: TcpSocket, message: TcpEnvelope) {
+  const connection = registerHostConnection(socket);
+  if (connection.queue.length >= LAN_NETWORK_LIMITS.socketQueueMaxPending) {
+    connection.queue.shift();
+    traceSocket('SOCKET_QUEUE_DROPPED_OLDEST', {
+      source: 'lanTcpTransport.enqueueHostEnvelope',
+      decision: 'queue_limit',
+      queueSize: connection.queue.length,
+      ...getEnvelopeTraceFields(message),
+      connectionPlayerKey: connection.playerKey,
+    });
+  }
+  const priority = getEnvelopePriority(message);
+  if (priority > 0) {
+    const insertAt = connection.queue.findIndex((queued) => getEnvelopePriority(queued) < priority);
+    if (insertAt >= 0) connection.queue.splice(insertAt, 0, message);
+    else connection.queue.push(message);
+  } else {
+    connection.queue.push(message);
+  }
+  flushHostConnectionQueue(connection);
+}
+
+function flushHostConnectionQueue(connection: HostConnection) {
+  if (connection.sending) return;
+  connection.sending = true;
+
+  const flushNext = () => {
+    if (!hostConnections.has(connection.socket) || closedSockets.has(connection.socket)) {
+      connection.queue = [];
+      connection.sending = false;
+      return;
+    }
+
+    const next = connection.queue.shift();
+    if (!next) {
+      connection.sending = false;
+      return;
+    }
+
+    sendEnvelope(connection.socket, next);
+    setTimeout(flushNext, 0);
+  };
+
+  flushNext();
 }
 
 function sendEnvelope(socket: TcpSocket, message: TcpEnvelope) {
   const startedAt = Date.now();
   const traceFields = getEnvelopeTraceFields(message);
+  const traceThisEnvelope = shouldTraceLanEnvelope(message.type, 'event' in message ? message.event?.type : undefined);
+
   if (closedSockets.has(socket)) {
-    traceSocket('SOCKET_SEND_SKIPPED_CLOSED', {
-      source: 'lanTcpTransport.sendEnvelope',
-      decision: 'socket_already_closed',
-      ...traceFields,
-    });
+    if (traceThisEnvelope) {
+      traceSocket('SOCKET_SEND_SKIPPED_CLOSED', {
+        source: 'lanTcpTransport.sendEnvelope',
+        decision: 'socket_already_closed',
+        ...traceFields,
+      });
+    }
     return false;
   }
-  traceSocket('SOCKET_SEND_START', {
-    source: 'lanTcpTransport.sendEnvelope',
-    ...traceFields,
-  });
+
+  if (traceThisEnvelope) {
+    traceSocket('SOCKET_SEND_START', {
+      source: 'lanTcpTransport.sendEnvelope',
+      ...traceFields,
+    });
+  }
 
   try {
     socket.write(`${JSON.stringify(message)}\n`);
-    traceSocket('SOCKET_SEND_DONE', {
-      source: 'lanTcpTransport.sendEnvelope',
-      durationMs: Date.now() - startedAt,
-      ...traceFields,
-    });
+    if (traceThisEnvelope) {
+      traceSocket('SOCKET_SEND_DONE', {
+        source: 'lanTcpTransport.sendEnvelope',
+        durationMs: Date.now() - startedAt,
+        ...traceFields,
+      });
+    }
     return true;
   } catch (error) {
-    traceError('SOCKET_SEND_START', 'SOCKET_SEND_ERROR', error, {
-      source: 'lanTcpTransport.sendEnvelope',
-      durationMs: Date.now() - startedAt,
-      ...traceFields,
-    });
+    if (traceThisEnvelope) {
+      traceError('SOCKET_SEND_START', 'SOCKET_SEND_ERROR', error, {
+        source: 'lanTcpTransport.sendEnvelope',
+        durationMs: Date.now() - startedAt,
+        ...traceFields,
+      });
+    }
     try {
       socket.destroy();
     } catch {
@@ -1227,7 +1454,7 @@ function sendEnvelope(socket: TcpSocket, message: TcpEnvelope) {
     }
 
     closedSockets.add(socket);
-    hostSockets.delete(socket);
+    unregisterHostConnection(socket);
 
     if (clientSocket === socket) {
       clientSocket = null;
@@ -1249,10 +1476,13 @@ function createLineReader(socket: TcpSocket, onMessage: (message: TcpEnvelope) =
       if (!trimmed) continue;
       try {
         const message = JSON.parse(trimmed) as TcpEnvelope;
-        traceSocket('SOCKET_RECEIVE', {
-          source: 'lanTcpTransport.createLineReader',
-          ...getEnvelopeTraceFields(message),
-        });
+        const traceThisEnvelope = shouldTraceLanEnvelope(message.type, 'event' in message ? message.event?.type : undefined);
+        if (traceThisEnvelope) {
+          traceSocket('SOCKET_RECEIVE', {
+            source: 'lanTcpTransport.createLineReader',
+            ...getEnvelopeTraceFields(message),
+          });
+        }
         traceSemanticEnvelopeReceive(message);
         onMessage(message);
       } catch (error) {
@@ -1267,6 +1497,7 @@ function createLineReader(socket: TcpSocket, onMessage: (message: TcpEnvelope) =
 }
 
 function traceSemanticEnvelopeReceive(message: TcpEnvelope) {
+  if (!shouldTraceLanEnvelope(message.type, 'event' in message ? message.event?.type : undefined)) return;
   const fields = getEnvelopeTraceFields(message);
   if (message.type === 'session_snapshot') {
     traceApp('SNAPSHOT_RECEIVED', 'SESSION_SNAPSHOT_RECEIVED', {
@@ -1409,6 +1640,7 @@ function configureSocket(socket: TcpSocket) {
   socket.setKeepAlive?.(true, 1000);
   socket.on('close', () => {
     closedSockets.add(socket);
+    unregisterHostConnection(socket);
     if (clientSocket === socket) {
       clientSocket = null;
       clearClientPayloadWaiters();
@@ -1423,6 +1655,7 @@ function configureSocket(socket: TcpSocket) {
   });
   socket.on('error', () => {
     closedSockets.add(socket);
+    unregisterHostConnection(socket);
   });
 }
 
@@ -1456,14 +1689,14 @@ function mergeRecentEvents(...eventLists: LanSessionEvent[][]) {
 function normalizeWireEvent(event: LanSessionEvent): LanSessionEvent {
   const entityType = (event as any).entityType || inferWireEventEntityType(event);
   const entityId = String((event as any).entityId || inferWireEventEntityId(event) || event.sessionId);
-  const seq = Number.isFinite(Number(event.seq))
+  const seq = Number.isFinite(Number(event.seq)) && Number(event.seq) > 0
     ? Number(event.seq)
-    : Number.isFinite(Number(event.serverSeq))
+    : Number.isFinite(Number(event.serverSeq)) && Number(event.serverSeq) > 0
       ? Number(event.serverSeq)
-      : undefined;
-  const entityRevision = Number.isFinite(Number((event as any).entityRevision))
+      : Math.max(1, getEventTimestamp(event));
+  const entityRevision = Number.isFinite(Number((event as any).entityRevision)) && Number((event as any).entityRevision) > 0
     ? Number((event as any).entityRevision)
-    : (seq || 0);
+    : seq;
 
   return {
     ...event,
@@ -1480,7 +1713,12 @@ function inferWireEventEntityType(event: LanSessionEvent) {
   if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
   if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  if (
+    event.type === 'resource_request' ||
+    event.type === 'resource_review' ||
+    event.type === 'pending_save_patch' ||
+    event.type === 'character_update_review'
+  ) return 'request';
   return 'player';
 }
 
@@ -1489,7 +1727,7 @@ function inferWireEventEntityId(event: LanSessionEvent) {
 }
 
 function shouldWireEventRequireAck(event: LanSessionEvent) {
-  return event.toKey !== 'master' && event.toKey !== 'party' && event.toKey !== 'session';
+  return shouldLanEventRequireAck(event);
 }
 
 function rememberHostKickedJoinKeys(sessionId: string, remoteKey?: string, clientId?: string) {
@@ -1511,46 +1749,128 @@ function makeHostJoinBlockKeys(sessionId: string, remoteKey?: string, clientId?:
 
 function getEventsAfterSeq(seq: number, sessionId?: string) {
   return mergeRecentEvents(hostPayload?.events || [], hostEvents)
-    .filter((event) => (!sessionId || event.sessionId === sessionId) && getEventSeq(event) > seq)
+    .filter((event) => (!sessionId || event.sessionId === sessionId) && (getEventSeq(event) <= 0 || getEventSeq(event) > seq))
     .sort(compareEventsAscending);
 }
 
 function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions: Record<string, number>) {
   const events = mergeRecentEvents(hostPayload?.events || [], hostEvents)
     .filter((event) => !sessionId || event.sessionId === sessionId);
-  const replay: LanSessionEvent[] = [];
+
+  // IMPORTANTE:
+  // Resync por divergência de entityRevision NÃO pode fazer replay de eventos antigos.
+  // Eventos antigos de effect_patch/effect_save_result/inventory_patch são ações, não checkpoints.
+  // Reaplicá-los foi a causa de efeitos expirados voltarem, PV temporário persistir e histórico duplicar.
+  const latestRevisionByEntity = new Map<string, number>();
   for (const event of events) {
     const revision = Number(event.entityRevision || 0);
     if (revision <= 0) continue;
     const entityKey = getRuntimeEntityKey(event);
-    const knownRevision = Number(knownRevisions[entityKey] || 0);
-    if (knownRevision < revision) {
-      traceApp('RESYNC_RECEIVED', 'RESYNC_ENTITY_REVISION_MISMATCH', {
+    latestRevisionByEntity.set(entityKey, Math.max(latestRevisionByEntity.get(entityKey) || 0, revision));
+  }
+
+  const checkpointEvents: LanSessionEvent[] = [];
+  const now = Date.now();
+  let syntheticSeq = Math.max(now, ...events.map((event) => getEventSeq(event)), 0) + 1;
+
+  const currentPlayers = hostPayload?.state?.players || [];
+  for (const player of currentPlayers) {
+    const targetKey = String(player.remoteKey || player.characterName || player.id || '');
+    if (!targetKey) continue;
+
+    const effectEntityKey = `${player.sessionId || sessionId}:effect:${targetKey}`;
+    const latestEffectRevision = Math.max(
+      Number(player.revisionSeq || 0),
+      latestRevisionByEntity.get(effectEntityKey) || 0,
+    );
+    const knownEffectRevision = Number(knownRevisions[effectEntityKey] || 0);
+    if (latestEffectRevision > 0 && knownEffectRevision < latestEffectRevision) {
+      const seq = syntheticSeq++;
+      const checkpoint: LanSessionEvent = {
+        id: `checkpoint_effect_${targetKey}_${latestEffectRevision}_${seq}`,
+        sessionId: String(player.sessionId || sessionId || ''),
+        type: 'effect_patch',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: targetKey,
+        toName: String(player.characterName || player.playerName || targetKey),
+        entityType: 'effect',
+        entityId: targetKey,
+        entityRevision: latestEffectRevision,
+        seq,
+        serverSeq: seq,
+        ackRequired: true,
+        originClientId: 'master',
+        effectPatch: {
+          targetKey,
+          replace: true,
+          add: Array.isArray(player.effects) ? player.effects as any : [],
+          update: [],
+          remove: [],
+        },
+        message: 'Checkpoint de efeitos ativos.',
+        createdAt: new Date().toISOString(),
+      };
+      traceApp('RESYNC_RECEIVED', 'RESYNC_EFFECT_CHECKPOINT_CREATED', {
         source: 'lanTcpTransport.getEventsForRevisionGaps',
-        sessionId: event.sessionId,
-        eventId: event.id,
-        eventType: event.type,
-        seq: event.seq,
-        entityType: event.entityType,
-        entityId: event.entityId,
-        entityRevision: revision,
-        before: { knownRevision },
-        decision: 'replay_entity_event',
+        sessionId: checkpoint.sessionId,
+        player: targetKey,
+        entityRevision: latestEffectRevision,
+        before: { knownRevision: knownEffectRevision },
+        effectCount: checkpoint.effectPatch?.add?.length || 0,
+        decision: 'send_checkpoint_replace',
       });
-      traceApp('RESYNC_RECEIVED', 'RESYNC_ENTITY_EVENT_REPLAYED', {
-        source: 'lanTcpTransport.getEventsForRevisionGaps',
-        sessionId: event.sessionId,
-        eventId: event.id,
-        eventType: event.type,
-        seq: event.seq,
-        entityType: event.entityType,
-        entityId: event.entityId,
-        entityRevision: revision,
+      checkpointEvents.push(checkpoint);
+    }
+
+    const playerEntityKey = `${player.sessionId || sessionId}:player:${targetKey}`;
+    const latestPlayerRevision = Math.max(
+      Number(player.revisionSeq || 0),
+      latestRevisionByEntity.get(playerEntityKey) || 0,
+    );
+    const knownPlayerRevision = Number(knownRevisions[playerEntityKey] || 0);
+    if (latestPlayerRevision > 0 && knownPlayerRevision < latestPlayerRevision) {
+      const seq = syntheticSeq++;
+      checkpointEvents.push({
+        id: `checkpoint_player_${targetKey}_${latestPlayerRevision}_${seq}`,
+        sessionId: String(player.sessionId || sessionId || ''),
+        type: 'player_patch',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: targetKey,
+        toName: String(player.characterName || player.playerName || targetKey),
+        entityType: 'player',
+        entityId: targetKey,
+        entityRevision: latestPlayerRevision,
+        seq,
+        serverSeq: seq,
+        ackRequired: true,
+        originClientId: 'master',
+        numberPatch: {
+          hpCurrent: Number(player.hpCurrent || 0),
+          hpMax: Number(player.hpMax || 0),
+          tempHp: Number(player.tempHp || 0),
+          xp: Number(player.xp || 0),
+          gp: Number(player.gp || 0),
+          sp: Number(player.sp || 0),
+          cp: Number(player.cp || 0),
+        },
+        message: 'Checkpoint de recursos do jogador.',
+        createdAt: new Date().toISOString(),
       });
-      replay.push(event);
     }
   }
-  return replay.sort(compareEventsAscending);
+
+  if (checkpointEvents.length === 0) {
+    traceApp('RESYNC_RECEIVED', 'RESYNC_REVISION_GAP_NO_REPLAY', {
+      source: 'lanTcpTransport.getEventsForRevisionGaps',
+      sessionId,
+      knownRevisionCount: Object.keys(knownRevisions || {}).length,
+      decision: 'no_history_replay',
+    });
+  }
+
+  return checkpointEvents.sort(compareEventsAscending);
 }
 
 function mergeEventsById(...groups: LanSessionEvent[][]) {
@@ -1591,7 +1911,12 @@ function inferEventEntityType(event: LanSessionEvent) {
   if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
   if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  if (
+    event.type === 'resource_request' ||
+    event.type === 'resource_review' ||
+    event.type === 'pending_save_patch' ||
+    event.type === 'character_update_review'
+  ) return 'request';
   return 'player';
 }
 
@@ -1641,7 +1966,7 @@ function closeClientSocket() {
 
 function startClientHeartbeat(socket: TcpSocket, sessionId?: string) {
   stopClientHeartbeat();
-  clientHeartbeatTimer = setInterval(() => {
+  const tick = () => {
     if (clientSocket !== socket) {
       stopClientHeartbeat();
       return;
@@ -1652,12 +1977,17 @@ function startClientHeartbeat(socket: TcpSocket, sessionId?: string) {
       sessionId,
       sentAt: new Date().toISOString(),
     });
-  }, 5000);
+
+    const status = clientPayload?.state?.status;
+    clientHeartbeatTimer = setTimeout(tick, getHeartbeatIntervalForSessionStatus(status));
+  };
+
+  clientHeartbeatTimer = setTimeout(tick, getHeartbeatIntervalForSessionStatus(clientPayload?.state?.status));
 }
 
 function stopClientHeartbeat() {
   if (!clientHeartbeatTimer) return;
-  clearInterval(clientHeartbeatTimer);
+  clearTimeout(clientHeartbeatTimer);
   clientHeartbeatTimer = null;
 }
 
@@ -1912,6 +2242,7 @@ type TcpSocketModule = {
 type LanNativeModule = {
   getLocalIpv4Addresses?: () => Promise<string[]>;
   updateForegroundSession?: (sessionName: string, inviteCode: string, joinUrl: string, playerCount: number) => Promise<boolean>;
+  stopForegroundSession?: () => Promise<boolean>;
 };
 
 const LanNative = NativeModules.LanSessionModule as LanNativeModule | undefined;

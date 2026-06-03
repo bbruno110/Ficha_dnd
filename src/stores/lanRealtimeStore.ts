@@ -84,7 +84,12 @@ const inferEntityType = (event: LanSessionEvent) => {
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
   if (event.type === 'effect_save_request' || event.type === 'effect_save_result') return 'save';
   if (event.type.includes('action') || event.type.includes('skill') || event.type.includes('spell') || event.type.includes('ability')) return 'action';
-  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  if (
+    event.type === 'resource_request' ||
+    event.type === 'resource_review' ||
+    event.type === 'pending_save_patch' ||
+    event.type === 'character_update_review'
+  ) return 'request';
   return 'player';
 };
 

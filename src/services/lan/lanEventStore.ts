@@ -238,7 +238,12 @@ function inferLanEventEntityType(event: LanSessionEvent) {
   ) return 'inventory';
   if (event.type === 'coin_self_patch_request') return 'player';
   if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (event.type === 'resource_request' || event.type === 'resource_review' || event.type === 'pending_save_patch') return 'request';
+  if (
+    event.type === 'resource_request' ||
+    event.type === 'resource_review' ||
+    event.type === 'pending_save_patch' ||
+    event.type === 'character_update_review'
+  ) return 'request';
   return 'player';
 }
 

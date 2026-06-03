@@ -37,7 +37,10 @@ export default function HomeScreen() {
          LEFT JOIN lan_local_character_bindings b
            ON b.character_id = c.id
           AND COALESCE(b.is_active, 1) = 1
-         LEFT JOIN lan_sessions s ON s.id = b.session_id
+         LEFT JOIN lan_sessions s
+           ON s.id = b.session_id
+          AND COALESCE(s.active, 1) = 1
+          AND COALESCE(s.status, 'active') != 'ended'
          GROUP BY c.id
          ORDER BY c.created_at DESC`
       );

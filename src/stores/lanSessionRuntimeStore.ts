@@ -220,9 +220,11 @@ export function applyHostEffectPatchRuntime(
   }
 
   const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
+  const nextEffects = Array.from(byId.values());
   const updatedPlayer = {
     ...player,
-    effects: Array.from(byId.values()),
+    effects: nextEffects,
+    tempHp: calculateStandardTempHpFromEffects(nextEffects),
     revisionSeq: revision,
   };
   const nextState = {
@@ -252,7 +254,7 @@ export function applyHostTurnRuntime(
       const effects = tickRuntimeEffects(player.effects || [], unit);
       if (effects === player.effects) return player;
       const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
-      const updatedPlayer = { ...player, effects, revisionSeq: revision };
+      const updatedPlayer = { ...player, effects, tempHp: calculateStandardTempHpFromEffects(effects), revisionSeq: revision };
       markRuntimeEntity(sessionId, getPlayerKey(sessionId, updatedPlayer), revision, revision, 'runtime');
       return updatedPlayer;
     }),
@@ -278,6 +280,21 @@ export function removeHostPlayerRuntime(
   };
   useLanSessionRuntimeStore.getState().setSessionState(sessionId, nextState);
   return { state: nextState, revision };
+}
+
+
+function isTempHpRuntimeEffect(effect: any) {
+  return String(effect?.target || '').toUpperCase() === 'PV_TEMP' || String(effect?.kind || '').toLowerCase() === 'temp_hp';
+}
+
+function getTempHpRuntimeValue(effect: any) {
+  return isTempHpRuntimeEffect(effect) ? Math.max(0, Math.floor(Number(effect?.value) || 0)) : 0;
+}
+
+function calculateStandardTempHpFromEffects(effects: any[]) {
+  return (Array.isArray(effects) ? effects : [])
+    .filter((effect) => isTempHpRuntimeEffect(effect) && getTempHpRuntimeValue(effect) > 0)
+    .reduce((max, effect) => Math.max(max, getTempHpRuntimeValue(effect)), 0);
 }
 
 function preserveLivePlayerFields(currentPlayer: LanSessionPlayerState, incomingPlayer: LanSessionPlayerState) {

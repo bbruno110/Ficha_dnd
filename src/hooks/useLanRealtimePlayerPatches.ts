@@ -14,8 +14,9 @@ import {
   shouldPlayerProcessLanEvent,
   shouldRequestLanResync,
 } from '@/services/lan/lanClientEngine';
+import { LAN_NETWORK_LIMITS, isCriticalLanSessionEvent } from '@/services/lan/lanNetworkPolicy';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
-import { useLanRealtimeStore } from '@/stores/lanRealtimeStore';
+import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 
 type LanNumberPatch = NonNullable<LanSessionEvent['numberPatch']>;
 type LanEffectPatch = NonNullable<LanSessionEvent['effectPatch']>;
@@ -62,6 +63,7 @@ export function useLanRealtimePlayerPatches({
   const onKickedRef = useRef(onKicked);
   const onHostUnreachableRef = useRef(onHostUnreachable);
   const applyRunningRef = useRef(false);
+  const processingEventIdsRef = useRef<Set<string>>(new Set());
   const lastResyncRequestAtRef = useRef(0);
   const consecutiveFetchErrorsRef = useRef(0);
 
@@ -97,6 +99,7 @@ export function useLanRealtimePlayerPatches({
     if (!enabled || !joinUrl || !sessionId) return;
     let disposed = false;
     const getEventSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
+    const isCriticalSessionEvent = (event: LanSessionEvent) => isCriticalLanSessionEvent(event);
 
     const shouldProcessEvent = (event: LanSessionEvent) => {
       if (event.sessionId !== sessionId) {
@@ -109,6 +112,9 @@ export function useLanRealtimePlayerPatches({
         return false;
       }
       if (!isLanLiveCommittedEvent(event)) return false;
+      if (paused && !isCriticalSessionEvent(event)) {
+        return false;
+      }
       if (isLanSessionGlobalEvent(event)) {
         debugLanFlow('PLAYER_GLOBAL_EVENT_ACCEPTED', {
           eventId: event.id,
@@ -169,21 +175,14 @@ export function useLanRealtimePlayerPatches({
     };
 
     const requestResyncIfNeeded = async (reason = 'manual') => {
-      if (paused) {
-        debugLanFlow('PLAYER_STOP_LIVE_SYNC_WHILE_PAUSED', {
-          reason,
-          sessionId,
-          selfKey,
-        });
-        return;
-      }
+      if (paused) return;
       const now = Date.now();
-      if (now - lastResyncRequestAtRef.current < 2500) return;
+      if (now - lastResyncRequestAtRef.current < LAN_NETWORK_LIMITS.resyncMinIntervalMs) return;
       lastResyncRequestAtRef.current = now;
 
       try {
         const runtime = useLanRealtimeStore.getState();
-        const lastAppliedSeq = reason === 'entity_revision_gap' ? 0 : runtime.lastAppliedSeq;
+        const lastAppliedSeq = runtime.lastAppliedSeq;
         debugLanFlow('PLAYER_SEQ_GAP_RESYNC_START', {
           reason,
           sessionId,
@@ -194,6 +193,7 @@ export function useLanRealtimePlayerPatches({
           sessionId,
           playerKey: selfKey,
           lastAppliedSeq,
+          knownRevisions: getKnownLanEntityRevisions(sessionId),
         });
         debugLanFlow('PLAYER_SEQ_GAP_RESYNC_DONE', {
           reason,
@@ -208,8 +208,39 @@ export function useLanRealtimePlayerPatches({
       }
     };
 
+    const runSideEffectInBackground = (label: string, event: LanSessionEvent, task: () => void | Promise<void>) => {
+      Promise.resolve()
+        .then(task)
+        .catch(async (error) => {
+          const reason = error instanceof Error ? error.message : String(error);
+          useLanRealtimeStore.getState().nackEvent(event.clientMsgId || event.id, reason);
+          debugLanFlow('PLAYER_BACKGROUND_EVENT_HANDLER_ERROR', {
+            label,
+            reason,
+            eventId: event.id,
+            type: event.type,
+            seq: event.seq,
+            entityType: event.entityType,
+            entityId: event.entityId,
+            entityRevision: event.entityRevision,
+          });
+          await nackLanSessionEvent(joinUrl, {
+            sessionId,
+            eventId: event.id,
+            clientMsgId: event.clientMsgId,
+            playerKey: selfKey,
+            reason,
+          }).catch(() => false);
+          if (!paused) await requestResyncIfNeeded(`background_${label}_error`);
+        });
+    };
+
     const applyOneEvent = async (event: LanSessionEvent) => {
+      const eventKey = String(event.id || event.clientMsgId || '');
+      if (eventKey && processingEventIdsRef.current.has(eventKey)) return;
+      if (eventKey) processingEventIdsRef.current.add(eventKey);
       const runtime = useLanRealtimeStore.getState();
+      const criticalSessionEvent = isCriticalSessionEvent(event);
       const decision = runtime.getEventApplyDecision(event);
 
       debugLanFlow('PLAYER_EVENT_DECISION', {
@@ -231,23 +262,38 @@ export function useLanRealtimePlayerPatches({
       });
 
       if (!decision.apply) {
-        debugLanFlow('PLAYER_IGNORE_EVENT_DECISION', {
-          reason: decision.reason,
-          eventId: event.id,
-          type: event.type,
-          seq: event.seq,
-          entityType: event.entityType,
-          entityId: event.entityId,
-          entityRevision: event.entityRevision,
-          currentRevision: decision.currentRevision,
-          lastAppliedSeq: decision.lastAppliedSeq,
-          expectedSeq: decision.expectedSeq,
-          receivedSeq: decision.receivedSeq,
-        });
-        if (shouldRequestLanResync(decision)) {
-          await requestResyncIfNeeded(decision.reason);
+        if (criticalSessionEvent && decision.reason !== 'duplicate_id') {
+          debugLanFlow('PLAYER_FORCE_APPLY_CRITICAL_SESSION_EVENT', {
+            reason: decision.reason,
+            eventId: event.id,
+            type: event.type,
+            seq: event.seq,
+            entityType: event.entityType,
+            entityId: event.entityId,
+            entityRevision: event.entityRevision,
+            currentRevision: decision.currentRevision,
+            lastAppliedSeq: decision.lastAppliedSeq,
+          });
+        } else {
+          debugLanFlow('PLAYER_IGNORE_EVENT_DECISION', {
+            reason: decision.reason,
+            eventId: event.id,
+            type: event.type,
+            seq: event.seq,
+            entityType: event.entityType,
+            entityId: event.entityId,
+            entityRevision: event.entityRevision,
+            currentRevision: decision.currentRevision,
+            lastAppliedSeq: decision.lastAppliedSeq,
+            expectedSeq: decision.expectedSeq,
+            receivedSeq: decision.receivedSeq,
+          });
+          if (shouldRequestLanResync(decision)) {
+            await requestResyncIfNeeded(decision.reason);
+          }
+          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          return;
         }
-        return;
       }
 
       try {
@@ -272,6 +318,7 @@ export function useLanRealtimePlayerPatches({
           });
           await ackEvent(event);
           await onSessionPatchRef.current?.(event);
+          if (eventKey) processingEventIdsRef.current.delete(eventKey);
           return;
         }
 
@@ -285,23 +332,16 @@ export function useLanRealtimePlayerPatches({
             toName: event.toName,
             patch: event.numberPatch,
           });
-          debugLanFlow('PLAYER_NUMBER_PATCH_APPLY_START', {
-            eventId: event.id,
-            seq: event.seq,
-            toKey: event.toKey,
-            selfKey,
-            patch: event.numberPatch,
-          });
           if (!onNumberPatchRef.current) {
             throw new Error('onNumberPatch handler nao configurado.');
           }
-          await onNumberPatchRef.current(event.numberPatch, event);
-          debugLanFlow('PLAYER_NUMBER_PATCH_APPLY_DONE', {
-            eventId: event.id,
-            seq: event.seq,
-            toKey: event.toKey,
-            selfKey,
-          });
+          // Caminho zero-latência: a UI é atualizada dentro do handler antes do SQLite.
+          // Não bloqueie a fila de socket esperando persistência local.
+          runSideEffectInBackground('number_patch', event, () => onNumberPatchRef.current?.(event.numberPatch!, event));
+          useLanRealtimeStore.getState().markEventApplied(event);
+          await ackEvent(event);
+          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          return;
         } else if (event.type === 'effect_patch' && event.effectPatch) {
           debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_START', {
             eventId: event.id,
@@ -312,15 +352,17 @@ export function useLanRealtimePlayerPatches({
             updateCount: event.effectPatch.update?.length || 0,
             removeCount: event.effectPatch.remove?.length || 0,
           });
-          await onEffectPatchRef.current?.(event.effectPatch, event);
-          debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_DONE', {
-            eventId: event.id,
-            seq: event.seq,
-            toKey: event.toKey,
-            selfKey,
-          });
+          runSideEffectInBackground('effect_patch', event, () => onEffectPatchRef.current?.(event.effectPatch!, event));
+          useLanRealtimeStore.getState().markEventApplied(event);
+          await ackEvent(event);
+          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          return;
         } else if (event.type === 'inventory_patch' && event.inventoryPatch) {
-          await onInventoryPatchRef.current?.(event.inventoryPatch, event);
+          runSideEffectInBackground('inventory_patch', event, () => onInventoryPatchRef.current?.(event.inventoryPatch!, event));
+          useLanRealtimeStore.getState().markEventApplied(event);
+          await ackEvent(event);
+          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          return;
         } else if (event.type === 'session_patch') {
           await onSessionPatchRef.current?.(event);
         } else if (event.type === 'player_kicked') {
@@ -347,6 +389,7 @@ export function useLanRealtimePlayerPatches({
           lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
         });
         await ackEvent(event);
+        if (eventKey) processingEventIdsRef.current.delete(eventKey);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         useLanRealtimeStore.getState().nackEvent(event.clientMsgId || event.id, reason);
@@ -365,6 +408,7 @@ export function useLanRealtimePlayerPatches({
           error,
         });
         await requestResyncIfNeeded('apply_error');
+        if (eventKey) processingEventIdsRef.current.delete(eventKey);
       }
     };
 
@@ -382,12 +426,6 @@ export function useLanRealtimePlayerPatches({
 
       try {
         const runtimeBeforeFetch = useLanRealtimeStore.getState();
-        debugLanFlow('PLAYER_EVENT_POLLING_TICK', {
-          sessionId,
-          selfKey,
-          lastAppliedSeq: runtimeBeforeFetch.lastAppliedSeq,
-          lastSeenSeq: runtimeBeforeFetch.lastSeenSeq,
-        });
         const events = await fetchLanSessionEvents(joinUrl, sessionId, {
           afterSeq: runtimeBeforeFetch.lastAppliedSeq,
           playerKey: selfKey,
@@ -478,12 +516,6 @@ export function useLanRealtimePlayerPatches({
 
         if (consecutiveFetchErrorsRef.current >= 4) {
           if (paused) {
-            debugLanFlow('PLAYER_STOP_LIVE_SYNC_WHILE_PAUSED', {
-              sessionId,
-              selfKey,
-              consecutiveFetchErrors: consecutiveFetchErrorsRef.current,
-              reason,
-            });
             resetConnectionWhilePaused();
             return;
           }
@@ -499,33 +531,44 @@ export function useLanRealtimePlayerPatches({
 
         if (!paused) {
           await requestResyncIfNeeded('fetch_error');
-        } else {
-          debugLanFlow('PLAYER_STOP_LIVE_SYNC_WHILE_PAUSED', {
-            sessionId,
-            selfKey,
-            reason: 'fetch_error',
-          });
         }
       } finally {
         applyRunningRef.current = false;
       }
     };
 
-    void applyEvents();
-
-    const timer = setInterval(() => {
+    if (!paused) {
       void applyEvents();
-    }, paused ? 5000 : 750);
+    } else {
+      resetConnectionWhilePaused();
+    }
 
-    const unsubscribe = subscribeLanSessionClientUpdates(joinUrl, () => {
-      // O transporte agora trata payload_update como cache estrutural.
-      // Aqui buscamos/aplicamos apenas eventos vivos para evitar rollback por snapshot antigo.
+    const timer = paused
+      ? null
+      : setInterval(() => {
+          void applyEvents();
+        }, LAN_NETWORK_LIMITS.fallbackPollActiveMs);
+
+    const unsubscribe = subscribeLanSessionClientUpdates(joinUrl, (update) => {
+      // Caminho rapido: quando o socket recebe event_commit, aplique imediatamente.
+      // O polling abaixo fica apenas como fallback/recovery.
+      if (update?.event) {
+        const event = update.event;
+        if (shouldProcessEvent(event)) {
+          void applyOneEvent(event);
+          return;
+        }
+      }
+
+      // payload_update/session_snapshot sao cache estrutural. Em pausa, evite polling
+      // agressivo; session_patch/session_ended chegam por event_commit.
+      if (paused) return;
       void applyEvents();
     });
 
     return () => {
       disposed = true;
-      clearInterval(timer);
+      if (timer) clearInterval(timer);
       unsubscribe();
     };
   }, [characterName, enabled, joinUrl, paused, selfKey, sessionId]);

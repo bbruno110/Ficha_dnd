@@ -524,38 +524,42 @@ export default function EditCharacterScreen() {
       );
 
       if (sessionId) {
-        await joinLanSessionWithCharacter(db, String(sessionId), character.id, '', {
-          joinUrl: firstParam(joinUrl) || '',
-        });
-        const updatedCharacter = await db.getFirstAsync<Record<string, unknown>>(
-          `SELECT * FROM characters WHERE id = ?`,
-          [character.id]
-        );
-
-        await notifyMasterJoin(
-          firstParam(joinUrl),
-          String(sessionId),
-          updatedCharacter || character,
-          '',
-          { reviewSnapshot: true }
-        );
-
         const sessionValue = String(sessionId);
-        const joinUrlValue = firstParam(joinUrl) || '';
-        const playerKey = makeLanCharacterKey(sessionValue, updatedCharacter || character);
-        const runtime = useLanRealtimeStore.getState();
-        runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
-        await requestLanSessionResync(joinUrlValue, {
-          sessionId: sessionValue,
-          playerKey,
-          lastAppliedSeq: runtime.sessionId === sessionValue ? runtime.lastAppliedSeq : 0,
-          knownRevisions: getKnownLanEntityRevisions(sessionValue),
-        }).catch(() => false);
+        const joinUrlValue = decodeParam(firstParam(joinUrl)) || '';
+        try {
+          await joinLanSessionWithCharacter(db, sessionValue, character.id, '', {
+            joinUrl: joinUrlValue,
+          });
+          const updatedCharacter = await db.getFirstAsync<Record<string, unknown>>(
+            `SELECT * FROM characters WHERE id = ?`,
+            [character.id]
+          );
+
+          await notifyMasterJoin(
+            joinUrlValue,
+            sessionValue,
+            updatedCharacter || character,
+            '',
+            { reviewSnapshot: true }
+          );
+
+          const playerKey = makeLanCharacterKey(sessionValue, updatedCharacter || character);
+          const runtime = useLanRealtimeStore.getState();
+          runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
+          await requestLanSessionResync(joinUrlValue, {
+            sessionId: sessionValue,
+            playerKey,
+            lastAppliedSeq: runtime.sessionId === sessionValue ? runtime.lastAppliedSeq : 0,
+            knownRevisions: getKnownLanEntityRevisions(sessionValue),
+          }).catch(() => false);
+        } catch (lanError) {
+          console.warn("Ficha salva, mas falhou ao avisar a sessao LAN:", lanError);
+        }
       }
 
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!
       if (sessionId) {
-        router.replace(`/sheet?id=${character.id}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(firstParam(joinUrl) || '')}` as any);
+        router.replace(`/sheet?id=${character.id}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(decodeParam(firstParam(joinUrl)) || '')}` as any);
       } else if (router.canGoBack()) {
         router.back();
       } else {
@@ -1022,4 +1026,13 @@ export default function EditCharacterScreen() {
 function firstParam(value?: string | string[]) {
   if (Array.isArray(value)) return value[0];
   return value;
+}
+
+function decodeParam(value?: string) {
+  if (!value) return '';
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }

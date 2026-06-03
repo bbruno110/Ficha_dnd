@@ -76,7 +76,8 @@ const DEFAULT_SLOTS = {
 const SPELL_LEVELS = ['Todos', 'Passiva', 'Habilidade', 'Truque', 'Nível 1', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6', 'Nível 7', 'Nível 8', 'Nível 9'];
 const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 
-const COIN_RATES = { gp: 100, sp: 10, cp: 1 };
+// Regra da mesa/app: 1 ouro = 20 pratas; 1 prata = 10 cobres.
+const COIN_RATES = { gp: 200, sp: 10, cp: 1 };
 const COIN_NAMES = { gp: 'Ouro', sp: 'Prata', cp: 'Cobre' };
 const COIN_COLORS = { gp: appColors.warning, sp: appColors.silver, cp: appColors.copper };
 const LAN_NUMBER_COLUMNS = `
@@ -104,6 +105,72 @@ const safeJsonParse = <T,>(value: unknown, fallback: T): T => {
   if (value == null || value === '') return fallback;
   if (typeof value !== 'string') return value as T;
   try { return JSON.parse(value) as T; } catch { return fallback; }
+};
+
+
+const isTempHpEffectSnapshot = (effect: any) => (
+  String(effect?.target || '').toUpperCase() === 'PV_TEMP' ||
+  String(effect?.kind || '').toLowerCase() === 'temp_hp'
+);
+
+const getTempHpEffectValue = (effect: any) => isTempHpEffectSnapshot(effect)
+  ? Math.max(0, Math.floor(Number(effect?.value) || 0))
+  : 0;
+
+const calculateStandardTempHpFromEffects = (effects: any[]) => (Array.isArray(effects) ? effects : [])
+  .filter((effect) => isTempHpEffectSnapshot(effect) && getTempHpEffectValue(effect) > 0)
+  .reduce((max, effect) => Math.max(max, getTempHpEffectValue(effect)), 0);
+
+const getTempHpUnitWeight = (unit: unknown) => {
+  const value = String(unit || '').toLowerCase();
+  if (value === 'turn' || value === 'round') return 1;
+  if (value === 'minute') return 2;
+  if (value === 'hour') return 3;
+  if (value === 'day') return 4;
+  if (value === 'short_rest' || value === 'rest') return 5;
+  if (value === 'long_rest') return 6;
+  if (value === 'manual' || value === 'permanent') return 7;
+  return 8;
+};
+
+const consumeTempHpEffectsLocally = (effects: any[], amount: number) => {
+  let remainingDamage = Math.max(0, Math.floor(Number(amount) || 0));
+  if (remainingDamage <= 0) return { effects, changed: false };
+
+  const indexedEffects = effects.map((effect, index) => ({ effect, index }));
+  const tempHpEntries = indexedEffects
+    .filter(({ effect }) => isTempHpEffectSnapshot(effect) && getTempHpEffectValue(effect) > 0)
+    .sort((a, b) => {
+      const unitDiff = getTempHpUnitWeight(a.effect?.unit) - getTempHpUnitWeight(b.effect?.unit);
+      if (unitDiff !== 0) return unitDiff;
+      const remainingDiff = Math.max(0, Number(a.effect?.remaining) || 0) - Math.max(0, Number(b.effect?.remaining) || 0);
+      if (remainingDiff !== 0) return remainingDiff;
+      return String(a.effect?.id || '').localeCompare(String(b.effect?.id || ''));
+    });
+
+  if (tempHpEntries.length === 0) return { effects, changed: false };
+
+  const nextEffects = [...effects];
+  const removedIndexes = new Set<number>();
+
+  for (const { effect, index } of tempHpEntries) {
+    if (remainingDamage <= 0) break;
+    const currentValue = getTempHpEffectValue(effect);
+    const consumed = Math.min(currentValue, remainingDamage);
+    const nextValue = Math.max(0, currentValue - consumed);
+    remainingDamage -= consumed;
+
+    if (nextValue <= 0) {
+      removedIndexes.add(index);
+    } else {
+      nextEffects[index] = { ...effect, value: nextValue };
+    }
+  }
+
+  return {
+    effects: nextEffects.filter((_, index) => !removedIndexes.has(index)),
+    changed: removedIndexes.size > 0 || remainingDamage !== amount,
+  };
 };
 
 
@@ -173,6 +240,7 @@ export default function CharacterSheetScreen() {
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
   const [lanInfo, setLanInfo] = useState<{ sessionId: string; joinUrl: string; hostInstanceId?: string } | null>(null);
   const [lanSessionStatus, setLanSessionStatus] = useState<LanSessionStatus | null>(null);
+  const lanSessionStatusRef = useRef<LanSessionStatus | null>(null);
   const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
   const sheetRuntimeMode = getSheetRuntimeMode({
     lanInfo,
@@ -183,6 +251,8 @@ export default function CharacterSheetScreen() {
   const characterRef = useRef<any>(null);
   const lastLanJoinNotifyRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
   const sessionTerminatedRef = useRef<string | null>(null);
+  const handledSessionEventIdsRef = useRef<Set<string>>(new Set());
+  const lastPausedAlertKeyRef = useRef<string>('');
   const lastAuthoritativePlayerPatchRef = useRef<{ seq: number; entityRevision: number; appliedAt: number }>({
     seq: 0,
     entityRevision: 0,
@@ -235,6 +305,10 @@ export default function CharacterSheetScreen() {
   useEffect(() => {
     characterRef.current = character;
   }, [character]);
+
+  useEffect(() => {
+    lanSessionStatusRef.current = lanSessionStatus;
+  }, [lanSessionStatus]);
 
   useEffect(() => {
     if (!character) return;
@@ -654,6 +728,33 @@ export default function CharacterSheetScreen() {
       patch,
     });
 
+    // Caminho rápido: a UI do jogador deve reagir ao socket imediatamente.
+    // O SQLite continua sendo persistência, mas não pode segurar HP/XP/moedas/vida temp na tela.
+    const optimisticBase = currentCharacter;
+    const optimisticNextValues = {
+      hp_current: patch.hpCurrent ?? optimisticBase.hp_current,
+      hp_max: patch.hpMax ?? optimisticBase.hp_max,
+      temp_hp: patch.tempHp ?? optimisticBase.temp_hp,
+      xp: patch.xp ?? optimisticBase.xp,
+      gp: patch.gp ?? optimisticBase.gp,
+      sp: patch.sp ?? optimisticBase.sp,
+      cp: patch.cp ?? optimisticBase.cp,
+    };
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = { ...prev, ...optimisticNextValues };
+      characterRef.current = merged;
+      return merged;
+    });
+    debugLanFlow('PLAYER_NUMBER_PATCH_UI_OPTIMISTIC_APPLIED', {
+      eventId: event?.id,
+      characterId: currentCharacter.id,
+      hpCurrent: optimisticNextValues.hp_current,
+      hpMax: optimisticNextValues.hp_max,
+      tempHp: optimisticNextValues.temp_hp,
+      xp: optimisticNextValues.xp,
+    });
+
     traceSqlite('SQLITE_READ_START', {
       screen: 'sheet',
       source: 'applyLanNumberPatchToCharacter',
@@ -929,6 +1030,60 @@ export default function CharacterSheetScreen() {
       removeCount: patch.remove?.length || 0,
     });
 
+    // Caminho rápido: aplica visualmente o patch de efeito antes de qualquer leitura SQLite.
+    // Isso cobre PV temporário expirando, atributo temporário, condição, cegueira/lentidão etc.
+    const optimisticCurrentEffects = Array.isArray((currentCharacter as any).active_effects)
+      ? [...((currentCharacter as any).active_effects || [])]
+      : safeJsonParse<any[]>((currentCharacter as any).active_effects_json, []);
+    const optimisticRemoveSet = new Set((patch.remove || []).map(String));
+    const optimisticById = new Map<string, any>();
+    if (patch.replace === true) {
+      for (const effect of patch.add || []) {
+        const id = String((effect as any)?.id || '');
+        if (!id || optimisticRemoveSet.has(id)) continue;
+        optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+      }
+    } else {
+      for (const effect of optimisticCurrentEffects) {
+        const id = String(effect?.id || '');
+        const lanEffectId = String(effect?.lanEffectId || effect?.lanEffectID || '');
+        if (id && !optimisticRemoveSet.has(id) && !optimisticRemoveSet.has(lanEffectId)) {
+          optimisticById.set(id, effect);
+        }
+      }
+      for (const effect of patch.update || []) {
+        const id = String((effect as any)?.id || '');
+        if (id && !optimisticRemoveSet.has(id)) optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+      }
+      for (const effect of patch.add || []) {
+        const id = String((effect as any)?.id || '');
+        if (!id || optimisticRemoveSet.has(id)) continue;
+        optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+      }
+    }
+    const optimisticNextEffects = Array.from(optimisticById.values());
+    const optimisticTempHp = calculateStandardTempHpFromEffects(optimisticNextEffects);
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = {
+        ...prev,
+        active_effects: optimisticNextEffects,
+        active_effects_json: JSON.stringify(optimisticNextEffects),
+        temp_hp: optimisticTempHp,
+      };
+      characterRef.current = merged;
+      return merged;
+    });
+    debugLanFlow('PLAYER_EFFECT_PATCH_UI_OPTIMISTIC_APPLIED', {
+      eventId: event?.id,
+      characterId: currentCharacter.id,
+      effectCount: optimisticNextEffects.length,
+      tempHp: optimisticTempHp,
+      addCount: patch.add?.length || 0,
+      updateCount: patch.update?.length || 0,
+      removeCount: patch.remove?.length || 0,
+    });
+
     traceSqlite('SQLITE_READ_START', {
       screen: 'sheet',
       source: 'applyLanEffectPatchToCharacter',
@@ -959,39 +1114,54 @@ export default function CharacterSheetScreen() {
     const removeSet = new Set((patch.remove || []).map(String));
     const byId = new Map<string, any>();
 
-    for (const effect of currentEffects) {
-      const id = String(effect?.id || '');
-      const lanEffectId = String(effect?.lanEffectId || effect?.lanEffectID || '');
-      if (id && !removeSet.has(id) && !removeSet.has(lanEffectId)) byId.set(id, effect);
-    }
+    if (patch.replace === true) {
+      for (const effect of patch.add || []) {
+        const id = String((effect as any)?.id || '');
+        if (!id || removeSet.has(id)) continue;
+        byId.set(id, markLanEffectForLocalCharacter(effect, event));
+      }
+      debugLanFlow('PLAYER_EFFECT_CHECKPOINT_REPLACE_APPLIED', {
+        eventId: event?.id,
+        characterId: currentCharacter.id,
+        addCount: patch.add?.length || 0,
+        removeCount: patch.remove?.length || 0,
+      });
+    } else {
+      for (const effect of currentEffects) {
+        const id = String(effect?.id || '');
+        const lanEffectId = String(effect?.lanEffectId || effect?.lanEffectID || '');
+        if (id && !removeSet.has(id) && !removeSet.has(lanEffectId)) byId.set(id, effect);
+      }
 
-    for (const effect of patch.update || []) {
-      const id = String((effect as any)?.id || '');
-      if (id && !removeSet.has(id)) {
+      for (const effect of patch.update || []) {
+        const id = String((effect as any)?.id || '');
+        if (id && !removeSet.has(id)) {
+          byId.set(id, markLanEffectForLocalCharacter(effect, event));
+        }
+      }
+
+      for (const effect of patch.add || []) {
+        const id = String((effect as any)?.id || '');
+        if (!id || removeSet.has(id)) continue;
+
+        // Se havia um efeito otimista local do mesmo item/alvo, substitui pelo efeito autoritativo do Host.
+        for (const [existingId, existing] of Array.from(byId.entries())) {
+          const isOptimisticLocal = String(existingId).startsWith('local_') || String(existingId).startsWith('pending_item_');
+          const sameEffect =
+            String(existing?.source || '') === String((effect as any)?.source || '') &&
+            String(existing?.name || '') === String((effect as any)?.name || '') &&
+            String(existing?.target || '') === String((effect as any)?.target || '') &&
+            Number(existing?.value || 0) === Number((effect as any)?.value || 0);
+
+          if (isOptimisticLocal && sameEffect) byId.delete(existingId);
+        }
+
         byId.set(id, markLanEffectForLocalCharacter(effect, event));
       }
     }
 
-    for (const effect of patch.add || []) {
-      const id = String((effect as any)?.id || '');
-      if (!id || removeSet.has(id)) continue;
-
-      // Se havia um efeito otimista local do mesmo item/alvo, substitui pelo efeito autoritativo do Host.
-      for (const [existingId, existing] of Array.from(byId.entries())) {
-        const isOptimisticLocal = String(existingId).startsWith('local_') || String(existingId).startsWith('pending_item_');
-        const sameEffect =
-          String(existing?.source || '') === String((effect as any)?.source || '') &&
-          String(existing?.name || '') === String((effect as any)?.name || '') &&
-          String(existing?.target || '') === String((effect as any)?.target || '') &&
-          Number(existing?.value || 0) === Number((effect as any)?.value || 0);
-
-        if (isOptimisticLocal && sameEffect) byId.delete(existingId);
-      }
-
-      byId.set(id, markLanEffectForLocalCharacter(effect, event));
-    }
-
     const nextEffects = Array.from(byId.values());
+    const nextTempHpFromEffects = calculateStandardTempHpFromEffects(nextEffects);
     traceStateChange('STATE_CHANGE', 'PLAYER_CHARACTER_EFFECT_PATCH_COMPUTED', {
       effectCount: currentEffects.length,
       effects: currentEffects,
@@ -1011,7 +1181,12 @@ export default function CharacterSheetScreen() {
       patch,
     });
 
-    setCharacter((prev: any) => prev ? ({ ...prev, active_effects: nextEffects, active_effects_json: JSON.stringify(nextEffects) }) : prev);
+    setCharacter((prev: any) => prev ? ({
+      ...prev,
+      active_effects: nextEffects,
+      active_effects_json: JSON.stringify(nextEffects),
+      temp_hp: nextTempHpFromEffects,
+    }) : prev);
     debugLanFlow('PLAYER_RUNTIME_PATCH_APPLIED', {
       eventId: event?.id,
       type: event?.type,
@@ -1044,8 +1219,8 @@ export default function CharacterSheetScreen() {
       patch,
     });
     await db.runAsync(
-      `UPDATE characters SET active_effects_json = ? WHERE id = ?`,
-      [JSON.stringify(nextEffects), Number(currentCharacter.id)]
+      `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
+      [JSON.stringify(nextEffects), nextTempHpFromEffects, Number(currentCharacter.id)]
     );
     traceSqlite('SQLITE_WRITE_DONE', {
       screen: 'sheet',
@@ -1064,7 +1239,12 @@ export default function CharacterSheetScreen() {
       field: 'active_effects_json',
     });
 
-    setCharacter((prev: any) => prev ? ({ ...prev, active_effects: nextEffects, active_effects_json: JSON.stringify(nextEffects) }) : prev);
+    setCharacter((prev: any) => prev ? ({
+      ...prev,
+      active_effects: nextEffects,
+      active_effects_json: JSON.stringify(nextEffects),
+      temp_hp: nextTempHpFromEffects,
+    }) : prev);
     debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_DONE', {
       characterId: currentCharacter.id,
       characterName: currentCharacter.name,
@@ -1132,14 +1312,16 @@ export default function CharacterSheetScreen() {
       return !isLanSessionEffect;
     });
 
+    const nextTempHp = calculateStandardTempHpFromEffects(nextEffects);
     await db.runAsync(
-      `UPDATE characters SET active_effects_json = ? WHERE id = ?`,
-      [JSON.stringify(nextEffects), Number(currentCharacter.id)]
+      `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
+      [JSON.stringify(nextEffects), nextTempHp, Number(currentCharacter.id)]
     );
     setCharacter((prev: any) => prev ? ({
       ...prev,
       active_effects: nextEffects,
       active_effects_json: JSON.stringify(nextEffects),
+      temp_hp: nextTempHp,
     }) : prev);
 
     debugLanFlow('PLAYER_KICKED_CLEAN_LAN_EFFECTS_DONE', {
@@ -1156,12 +1338,19 @@ export default function CharacterSheetScreen() {
 
     const nextEquipment = normalizeSheetEquipment(patch.equipment);
 
+    // Multiplayer: inventario recebido do host deve aparecer na UI imediatamente.
+    // SQLite e persistencia local nao podem bloquear a sensacao de tempo real.
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = { ...prev, equipment: nextEquipment };
+      characterRef.current = merged;
+      return merged;
+    });
+
     await db.runAsync(
       `UPDATE characters SET equipment = ? WHERE id = ?`,
       [JSON.stringify(nextEquipment), Number(currentCharacter.id)]
     );
-
-    setCharacter((prev: any) => prev ? ({ ...prev, equipment: nextEquipment }) : prev);
   }, [db]);
 
   const terminateLanSessionFromMaster = useCallback(async (
@@ -1174,6 +1363,13 @@ export default function CharacterSheetScreen() {
     const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
 
     sessionTerminatedRef.current = sessionValue;
+    // Evento terminal: a UI deve sair do modo LAN imediatamente. A limpeza SQLite roda em seguida.
+    setLanSessionStatus(null);
+    setLanInfo(null);
+    setLanPlayers([]);
+    setIncomingTrades([]);
+    useLanRealtimeStore.getState().resetSession(sessionValue);
+    resetLanClientConnection();
     traceApp('LAN_JOIN', 'PLAYER_TERMINATION_FLAG_SET', {
       screen: 'sheet',
       source,
@@ -1200,6 +1396,12 @@ export default function CharacterSheetScreen() {
       selfKey,
     });
     await unlinkCharacterFromLanSession(db, Number(currentCharacter.id), sessionValue).catch(() => {});
+    await db.runAsync(
+      `UPDATE lan_local_character_bindings
+       SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+       WHERE session_id = ?`,
+      [sessionValue]
+    ).catch(() => {});
     debugLanFlow('PLAYER_LAN_BINDING_ENDED', {
       sessionId: sessionValue,
       characterId: currentCharacter.id,
@@ -1225,7 +1427,7 @@ export default function CharacterSheetScreen() {
     await db.runAsync(
       `UPDATE lan_sessions
        SET status = 'ended', active = 0, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND COALESCE(is_master, 0) = 0`,
+       WHERE id = ?`,
       [sessionValue]
     ).catch(() => {});
 
@@ -1453,7 +1655,6 @@ export default function CharacterSheetScreen() {
       character &&
       lanInfo?.sessionId &&
       lanInfo?.joinUrl &&
-      lanSessionStatus !== 'paused' &&
       sessionTerminatedRef.current !== lanInfo.sessionId
     ),
     joinUrl: lanInfo?.joinUrl,
@@ -1487,17 +1688,6 @@ export default function CharacterSheetScreen() {
         toName: event.toName,
         patch,
       });
-      const stored = await rememberLanSessionEvent(db, event).catch(() => false);
-      if (!stored) {
-        debugLanFlow('PLAYER_EVENT_DECISION', {
-          eventId: event.id,
-          type: event.type,
-          seq: event.seq,
-          entityRevision: event.entityRevision,
-          reason: 'stored_duplicate_but_apply_needed',
-          apply: true,
-        });
-      }
       const nextValues = await applyLanNumberPatchToCharacter(patch, event);
       if (lanInfo?.sessionId && character) {
         const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
@@ -1509,6 +1699,8 @@ export default function CharacterSheetScreen() {
         if (nextValues) {
           updateSelfLanBarFromAuthoritativePatch(lanInfo.sessionId, nextValues, event);
         }
+        // Persistencia de evento/aplicacao roda depois da UI. Nao segure o socket.
+        await rememberLanSessionEvent(db, event).catch(() => false);
         await markLanEventsApplied(db, {
           sessionId: lanInfo.sessionId,
           deviceId: selfKey,
@@ -1545,18 +1737,8 @@ export default function CharacterSheetScreen() {
         toKey: event.toKey,
         patch: effectPatch,
       });
-      const stored = await rememberLanSessionEvent(db, event).catch(() => false);
-      if (!stored) {
-        debugLanFlow('PLAYER_EVENT_DECISION', {
-          eventId: event.id,
-          type: event.type,
-          seq: event.seq,
-          entityRevision: event.entityRevision,
-          reason: 'stored_duplicate_but_apply_needed',
-          apply: true,
-        });
-      }
       await applyLanEffectPatchToCharacter(effectPatch, event);
+      await rememberLanSessionEvent(db, event).catch(() => false);
       debugLanFlow('PLAYER_EFFECT_PATCH_APPLIED', {
         eventId: event.id,
         seq: event.seq,
@@ -1586,16 +1768,8 @@ export default function CharacterSheetScreen() {
         targetKey: patch.targetKey,
         reason: patch.reason,
       });
-      const fresh = await rememberLanSessionEvent(db, event);
-      if (!fresh) {
-        debugLanFlow('PLAYER_INVENTORY_PATCH_DUPLICATE_IGNORED', {
-          eventId: event.id,
-          seq: event.seq,
-          entityRevision: event.entityRevision,
-        });
-        return;
-      }
       await applyLanInventoryPatchToCharacter(patch);
+      await rememberLanSessionEvent(db, event).catch(() => false);
       debugLanFlow(
         patch.action === 'grant' ? 'PLAYER_GRANTED_ITEM_APPLIED' : 'PLAYER_INVENTORY_PATCH_APPLIED',
         {
@@ -1624,6 +1798,14 @@ export default function CharacterSheetScreen() {
     onSessionPatch: async (event) => {
       if (!character || !lanInfo?.sessionId) return;
       const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+      const sessionEventKey = String(event.id || `${event.type}:${event.sessionId}:${event.entityRevision || event.seq || event.createdAt || ''}`);
+      if (handledSessionEventIdsRef.current.has(sessionEventKey)) {
+        return;
+      }
+      handledSessionEventIdsRef.current.add(sessionEventKey);
+      if (handledSessionEventIdsRef.current.size > 100) {
+        handledSessionEventIdsRef.current = new Set(Array.from(handledSessionEventIdsRef.current).slice(-50));
+      }
       debugLanFlow('PLAYER_SESSION_PATCH_RECEIVED', {
         eventId: event.id,
         sessionId: lanInfo.sessionId,
@@ -1644,10 +1826,23 @@ export default function CharacterSheetScreen() {
       });
 
       if (!isLanSessionEndedEvent(event)) {
-        await rememberLanSessionEvent(db, event).catch(() => false);
         const status = event.sessionPatch?.status;
+        const currentLanStatus = lanSessionStatusRef.current;
+        if (status === currentLanStatus && status === 'paused') {
+          debugLanFlow('PLAYER_SESSION_PATCH_DUPLICATE_STATUS_SKIPPED', {
+            eventId: event.id,
+            sessionId: lanInfo.sessionId,
+            status,
+          });
+          return;
+        }
         if (status === 'paused' || status === 'active') {
+          // Pausar/continuar e um evento de ciclo de vida. Atualize UI primeiro;
+          // SQLite/cache nunca pode atrasar o botao/estado da ficha.
           setLanSessionStatus(status);
+          lanSessionStatusRef.current = status;
+          if (status === 'active') lastPausedAlertKeyRef.current = '';
+          await rememberLanSessionEvent(db, event).catch(() => false);
           await db.runAsync(
             `UPDATE lan_sessions
              SET status = ?, active = 1, updated_at = CURRENT_TIMESTAMP
@@ -1675,16 +1870,21 @@ export default function CharacterSheetScreen() {
               sessionId: lanInfo.sessionId,
               selfKey,
             });
-            debugLanFlow('PLAYER_SHOW_PAUSED_SESSION_ALERT', {
-              eventId: event.id,
-              sessionId: lanInfo.sessionId,
-              selfKey,
-            });
-            showCustomAlert(
-              'Sessao pausada pelo mestre',
-              'A campanha continuara depois. Sua ficha ficara em modo leitura ate o mestre retomar.'
-            );
+            const pausedAlertKey = `${lanInfo.sessionId}:paused`;
+            if (lastPausedAlertKeyRef.current !== pausedAlertKey) {
+              lastPausedAlertKeyRef.current = pausedAlertKey;
+              debugLanFlow('PLAYER_SHOW_PAUSED_SESSION_ALERT', {
+                eventId: event.id,
+                sessionId: lanInfo.sessionId,
+                selfKey,
+              });
+              showCustomAlert(
+                'Sessao pausada pelo mestre',
+                'A campanha continuara depois. Sua ficha ficara em modo leitura ate o mestre retomar.'
+              );
+            }
           } else {
+            lastPausedAlertKeyRef.current = '';
             debugLanFlow('PLAYER_SESSION_RESUMED_RECEIVED', {
               eventId: event.id,
               sessionId: lanInfo.sessionId,
@@ -2264,10 +2464,9 @@ export default function CharacterSheetScreen() {
       if (event.type === 'trade_accept') {
         const fresh = await rememberLanSessionEvent(db, event);
         if (fresh) {
-          const removed = await removeTradeItemFromBagByName(event.offeredItem);
-          if (removed) await addTradeItemToBag(event.requestedItem);
-          showCustomAlert('Troca aceita', `${event.fromName} aceitou a troca.`);
+          showCustomAlert('Troca respondida', event.message || `${event.fromName} respondeu à troca.`);
         }
+        continue;
       }
 
       if (event.type === 'trade_decline') {
@@ -2963,7 +3162,8 @@ export default function CharacterSheetScreen() {
       await sendLanSessionEvent(lanInfo.joinUrl, event);
       await rememberLanSessionEvent(db, event).catch(() => false);
       await updateDB(next, { allowLanAuthoritativeCache: true, reason: 'lan_player_self_coin_patch' });
-      showCustomAlert('Pedido enviado', 'O mestre recebeu sua alteracao de moedas para confirmar.');
+      // Redução/conversão de moeda própria é uma ação normal do jogador.
+      // Não mostre alerta modal; o mestre só verá no histórico da sessão.
       return true;
     } catch {
       showCustomAlert('Sincronizacao falhou', 'Nao consegui enviar esta alteracao ao mestre.');
@@ -3178,19 +3378,20 @@ export default function CharacterSheetScreen() {
         damage: amount,
         result: damageResult,
       });
-      if (damageResult.tempHpWasDepleted) {
+      if (damageResult.absorbedTempHp > 0) {
         const currentEffects: any[] = Array.isArray(character.active_effects)
           ? character.active_effects
           : safeJsonParse<any[]>(character.active_effects_json, []);
-        const filteredEffects = currentEffects.filter((effect: any) => (
-          String(effect?.target || '').toUpperCase() !== 'PV_TEMP' &&
-          String(effect?.kind || '').toLowerCase() !== 'temp_hp'
-        ));
-        nextActiveEffects = filteredEffects;
-        debugLanFlow(filteredEffects.length === currentEffects.length ? 'TEMP_HP_DEPLETED_NO_EFFECT_FOUND' : 'PLAYER_TEMP_HP_EFFECT_REMOVED', {
+        const consumedEffects = consumeTempHpEffectsLocally(currentEffects, damageResult.absorbedTempHp);
+        if (consumedEffects.changed) {
+          nextActiveEffects = consumedEffects.effects;
+        }
+        debugLanFlow(consumedEffects.changed ? 'PLAYER_TEMP_HP_EFFECTS_CONSUMED_LOCALLY' : 'TEMP_HP_DAMAGE_NO_ACTIVE_EFFECTS', {
           screen: 'sheet',
           characterId: character.id,
-          removedCount: currentEffects.length - filteredEffects.length,
+          absorbedTempHp: damageResult.absorbedTempHp,
+          beforeCount: currentEffects.length,
+          afterCount: consumedEffects.effects.length,
         });
       }
     }
@@ -3532,10 +3733,10 @@ export default function CharacterSheetScreen() {
         type: 'send_item_request',
         fromKey: selfKey,
         fromName: character.name,
-        toKey: 'master',
-        toName: 'Mestre',
+        toKey: target.key,
+        toName: target.characterName,
         entityType: 'inventory',
-        entityId: selfKey,
+        entityId: target.key,
         ackRequired: true,
         sendItemRequest: {
           requestId,
@@ -3545,12 +3746,12 @@ export default function CharacterSheetScreen() {
           qty: tradeItem.qty,
         },
         item: tradeItem,
-        message: `${character.name} pediu para enviar ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
+        message: `${character.name} enviou ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
         createdAt: new Date().toISOString(),
       };
       await sendLanSessionEvent(lanInfo.joinUrl, event);
       await rememberLanSessionEvent(db, event).catch(() => false);
-      showCustomAlert('Pedido enviado', `O mestre vai confirmar o envio de ${tradeItem.qty}x ${tradeItem.name}.`);
+      showCustomAlert('Item enviado', `${target.characterName} receberá ${tradeItem.qty}x ${tradeItem.name}. O mestre verá no histórico da sessão.`);
     } catch {
       showCustomAlert('Envio falhou', 'Nao consegui avisar a sessao LAN. O inventario local nao foi alterado.');
     } finally {
@@ -3613,12 +3814,14 @@ export default function CharacterSheetScreen() {
   const handleAcceptTrade = async () => {
     await runSheetAction(`trade_accept:${selectedTradeOffer?.id || ''}`, async () => {
     if (!ensureLanWritable()) return;
-    if (!selectedTradeOffer || !tradeCounterItem || !lanInfo || !character) return;
-    const requestedItem = makeTradeItem(tradeCounterItem.item, tradeCounterQty);
-    const availableQty = Math.max(0, Number(tradeCounterItem.item?.qty || 0));
-    if (availableQty < requestedItem.qty) {
-      showCustomAlert('Troca cancelada', 'Voce nao tem quantidade suficiente do item escolhido.');
-      return;
+    if (!selectedTradeOffer || !lanInfo || !character) return;
+    const requestedItem = tradeCounterItem ? makeTradeItem(tradeCounterItem.item, tradeCounterQty) : undefined;
+    if (tradeCounterItem && requestedItem) {
+      const availableQty = Math.max(0, Number(tradeCounterItem.item?.qty || 0));
+      if (availableQty < requestedItem.qty) {
+        showCustomAlert('Troca cancelada', 'Voce nao tem quantidade suficiente do item escolhido.');
+        return;
+      }
     }
 
     try {
@@ -3631,8 +3834,8 @@ export default function CharacterSheetScreen() {
         type: 'trade_accept',
         fromKey: selfKey,
         fromName: character.name,
-        toKey: 'master',
-        toName: 'Mestre',
+        toKey: selectedTradeOffer.fromKey,
+        toName: selectedTradeOffer.fromName,
         entityType: 'inventory',
         entityId: selectedTradeOffer.id,
         ackRequired: true,
@@ -3644,13 +3847,15 @@ export default function CharacterSheetScreen() {
         },
         offeredItem: selectedTradeOffer.offeredItem,
         requestedItem,
-        message: `${character.name} aceitou a troca com ${selectedTradeOffer.fromName}.`,
+        message: requestedItem
+          ? `${character.name} aceitou a troca com ${selectedTradeOffer.fromName} oferecendo ${requestedItem.qty}x ${requestedItem.name}.`
+          : `${character.name} aceitou receber ${selectedTradeOffer.offeredItem?.qty || 1}x ${selectedTradeOffer.offeredItem?.name || 'item'} de ${selectedTradeOffer.fromName}.`,
         createdAt: new Date().toISOString(),
       });
       setIncomingTrades((current) => current.filter((event) => event.id !== selectedTradeOffer.id));
       setSelectedTradeOffer(null);
       setTradeCounterItem(null);
-      showCustomAlert('Troca enviada', 'O mestre vai validar os dois inventarios antes de concluir.');
+      showCustomAlert('Troca respondida', 'A troca será validada automaticamente e o mestre verá apenas o histórico.');
     } catch {
       showCustomAlert('Troca falhou', 'Nao consegui confirmar a troca na sessao LAN. O inventario local nao foi alterado.');
     }
@@ -3669,8 +3874,8 @@ export default function CharacterSheetScreen() {
         type: 'trade_decline',
         fromKey: getSelfLanKey(lanInfo.sessionId),
         fromName: character.name,
-        toKey: 'master',
-        toName: 'Mestre',
+        toKey: event.fromKey,
+        toName: event.fromName,
         entityType: 'inventory',
         entityId: event.id,
         ackRequired: true,
@@ -4061,7 +4266,7 @@ export default function CharacterSheetScreen() {
       }
 
       if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
-        const nextTempHp = Math.max(Number(character.temp_hp || 0), Number(character.temp_hp || 0) + value * qty);
+        const nextTempHp = Math.max(Number(character.temp_hp || 0), value * qty);
         dbUpdates.temp_hp = nextTempHp;
         numberPatch.tempHp = nextTempHp;
         messages.push(`PV temporario +${value * qty}.`);
@@ -5661,7 +5866,7 @@ export default function CharacterSheetScreen() {
             {selectedTradeOffer && (
               <>
                 <Text style={styles.modalTitle}>Troca com {selectedTradeOffer.fromName}</Text>
-                <Text style={styles.sessionPartyHint}>Escolha um item da sua mochila para colocar na troca.</Text>
+                <Text style={styles.sessionPartyHint}>Escolha um item para oferecer em troca, ou aceite sem contraoferta.</Text>
 
                 <View style={styles.tradeBoard}>
                   <View style={styles.tradeColumn}>
@@ -5679,8 +5884,8 @@ export default function CharacterSheetScreen() {
                   <View style={styles.tradeColumn}>
                     <Text style={styles.tradeColumnTitle}>Sua oferta</Text>
                     <View style={[styles.tradeSlot, tradeCounterItem && styles.tradeSlotActive]}>
-                      <Text style={styles.tradeSlotName}>{tradeCounterItem?.item?.name || 'Selecione abaixo'}</Text>
-                      <Text style={styles.tradeSlotMeta}>Qtd. {tradeCounterItem ? tradeCounterQty : '-'}</Text>
+                      <Text style={styles.tradeSlotName}>{tradeCounterItem?.item?.name || 'Sem contraoferta'}</Text>
+                      <Text style={styles.tradeSlotMeta}>{tradeCounterItem ? `Qtd. ${tradeCounterQty}` : 'Você não enviará item de volta'}</Text>
                     </View>
                     {tradeCounterItem && (
                       <View style={styles.actionQtyRow}>
@@ -5723,8 +5928,8 @@ export default function CharacterSheetScreen() {
                     <Text style={{color:'#ff6666', fontWeight:'bold'}}>{isSheetActionSubmitting(`trade_decline:${selectedTradeOffer.id}`) ? 'Recusando...' : 'Recusar'}</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={[styles.modalBtn, {opacity: tradeCounterItem && !isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`) ? 1 : 0.5}]}
-                    disabled={!tradeCounterItem || isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`)}
+                    style={[styles.modalBtn, {opacity: !isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`) ? 1 : 0.5}]}
+                    disabled={isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`)}
                     onPress={handleAcceptTrade}
                   >
                     <Text style={{color:'#00fa9a', fontWeight:'bold'}}>{isSheetActionSubmitting(`trade_accept:${selectedTradeOffer.id}`) ? 'Aceitando...' : 'Aceitar'}</Text>

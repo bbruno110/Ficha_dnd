@@ -1,4 +1,4 @@
-export type EffectKind = 'condition' | 'buff' | 'debuff' | 'disease' | 'curse' | 'custom' | 'status';
+export type EffectKind = 'condition' | 'buff' | 'debuff' | 'disease' | 'curse' | 'custom' | 'status' | 'temp_hp';
 
 export type SaveAbility = 'FOR' | 'DES' | 'CON' | 'INT' | 'SAB' | 'CAR';
 
@@ -115,6 +115,11 @@ export type LanEffectPatch = {
   add: LanActiveEffectSnapshot[];
   update: LanActiveEffectSnapshot[];
   remove: string[];
+  /**
+   * Quando true, este patch é um checkpoint autoritativo: a lista local de
+   * efeitos ativos deve ser substituída por `add`, sem replay de histórico.
+   */
+  replace?: boolean;
 };
 
 export type PendingSaveStatus = 'pending' | 'success' | 'failure' | 'ignored';

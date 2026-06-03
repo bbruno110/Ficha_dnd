@@ -17,6 +17,7 @@ const LIVE_EVENT_TYPES = new Set<LanSessionEvent['type']>([
   'session_ended',
   'timeline_event',
   'player_kicked',
+  'character_update_review',
   'resource_review',
   'send_item',
   'send_item_result',

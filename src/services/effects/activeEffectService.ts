@@ -81,8 +81,67 @@ export async function applyEffectToPlayer(
   const snapshot = buildInputSnapshot(input, catalog, session.currentTurn);
   const normalizedStatusKey = snapshot.statusKey || statusKey || normalizeStatusKey(snapshot.name);
   const removed: LanActiveEffectSnapshot[] = [];
+  const isTempHpEffect = isTempHpSnapshot(snapshot);
+  const incomingTempHp = getTempHpValue(snapshot);
+  const currentRowsForTarget = isTempHpEffect
+    ? await getActiveRowsForTarget(db, player.session_id, player.target_key)
+    : [];
+  const currentTempHpEffects = currentRowsForTarget
+    .map(mapActiveEffectRow)
+    .filter(isTempHpSnapshot);
 
-  if (catalog && !catalog.stackable) {
+  // Regra padrão de D&D: PV temporário NÃO acumula.
+  // Se o novo valor for menor/igual ao PV temporário ativo, mantém o atual.
+  // Se for maior, substitui todas as fontes antigas por esta nova fonte.
+  if (isTempHpEffect) {
+    const currentTempHp = currentTempHpEffects.reduce((max, effect) => Math.max(max, getTempHpValue(effect)), 0);
+
+    if (input.sourceId) {
+      const duplicatedSource = currentTempHpEffects.find((effect) => effect.sourceId === input.sourceId);
+      if (duplicatedSource) {
+        debugLanFlow('TEMP_HP_EFFECT_IGNORED_DUPLICATE_SOURCE', {
+          sessionId: player.session_id,
+          playerId,
+          targetKey: player.target_key,
+          sourceId: input.sourceId,
+          existingEffectId: duplicatedSource.id,
+          incomingTempHp,
+        });
+        return null;
+      }
+    }
+
+    if (incomingTempHp <= 0) {
+      debugLanFlow('TEMP_HP_EFFECT_IGNORED_INVALID_VALUE', {
+        sessionId: player.session_id,
+        playerId,
+        targetKey: player.target_key,
+        incomingTempHp,
+      });
+      return null;
+    }
+
+    if (currentTempHpEffects.length > 0 && incomingTempHp <= currentTempHp) {
+      debugLanFlow('TEMP_HP_EFFECT_IGNORED_LOWER_OR_EQUAL_STANDARD_DND', {
+        sessionId: player.session_id,
+        playerId,
+        targetKey: player.target_key,
+        currentTempHp,
+        incomingTempHp,
+      });
+      return null;
+    }
+
+    for (const effect of currentTempHpEffects) {
+      removed.push(effect);
+      await db.runAsync(
+        `UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [effect.id],
+      );
+    }
+  }
+
+  if (catalog && !catalog.stackable && !isTempHpEffect) {
     const current = await getActiveRowsForTarget(db, player.session_id, player.target_key, normalizedStatusKey);
     for (const row of current) {
       const existingSnapshot = mapActiveEffectRow(row);
@@ -170,8 +229,12 @@ export async function applyEffectToPlayer(
     entityId: id,
   });
 
-  const tempDelta = getTempHpDelta(finalSnapshot) - removed.reduce((sum, effect) => sum + getTempHpDelta(effect), 0);
-  await rebuildPlayerEffectsCache(db, player, tempDelta);
+  const tempDelta = isTempHpSnapshot(finalSnapshot)
+    ? 0
+    : getTempHpValue(finalSnapshot) - removed.reduce((sum, effect) => sum + getTempHpValue(effect), 0);
+  await rebuildPlayerEffectsCache(db, player, tempDelta, {
+    tempHpMode: isTempHpSnapshot(finalSnapshot) ? 'sum_active' : 'delta',
+  });
 
   const result = {
     playerId,
@@ -235,7 +298,7 @@ export async function removeEffectFromPlayer(
     `UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [effectId],
   );
-  await rebuildPlayerEffectsCache(db, player, -getTempHpDelta(removed));
+  await rebuildPlayerEffectsCache(db, player, -getTempHpValue(removed));
 
   const result = {
     playerId,
@@ -262,6 +325,117 @@ export async function removeEffectFromPlayer(
   return result;
 }
 
+
+export async function consumeTempHpFromPlayer(
+  db: SQLiteDatabase,
+  playerId: number,
+  amount: number,
+): Promise<{
+  playerId: number;
+  sessionId: string;
+  targetKey: string;
+  targetName: string;
+  absorbed: number;
+  patch: LanEffectPatch;
+} | null> {
+  const startedAt = Date.now();
+  const damageToAbsorb = Math.max(0, Math.floor(Number(amount) || 0));
+  traceFunctionCall('consumeTempHpFromPlayer', { playerId, amount: damageToAbsorb }, {
+    source: 'activeEffectService',
+    playerId,
+  });
+  if (damageToAbsorb <= 0) return null;
+
+  await ensureEffectSchema(db);
+  const player = await getPlayerRow(db, playerId);
+  if (!player) return null;
+  await backfillPlayerActiveEffectsFromCache(db, player);
+
+  const rows = await getActiveRowsForTarget(db, player.session_id, player.target_key);
+  const tempHpEffects = rows
+    .map(mapActiveEffectRow)
+    .filter(isTempHpSnapshot)
+    .sort(compareTempHpAbsorptionOrder);
+
+  if (tempHpEffects.length === 0) {
+    debugLanFlow('TEMP_HP_DAMAGE_NO_ACTIVE_EFFECTS', {
+      sessionId: player.session_id,
+      playerId,
+      targetKey: player.target_key,
+      amount: damageToAbsorb,
+    });
+    return null;
+  }
+
+  let remainingDamage = damageToAbsorb;
+  let absorbed = 0;
+  const update: LanActiveEffectSnapshot[] = [];
+  const remove: string[] = [];
+
+  for (const effect of tempHpEffects) {
+    if (remainingDamage <= 0) break;
+    const currentValue = getTempHpValue(effect);
+    if (currentValue <= 0) continue;
+
+    const consumed = Math.min(currentValue, remainingDamage);
+    const nextValue = Math.max(0, currentValue - consumed);
+    remainingDamage -= consumed;
+    absorbed += consumed;
+
+    if (nextValue <= 0) {
+      await db.runAsync(
+        `UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [effect.id],
+      );
+      remove.push(effect.id);
+    } else {
+      const nextSnapshot = { ...effect, value: nextValue };
+      await db.runAsync(
+        `UPDATE lan_active_effects
+         SET effect_json = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [JSON.stringify(nextSnapshot), effect.id],
+      );
+      update.push(nextSnapshot);
+    }
+  }
+
+  if (absorbed <= 0) return null;
+
+  await rebuildPlayerEffectsCache(db, player, 0, { tempHpMode: 'sum_active' });
+  const result = {
+    playerId,
+    sessionId: player.session_id,
+    targetKey: player.target_key,
+    targetName: player.target_name,
+    absorbed,
+    patch: {
+      targetKey: player.target_key,
+      add: [],
+      update,
+      remove,
+    },
+  };
+
+  debugLanFlow('TEMP_HP_EFFECTS_CONSUMED_BY_DAMAGE', {
+    sessionId: player.session_id,
+    playerId,
+    targetKey: player.target_key,
+    absorbed,
+    updated: update.map((effect) => ({ id: effect.id, value: effect.value, remaining: effect.remaining, unit: effect.unit })),
+    removed: remove,
+  });
+  traceFunctionReturn('consumeTempHpFromPlayer', result, {
+    source: 'activeEffectService',
+    sessionId: player.session_id,
+    playerId,
+    playerKey: player.target_key,
+    playerName: player.target_name,
+    durationMs: Date.now() - startedAt,
+  });
+  return result;
+}
+
 export async function removeTempHpEffectsFromPlayer(
   db: SQLiteDatabase,
   playerId: number,
@@ -279,7 +453,7 @@ export async function removeTempHpEffectsFromPlayer(
   const rows = await getActiveRowsForTarget(db, player.session_id, player.target_key);
   const tempHpEffects = rows
     .map(mapActiveEffectRow)
-    .filter((effect) => effect.target === 'PV_TEMP' || effect.kind === 'temp_hp');
+    .filter(isTempHpSnapshot);
 
   if (tempHpEffects.length === 0) {
     debugLanFlow('TEMP_HP_DEPLETED_NO_EFFECT_FOUND', {
@@ -304,7 +478,7 @@ export async function removeTempHpEffectsFromPlayer(
     );
   }
 
-  await rebuildPlayerEffectsCache(db, player, 0);
+  await rebuildPlayerEffectsCache(db, player, 0, { tempHpMode: 'sum_active' });
   const removed = tempHpEffects[0];
   const result = {
     playerId,
@@ -455,7 +629,7 @@ export async function tickTurnEffects(
       if (nextRemaining <= 0) {
         await db.runAsync(`UPDATE lan_active_effects SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [snapshot.id]);
         patch.remove.push(snapshot.id);
-        tempDelta -= getTempHpDelta(snapshot);
+        tempDelta -= getTempHpValue(snapshot);
         result.expired.push({
           playerId: Number(player.id),
           targetKey: player.target_key,
@@ -495,7 +669,7 @@ export async function tickTurnEffects(
     }
 
     if (patch.remove.length || patch.update.length) result.patches.push(patch);
-    await rebuildPlayerEffectsCache(db, player, tempDelta);
+    await rebuildPlayerEffectsCache(db, player, tempDelta, { tempHpMode: 'sum_active' });
   }
 
   traceFunctionReturn('tickTurnEffects', {
@@ -521,7 +695,12 @@ export async function getActiveEffectsByPlayer(db: SQLiteDatabase, playerId: num
   return rows.map(mapActiveEffectRow);
 }
 
-export async function rebuildPlayerEffectsCache(db: SQLiteDatabase, player: PlayerRow, tempHpDelta = 0) {
+export async function rebuildPlayerEffectsCache(
+  db: SQLiteDatabase,
+  player: PlayerRow,
+  tempHpDelta = 0,
+  options?: { tempHpMode?: 'delta' | 'sum_active' },
+) {
   const before = {
     tempHp: player.temp_hp,
     effectsJson: player.effects_json,
@@ -530,7 +709,12 @@ export async function rebuildPlayerEffectsCache(db: SQLiteDatabase, player: Play
   const effects = rows
     .map(mapActiveEffectRow)
     .sort((a, b) => (b.visualPriority || 0) - (a.visualPriority || 0) || a.name.localeCompare(b.name));
-  const nextTempHp = Math.max(0, toNumber(player.temp_hp) + tempHpDelta);
+  const activeTempHpTotal = effects
+    .filter(isTempHpSnapshot)
+    .reduce((max, effect) => Math.max(max, getTempHpValue(effect)), 0);
+  const nextTempHp = options?.tempHpMode === 'sum_active'
+    ? activeTempHpTotal
+    : Math.max(0, toNumber(player.temp_hp) + tempHpDelta);
 
   traceSqlite('SQLITE_WRITE_START', {
     source: 'activeEffectService',
@@ -605,6 +789,26 @@ async function maybeCreateRepeatSave(
     return null;
   }
 
+  const existingPending = await db.getFirstAsync<{ id: string }>(
+    `SELECT id
+     FROM lan_pending_saves
+     WHERE session_id = ?
+       AND target_key = ?
+       AND source_id = ?
+       AND status = 'pending'
+     LIMIT 1`,
+    [sessionId, targetKey, snapshot.id],
+  );
+  if (existingPending?.id) {
+    debugLanFlow('MASTER_PENDING_SAVE_SKIPPED_ALREADY_PENDING', {
+      sessionId,
+      targetKey,
+      effectId: snapshot.id,
+      pendingSaveId: existingPending.id,
+    });
+    return null;
+  }
+
   const pending: LanPendingSave = {
     id: `save_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     sessionId,
@@ -645,13 +849,15 @@ async function maybeCreateRepeatSave(
 }
 
 async function backfillPlayerActiveEffectsFromCache(db: SQLiteDatabase, player: PlayerRow) {
-  const activeCount = await db.getFirstAsync<{ count: number }>(
+  const totalCount = await db.getFirstAsync<{ count: number }>(
     `SELECT COUNT(*) as count
      FROM lan_active_effects
-     WHERE session_id = ? AND target_key = ? AND COALESCE(active, 1) = 1`,
+     WHERE session_id = ? AND target_key = ?`,
     [player.session_id, player.target_key],
   );
-  if (Number(activeCount?.count || 0) > 0) return;
+  // Se ja existe qualquer registro (ativo ou expirado/removido), o cache JSON nao deve
+  // recriar efeitos. Isso evita efeito expirado voltar depois de troca de tela/resync.
+  if (Number(totalCount?.count || 0) > 0) return;
 
   const cached = parseJsonValue<LanActiveEffectSnapshot[]>(player.effects_json, []);
   if (!Array.isArray(cached) || cached.length === 0) return;
@@ -897,8 +1103,35 @@ function getExpiresAtMinutes(elapsedMinutes: number, remaining: number, unit: Du
   return null;
 }
 
-function getTempHpDelta(effect: LanActiveEffectSnapshot) {
-  return effect.target === 'PV_TEMP' ? Math.max(0, toNumber(effect.value)) : 0;
+function isTempHpSnapshot(effect: Pick<LanActiveEffectSnapshot, 'target' | 'kind'> | null | undefined) {
+  if (!effect) return false;
+  return effect.target === 'PV_TEMP' || String(effect.kind || '').toLowerCase() === 'temp_hp';
+}
+
+function getTempHpValue(effect: LanActiveEffectSnapshot) {
+  return isTempHpSnapshot(effect) ? Math.max(0, toNumber(effect.value)) : 0;
+}
+
+function compareTempHpAbsorptionOrder(a: LanActiveEffectSnapshot, b: LanActiveEffectSnapshot) {
+  const unitWeight = (unit: string | null | undefined) => {
+    const value = String(unit || '').toLowerCase();
+    if (value === 'turn' || value === 'round') return 1;
+    if (value === 'minute') return 2;
+    if (value === 'hour') return 3;
+    if (value === 'day') return 4;
+    if (value === 'short_rest' || value === 'rest') return 5;
+    if (value === 'long_rest') return 6;
+    if (value === 'manual' || value === 'permanent') return 7;
+    return 8;
+  };
+
+  const unitDiff = unitWeight(a.unit) - unitWeight(b.unit);
+  if (unitDiff !== 0) return unitDiff;
+
+  const remainingDiff = Math.max(0, toNumber(a.remaining)) - Math.max(0, toNumber(b.remaining));
+  if (remainingDiff !== 0) return remainingDiff;
+
+  return String(a.id || '').localeCompare(String(b.id || ''));
 }
 
 function normalizeTarget(value: unknown): EffectTarget {
