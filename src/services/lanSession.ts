@@ -474,6 +474,7 @@ export type LanSessionEvent = {
     grantId?: string;
   };
   numberPatch?: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
+  statsPatch?: Record<string, unknown>;
   tradeId?: string;
   visibility?: 'public' | 'party' | 'private' | string;
   message?: string;
@@ -1668,6 +1669,38 @@ export async function updateLanPlayerNumbers(
   }
 }
 
+export async function updateLanPlayerStats(
+  db: SQLiteDatabase,
+  playerId: number,
+  stats: Record<string, unknown>,
+  options?: { syncPayload?: boolean }
+) {
+  await ensureLanSchema(db);
+  const nextStats = stats && typeof stats === 'object' ? stats : {};
+  const player = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT session_id, character_id FROM lan_session_players WHERE id = ? AND COALESCE(is_active, 1) = 1`,
+    [playerId]
+  );
+  if (!player) return false;
+
+  await db.runAsync(
+    `UPDATE lan_session_players
+     SET stats_json = ?, revision_seq = COALESCE(revision_seq, 0) + 1, last_seen_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [JSON.stringify(nextStats), playerId]
+  );
+
+  if (player.character_id) {
+    await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [JSON.stringify(nextStats), Number(player.character_id)]);
+  }
+
+  if (options?.syncPayload && player.session_id) {
+    await syncLanSessionPayload(db, String(player.session_id));
+  }
+
+  return true;
+}
+
 export async function kickLanSessionPlayer(db: SQLiteDatabase, playerId: number) {
   await ensureLanSchema(db);
   const player = await db.getFirstAsync<Record<string, unknown>>(
@@ -2020,7 +2053,15 @@ export async function ensurePendingRemotePlayerFromEvent(
     [sessionId, fromKey]
   );
 
-  if (existing?.id) return existing.id;
+  if (existing?.id) {
+    await db.runAsync(
+      `UPDATE lan_session_players
+       SET is_connected = 1, last_seen_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [existing.id]
+    );
+    return existing.id;
+  }
 
   const fallbackName = String(event.fromName || 'Jogador pendente');
   const result = await db.runAsync(

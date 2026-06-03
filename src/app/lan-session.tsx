@@ -71,6 +71,7 @@ import {
   syncLanSessionPayload,
   updateLanPlayerEquipment,
   updateLanPlayerNumbers,
+  updateLanPlayerStats,
   upsertLanSessionPlayerFromNetwork,
   type CatalogOption,
   type LanAdvanceUnit,
@@ -140,6 +141,7 @@ type EffectDraft = {
   kind?: 'stat' | 'hp' | 'temp_hp' | 'status' | 'custom';
   mode?: 'add' | 'set';
   source?: string;
+  status?: string;
   statusKey?: string;
   color?: string;
   secondaryColor?: string;
@@ -147,6 +149,8 @@ type EffectDraft = {
   saveDc?: number;
   saveOnSuccess?: string;
 };
+
+const PERMANENT_STAT_TARGETS = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'] as const;
 
 type EffectOption = {
   key: string;
@@ -677,6 +681,48 @@ export default function LanSessionScreen() {
     rememberSentEventInTimeline(event);
     return event;
   }, [db, joinUrl, rememberSentEventInTimeline]);
+
+  const applyPermanentStatEffectToPlayer = useCallback(async (
+    sessionId: string,
+    player: LanSessionPlayerState,
+    effect: EffectDraft,
+  ) => {
+    const target = String(effect.target || '').toUpperCase();
+    if (!isPermanentStatEffect(effect)) return null;
+
+    const currentStats = player.stats && typeof player.stats === 'object' ? player.stats : {};
+    const currentValue = Math.floor(Number(currentStats[target]) || (target === 'CA' ? 10 : 10));
+    const nextValue = effect.mode === 'set'
+      ? Math.floor(Number(effect.value) || currentValue)
+      : currentValue + Math.floor(Number(effect.value) || 0);
+    const nextStats = {
+      ...currentStats,
+      [target]: String(Math.max(0, nextValue)),
+    };
+
+    await updateLanPlayerStats(db, player.id, nextStats, { syncPayload: false });
+    const nextState = await getLanSessionState(db, sessionId);
+    const updatedPlayer = nextState.players.find((entry) => entry.id === player.id) || { ...player, stats: nextStats };
+    const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
+      id: makeLanEventId(),
+      sessionId,
+      type: 'player_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: updatedPlayer.remoteKey || '',
+      toName: updatedPlayer.characterName,
+      entityType: 'player',
+      entityId: updatedPlayer.remoteKey || String(updatedPlayer.id),
+      entityRevision: Math.max(0, Number(updatedPlayer.revisionSeq || 0)),
+      ackRequired: true,
+      originClientId: 'master',
+      statsPatch: nextStats,
+      message: `${effect.name} aplicado permanentemente em ${updatedPlayer.characterName}.`,
+      createdAt: new Date().toISOString(),
+    });
+    rememberSentEventInTimeline(event);
+    return { player: updatedPlayer, statsPatch: nextStats, event };
+  }, [db, joinUrl, rememberSentEventInTimeline]);
   
   const filteredCatalogOptions = useMemo(() => {
     const search = catalogSearch.trim().toLowerCase();
@@ -1028,7 +1074,7 @@ useLanAppLifecycle({
               }
             } else if (!passed || (passed && onSuccess !== 'negates' && onSuccess !== 'ignore')) {
               const value = passed && onSuccess === 'half' ? Math.ceil(Number(pendingPayload.value || 0) / 2) : Number(pendingPayload.value || 0);
-              const result = await addLanPlayerEffect(db, targetPlayer.id, {
+              const draftAfterSave: EffectDraft = {
                 name: String(pendingPayload.name || pendingPayload.sourceName || 'Efeito'),
                 target: normalizeEffectTarget(pendingPayload.target),
                 value,
@@ -1044,13 +1090,18 @@ useLanAppLifecycle({
                 source: String(pendingPayload.source || pendingPayload.sourceName || 'Mestre'),
                 saveDc: undefined,
                 saveAbility: undefined,
-              });
+              };
+              const permanentResult = isPermanentStatEffect(draftAfterSave)
+                ? await applyPermanentStatEffectToPlayer(activeSessionId, targetPlayer, draftAfterSave)
+                : null;
+              const result = permanentResult ? null : await addLanPlayerEffect(db, targetPlayer.id, draftAfterSave);
               if (result?.targetKey) {
                 await sendLatestLiveEvent(activeSessionId, (latestEvent) => (
                   latestEvent.type === 'effect_patch' && latestEvent.toKey === result.targetKey
                 ));
                 appliedAfterSave = true;
               }
+              if (permanentResult) appliedAfterSave = true;
             }
 
             debugLanFlow(appliedAfterSave ? 'MASTER_EFFECT_APPLIED_AFTER_SAVE' : 'MASTER_EFFECT_NEGATED_BY_SAVE', {
@@ -1800,6 +1851,7 @@ useLanAppLifecycle({
           }
 
           if (event.type === 'player_joined') {
+            await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
             const alreadyPresent = currentState.players.some((entry) => (
               (event.fromKey && entry.remoteKey === event.fromKey) ||
               (event.fromName && entry.characterName === event.fromName)
@@ -1820,7 +1872,6 @@ useLanAppLifecycle({
             const fresh = await rememberLanSessionEvent(db, event);
             // O evento de entrada tambÃ©m precisa criar um jogador pendente,
             // porque em algumas redes o evento chega antes do roster do join.
-            await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
             if (fresh) {
               await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
               shouldReloadSessionState = true;
@@ -1969,11 +2020,35 @@ useLanAppLifecycle({
             );
             if (applied) {
               const nextState = await getLanSessionState(db, activeSessionId);
-              const targetPlayer = nextState.players.find((entry) => (
+              let targetPlayer = nextState.players.find((entry) => (
                 entry.remoteKey === event.fromKey ||
                 entry.characterName === event.fromName
               ));
               if (targetPlayer) {
+                if (event.statsPatch && typeof event.statsPatch === 'object') {
+                  const nextStats = sanitizePlayerOwnedStatsPatch(targetPlayer.stats, event.statsPatch);
+                  await updateLanPlayerStats(db, targetPlayer.id, nextStats, { syncPayload: false });
+                  const stateAfterStats = await getLanSessionState(db, activeSessionId);
+                  targetPlayer = stateAfterStats.players.find((entry) => entry.id === targetPlayer?.id) || { ...targetPlayer, stats: nextStats };
+                  const statsEvent = await rememberAndSendLanSessionEvent(db, joinUrl, {
+                    id: makeLanEventId(),
+                    sessionId: activeSessionId,
+                    type: 'player_patch',
+                    fromKey: 'master',
+                    fromName: 'Mestre',
+                    toKey: targetPlayer.remoteKey || '',
+                    toName: targetPlayer.characterName,
+                    entityType: 'player',
+                    entityId: targetPlayer.remoteKey || String(targetPlayer.id),
+                    entityRevision: Math.max(0, Number(targetPlayer.revisionSeq || 0)),
+                    ackRequired: true,
+                    originClientId: 'master',
+                    statsPatch: nextStats,
+                    message: `${targetPlayer.characterName} atualizou bonus de equipamento.`,
+                    createdAt: new Date().toISOString(),
+                  });
+                  rememberSentEventInTimeline(statsEvent);
+                }
                 await sendOfficialInventoryPatch(
                   activeSessionId,
                   targetPlayer,
@@ -4005,15 +4080,27 @@ useLanAppLifecycle({
       unit: manualDuration.unit,
       isPermanent: manualDuration.isPermanent,
     });
+    const manualEffectValue = parseInt(effectValue, 10) || 0;
+    const manualDurationText = manualDuration.isPermanent ? 'Permanente' : `${manualDuration.remaining} ${manualDuration.unit}`;
     const drafts: EffectDraft[] = selectedEffectOptions.length > 0
-      ? selectedEffectOptions.map(makeEffectDraftFromOption)
+      ? selectedEffectOptions.map((option) => {
+        const draft = makeEffectDraftFromOption(option);
+        return {
+          ...draft,
+          value: manualEffectValue,
+          remaining: manualDuration.remaining,
+          unit: manualDuration.unit as LanEffectUnit,
+          durationText: manualDurationText,
+          saveDc: draft.saveDc || (draft.saveAbility && manualEffectValue > 0 ? manualEffectValue : undefined),
+        };
+      })
       : [{
         name: effectName.trim() || 'Efeito temporario',
         target: effectTarget,
-        value: parseInt(effectValue, 10) || 0,
+        value: manualEffectValue,
         remaining: manualDuration.remaining,
         unit: manualDuration.unit as LanEffectUnit,
-        durationText: manualDuration.isPermanent ? 'Permanente' : `${manualDuration.remaining} ${manualDuration.unit}`,
+        durationText: manualDurationText,
         kind: effectTarget === 'PV_TEMP' ? 'temp_hp' : effectTarget === 'HP' ? 'hp' : effectTarget === 'custom' ? 'custom' : 'stat',
         mode: effectMode,
         source: [effectSource.trim(), effectSaveInfo].filter(Boolean).join(' - ') || undefined,
@@ -4092,12 +4179,25 @@ useLanAppLifecycle({
           directEffects.push(effect);
         }
       }
-      const result = directEffects.length > 0
+      for (const effect of directEffects.filter(isPermanentStatEffect)) {
+        const result = await applyPermanentStatEffectToPlayer(payload.session.id, targetPlayer, effect);
+        if (result?.event) {
+          debugLanFlow('MASTER_PERMANENT_STAT_PATCH_SENT', {
+            targetKey: targetPlayer.remoteKey,
+            effectName: effect.name,
+            target: effect.target,
+            value: effect.value,
+          });
+        }
+      }
+
+      const activeDirectEffects = directEffects.filter((effect) => !isPermanentStatEffect(effect));
+      const result = activeDirectEffects.length > 0
         ? await addLanPlayerEffectsBatch(
           db,
           targetPlayer.id,
-          directEffects,
-          `Mestre aplicou ${directEffects.length} efeito(s) em ${targetPlayer.characterName}.`
+          activeDirectEffects,
+          `Mestre aplicou ${activeDirectEffects.length} efeito(s) em ${targetPlayer.characterName}.`
         )
         : null;
 
@@ -4429,10 +4529,10 @@ useLanAppLifecycle({
                 ))}
               </View>
 
-              {detailPlayer.effects.length > 0 && (
+              {getVisibleMasterEffects(detailPlayer.effects).length > 0 && (
                 <View style={styles.effectBox}>
                   <Text style={styles.strongText}>Efeitos ativos</Text>
-                  {detailPlayer.effects.map((effect) => (
+                  {getVisibleMasterEffects(detailPlayer.effects).map((effect) => (
                     <Text key={effect.id} style={styles.effectText}>{summarizeEffect(effect)}</Text>
                   ))}
                 </View>
@@ -4949,6 +5049,7 @@ useLanAppLifecycle({
     const expanded = expandedPlayerIds.includes(player.id);
     const hpPercent = player.hpMax > 0 ? Math.max(0, Math.min(100, (player.hpCurrent / player.hpMax) * 100)) : 0;
     const bagPreview = getBagPreview(player.equipment);
+    const visibleEffects = getVisibleMasterEffects(player.effects);
 
     return (
       <TouchableOpacity
@@ -4961,7 +5062,7 @@ useLanAppLifecycle({
             <Text style={styles.playerName}>{player.characterName}</Text>
             <Text style={styles.playerMeta}>{player.race} - {player.className} - NÃ­vel {player.level}</Text>
             <Text style={styles.mutedText}>
-              HP {player.hpCurrent}/{player.hpMax} - XP {player.xp} - {player.gp} PO - {player.effects.length} efeito(s)
+              HP {player.hpCurrent}/{player.hpMax} - XP {player.xp} - {player.gp} PO - {visibleEffects.length} efeito(s)
             </Text>
           </View>
           <TouchableOpacity style={styles.statusPill} onPress={() => toggleExpandedPlayer(player.id)}>
@@ -5054,13 +5155,13 @@ useLanAppLifecycle({
               <Text style={styles.inventoryText}>{bagPreview || 'Bolsa vazia ou nÃ£o sincronizada.'}</Text>
             </View>
 
-            {player.effects.length > 0 && (
+            {visibleEffects.length > 0 && (
               <View style={styles.effectBox}>
                 <Text style={styles.strongText}>Efeitos ativos</Text>
-                {player.effects.map((effect) => (
+                {visibleEffects.map((effect) => (
                   <View key={effect.id} style={styles.effectRow}>
                     <Text style={styles.effectText}>{summarizeEffect(effect)}</Text>
-                    <TouchableOpacity style={styles.smallButton} onPress={() => handleRemoveEffect(player.id, effect.id)}>
+                    <TouchableOpacity style={styles.smallButton} onPress={() => handleRemoveEffect(player.id, String(effect.id))}>
                       <Ionicons name="trash" size={14} color={appColors.danger} />
                     </TouchableOpacity>
                   </View>
@@ -5284,8 +5385,19 @@ type LanPlayerEffectForUi = {
   id?: string;
   target?: string;
   value?: number | string | null;
+  unit?: string | null;
+  isPermanent?: boolean;
+  kind?: string | null;
   [key: string]: unknown;
 };
+
+function getVisibleMasterEffects<T extends { target?: unknown; unit?: unknown; isPermanent?: unknown; kind?: unknown }>(effects: T[] = []): T[] {
+  return effects.filter((effect) => {
+    const target = String(effect.target || '').toUpperCase();
+    const permanent = Boolean(effect.isPermanent || String(effect.unit || '').toLowerCase() === 'permanent');
+    return !(permanent && PERMANENT_STAT_TARGETS.includes(target as any) && effect.kind !== 'hp' && effect.kind !== 'temp_hp');
+  });
+}
 
 function getEffectiveStat(player: LanSessionPlayerState, stat: string) {
   const baseValue = Number(player.stats?.[stat]) || 0;
@@ -5579,6 +5691,24 @@ function normalizeEffectTarget(value: unknown): LanEffectTarget {
     return target as LanEffectTarget;
   }
   return 'custom';
+}
+
+function isPermanentStatEffect(effect: Pick<EffectDraft, 'target' | 'unit' | 'kind'>) {
+  const target = String(effect.target || '').toUpperCase();
+  return effect.unit === 'permanent' && PERMANENT_STAT_TARGETS.includes(target as any) && effect.kind !== 'hp' && effect.kind !== 'temp_hp';
+}
+
+function sanitizePlayerOwnedStatsPatch(currentStats: Record<string, unknown>, incomingStats: Record<string, unknown>) {
+  const nextStats = { ...(currentStats || {}) };
+  for (const key of ['temp_mods', 'equip_mods']) {
+    const value = incomingStats?.[key];
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      nextStats[key] = value;
+    } else {
+      delete (nextStats as Record<string, unknown>)[key];
+    }
+  }
+  return nextStats;
 }
 
 function normalizeHostEquipment(value: unknown): Record<string, any> {

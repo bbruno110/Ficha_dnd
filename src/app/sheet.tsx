@@ -1839,6 +1839,7 @@ export default function CharacterSheetScreen() {
         playerKey: selfKey,
         reason,
       });
+      sessionTerminatedRef.current = lanInfo.sessionId;
       await markLanConnectionStatus(db, {
         sessionId: lanInfo.sessionId,
         deviceId: selfKey,
@@ -2117,6 +2118,24 @@ export default function CharacterSheetScreen() {
         };
         if (nextValues) updateSelfLanBarFromAuthoritativePatch(sessionValue, nextValues, event);
 
+        continue;
+      }
+
+      if (event.type === 'player_patch' && event.statsPatch) {
+        await rememberLanSessionEvent(db, event).catch(() => false);
+        debugLanFlow('PLAYER_STATS_PATCH_RECEIVED', {
+          eventId: event.id,
+          seq: event.seq,
+          serverSeq: event.serverSeq,
+          entityRevision: event.entityRevision,
+          toKey: event.toKey,
+          toName: event.toName,
+          patch: event.statsPatch,
+        });
+        await updateDB(
+          { stats: event.statsPatch },
+          { allowLanAuthoritativeCache: true, reason: 'lan_authoritative_stats_patch' }
+        );
         continue;
       }
 
@@ -2798,7 +2817,12 @@ export default function CharacterSheetScreen() {
     }
   };
 
-  const notifyInventoryPatch = async (equipment: any, reason: string, clientRequestId = makeLanEventId()) => {
+  const notifyInventoryPatch = async (
+    equipment: any,
+    reason: string,
+    clientRequestId = makeLanEventId(),
+    statsPatch?: Record<string, unknown>
+  ) => {
     if (!lanInfo?.joinUrl || !character) return;
     try {
       const selfKey = getSelfLanKey(lanInfo.sessionId);
@@ -2815,6 +2839,7 @@ export default function CharacterSheetScreen() {
         entityId: selfKey,
         ackRequired: true,
         inventoryPatch: { targetKey: selfKey, equipment, reason, action: 'self_update' },
+        statsPatch,
         message: reason,
         createdAt: new Date().toISOString(),
       };
@@ -2909,9 +2934,10 @@ export default function CharacterSheetScreen() {
       sp: nextCoins.sp == null ? current.sp : Math.max(0, Math.floor(Number(nextCoins.sp) || 0)),
       cp: nextCoins.cp == null ? current.cp : Math.max(0, Math.floor(Number(nextCoins.cp) || 0)),
     };
+    const eventId = makeLanEventId();
     const event: LanSessionEvent = {
-      id: makeLanEventId(),
-      clientMsgId: makeLanEventId(),
+      id: eventId,
+      clientMsgId: eventId,
       sessionId: lanInfo.sessionId,
       type: 'coin_self_patch_request',
       fromKey: selfKey,
@@ -2936,6 +2962,7 @@ export default function CharacterSheetScreen() {
     try {
       await sendLanSessionEvent(lanInfo.joinUrl, event);
       await rememberLanSessionEvent(db, event).catch(() => false);
+      await updateDB(next, { allowLanAuthoritativeCache: true, reason: 'lan_player_self_coin_patch' });
       showCustomAlert('Pedido enviado', 'O mestre recebeu sua alteracao de moedas para confirmar.');
       return true;
     } catch {
@@ -3431,7 +3458,13 @@ export default function CharacterSheetScreen() {
           nextQty: newBag.find((entry: any) => entry.name === item.name)?.qty || 0,
         });
         void runSheetAction(actionId, async () => {
-          await notifyInventoryPatch(nextEquipment, `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`, makeLanEventId());
+          const sent = await notifyInventoryPatch(nextEquipment, `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`, makeLanEventId());
+          if (sent) {
+            await updateDB(
+              { equipment: nextEquipment },
+              { allowLanAuthoritativeCache: true, reason: 'lan_player_self_inventory_patch' }
+            );
+          }
         });
       }
       return;
@@ -4523,9 +4556,18 @@ export default function CharacterSheetScreen() {
     }
 
     const nextEquipment = { bag: newBag, slots: newSlots };
-    updateDB({ equipment: nextEquipment, stats: newStats });
     if (lanInfo?.sessionId) {
-      void notifyInventoryPatch(nextEquipment, `${character.name} atualizou equipamentos equipados.`);
+      void runSheetAction(`equip:${activeSlot}`, async () => {
+        const sent = await notifyInventoryPatch(nextEquipment, `${character.name} atualizou equipamentos equipados.`, makeLanEventId(), newStats);
+        if (sent) {
+          await updateDB(
+            { equipment: nextEquipment, stats: newStats },
+            { allowLanAuthoritativeCache: true, reason: 'lan_player_self_equip_patch' }
+          );
+        }
+      });
+    } else {
+      void updateDB({ equipment: nextEquipment, stats: newStats });
     }
     setSlotModalVisible(false);
   };
