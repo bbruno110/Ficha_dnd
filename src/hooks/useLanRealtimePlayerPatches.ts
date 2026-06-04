@@ -29,6 +29,7 @@ export type UseLanRealtimePlayerPatchesParams = {
   selfKey?: string;
   characterName?: string;
   paused?: boolean;
+  reconnectEpoch?: number;
 
   onNumberPatch?: (patch: LanNumberPatch, event: LanSessionEvent) => void | Promise<void>;
   onEffectPatch?: (patch: LanEffectPatch, event: LanSessionEvent) => void | Promise<void>;
@@ -47,6 +48,7 @@ export function useLanRealtimePlayerPatches({
   selfKey,
   characterName,
   paused = false,
+  reconnectEpoch = 0,
   onNumberPatch,
   onEffectPatch,
   onInventoryPatch,
@@ -98,8 +100,24 @@ export function useLanRealtimePlayerPatches({
   useEffect(() => {
     if (!enabled || !joinUrl || !sessionId) return;
     let disposed = false;
+    processingEventIdsRef.current.clear();
     const getEventSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
     const isCriticalSessionEvent = (event: LanSessionEvent) => isCriticalLanSessionEvent(event);
+    const isExplicitlyTargetedToSelf = (event: LanSessionEvent) => {
+      if (!selfKey && !characterName) return false;
+      const anyEvent = event as any;
+      if (selfKey) {
+        if (event.toKey === selfKey || event.entityId === selfKey) return true;
+        if (event.effectPatch?.targetKey === selfKey) return true;
+        if (event.inventoryPatch?.targetKey === selfKey) return true;
+        if (event.pendingSavePatch?.save?.targetKey === selfKey) return true;
+        if (anyEvent.saveRequest?.targetKey === selfKey) return true;
+        if (anyEvent.saveResult?.targetKey === selfKey) return true;
+        if (anyEvent.resourceReview?.targetKey === selfKey) return true;
+      }
+      if (characterName && event.toName === characterName) return true;
+      return false;
+    };
 
     const shouldProcessEvent = (event: LanSessionEvent) => {
       if (event.sessionId !== sessionId) {
@@ -150,7 +168,23 @@ export function useLanRealtimePlayerPatches({
         return false;
       }
 
-      return shouldPlayerProcessLanEvent(event, { sessionId, selfKey, characterName });
+      const accepted = shouldPlayerProcessLanEvent(event, { sessionId, selfKey, characterName });
+      if (!accepted) {
+        debugLanFlow('PLAYER_EVENT_NOT_FOR_SELF_SKIPPED', {
+          sessionId,
+          eventId: event.id,
+          type: event.type,
+          toKey: event.toKey,
+          toName: event.toName,
+          entityType: event.entityType,
+          entityId: event.entityId,
+          effectTargetKey: event.effectPatch?.targetKey,
+          inventoryTargetKey: event.inventoryPatch?.targetKey,
+          selfKey,
+          characterName,
+        });
+      }
+      return accepted;
     };
 
     const ackEvent = async (event: LanSessionEvent) => {
@@ -209,8 +243,15 @@ export function useLanRealtimePlayerPatches({
     };
 
     const runSideEffectInBackground = (label: string, event: LanSessionEvent, task: () => void | Promise<void>) => {
-      Promise.resolve()
-        .then(task)
+      let result: void | Promise<void>;
+      try {
+        // Chama o handler imediatamente. Funções async executam até o primeiro await,
+        // permitindo que a UI aplique o patch antes do SQLite/resync.
+        result = task();
+      } catch (error) {
+        result = Promise.reject(error);
+      }
+      Promise.resolve(result)
         .catch(async (error) => {
           const reason = error instanceof Error ? error.message : String(error);
           useLanRealtimeStore.getState().nackEvent(event.clientMsgId || event.id, reason);
@@ -420,14 +461,14 @@ export function useLanRealtimePlayerPatches({
       });
     };
 
-    const applyEvents = async () => {
+    const applyEvents = async (options?: { forceFullDrain?: boolean; reason?: string }) => {
       if (applyRunningRef.current) return;
       applyRunningRef.current = true;
 
       try {
         const runtimeBeforeFetch = useLanRealtimeStore.getState();
         const events = await fetchLanSessionEvents(joinUrl, sessionId, {
-          afterSeq: runtimeBeforeFetch.lastAppliedSeq,
+          afterSeq: options?.forceFullDrain ? 0 : runtimeBeforeFetch.lastAppliedSeq,
           playerKey: selfKey,
           includeGlobal: true,
         });
@@ -538,9 +579,18 @@ export function useLanRealtimePlayerPatches({
     };
 
     if (!paused) {
-      void applyEvents();
+      // Ao montar por QR ou pela Home/index, primeiro reenvie hello/resync com
+      // playerKey. Depois drene o buffer. Evita enxurrada de snapshots e mantém
+      // o socket associado ao jogador no host.
+      void requestResyncIfNeeded('mount_or_rebind');
+      setTimeout(() => { if (!disposed) void applyEvents({ reason: 'mount_or_reconnect' }); }, 120);
+      setTimeout(() => { if (!disposed) void applyEvents({ reason: 'post_mount_buffer_flush_650ms' }); }, 650);
+      if (reconnectEpoch > 0) {
+        setTimeout(() => { if (!disposed) void requestResyncIfNeeded('foreground_reconnect'); }, 120);
+        setTimeout(() => { if (!disposed) void applyEvents({ reason: 'foreground_reconnect_buffer_flush' }); }, 450);
+      }
     } else {
-      resetConnectionWhilePaused();
+      useLanRealtimeStore.getState().setConnection({ sessionId, playerKey: selfKey, connected: true });
     }
 
     const timer = paused
@@ -550,20 +600,46 @@ export function useLanRealtimePlayerPatches({
         }, LAN_NETWORK_LIMITS.fallbackPollActiveMs);
 
     const unsubscribe = subscribeLanSessionClientUpdates(joinUrl, (update) => {
-      // Caminho rapido: quando o socket recebe event_commit, aplique imediatamente.
-      // O polling abaixo fica apenas como fallback/recovery.
+      // Caminho principal: event_commit direto do socket.
+      // Payload/snapshot nao dispara reload de ficha viva; resync_events ja sao
+      // reemitidos pelo transporte como eventos individuais.
+      if (update?.reason === 'socket_closed' && !paused) {
+        useLanRealtimeStore.getState().setConnection({ sessionId, playerKey: selfKey, connected: false });
+        setTimeout(() => {
+          if (!disposed) void requestResyncIfNeeded('socket_closed');
+        }, 150);
+        setTimeout(() => {
+          if (!disposed) void applyEvents({ forceFullDrain: true, reason: 'socket_closed_recovery_flush' });
+        }, 700);
+      }
       if (update?.event) {
         const event = update.event;
-        if (shouldProcessEvent(event)) {
+        const accepted = shouldProcessEvent(event);
+        const explicitSelfTarget = isExplicitlyTargetedToSelf(event);
+        if (accepted || explicitSelfTarget) {
+          if (!accepted && explicitSelfTarget) {
+            debugLanFlow('PLAYER_FORCE_PROCESS_EXPLICIT_SELF_TARGET_EVENT', {
+              sessionId,
+              eventId: event.id,
+              type: event.type,
+              toKey: event.toKey,
+              toName: event.toName,
+              entityType: event.entityType,
+              entityId: event.entityId,
+              effectTargetKey: event.effectPatch?.targetKey,
+              inventoryTargetKey: event.inventoryPatch?.targetKey,
+              selfKey,
+              characterName,
+            });
+          }
           void applyOneEvent(event);
-          return;
+        } else {
+          // O evento permanece no buffer do transporte. Um flush curto evita que
+          // efeito/condicao fique esperando o polling de fallback quando a tela
+          // acabou de remontar ou o selfKey ainda estava inicializando.
+          setTimeout(() => { if (!disposed) void applyEvents({ forceFullDrain: true, reason: 'socket_event_not_accepted_retry' }); }, 200);
         }
       }
-
-      // payload_update/session_snapshot sao cache estrutural. Em pausa, evite polling
-      // agressivo; session_patch/session_ended chegam por event_commit.
-      if (paused) return;
-      void applyEvents();
     });
 
     return () => {
@@ -571,5 +647,5 @@ export function useLanRealtimePlayerPatches({
       if (timer) clearInterval(timer);
       unsubscribe();
     };
-  }, [characterName, enabled, joinUrl, paused, selfKey, sessionId]);
+  }, [characterName, enabled, joinUrl, paused, reconnectEpoch, selfKey, sessionId]);
 }

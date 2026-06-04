@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { AppState, AppStateStatus } from 'react-native';
+import { notifyLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 
 type UseLanAppLifecycleParams = {
   enabled: boolean;
@@ -51,6 +52,7 @@ export function useLanAppLifecycle({
 
       if (cameToForeground) {
         try {
+          notifyLanForegroundRecovery('app_foreground');
           await safeForeground();
         } catch (error) {
           console.warn('[LAN] Erro ao retomar ciclo de vida LAN:', error);

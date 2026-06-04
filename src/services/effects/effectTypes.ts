@@ -84,6 +84,8 @@ export type LanActiveEffectSnapshot = {
 };
 
 export type ApplyActiveEffectInput = {
+  /** Optional pre-generated effect id used by LAN fast-path so socket/UI and SQLite use the same active effect id. */
+  id?: string;
   statusKey?: string;
   name?: string;
   target?: EffectTarget;

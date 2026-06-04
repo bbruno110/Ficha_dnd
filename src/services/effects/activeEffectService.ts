@@ -153,7 +153,7 @@ export async function applyEffectToPlayer(
     }
   }
 
-  const id = makeActiveEffectId();
+  const id = String((input as any).id || '') || makeActiveEffectId();
   const finalSnapshot: LanActiveEffectSnapshot = {
     ...snapshot,
     id,

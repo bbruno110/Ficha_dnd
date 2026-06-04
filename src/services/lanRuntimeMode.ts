@@ -65,9 +65,9 @@ export function hasLanBlockedUpdates(updates?: Record<string, unknown>) {
 }
 
 export function debugLanFlow(label: string, payload?: Record<string, unknown>) {
-  // Log temporario para diagnostico LAN. Remova depois que o fluxo estiver estabilizado.
+  // Nunca use console.log no caminho quente do multiplayer. O console do Android
+  // atrasa o socket e a renderizacao quando ha varios celulares conectados.
   try {
-    console.log(`[LAN DEBUG] ${label}`, payload || {});
     traceApp(inferLanDebugCategory(label), label, {
       ...(payload || {}),
       source: 'debugLanFlow',

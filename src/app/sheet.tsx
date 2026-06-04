@@ -59,6 +59,7 @@ import {
   seedDefaultXpProgression,
 } from '@/services/xpProgressionService';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
+import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -240,6 +241,7 @@ export default function CharacterSheetScreen() {
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
   const [lanInfo, setLanInfo] = useState<{ sessionId: string; joinUrl: string; hostInstanceId?: string } | null>(null);
   const [lanSessionStatus, setLanSessionStatus] = useState<LanSessionStatus | null>(null);
+  const [lanReconnectEpoch, setLanReconnectEpoch] = useState(0);
   const lanSessionStatusRef = useRef<LanSessionStatus | null>(null);
   const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
   const sheetRuntimeMode = getSheetRuntimeMode({
@@ -253,6 +255,8 @@ export default function CharacterSheetScreen() {
   const sessionTerminatedRef = useRef<string | null>(null);
   const handledSessionEventIdsRef = useRef<Set<string>>(new Set());
   const lastPausedAlertKeyRef = useRef<string>('');
+  const pendingOutgoingItemSendsRef = useRef<Set<string>>(new Set());
+  const lanRecoveryGateRef = useRef<{ at: number; reason: string }>({ at: 0, reason: '' });
   const lastAuthoritativePlayerPatchRef = useRef<{ seq: number; entityRevision: number; appliedAt: number }>({
     seq: 0,
     entityRevision: 0,
@@ -350,8 +354,12 @@ export default function CharacterSheetScreen() {
     });
   }, [character?.id, character?.name, sheetRuntimeMode, lanInfo?.sessionId, lanInfo?.joinUrl, routeSessionId, routeJoinUrl]);
 
+  // Nao derrube o socket LAN ao desmontar a tela da ficha.
+  // O jogador pode voltar para a Home/index e reabrir a ficha vinculada;
+  // se fecharmos a conexao aqui, o host perde o bind socket -> playerKey
+  // e o tempo real passa a depender de snapshot/reload.
   useEffect(() => () => {
-    resetLanClientConnection();
+    // limpeza real ocorre apenas em kick/session_ended/troca de papel.
   }, []);
 
   useEffect(() => {
@@ -1664,6 +1672,7 @@ export default function CharacterSheetScreen() {
       : '',
     characterName: character?.name,
     paused: lanSessionStatus === 'paused',
+    reconnectEpoch: lanReconnectEpoch,
     onNumberPatch: async (patch, event) => {
       traceFunctionCall('useLanRealtimePlayerPatches.onNumberPatch', { patch, event }, {
         screen: 'sheet',
@@ -1769,6 +1778,7 @@ export default function CharacterSheetScreen() {
         reason: patch.reason,
       });
       await applyLanInventoryPatchToCharacter(patch);
+      pendingOutgoingItemSendsRef.current.clear();
       await rememberLanSessionEvent(db, event).catch(() => false);
       debugLanFlow(
         patch.action === 'grant' ? 'PLAYER_GRANTED_ITEM_APPLIED' : 'PLAYER_INVENTORY_PATCH_APPLIED',
@@ -2078,7 +2088,16 @@ export default function CharacterSheetScreen() {
       sessionTerminatedRef.current !== lanInfo.sessionId
     ),
     onBackground: async () => {
-      resetLanClientConnection();
+      // Não destrua o socket ao abrir Telegram/compartilhar logs/alternar apps.
+      // O Android pode manter a conexão viva; se ela cair, o foreground recovery
+      // força reconnect/resync. Resetar aqui era a causa de ficha voltar sem listener.
+      traceApp('LAN_JOIN', 'PLAYER_KEEP_SOCKET_DURING_BACKGROUND', {
+        screen: 'sheet',
+        source: 'useLanAppLifecycle.onBackground',
+        sessionId: lanInfo?.sessionId,
+        characterId: character?.id,
+        characterName: character?.name,
+      });
     },
     onForeground: async () => {
       if (lanInfo?.sessionId && sessionTerminatedRef.current === lanInfo.sessionId) {
@@ -2091,10 +2110,124 @@ export default function CharacterSheetScreen() {
         });
         return;
       }
-      resetLanClientConnection();
-      await syncLanFromHost();
+      const selfKey = getSelfLanKey(lanInfo?.sessionId);
+      // Foreground apos compartilhar/alternar app deve reamarrar, nao destruir,
+      // a conexao. requestLanSessionResync envia hello com playerKey e reconecta
+      // se o socket tiver caido.
+      setLanReconnectEpoch((current) => current + 1);
+      if (lanInfo?.joinUrl && lanInfo?.sessionId && selfKey) {
+        void requestLanSessionResync(lanInfo.joinUrl, {
+          sessionId: lanInfo.sessionId,
+          playerKey: selfKey,
+          lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+          knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+        }).catch(() => false);
+      }
     },
   });
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!character?.id || !lanInfo?.sessionId || !lanInfo?.joinUrl) return;
+      let disposed = false;
+      const selfKey = getSelfLanKey(lanInfo.sessionId);
+
+      // Reabrir a ficha pela Home/index NAO deve matar o socket.
+      // Apenas reenvia hello/resync com playerKey para reamarrar o socket no host.
+      const scheduleRebind = (delayMs: number, reason: string) => {
+        setTimeout(() => {
+          if (disposed || sessionTerminatedRef.current === lanInfo.sessionId) return;
+          traceApp('LAN_JOIN', 'PLAYER_SHEET_FOCUS_REBIND_START', {
+            screen: 'sheet',
+            source: 'useFocusEffect',
+            reason,
+            sessionId: lanInfo.sessionId,
+            characterId: character.id,
+            characterName: character.name,
+            playerKey: selfKey,
+          });
+          setLanReconnectEpoch((current) => current + 1);
+          if (selfKey) {
+            void requestLanSessionResync(lanInfo.joinUrl, {
+              sessionId: lanInfo.sessionId,
+              playerKey: selfKey,
+              lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+              knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+            }).catch(() => false);
+          }
+        }, delayMs);
+      };
+
+      scheduleRebind(80, 'focus_open_or_return');
+      scheduleRebind(650, 'focus_confirm_bind');
+
+      return () => {
+        disposed = true;
+      };
+    }, [character?.id, character?.name, lanInfo?.sessionId, lanInfo?.joinUrl])
+  );
+
+  useEffect(() => {
+    if (!character?.id || !lanInfo?.sessionId || !lanInfo?.joinUrl) return;
+
+    let disposed = false;
+    const recover = (reason: string) => {
+      if (disposed || sessionTerminatedRef.current === lanInfo.sessionId) return;
+      const now = Date.now();
+      if (now - lanRecoveryGateRef.current.at < 1200) {
+        traceApp('LAN_JOIN', 'PLAYER_EXTERNAL_FOREGROUND_RECOVERY_DEBOUNCED', {
+          screen: 'sheet',
+          source: 'subscribeLanForegroundRecovery',
+          reason,
+          previousReason: lanRecoveryGateRef.current.reason,
+          sessionId: lanInfo.sessionId,
+          characterId: character.id,
+          characterName: character.name,
+        });
+        return;
+      }
+      lanRecoveryGateRef.current = { at: now, reason };
+      const selfKey = getSelfLanKey(lanInfo.sessionId);
+      traceApp('LAN_JOIN', 'PLAYER_EXTERNAL_FOREGROUND_RECOVERY_START', {
+        screen: 'sheet',
+        source: 'subscribeLanForegroundRecovery',
+        reason,
+        sessionId: lanInfo.sessionId,
+        characterId: character.id,
+        characterName: character.name,
+      });
+      setLanReconnectEpoch((current) => current + 1);
+      setTimeout(() => {
+        if (disposed) return;
+        if (selfKey) {
+          void requestLanSessionResync(lanInfo.joinUrl, {
+            sessionId: lanInfo.sessionId,
+            playerKey: selfKey,
+            lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+            knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+          }).catch(() => false);
+        }
+      }, 80);
+      setTimeout(() => {
+        if (disposed) return;
+        setLanReconnectEpoch((current) => current + 1);
+        if (selfKey) {
+          void requestLanSessionResync(lanInfo.joinUrl, {
+            sessionId: lanInfo.sessionId,
+            playerKey: selfKey,
+            lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+            knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+          }).catch(() => false);
+        }
+      }, 650);
+    };
+
+    const unsubscribe = subscribeLanForegroundRecovery(recover);
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [character?.id, character?.name, lanInfo?.sessionId, lanInfo?.joinUrl, syncLanFromHost]);
 
   const getSelfLanKey = (sessionValue?: string) => {
     if (!character || !sessionValue) return '';
@@ -2681,13 +2814,23 @@ export default function CharacterSheetScreen() {
   }, [db, character?.id, character?.name, character?.level, character?.xp, routeSessionId, routeJoinUrl, fetchLanPayloadWithRecovery, terminateLanSessionFromMaster]);
 
   useEffect(() => {
-    if (!routeSessionId) return;
+    const isLanBoundSheet = Boolean(routeSessionId || lanInfo?.sessionId);
+    if (!isLanBoundSheet) return;
+
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      traceApp('NAVIGATION', 'PLAYER_SHEET_HARDWARE_BACK_TO_HOME', {
+        screen: 'sheet',
+        source: 'BackHandler',
+        sessionId: lanInfo?.sessionId || routeSessionId,
+        characterId: characterRef.current?.id,
+        characterName: characterRef.current?.name,
+      });
       router.replace('/' as any);
       return true;
     });
+
     return () => subscription.remove();
-  }, [routeSessionId, router]);
+  }, [lanInfo?.sessionId, routeSessionId, router]);
 
   // Se estiver carregando ou sem personagem, encerra o render aqui
   if (loading) return <View style={styles.loadingContainer}><ActivityIndicator size="large" color={appColors.primary} /></View>;
@@ -3714,50 +3857,91 @@ export default function CharacterSheetScreen() {
 
   const handleSendItemToPlayer = async (target: PublicLanPlayer) => {
     await runSheetAction(`send_item:${target.key}`, async () => {
-    if (!ensureLanWritable()) return;
-    if (!selectedBagItem || !lanInfo || !character) return;
-    const tradeItem = makeTradeItem(selectedBagItem.item, actionQty);
-    const availableQty = Math.max(0, Number(selectedBagItem.item?.qty || 0));
-    if (availableQty < tradeItem.qty) {
-      showCustomAlert('Envio cancelado', 'Voce nao tem quantidade suficiente deste item.');
-      return;
-    }
+      if (!ensureLanWritable()) return;
+      if (!selectedBagItem || !lanInfo || !character) return;
 
-    try {
-      const selfKey = getSelfLanKey(lanInfo.sessionId);
-      const requestId = makeLanEventId();
-      const event: LanSessionEvent = {
-        id: requestId,
-        clientMsgId: requestId,
-        sessionId: lanInfo.sessionId,
-        type: 'send_item_request',
-        fromKey: selfKey,
-        fromName: character.name,
-        toKey: target.key,
-        toName: target.characterName,
-        entityType: 'inventory',
-        entityId: target.key,
-        ackRequired: true,
-        sendItemRequest: {
-          requestId,
-          fromKey: selfKey,
-          toKey: target.key,
-          item: tradeItem,
+      const tradeItem = makeTradeItem(selectedBagItem.item, actionQty);
+      const availableQty = Math.max(0, Number(selectedBagItem.item?.qty || 0));
+      if (availableQty < tradeItem.qty) {
+        showCustomAlert('Envio cancelado', 'Voce nao tem quantidade suficiente deste item.');
+        return;
+      }
+
+      const pendingKey = `${lanInfo.sessionId}:${target.key}:${String(tradeItem.name || '').toLowerCase()}:${tradeItem.qty}`;
+      if (pendingOutgoingItemSendsRef.current.has(pendingKey)) {
+        debugLanFlow('SEND_ITEM_DUPLICATE_TAP_BLOCKED', {
+          sessionId: lanInfo.sessionId,
+          characterId: character.id,
+          characterName: character.name,
+          targetKey: target.key,
+          itemName: tradeItem.name,
           qty: tradeItem.qty,
-        },
-        item: tradeItem,
-        message: `${character.name} enviou ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
-        createdAt: new Date().toISOString(),
-      };
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
-      await rememberLanSessionEvent(db, event).catch(() => false);
-      showCustomAlert('Item enviado', `${target.characterName} receberá ${tradeItem.qty}x ${tradeItem.name}. O mestre verá no histórico da sessão.`);
-    } catch {
-      showCustomAlert('Envio falhou', 'Nao consegui avisar a sessao LAN. O inventario local nao foi alterado.');
-    } finally {
-      setTargetPickerMode(null);
-      setSelectedBagItem(null);
-    }
+        });
+        showCustomAlert('Envio em andamento', 'Aguarde a confirmação da mesa antes de enviar este item novamente.');
+        return;
+      }
+
+      try {
+        pendingOutgoingItemSendsRef.current.add(pendingKey);
+        setTimeout(() => pendingOutgoingItemSendsRef.current.delete(pendingKey), 8000);
+
+        const selfKey = getSelfLanKey(lanInfo.sessionId);
+        const requestId = makeLanEventId();
+        const event: LanSessionEvent = {
+          id: requestId,
+          clientMsgId: requestId,
+          sessionId: lanInfo.sessionId,
+          type: 'send_item_request',
+          fromKey: selfKey,
+          fromName: character.name,
+          toKey: target.key,
+          toName: target.characterName,
+          entityType: 'inventory',
+          entityId: target.key,
+          ackRequired: true,
+          sendItemRequest: {
+            requestId,
+            fromKey: selfKey,
+            toKey: target.key,
+            item: tradeItem,
+            qty: tradeItem.qty,
+          },
+          item: tradeItem,
+          message: `${character.name} enviou ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
+          createdAt: new Date().toISOString(),
+        };
+
+        await sendLanSessionEvent(lanInfo.joinUrl, event);
+        await rememberLanSessionEvent(db, event).catch(() => false);
+
+        // Atualizacao otimista: remove imediatamente da mochila local para impedir
+        // duplo envio acidental antes do inventory_patch oficial chegar do host.
+        const currentEquipment = characterRef.current?.equipment || character.equipment;
+        const nextBag = [...(currentEquipment?.bag || [])];
+        const itemIndex = nextBag.findIndex((entry: any, index: number) => (
+          index === selectedBagItem.index || String(entry?.name || '') === String(tradeItem.name || '')
+        ));
+        if (itemIndex >= 0) {
+          const currentItem = nextBag[itemIndex];
+          const nextQty = Math.max(0, Number(currentItem?.qty || 0) - tradeItem.qty);
+          if (nextQty <= 0) nextBag.splice(itemIndex, 1);
+          else nextBag[itemIndex] = { ...currentItem, qty: nextQty };
+          const nextEquipment = { ...currentEquipment, bag: nextBag };
+          setCharacter((current: any) => current ? ({ ...current, equipment: nextEquipment }) : current);
+          await updateDB(
+            { equipment: nextEquipment },
+            { allowLanAuthoritativeCache: true, reason: 'lan_player_send_item_optimistic_remove' }
+          );
+        }
+
+        showCustomAlert('Item enviado', `${target.characterName} receberá ${tradeItem.qty}x ${tradeItem.name}. O mestre verá no histórico da sessão.`);
+      } catch {
+        pendingOutgoingItemSendsRef.current.delete(pendingKey);
+        showCustomAlert('Envio falhou', 'Nao consegui avisar a sessao LAN. O inventario local nao foi alterado.');
+      } finally {
+        setTargetPickerMode(null);
+        setSelectedBagItem(null);
+      }
     });
   };
 
@@ -5011,7 +5195,7 @@ export default function CharacterSheetScreen() {
 
   return (
     <LinearGradient colors={appGradients.main} style={[styles.container, conditionFrameStyle]}>
-      <Stack.Screen options={{ headerShown: false }} />
+      <Stack.Screen options={{ headerShown: false, gestureEnabled: false }} />
 
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarBack} onPress={() => {

@@ -87,7 +87,7 @@ import {
   type LanTradeItem,
 } from '@/services/lanSession';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
-import { commitHostPlayerNumberDelta } from '@/services/lan/lanHostEngine';
+import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import {
   applyHostEffectPatchRuntime,
   applyHostNumberDeltaRuntime,
@@ -143,6 +143,14 @@ type EffectDraft = {
   kind?: 'stat' | 'hp' | 'temp_hp' | 'status' | 'custom';
   mode?: 'add' | 'set';
   source?: string;
+  sourceType?: string;
+  sourceId?: string;
+  visibleToPlayer?: boolean;
+  publicNote?: string;
+  privateNote?: string;
+  icon?: string;
+  removableBySave?: boolean;
+  visualPriority?: number;
   status?: string;
   statusKey?: string;
   color?: string;
@@ -183,6 +191,7 @@ export default function LanSessionScreen() {
   const endingSessionRef = useRef(false);
   const pauseToggleRunningRef = useRef(false);
   const pendingMasterActionIdsRef = useRef<Set<string>>(new Set());
+  const grantItemCooldownRef = useRef<Set<string>>(new Set());
   const processedHostActionIdsRef = useRef<Set<string>>(new Set());
   const seenNativeHostEventIdsRef = useRef<Set<string>>(new Set());
 
@@ -513,6 +522,30 @@ export default function LanSessionScreen() {
     }
   }, [db, sendLiveEventToClients]);
 
+  const applyAndSendEffectResult = useCallback(async (
+    sessionId: string,
+    result: { targetKey?: string; patch?: NonNullable<LanSessionEvent['effectPatch']>; event?: LanSessionEvent | null } | null | undefined,
+  ) => {
+    if (!result?.targetKey || !result.patch) return null;
+
+    const runtimeResult = applyHostEffectPatchRuntime(sessionId, sessionStateRef.current, result.targetKey, result.patch);
+    if (runtimeResult) {
+      sessionStateRef.current = runtimeResult.state;
+      setSessionState(runtimeResult.state);
+      setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
+    }
+
+    if (result.event) {
+      await sendLiveEventToClients(result.event);
+      return result.event;
+    }
+
+    const fallback = await sendLatestLiveEvent(sessionId, (event) => (
+      event.type === 'effect_patch' && event.toKey === result.targetKey
+    ));
+    return fallback;
+  }, [sendLatestLiveEvent, sendLiveEventToClients]);
+
   const rememberSentEventInTimeline = useCallback((event: LanSessionEvent | null | undefined) => {
     if (!event) return;
     setSessionEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20));
@@ -560,6 +593,57 @@ export default function LanSessionScreen() {
     rememberSentEventInTimeline(event);
     return event;
   }, [db, getPlayerRevision, joinUrl, rememberSentEventInTimeline]);
+
+
+  const applyHostInventoryRuntimePatch = useCallback((
+    targetKey: string | undefined,
+    equipment: unknown,
+    statsPatch?: Record<string, unknown>,
+  ) => {
+    const currentState = sessionStateRef.current;
+    if (!currentState || !targetKey) return null;
+
+    const normalizedEquipment = normalizeHostEquipment(equipment);
+    let updatedPlayer: LanSessionPlayerState | null = null;
+    const nextState: LanSessionState = {
+      ...currentState,
+      players: currentState.players.map((player) => {
+        const matches = player.remoteKey === targetKey || player.characterName === targetKey;
+        if (!matches) return player;
+        const nextStats = statsPatch && typeof statsPatch === 'object'
+          ? sanitizePlayerOwnedStatsPatch(player.stats, statsPatch)
+          : player.stats;
+        const nextPlayer: LanSessionPlayerState = {
+          ...player,
+          equipment: normalizedEquipment,
+          stats: nextStats,
+          revisionSeq: Math.max(Number(player.revisionSeq || 0), Date.now()),
+        };
+        updatedPlayer = nextPlayer;
+        return nextPlayer;
+      }),
+    };
+
+    if (!updatedPlayer) return null;
+
+    sessionStateRef.current = nextState;
+    setSessionState(nextState);
+    setPayload((current) => current ? ({ ...current, state: nextState }) : current);
+    setInventoryModalPlayer((current) => current?.remoteKey === updatedPlayer?.remoteKey ? updatedPlayer : current);
+    setDetailPlayer((current) => current?.remoteKey === updatedPlayer?.remoteKey ? updatedPlayer : current);
+
+    debugLanFlow('MASTER_INVENTORY_RUNTIME_PATCH_APPLIED', {
+      sessionId: activeSessionId,
+      targetKey,
+      playerId: updatedPlayer.id,
+      playerName: updatedPlayer.characterName,
+      bagCount: Array.isArray((normalizedEquipment as any).bag) ? (normalizedEquipment as any).bag.length : 0,
+      slotKeys: Object.keys((normalizedEquipment as any).slots || {}),
+      hasStatsPatch: Boolean(statsPatch),
+    });
+
+    return updatedPlayer;
+  }, [activeSessionId]);
 
   const sendItemTransferResult = useCallback(async (
     sessionId: string,
@@ -921,6 +1005,34 @@ useLanAppLifecycle({
   },
 });
 
+useFocusEffect(
+  useCallback(() => {
+    if (!payload?.session?.id || !joinUrl || isEndingSession) return;
+    let disposed = false;
+    setTimeout(() => {
+      if (!disposed) void resumeMasterHost();
+    }, 120);
+    return () => {
+      disposed = true;
+    };
+  }, [isEndingSession, joinUrl, payload?.session?.id, resumeMasterHost])
+);
+
+useEffect(() => {
+  if (!payload?.session?.id || !joinUrl) return;
+  const unsubscribe = subscribeLanForegroundRecovery((reason) => {
+    traceApp('LAN_JOIN', 'MASTER_EXTERNAL_FOREGROUND_RECOVERY_START', {
+      screen: 'lan-session',
+      source: 'subscribeLanForegroundRecovery',
+      reason,
+      sessionId: payload.session.id,
+      joinUrl,
+    });
+    void resumeMasterHost();
+  });
+  return unsubscribe;
+}, [joinUrl, payload?.session?.id, resumeMasterHost]);
+
   useEffect(() => {
     loadCatalogOptions();
     loadEffectOptions();
@@ -1054,19 +1166,9 @@ useLanAppLifecycle({
             const activeEffectId = getActiveEffectIdFromPendingPayload(pendingPayload, targetPlayer);
             if (activeEffectId) {
               if (passed) {
-                const removal = await removeLanPlayerEffect(db, targetPlayer.id, activeEffectId);
+                const removal = await removeLanPlayerEffect(db, targetPlayer.id, activeEffectId, { syncPayload: false });
                 if (removal?.targetKey) {
-                  const runtimeResult = applyHostEffectPatchRuntime(activeSessionId, sessionStateRef.current, removal.targetKey, removal.patch);
-                  if (runtimeResult) {
-                    sessionStateRef.current = runtimeResult.state;
-                    setSessionState(runtimeResult.state);
-                    setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
-                  }
-                  await sendLatestLiveEvent(activeSessionId, (latestEvent) => (
-                    latestEvent.type === 'effect_patch' &&
-                    latestEvent.toKey === removal.targetKey &&
-                    Boolean(latestEvent.effectPatch?.remove?.some((id) => removal.patch.remove.includes(id)))
-                  ));
+                  await applyAndSendEffectResult(activeSessionId, removal);
                   appliedAfterSave = true;
                 }
               } else {
@@ -1131,11 +1233,9 @@ useLanAppLifecycle({
               const permanentResult = isPermanentStatEffect(draftAfterSave)
                 ? await applyPermanentStatEffectToPlayer(activeSessionId, targetPlayer, draftAfterSave)
                 : null;
-              const result = permanentResult ? null : await addLanPlayerEffect(db, targetPlayer.id, draftAfterSave);
+              const result = permanentResult ? null : await addLanPlayerEffect(db, targetPlayer.id, draftAfterSave, { syncPayload: false });
               if (result?.targetKey) {
-                await sendLatestLiveEvent(activeSessionId, (latestEvent) => (
-                  latestEvent.type === 'effect_patch' && latestEvent.toKey === result.targetKey
-                ));
+                await applyAndSendEffectResult(activeSessionId, result);
                 appliedAfterSave = true;
               }
               if (permanentResult) appliedAfterSave = true;
@@ -1351,7 +1451,8 @@ useLanAppLifecycle({
                   actionId: event.actionRequest.actionId,
                   effectName: draft.name,
                 });
-                await addLanPlayerEffect(db, itemTargetState.id, draft as any);
+                const itemEffectResult = await addLanPlayerEffect(db, itemTargetState.id, draft as any, { syncPayload: false });
+                await applyAndSendEffectResult(activeSessionId, itemEffectResult);
               }
               if (itemNumberPatch) {
                 const stateAfterNumbers = await getLanSessionState(db, activeSessionId);
@@ -1631,12 +1732,8 @@ useLanAppLifecycle({
               actionId: event.actionRequest.actionId,
               effectName: draft.name,
             });
-            const result = await addLanPlayerEffect(db, targetPlayer.id, draft as any);
-            if (result?.targetKey) {
-              await sendLatestLiveEvent(activeSessionId, (latestEvent) => (
-                latestEvent.type === 'effect_patch' && latestEvent.toKey === result.targetKey
-              ));
-            }
+            const result = await addLanPlayerEffect(db, targetPlayer.id, draft as any, { syncPayload: false });
+            await applyAndSendEffectResult(activeSessionId, result);
             await sendActionResult(
               activeSessionId,
               event.fromKey,
@@ -1761,6 +1858,8 @@ useLanAppLifecycle({
 
             const result = await applyLanSendItemRequest(db, event);
             const nextState = await getLanSessionState(db, activeSessionId);
+            setSessionState(nextState);
+            setPayload((current) => current ? ({ ...current, state: nextState }) : current);
             const affectedPlayers = nextState.players.filter((entry) => result.targetKeys.includes(entry.remoteKey || ''));
             const reason = result.accepted
               ? event.message || 'Item enviado entre jogadores.'
@@ -1787,8 +1886,7 @@ useLanAppLifecycle({
               reason
             );
 
-            await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
-            shouldReloadSessionState = true;
+            scheduleSilentPayloadRefresh(activeSessionId);
             continue;
           }
 
@@ -1992,7 +2090,7 @@ useLanAppLifecycle({
             if (!fresh) continue;
             const targetPlayer = currentState.players.find((entry) => entry.remoteKey === event.toKey || entry.characterName === event.toName);
             if (!targetPlayer) continue;
-            await addLanPlayerEffect(db, targetPlayer.id, {
+            const spellEffectResult = await addLanPlayerEffect(db, targetPlayer.id, {
               name: event.spellEffect.spellName,
               target: event.spellEffect.target || 'custom',
               value: event.spellEffect.value || 0,
@@ -2007,8 +2105,9 @@ useLanAppLifecycle({
               color: event.spellEffect.color,
               secondaryColor: event.spellEffect.secondaryColor,
               source: event.fromName,
-            });
-            shouldReloadSessionState = true;
+            }, { syncPayload: false });
+            await applyAndSendEffectResult(activeSessionId, spellEffectResult);
+            shouldReloadSessionState = false;
           }
 
           if ((event.type as string) === 'send_item' || (event.type as string) === 'trade_accept') {
@@ -2091,6 +2190,12 @@ useLanAppLifecycle({
               continue;
             }
             processedHostActionIdsRef.current.add(inventoryActionId);
+            const runtimePlayer = applyHostInventoryRuntimePatch(
+              event.inventoryPatch.targetKey || event.fromKey,
+              event.inventoryPatch.equipment,
+              event.statsPatch && typeof event.statsPatch === 'object' ? event.statsPatch as Record<string, unknown> : undefined,
+            );
+
             const applied = await applyLanPlayerInventoryPatch(
               db,
               activeSessionId,
@@ -2101,8 +2206,9 @@ useLanAppLifecycle({
               const nextState = await getLanSessionState(db, activeSessionId);
               let targetPlayer = nextState.players.find((entry) => (
                 entry.remoteKey === event.fromKey ||
+                entry.remoteKey === event.inventoryPatch?.targetKey ||
                 entry.characterName === event.fromName
-              ));
+              )) || runtimePlayer;
               if (targetPlayer) {
                 if (event.statsPatch && typeof event.statsPatch === 'object') {
                   const nextStats = sanitizePlayerOwnedStatsPatch(targetPlayer.stats, event.statsPatch);
@@ -2135,8 +2241,11 @@ useLanAppLifecycle({
                   event.inventoryPatch.action || 'self_update'
                 );
               }
-              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
-              shouldReloadSessionState = true;
+              // Nao recarregue a mesa inteira para refletir equipar/desequipar.
+              // O runtime do mestre ja foi atualizado acima e o jogador recebe
+              // o inventory_patch oficial via socket. Payload fica apenas como cache.
+              scheduleSilentPayloadRefresh(activeSessionId);
+              shouldReloadSessionState = false;
             }
           }
 
@@ -2172,11 +2281,11 @@ useLanAppLifecycle({
             if (!targetPlayer) continue;
 
             for (const effectId of event.effectPatch.remove || []) {
-              await removeLanPlayerEffect(db, targetPlayer.id, String(effectId));
+              await removeLanPlayerEffect(db, targetPlayer.id, String(effectId), { syncPayload: false });
             }
 
             for (const effect of [...(event.effectPatch.add || []), ...(event.effectPatch.update || [])]) {
-              await addLanPlayerEffect(db, targetPlayer.id, {
+              const patchEffectResult = await addLanPlayerEffect(db, targetPlayer.id, {
                 name: String((effect as any).name || event.message || 'Efeito de item'),
                 target: ((effect as any).target || 'custom') as LanEffectTarget,
                 value: Number((effect as any).value || 0),
@@ -2333,6 +2442,21 @@ useLanAppLifecycle({
         })();
         return;
       }
+      if (update?.event?.sessionId === activeSessionId) {
+        traceApp('SUBSCRIPTION_UPDATE', 'MASTER_SUBSCRIPTION_EVENT_PROCESS_NOW', {
+          screen: 'lan-session',
+          source: 'subscribeLanSessionHostUpdates',
+          sessionId: activeSessionId,
+          joinUrl,
+          eventId: update.event.id,
+          eventType: update.event.type,
+          envelopeType: update.envelopeType,
+          decision: 'process_native_event_immediately',
+        });
+        void pollJoinedPlayers();
+        return;
+      }
+
       traceApp('SUBSCRIPTION_UPDATE', 'MASTER_SUBSCRIPTION_NO_CHANGE_SKIPPED', {
         screen: 'lan-session',
         source: 'subscribeLanSessionHostUpdates',
@@ -2352,6 +2476,7 @@ useLanAppLifecycle({
     joinUrl,
     reloadSessionState,
     rememberSentEventInTimeline,
+    applyHostInventoryRuntimePatch,
     sendActionResult,
     sendEffectSaveRequest,
     sendItemTransferResult,
@@ -3071,22 +3196,19 @@ useLanAppLifecycle({
         unit,
       });
     }
-    await advanceLanSessionTime(db, payload.session.id, unit);
+    await advanceLanSessionTime(db, payload.session.id, unit, { syncPayload: false });
     await recordMasterTimelineEvent(`Mestre avancou ${formatAdvanceUnit(unit)}.`);
     await sendRecentLiveEvents(payload.session.id, (event) => (
       !eventIdsBeforeAdvance.has(event.id) &&
       ['effect_patch', 'effect_expired', 'pending_save_patch', 'session_patch'].includes(event.type)
     ));
-    const nextPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
-    if (nextPayload) {
-      applyExternalPayload(nextPayload, 'sqlite');
-      setSessionEvents(await getLanSessionEvents(db, payload.session.id, 20));
-    }
+    setSessionEvents(await getLanSessionEvents(db, payload.session.id, 20));
+    scheduleSilentPayloadRefresh(payload.session.id);
     traceFunctionReturn('handleAdvanceTime', {
       sessionId: payload.session.id,
       unit,
-      currentTurn: nextPayload?.state?.currentTurn,
-      elapsedMinutes: nextPayload?.state?.elapsedMinutes,
+      currentTurn: sessionStateRef.current?.currentTurn,
+      elapsedMinutes: sessionStateRef.current?.elapsedMinutes,
     }, {
       screen: 'lan-session',
       source: 'master_click',
@@ -3317,41 +3439,159 @@ useLanAppLifecycle({
     })();
   }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh]);
 
-  const persistHostNumberDelta = useCallback((
-    playerId: number,
-    field: 'hpCurrent' | 'xp' | 'gp' | 'sp' | 'cp' | 'tempHp',
-    delta: number,
-    message: string,
-  ) => {
-    if (!payload?.session?.id || endingSessionRef.current) return;
-    const sessionId = payload.session.id;
 
-    void commitHostPlayerNumberDelta(db, {
-      sessionId,
-      joinUrl,
-      playerId,
-      field,
-      delta,
-      message,
-    }).then((result) => {
-      if (!result) return;
-      if (result.event) {
-        setSessionEvents((current) =>
-          [result.event!, ...current.filter((item) => item.id !== result.event!.id)].slice(0, 20)
-        );
-      }
-      scheduleSilentPayloadRefresh(sessionId);
-    }).catch((error) => {
-      traceError('FUNCTION_CALL', 'commitHostPlayerNumberDelta_ERROR', error, {
-        screen: 'lan-session',
-        source: 'persistHostNumberDelta',
-        functionName: 'commitHostPlayerNumberDelta',
+
+  const persistHostEffectPatch = useCallback((
+    player: LanSessionPlayerState,
+    draft: EffectDraft,
+    message?: string,
+  ) => {
+    if (!payload?.session?.id || endingSessionRef.current) return null;
+    const sessionId = payload.session.id;
+    const targetKey = player.remoteKey || makeLanCharacterKey(sessionId, { id: player.sourceCharacterId || player.id, name: player.characterName });
+    const activeId = String(draft.sourceId || '').startsWith('active_fx_')
+      ? String(draft.sourceId)
+      : `active_fx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const isTempHp = draft.target === 'PV_TEMP' || draft.kind === 'temp_hp';
+    const existingTempEffects = (player.effects || []).filter((effect) => (
+      String(effect?.target || '').toUpperCase() === 'PV_TEMP' || String(effect?.kind || '').toLowerCase() === 'temp_hp'
+    ));
+    const incomingTempHp = Math.max(0, Math.floor(Number(draft.value || 0)));
+    const currentTempHp = existingTempEffects.reduce((max, effect) => Math.max(max, Math.floor(Number(effect?.value || 0))), 0);
+
+    if (isTempHp && incomingTempHp <= 0) {
+      debugLanFlow('MASTER_FAST_EFFECT_IGNORED_INVALID_TEMP_HP', { sessionId, playerId: player.id, incomingTempHp });
+      return null;
+    }
+    if (isTempHp && existingTempEffects.length > 0 && incomingTempHp <= currentTempHp) {
+      // Regra padrao D&D: PV temporario nao acumula. Valor menor/igual nao substitui o atual.
+      debugLanFlow('MASTER_FAST_EFFECT_IGNORED_TEMP_HP_LOWER_OR_EQUAL', {
         sessionId,
-        playerId,
-        args: { field, delta },
+        playerId: player.id,
+        targetKey,
+        currentTempHp,
+        incomingTempHp,
       });
-      console.warn('[LAN MASTER] Falha ao persistir delta vivo no SQLite:', error);
+      return null;
+    }
+
+    const effectSnapshot = {
+      id: activeId,
+      name: draft.name || 'Efeito',
+      target: draft.target,
+      value: Math.floor(Number(draft.value || 0)),
+      remaining: Math.max(0, Math.floor(Number(draft.remaining || 0))),
+      unit: draft.unit,
+      isPermanent: Boolean(draft.isPermanent),
+      kind: draft.kind,
+      mode: draft.mode || 'add',
+      durationText: draft.durationText,
+      status: draft.status,
+      statusKey: draft.statusKey || draft.status,
+      source: draft.source || 'Mestre',
+      sourceType: draft.sourceType || 'lan_session',
+      sourceId: activeId,
+      color: draft.color,
+      secondaryColor: draft.secondaryColor,
+      icon: draft.icon,
+      visibleToPlayer: draft.visibleToPlayer !== false,
+      publicNote: draft.publicNote,
+      privateNote: draft.privateNote,
+      saveDc: draft.saveDc ?? null,
+      saveAbility: draft.saveAbility ?? null,
+      repeatSave: draft.repeatSave ?? null,
+      removableBySave: draft.removableBySave,
+      visualPriority: draft.visualPriority,
+    } as LanSessionEffect;
+
+    const patch: NonNullable<LanSessionEvent['effectPatch']> = {
+      targetKey,
+      add: [effectSnapshot as any],
+      update: [],
+      remove: isTempHp ? existingTempEffects.map((effect) => String(effect.id)).filter(Boolean) : [],
+    };
+
+    const runtimeResult = applyHostEffectPatchRuntime(sessionId, sessionStateRef.current, targetKey, patch);
+    if (!runtimeResult) return null;
+    sessionStateRef.current = runtimeResult.state;
+    setSessionState(runtimeResult.state);
+    setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
+
+    const seq = Date.now();
+    const liveEvent: LanSessionEvent = {
+      id: makeLanEventId(),
+      sessionId,
+      seq,
+      serverSeq: seq,
+      type: 'effect_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: targetKey,
+      toName: player.characterName,
+      entityType: 'effect',
+      entityId: targetKey,
+      entityRevision: runtimeResult.revision,
+      ackRequired: true,
+      originClientId: 'master',
+      effectPatch: patch,
+      message: message || `${effectSnapshot.name} aplicado em ${player.characterName}.`,
+      createdAt: new Date().toISOString(),
+    };
+
+    debugLanFlow('MASTER_FAST_EFFECT_PATCH_EVENT_CREATED', {
+      sessionId,
+      playerId: player.id,
+      playerKey: targetKey,
+      eventId: liveEvent.id,
+      seq: liveEvent.seq,
+      entityRevision: liveEvent.entityRevision,
+      addCount: patch.add?.length || 0,
+      removeCount: patch.remove?.length || 0,
+      tempHp: runtimeResult.player.tempHp,
     });
+
+    void sendLanSessionEvent(joinUrl, liveEvent)
+      .then(() => {
+        debugLanFlow('MASTER_FAST_EFFECT_PATCH_EVENT_SENT', {
+          sessionId,
+          playerId: player.id,
+          playerKey: targetKey,
+          eventId: liveEvent.id,
+          entityRevision: liveEvent.entityRevision,
+        });
+        setSessionEvents((current) => [liveEvent, ...current.filter((item) => item.id !== liveEvent.id)].slice(0, 20));
+      })
+      .catch((error) => {
+        traceError('SOCKET_SEND_START', 'MASTER_FAST_EFFECT_PATCH_SOCKET_SEND_ERROR', error, {
+          screen: 'lan-session',
+          source: 'persistHostEffectPatch',
+          sessionId,
+          playerId: player.id,
+          playerKey: targetKey,
+          eventId: liveEvent.id,
+          eventType: liveEvent.type,
+        });
+      });
+
+    void (async () => {
+      try {
+        await rememberLanSessionEvent(db, liveEvent);
+        await addLanPlayerEffect(db, player.id, effectSnapshot as any, { syncPayload: false, recordEvent: false });
+        scheduleSilentPayloadRefresh(sessionId);
+      } catch (error) {
+        traceError('SQLITE_WRITE_START', 'MASTER_FAST_EFFECT_PATCH_PERSIST_ERROR', error, {
+          screen: 'lan-session',
+          source: 'persistHostEffectPatch',
+          sessionId,
+          playerId: player.id,
+          playerKey: targetKey,
+          eventId: liveEvent.id,
+        });
+      }
+    })();
+
+    return liveEvent;
   }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh]);
 
   const applyMasterPlayerPatchInternal = async (
@@ -3422,79 +3662,6 @@ useLanAppLifecycle({
     });
     return;
 
-    /*
-    debugLanFlow('MASTER_MUTATION_PLAYER_PATCH_START', {
-      playerId: player.id,
-      remoteKey: player.remoteKey,
-      characterName: player.characterName,
-      patch,
-      beforeHp: player.hpCurrent,
-    });
-
-    const result = await commitHostPlayerNumberPatch(db, {
-      sessionId: payload.session.id,
-      joinUrl,
-      playerId: player.id,
-      patch,
-      message,
-    });
-
-    if (!result) return;
-
-    const { event, patch: cleanPatch, player: updatedPlayer } = result;
-
-    // 1. Atualiza a tela do mestre imediatamente, mas sempre mantendo o patch mais recente.
-    setSessionState((current) => {
-      if (!current) return current;
-
-      return {
-        ...current,
-        players: current.players.map((entry) =>
-          entry.id === player.id
-            ? { ...entry, ...updatedPlayer, ...cleanPatch }
-            : entry
-        ),
-      };
-    });
-
-    // 2. Atualiza o payload local em memória também, para evitar voltar para valor antigo.
-    setPayload((current) => {
-      if (!current?.state) return current;
-
-      return {
-        ...current,
-        state: {
-          ...current.state,
-          players: current.state.players.map((entry) =>
-            entry.id === player.id
-              ? { ...entry, ...updatedPlayer, ...cleanPatch }
-              : entry
-          ),
-        },
-      };
-    });
-
-
-    // Não faça broadcast de payload/snapshot aqui. O estado vivo da ficha deve ir por evento.
-    if (event) {
-      debugLanFlow('MASTER_MUTATION_PLAYER_PATCH_SENT', {
-        eventId: event.id,
-        seq: event.seq,
-        entityType: event.entityType,
-        entityId: event.entityId,
-        entityRevision: event.entityRevision,
-        toKey: event.toKey,
-        numberPatch: event.numberPatch,
-      });
-      setSessionEvents((current) =>
-        [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
-      );
-    }
-
-    // 5. Recalcula payload apenas para cache estrutural/futuro join, em debounce,
-    // sem mandar payload_update para os jogadores atuais.
-    scheduleSilentPayloadRefresh(payload.session.id);
-    */
   };
 
   const handleUpdatePlayerPatch = async (
@@ -3609,10 +3776,9 @@ useLanAppLifecycle({
       revision: runtimeResult.revision,
     });
 
-    persistHostNumberDelta(
+    persistHostNumberPatch(
       player.id,
-      field,
-      delta,
+      runtimeResult.patch,
       messagePrefix || `Mestre ajustou ${formatPlayerField(field as any)} de ${runtimeResult.player.characterName}.`
     );
     traceFunctionReturn('handleUpdatePlayerDelta', {
@@ -3631,64 +3797,19 @@ useLanAppLifecycle({
     });
     return;
 
-    /*
-    const result = await commitHostPlayerNumberDelta(db, {
-      sessionId: payload.session.id,
-      joinUrl,
-      playerId: player.id,
-      field,
-      delta,
-      message: messagePrefix,
-    });
-
-    if (!result) return;
-    const { event, patch: cleanPatch, player: updatedPlayer } = result;
-
-    setSessionState((current) => current
-      ? {
-        ...current,
-        players: current.players.map((entry) => entry.id === player.id ? { ...entry, ...updatedPlayer, ...cleanPatch } : entry),
-      }
-      : current
-    );
-
-    setPayload((current) => current?.state
-      ? {
-        ...current,
-        state: {
-          ...current.state,
-          players: current.state.players.map((entry) => entry.id === player.id ? { ...entry, ...updatedPlayer, ...cleanPatch } : entry),
-        },
-      }
-      : current
-    );
-
-    if (event) {
-      setSessionEvents((current) =>
-        [event, ...current.filter((item) => item.id !== event.id)].slice(0, 20)
-      );
-    }
-
-    scheduleSilentPayloadRefresh(payload.session.id);
-    */
   };
 
   const syncTempHpEffectsAfterDamage = async (sessionId: string, playerId: number, absorbedTempHp: number) => {
     const cleanAbsorbed = Math.max(0, Math.floor(Number(absorbedTempHp) || 0));
     if (cleanAbsorbed <= 0) return;
 
-    const result = await consumeLanPlayerTempHpAfterDamage(db, playerId, cleanAbsorbed);
+    const result = await consumeLanPlayerTempHpAfterDamage(db, playerId, cleanAbsorbed, { syncPayload: false });
     if (!result?.targetKey) {
       debugLanFlow('TEMP_HP_DAMAGE_NO_EFFECT_PATCH', { sessionId, playerId, absorbedTempHp: cleanAbsorbed });
       return;
     }
 
-    const runtimeResult = applyHostEffectPatchRuntime(sessionId, sessionStateRef.current, result.targetKey, result.patch);
-    if (runtimeResult) {
-      sessionStateRef.current = runtimeResult.state;
-      setSessionState(runtimeResult.state);
-      setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
-    }
+    await applyAndSendEffectResult(sessionId, result);
 
     debugLanFlow('PLAYER_TEMP_HP_EFFECTS_SYNCED_AFTER_DAMAGE', {
       sessionId,
@@ -3698,12 +3819,7 @@ useLanAppLifecycle({
       updated: result.patch.update?.map((effect: { id: string; value?: number }) => ({ id: effect.id, value: effect.value })),
       removed: result.patch.remove,
     });
-    await sendLatestLiveEvent(sessionId, (event) => (
-      event.type === 'effect_patch' &&
-      event.toKey === result.targetKey &&
-      (Boolean(event.effectPatch?.remove?.some((id) => result.patch.remove.includes(id))) ||
-        Boolean(event.effectPatch?.update?.some((effect) => result.patch.update.some((updated: { id: string }) => updated.id === effect.id))))
-    ));
+
   };
 
   const handleApplyDamageToPlayer = async (player: LanSessionPlayerState, damage: number) => {
@@ -3902,14 +4018,14 @@ useLanAppLifecycle({
       await handleUpdatePlayer(player, 'xp', player.xp + baseShare + (index < remainder ? 1 : 0));
     }
     await recordMasterTimelineEvent(`Mestre distribuiu ${totalXp} XP para a party.`);
-    await reloadSessionState(payload.session.id, false);
+    scheduleSilentPayloadRefresh(payload.session.id);
   };
 
   const handleAcceptSpellEffect = async (event: LanSessionEvent, accepted: boolean) => {
     if (!payload) return;
     const targetPlayer = sessionState?.players.find((entry) => entry.remoteKey === event.toKey || entry.characterName === event.toName);
     if (accepted && targetPlayer && event.spellEffect) {
-      await addLanPlayerEffect(db, targetPlayer.id, {
+      const spellEffectResult = await addLanPlayerEffect(db, targetPlayer.id, {
         name: event.spellEffect.spellName,
         target: event.spellEffect.target || 'custom',
         value: event.spellEffect.value || 0,
@@ -3924,7 +4040,8 @@ useLanAppLifecycle({
         color: event.spellEffect.color,
         secondaryColor: event.spellEffect.secondaryColor,
         source: event.fromName,
-      });
+      }, { syncPayload: false });
+      await applyAndSendEffectResult(payload.session.id, spellEffectResult);
     }
     await rememberLanSessionEvent(db, {
       id: makeLanEventId(),
@@ -3944,11 +4061,6 @@ useLanAppLifecycle({
       createdAt: new Date().toISOString(),
     });
 
-    if (accepted && targetPlayer?.remoteKey) {
-      await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
-        latestEvent.type === 'effect_patch' && latestEvent.toKey === targetPlayer.remoteKey
-      ));
-    }
     await sendLatestLiveEvent(payload.session.id, (latestEvent) => (
       latestEvent.type === 'character_update_review' && latestEvent.toKey === event.fromKey
     ));
@@ -4068,20 +4180,8 @@ useLanAppLifecycle({
 
     if (targetPlayer && activeEffectId) {
       if (passed) {
-        const removal = await removeLanPlayerEffect(db, targetPlayer.id, activeEffectId);
-        if (removal?.targetKey) {
-          const runtimeResult = applyHostEffectPatchRuntime(payload.session.id, sessionStateRef.current, removal.targetKey, removal.patch);
-          if (runtimeResult) {
-            sessionStateRef.current = runtimeResult.state;
-            setSessionState(runtimeResult.state);
-            setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
-          }
-          await sendLatestLiveEvent(payload.session.id, (event) => (
-            event.type === 'effect_patch' &&
-            event.toKey === removal.targetKey &&
-            Boolean(event.effectPatch?.remove?.some((id) => removal.patch.remove.includes(id)))
-          ));
-        }
+        const removal = await removeLanPlayerEffect(db, targetPlayer.id, activeEffectId, { syncPayload: false });
+        await applyAndSendEffectResult(payload.session.id, removal);
       } else {
         debugLanFlow('MASTER_ACTIVE_EFFECT_SAVE_FAILED_KEEPING_EFFECT', {
           sessionId: payload.session.id,
@@ -4097,18 +4197,8 @@ useLanAppLifecycle({
       const permanentResult = isPermanentStatEffect(draftAfterSave)
         ? await applyPermanentStatEffectToPlayer(payload.session.id, targetPlayer, draftAfterSave)
         : null;
-      const result = permanentResult ? null : await addLanPlayerEffect(db, targetPlayer.id, draftAfterSave);
-      if (result?.targetKey) {
-        const runtimeResult = applyHostEffectPatchRuntime(payload.session.id, sessionStateRef.current, result.targetKey, result.patch);
-        if (runtimeResult) {
-          sessionStateRef.current = runtimeResult.state;
-          setSessionState(runtimeResult.state);
-          setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
-        }
-        await sendLatestLiveEvent(payload.session.id, (event) => (
-          event.type === 'effect_patch' && event.toKey === result.targetKey
-        ));
-      }
+      const result = permanentResult ? null : await addLanPlayerEffect(db, targetPlayer.id, draftAfterSave, { syncPayload: false });
+      await applyAndSendEffectResult(payload.session.id, result);
     }
     await rememberAndSendLanSessionEvent(db, joinUrl, {
       id: makeLanEventId(),
@@ -4135,9 +4225,24 @@ useLanAppLifecycle({
   };
 
   const handleGrantItemToPlayer = async (item: InventoryItemOption) => {
-    await runMasterAction(`grant_item:${inventoryModalPlayer?.id || 'none'}:${item.id || item.name}`, async () => {
-    if (!inventoryModalPlayer || !payload) return;
     const qty = Math.max(1, parseInt(grantItemQty, 10) || 1);
+    const actionId = `grant_item:${inventoryModalPlayer?.id || 'none'}:${item.id || item.name}:${qty}`;
+    if (grantItemCooldownRef.current.has(actionId)) {
+      debugLanFlow('MASTER_GRANT_ITEM_DUPLICATE_TAP_BLOCKED', {
+        sessionId: payload?.session?.id,
+        playerId: inventoryModalPlayer?.id,
+        playerKey: inventoryModalPlayer?.remoteKey,
+        itemName: item.name,
+        qty,
+      });
+      return;
+    }
+
+    grantItemCooldownRef.current.add(actionId);
+    setTimeout(() => grantItemCooldownRef.current.delete(actionId), 7000);
+
+    await runMasterAction(actionId, async () => {
+    if (!inventoryModalPlayer || !payload) return;
     debugLanFlow('MASTER_GRANT_ITEM_START', {
       sessionId: payload.session.id,
       playerId: inventoryModalPlayer.id,
@@ -4176,11 +4281,53 @@ useLanAppLifecycle({
       bag.push(nextItem);
     }
 
-    await updateLanPlayerEquipment(
+    const nextEquipment = { ...equipment, bag };
+    const nextPlayer: LanSessionPlayerState = { ...inventoryModalPlayer, equipment: nextEquipment };
+
+    // Fast path: a UI do mestre e o jogador recebem o inventory_patch antes do reload/payload.
+    setInventoryModalPlayer(nextPlayer);
+    const optimisticState = sessionStateRef.current
+      ? {
+          ...sessionStateRef.current,
+          players: sessionStateRef.current.players.map((player) => player.id === nextPlayer.id ? nextPlayer : player),
+        }
+      : null;
+    if (optimisticState) {
+      setSessionState(optimisticState);
+      setPayload((current) => current ? ({ ...current, state: optimisticState }) : current);
+    }
+
+    const persistPromise = updateLanPlayerEquipment(
       db,
       inventoryModalPlayer.id,
-      { ...equipment, bag }
+      nextEquipment
     );
+
+    debugLanFlow('MASTER_GRANT_ITEM_RUNTIME_APPLIED', {
+      sessionId: payload.session.id,
+      playerId: nextPlayer.id,
+      playerKey: nextPlayer.remoteKey,
+      itemName: item.name,
+      qty,
+      mode: 'fast_path_before_reload',
+    });
+
+    const event = await sendOfficialInventoryPatch(
+      payload.session.id,
+      nextPlayer,
+      `Mestre entregou ${qty}x ${item.name} para ${nextPlayer.characterName}.`,
+      'grant'
+    );
+    debugLanFlow('MASTER_GRANT_ITEM_PATCH_SENT', {
+      sessionId: payload.session.id,
+      eventId: event?.id,
+      playerId: nextPlayer.id,
+      playerKey: nextPlayer.remoteKey,
+      itemName: item.name,
+      qty,
+    });
+
+    await persistPromise;
     debugLanFlow('MASTER_GRANT_ITEM_SQLITE_DONE', {
       sessionId: payload.session.id,
       playerId: inventoryModalPlayer.id,
@@ -4188,34 +4335,6 @@ useLanAppLifecycle({
       itemName: item.name,
       qty,
     });
-
-    await reloadSessionState(payload.session.id, false);
-    const nextState = await getLanSessionState(db, payload.session.id);
-    const nextPlayer = nextState.players.find((player) => player.id === inventoryModalPlayer.id);
-    if (nextPlayer) {
-      setInventoryModalPlayer(nextPlayer);
-      debugLanFlow('MASTER_GRANT_ITEM_RUNTIME_APPLIED', {
-        sessionId: payload.session.id,
-        playerId: nextPlayer.id,
-        playerKey: nextPlayer.remoteKey,
-        itemName: item.name,
-        qty,
-      });
-      const event = await sendOfficialInventoryPatch(
-        payload.session.id,
-        nextPlayer,
-        `Mestre entregou ${qty}x ${item.name} para ${nextPlayer.characterName}.`,
-        'grant'
-      );
-      debugLanFlow('MASTER_GRANT_ITEM_PATCH_SENT', {
-        sessionId: payload.session.id,
-        eventId: event?.id,
-        playerId: nextPlayer.id,
-        playerKey: nextPlayer.remoteKey,
-        itemName: item.name,
-        qty,
-      });
-    }
     scheduleSilentPayloadRefresh(payload.session.id);
     });
   };
@@ -4370,32 +4489,17 @@ useLanAppLifecycle({
       }
 
       const activeDirectEffects = directEffects.filter((effect) => !isPermanentStatEffect(effect));
-      const result = activeDirectEffects.length > 0
-        ? await addLanPlayerEffectsBatch(
-          db,
-          targetPlayer.id,
-          activeDirectEffects,
-          `Mestre aplicou ${activeDirectEffects.length} efeito(s) em ${targetPlayer.characterName}.`
-        )
-        : null;
-
-      if (result?.targetKey) {
-        const runtimeResult = applyHostEffectPatchRuntime(payload.session.id, sessionStateRef.current, result.targetKey, result.patch);
-        if (runtimeResult) {
-          sessionStateRef.current = runtimeResult.state;
-          setSessionState(runtimeResult.state);
-          setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
-        }
-        await sendLatestLiveEvent(payload.session.id, (event) => (
-          event.type === 'effect_patch' &&
-          event.toKey === result.targetKey
-        ));
+      for (const effect of activeDirectEffects) {
+        persistHostEffectPatch(
+          targetPlayer,
+          effect,
+          `${effect.name || 'Efeito'} aplicado em ${targetPlayer.characterName}.`
+        );
       }
     }
 
     await recordMasterTimelineEvent(`Mestre aplicou ${drafts.length} efeito(s) em ${targets.length} alvo(s).`);
     setSelectedEffectKeys([]);
-    await reloadSessionState(payload.session.id, false);
     scheduleSilentPayloadRefresh(payload.session.id);
   }));
 
@@ -4407,21 +4511,9 @@ useLanAppLifecycle({
       playerId,
       entityId: effectId,
     });
-    const result = await removeLanPlayerEffect(db, playerId, effectId);
-    if (result?.targetKey) {
-      const runtimeResult = applyHostEffectPatchRuntime(payload.session.id, sessionStateRef.current, result.targetKey, result.patch);
-      if (runtimeResult) {
-        sessionStateRef.current = runtimeResult.state;
-        setSessionState(runtimeResult.state);
-        setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
-      }
-      await sendLatestLiveEvent(payload.session.id, (event) => (
-        event.type === 'effect_patch' &&
-        event.toKey === result.targetKey
-      ));
-    }
+    const result = await removeLanPlayerEffect(db, playerId, effectId, { syncPayload: false });
+    await applyAndSendEffectResult(payload.session.id, result);
     await recordMasterTimelineEvent('Mestre removeu um efeito ativo.');
-    await reloadSessionState(payload.session.id, false);
     scheduleSilentPayloadRefresh(payload.session.id);
   });
 
@@ -4522,7 +4614,7 @@ useLanAppLifecycle({
        const effKind = effectType === 'PV_TEMP' ? 'temp_hp' : effectType === 'HP' ? 'hp' : 'stat';
        const duration = createEffectDurationPayload({ value: qeDuration, unit: qeUnit });
 
-       const result = await addLanPlayerEffect(db, player.id, {
+       const draft: EffectDraft = {
            name: effName,
            target: effTarget,
            value: val,
@@ -4531,35 +4623,10 @@ useLanAppLifecycle({
            durationText: qeIsTemp ? `${duration.remaining} ${duration.unit}` : 'Permanente',
            isPermanent: !qeIsTemp,
            kind: effKind,
+           mode: 'add',
            source: qeIsTemp ? 'Mestre' : 'Mestre (Permanente)',
-       });
-       if (effectType === 'PV_TEMP' && payload?.session?.id) {
-         const nextState = await getLanSessionState(db, payload.session.id);
-         const updatedPlayer = nextState.players.find((entry) => entry.id === player.id);
-         if (updatedPlayer) {
-           sessionStateRef.current = nextState;
-           setSessionState(nextState);
-           setPayload((current) => current ? ({ ...current, state: nextState }) : current);
-           traceApp('STATE_CHANGE', 'MASTER_TEMP_HP_RUNTIME_APPLIED_BY_EFFECT_PATCH', {
-             screen: 'lan-session',
-             source: 'handleApplyQuickEdit',
-             sessionId: payload.session.id,
-             playerId: updatedPlayer.id,
-             playerKey: updatedPlayer.remoteKey,
-             playerName: updatedPlayer.characterName,
-             tempHp: updatedPlayer.tempHp,
-           });
-         }
-       }
-       if (payload?.session?.id && result?.targetKey) {
-         await sendLatestLiveEvent(payload.session.id, (event) => (
-           event.type === 'effect_patch' && event.toKey === result.targetKey
-         ));
-       }
-       if (payload) {
-         await reloadSessionState(payload.session.id, false);
-         scheduleSilentPayloadRefresh(payload.session.id);
-       }
+       };
+       persistHostEffectPatch(player, draft, `${effName} aplicado em ${player.characterName}.`);
     }
     setQuickEdit(null);
   });
@@ -4665,6 +4732,7 @@ useLanAppLifecycle({
       : parseStringArray(snapshot.proficiencies).filter((id) => id.startsWith('skill_'));
     const spellIds = parseStringArray(snapshot.spells);
     const bag = Array.isArray((detailPlayer.equipment as any)?.bag) ? (detailPlayer.equipment as any).bag : [];
+    const equippedItems = getEquippedItemsForMaster(detailPlayer.equipment);
 
     return (
       <Modal visible={!!detailPlayer} transparent animationType="slide">
@@ -4733,6 +4801,21 @@ useLanAppLifecycle({
                   <Text key={`${item?.name || 'item'}-${index}`} style={styles.inventoryText}>
                     {item.qty || 1}x {item.name || 'Item'}{describeInventoryItem(item) ? ` - ${describeInventoryItem(item)}` : ''}
                   </Text>
+                ))}
+              </View>
+
+              <View style={styles.inventoryBox}>
+                <Text style={styles.strongText}>Equipados</Text>
+                {equippedItems.length === 0 ? (
+                  <Text style={styles.inventoryText}>Nenhum equipamento sincronizado como equipado.</Text>
+                ) : equippedItems.map((entry) => (
+                  <View key={entry.slotKey} style={styles.effectRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.effectText}>{entry.slotLabel}: {entry.itemName}</Text>
+                      {!!entry.metaText && <Text style={styles.inventoryText}>{entry.metaText}</Text>}
+                      <Text style={styles.inventoryText}>{entry.effectText ? `Efeitos: ${entry.effectText}` : 'Sem efeitos mecânicos cadastrados.'}</Text>
+                    </View>
+                  </View>
                 ))}
               </View>
 
@@ -4972,7 +5055,7 @@ useLanAppLifecycle({
 
         <TouchableOpacity style={styles.joinSessionButton} onPress={() => {
           traceButton('lan-session', 'OPEN_SESSION_JOIN', { source: 'player_click' });
-          router.push('/sessionJoin' as any);
+          router.replace('/sessionJoin' as any);
         }} disabled={loading}>
           <Ionicons name="qr-code" size={18} color={appColors.success} />
           <Text style={styles.joinSessionButtonText}>ENTRAR EM SESSÃO EXISTENTE</Text>
@@ -5257,6 +5340,7 @@ useLanAppLifecycle({
     const expanded = expandedPlayerIds.includes(player.id);
     const hpPercent = player.hpMax > 0 ? Math.max(0, Math.min(100, (player.hpCurrent / player.hpMax) * 100)) : 0;
     const bagPreview = getBagPreview(player.equipment);
+    const equippedItems = getEquippedItemsForMaster(player.equipment);
     const visibleEffects = getVisibleMasterEffects(player.effects);
 
     return (
@@ -5361,6 +5445,26 @@ useLanAppLifecycle({
                 </TouchableOpacity>
               </View>
               <Text style={styles.inventoryText}>{bagPreview || 'Bolsa vazia ou não sincronizada.'}</Text>
+            </View>
+
+            <View style={styles.inventoryBox}>
+              <View style={styles.rowBetween}>
+                <Text style={styles.strongText}>Equipados</Text>
+                <Text style={styles.mutedText}>{equippedItems.length} slot(s)</Text>
+              </View>
+              {equippedItems.length === 0 ? (
+                <Text style={styles.inventoryText}>Nenhum equipamento sincronizado como equipado.</Text>
+              ) : equippedItems.map((entry) => (
+                <View key={entry.slotKey} style={styles.effectRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.effectText}>{entry.slotLabel}: {entry.itemName}</Text>
+                    {!!entry.metaText && <Text style={styles.inventoryText}>{entry.metaText}</Text>}
+                    <Text style={styles.inventoryText}>
+                      {entry.effectText ? `Efeitos: ${entry.effectText}` : 'Sem efeitos mecânicos cadastrados.'}
+                    </Text>
+                  </View>
+                </View>
+              ))}
             </View>
 
             {visibleEffects.length > 0 && (
@@ -5546,7 +5650,7 @@ useLanAppLifecycle({
       <View style={styles.topBar}>
         <TouchableOpacity onPress={() => {
           traceButton('lan-session', 'LAN_SESSION_BACK', { sessionId: activeSessionId });
-          router.back();
+          router.replace('/' as any);
         }}>
           <Ionicons name="arrow-back" size={28} color={appColors.textPrimary} />
         </TouchableOpacity>
@@ -5633,6 +5737,105 @@ function getBagPreview(equipment: Record<string, unknown>) {
     .slice(0, 5)
     .map((item: any) => `${item.qty || 1}x ${item.name || 'Item'}`)
     .join(', ');
+}
+
+const MASTER_SLOT_LABELS: Record<string, string> = {
+  weapon: 'Arma',
+  mainHand: 'Mão principal',
+  offHand: 'Mão secundária',
+  shield: 'Escudo',
+  armor: 'Armadura',
+  helmet: 'Elmo',
+  cloak: 'Capa',
+  amulet: 'Amuleto',
+  ring: 'Anel',
+  boots: 'Botas',
+  gloves: 'Luvas',
+};
+
+type MasterEquippedItemSummary = {
+  slotKey: string;
+  slotLabel: string;
+  itemName: string;
+  metaText: string;
+  effectText: string;
+};
+
+function getEquippedItemsForMaster(equipment: Record<string, unknown>): MasterEquippedItemSummary[] {
+  const normalized = normalizeHostEquipment(equipment);
+  const slots = normalized.slots && typeof normalized.slots === 'object' ? normalized.slots : {};
+
+  return Object.entries(slots)
+    .map(([slotKey, rawItem]) => {
+      const item = normalizeEquippedItem(rawItem);
+      if (!item) return null;
+      const itemName = String(item.name || item.nome || item.label || '').trim();
+      if (!itemName) return null;
+      return {
+        slotKey,
+        slotLabel: MASTER_SLOT_LABELS[slotKey] || formatMasterSlotLabel(slotKey),
+        itemName,
+        metaText: describeInventoryItem(item),
+        effectText: summarizeInventoryItemEffects(item),
+      };
+    })
+    .filter(Boolean) as MasterEquippedItemSummary[];
+}
+
+function normalizeEquippedItem(value: unknown): Record<string, any> | null {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === 'object') return value as Record<string, any>;
+  return null;
+}
+
+function formatMasterSlotLabel(slotKey: string) {
+  return String(slotKey || 'slot')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function summarizeInventoryItemEffects(item: Record<string, unknown>) {
+  const effects = [
+    ...parseOptionEffects(item.effect_json),
+    ...(Array.isArray((item as any).effects) ? (item as any).effects.map(normalizeCatalogEffect) : []),
+  ];
+
+  const unique = new Set<string>();
+  const parts = effects
+    .map(formatInventoryItemEffect)
+    .filter((part) => {
+      if (!part || unique.has(part)) return false;
+      unique.add(part);
+      return true;
+    });
+
+  return parts.join('; ');
+}
+
+function formatInventoryItemEffect(effect: Record<string, any>) {
+  const target = String(effect.target || effect.stat || '').toUpperCase();
+  const value = Number(effect.value ?? effect.amount ?? 0) || 0;
+  const conditionName = String(effect.conditionName || effect.name || effect.status || effect.statusKey || '').trim();
+  const saveInfo = formatEffectSaveInfo(effect);
+
+  let base = '';
+  if (target === 'PV_TEMP') base = `PV temp ${value > 0 ? '+' : ''}${value}`;
+  else if (target === 'HP') base = `HP ${value > 0 ? '+' : ''}${value}`;
+  else if (target && target !== 'CUSTOM' && target !== 'UNDEFINED') base = `${target} ${value > 0 ? '+' : ''}${value}`;
+  else if (conditionName) base = conditionName;
+
+  if (!base && saveInfo) base = saveInfo;
+  else if (base && saveInfo) base = `${base} (${saveInfo})`;
+
+  return base.trim();
 }
 
 function makeEffectDraftFromOption(option: EffectOption): EffectDraft {

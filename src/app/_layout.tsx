@@ -30,7 +30,11 @@ export default function RootLayout() {
             }}
           >
             <Stack.Screen name="index" options={{ headerShown: false }} />
-            <Stack.Screen name="create" options={{ headerShown: false }} />
+            <Stack.Screen name="create" options={{ headerShown: false, gestureEnabled: false }} />
+            <Stack.Screen name="sessionJoin" options={{ headerShown: false, gestureEnabled: false }} />
+            <Stack.Screen name="lan-session" options={{ headerShown: false, gestureEnabled: false }} />
+            <Stack.Screen name="sheet" options={{ headerShown: false, gestureEnabled: false }} />
+            <Stack.Screen name="edit" options={{ headerShown: false }} />
             <Stack.Screen name="debug-trace" options={{ headerShown: false }} />
           </Stack>
         </LinearGradient>

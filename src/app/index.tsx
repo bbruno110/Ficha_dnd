@@ -4,7 +4,7 @@ import Constants from 'expo-constants'; // 1. Importar o Constants
 import { LinearGradient } from 'expo-linear-gradient';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { Alert, FlatList, Text, TouchableOpacity, View } from 'react-native';
 import CharacterCard, { Character } from '../components/CharacterCard';
 
@@ -16,6 +16,24 @@ export default function HomeScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const [charactersList, setCharactersList] = useState<Character[]>([]);
+  const navigationGateRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
+
+  const runNavigationOnce = (key: string, navigate: () => void) => {
+    const now = Date.now();
+    const gate = navigationGateRef.current;
+    if (gate.key === key && now - gate.at < 1200) {
+      return false;
+    }
+
+    navigationGateRef.current = { key, at: now };
+    requestAnimationFrame(navigate);
+    setTimeout(() => {
+      if (navigationGateRef.current.key === key) {
+        navigationGateRef.current = { key: '', at: 0 };
+      }
+    }, 1500);
+    return true;
+  };
 
   const appVersion = Constants.expoConfig?.version || '1.0.0';
 
@@ -99,17 +117,21 @@ export default function HomeScreen() {
   };
 
   const handleOpenSheet = (character: Character) => {
-    traceButton('home', 'OPEN_CHARACTER_SHEET', {
+    const routeKey = `sheet:${character.id}:${character.sessionId || 'offline'}`;
+    const accepted = runNavigationOnce(routeKey, () => {
+      if (character.sessionId) {
+        router.replace(`/sheet?id=${character.id}&sessionId=${character.sessionId}&joinUrl=${encodeURIComponent(character.joinUrl || '')}` as any);
+        return;
+      }
+      router.replace(`/sheet?id=${character.id}` as any);
+    });
+
+    traceButton('home', accepted ? 'OPEN_CHARACTER_SHEET' : 'OPEN_CHARACTER_SHEET_IGNORED_IN_FLIGHT', {
       characterId: character.id,
       characterName: character.name,
       sessionId: character.sessionId,
       source: character.sessionId ? 'lan_binding' : 'offline',
     });
-    if (character.sessionId) {
-      router.push(`/sheet?id=${character.id}&sessionId=${character.sessionId}&joinUrl=${encodeURIComponent(character.joinUrl || '')}` as any);
-      return;
-    }
-    router.push(`/sheet?id=${character.id}`);
   };
 
   return (
@@ -165,7 +187,7 @@ export default function HomeScreen() {
 
         <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => {
           traceButton('home', 'OPEN_LAN_SESSION');
-          router.push('/lan-session' as any);
+          runNavigationOnce('lan-session', () => router.replace('/lan-session' as any));
         }}>
           <Ionicons name="wifi-outline" size={20} color={appColors.success} style={styles.buttonIconGap} />
           <Text style={styles.lanButtonText}>SESSAO LAN</Text>
@@ -173,7 +195,7 @@ export default function HomeScreen() {
 
         <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => {
           traceButton('home', 'CREATE_CHARACTER');
-          router.push('/create');
+          runNavigationOnce('create-character', () => router.replace('/create' as any));
         }}>
           <Text style={styles.createButtonIcon}>+</Text>
           <Text style={styles.createButtonText}>NOVO PERSONAGEM</Text>

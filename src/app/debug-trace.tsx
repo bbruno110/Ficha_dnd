@@ -8,6 +8,7 @@ import {
   type AppTraceRecord,
   type AppTraceState,
 } from '@/services/debug/appTrace';
+import { notifyLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import { appColors, appGradients } from '@/styles/globalStyles';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
@@ -15,7 +16,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   FlatList,
@@ -73,6 +74,38 @@ export default function DebugTraceScreen() {
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [levelFilter, setLevelFilter] = useState<(typeof LEVELS)[number]>('all');
   const [selectedLog, setSelectedLog] = useState<AppTraceRecord | null>(null);
+  const shareInProgressRef = useRef(false);
+  const [sharingNow, setSharingNow] = useState(false);
+
+  const shareFileSafely = async (
+    fileUri: string,
+    options: { mimeType: string; dialogTitle: string; UTI: string },
+  ) => {
+    if (shareInProgressRef.current) {
+      Alert.alert('Debug Trace', 'Já existe um compartilhamento aberto. Conclua ou cancele o envio atual antes de gerar outro arquivo.');
+      notifyLanForegroundRecovery('debug_trace_share_returned');
+      return;
+    }
+
+    shareInProgressRef.current = true;
+    setSharingNow(true);
+    try {
+      await Sharing.shareAsync(fileUri, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (/another share request/i.test(message) || /share request is being processed/i.test(message)) {
+        Alert.alert('Debug Trace', 'O Android ainda está processando outro compartilhamento. Aguarde alguns segundos e tente novamente.');
+        return;
+      }
+      throw error;
+    } finally {
+      setSharingNow(false);
+      setTimeout(() => {
+        shareInProgressRef.current = false;
+        notifyLanForegroundRecovery('debug_trace_share_returned');
+      }, 900);
+    }
+  };
 
   useEffect(() => {
     const refresh = () => setTraceState(getTraceState());
@@ -221,7 +254,7 @@ export default function DebugTraceScreen() {
         return;
       }
 
-      await Sharing.shareAsync(fileUri, {
+      await shareFileSafely(fileUri, {
         mimeType: getMimeType(format),
         dialogTitle: `Compartilhar ${fileName}`,
         UTI: format === 'json' ? 'public.json' : 'public.plain-text',
@@ -308,7 +341,7 @@ export default function DebugTraceScreen() {
         return;
       }
 
-      await Sharing.shareAsync(fileUri, {
+      await shareFileSafely(fileUri, {
         mimeType: 'text/plain',
         dialogTitle: `Compartilhar ${fileName}`,
         UTI: 'public.plain-text',
@@ -361,27 +394,27 @@ export default function DebugTraceScreen() {
       <ScrollView style={styles.controlsScroll} showsVerticalScrollIndicator={false}>
         <Text style={styles.sectionTitle}>Gerar arquivo completo</Text>
         <View style={styles.toolbar}>
-          <TraceButton label="Arquivo TXT" onPress={() => fileAll('txt')} />
-          <TraceButton label="Arquivo JSON" onPress={() => fileAll('json')} />
-          <TraceButton label="Arquivo JSONL" onPress={() => fileAll('jsonl')} />
-          <TraceButton label="TXT compacto" onPress={() => fileAll('txt', true)} />
+          <TraceButton label={sharingNow ? 'Compartilhando...' : 'Arquivo TXT'} disabled={sharingNow} onPress={() => fileAll('txt')} />
+          <TraceButton label="Arquivo JSON" disabled={sharingNow} onPress={() => fileAll('json')} />
+          <TraceButton label="Arquivo JSONL" disabled={sharingNow} onPress={() => fileAll('jsonl')} />
+          <TraceButton label="TXT compacto" disabled={sharingNow} onPress={() => fileAll('txt', true)} />
         </View>
 
         <Text style={styles.sectionTitle}>Gerar arquivo filtrado</Text>
         <View style={styles.toolbar}>
-          <TraceButton label="Filtrado TXT" onPress={() => fileFiltered('txt')} />
-          <TraceButton label="Filtrado JSON" onPress={() => fileFiltered('json')} />
-          <TraceButton label="Filtrado JSONL" onPress={() => fileFiltered('jsonl')} />
-          <TraceButton label="Crítico TXT" onPress={() => fileCritical('txt', true)} />
-          <TraceButton label="Crítico JSONL" onPress={() => fileCritical('jsonl', true)} />
+          <TraceButton label="Filtrado TXT" disabled={sharingNow} onPress={() => fileFiltered('txt')} />
+          <TraceButton label="Filtrado JSON" disabled={sharingNow} onPress={() => fileFiltered('json')} />
+          <TraceButton label="Filtrado JSONL" disabled={sharingNow} onPress={() => fileFiltered('jsonl')} />
+          <TraceButton label="Crítico TXT" disabled={sharingNow} onPress={() => fileCritical('txt', true)} />
+          <TraceButton label="Crítico JSONL" disabled={sharingNow} onPress={() => fileCritical('jsonl', true)} />
         </View>
 
         <Text style={styles.sectionTitle}>Gerar recortes</Text>
         <View style={styles.toolbar}>
-          <TraceButton label="Últimos 200 TXT" onPress={() => fileLast200('txt')} />
-          <TraceButton label="Últimos 200 JSON" onPress={() => fileLast200('json')} />
-          <TraceButton label="Últimos 200 JSONL" onPress={() => fileLast200('jsonl')} />
-          <TraceButton label="Arquivo resumo" onPress={fileSummary} />
+          <TraceButton label="Últimos 200 TXT" disabled={sharingNow} onPress={() => fileLast200('txt')} />
+          <TraceButton label="Últimos 200 JSON" disabled={sharingNow} onPress={() => fileLast200('json')} />
+          <TraceButton label="Últimos 200 JSONL" disabled={sharingNow} onPress={() => fileLast200('jsonl')} />
+          <TraceButton label="Arquivo resumo" disabled={sharingNow} onPress={fileSummary} />
         </View>
 
         <Text style={styles.sectionTitle}>Copiar para área de transferência</Text>
@@ -482,8 +515,8 @@ export default function DebugTraceScreen() {
             <View style={styles.modalToolbar}>
               <TraceButton label="Copiar TXT" onPress={() => copySelected('txt')} />
               <TraceButton label="Copiar JSON" onPress={() => copySelected('json')} />
-              <TraceButton label="Arquivo TXT" onPress={() => fileSelected('txt')} />
-              <TraceButton label="Arquivo JSON" onPress={() => fileSelected('json')} />
+              <TraceButton label="Arquivo TXT" disabled={sharingNow} onPress={() => fileSelected('txt')} />
+              <TraceButton label="Arquivo JSON" disabled={sharingNow} onPress={() => fileSelected('json')} />
             </View>
 
             <ScrollView style={styles.modalBody}>
@@ -501,14 +534,20 @@ export default function DebugTraceScreen() {
 function TraceButton({
   label,
   danger,
+  disabled,
   onPress,
 }: {
   label: string;
   danger?: boolean;
+  disabled?: boolean;
   onPress: () => void;
 }) {
   return (
-    <TouchableOpacity style={[styles.toolbarButton, danger && styles.toolbarButtonDanger]} onPress={onPress}>
+    <TouchableOpacity
+      style={[styles.toolbarButton, danger && styles.toolbarButtonDanger, disabled && { opacity: 0.45 }]}
+      disabled={disabled}
+      onPress={onPress}
+    >
       <Text style={[styles.toolbarButtonText, danger && styles.toolbarButtonTextDanger]}>
         {label}
       </Text>

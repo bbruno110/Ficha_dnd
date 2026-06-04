@@ -94,12 +94,17 @@ let clientSocket: TcpSocket | null = null;
 let clientUrl = '';
 let clientPayload: LanSessionPayload | null = null;
 let clientEvents: LanSessionEvent[] = [];
+let clientLastPayloadStatus = '';
+let clientSyntheticStatusEventIds = new Set<string>();
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
 export type ClientUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string; payload?: LanSessionPayload };
 let clientUpdateListeners = new Set<(update?: ClientUpdate) => void>();
 let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
 let clientJoinAckWaiters = new Set<ClientJoinAckWaiter>();
 let clientHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let clientBoundPlayerKey = '';
+let clientBoundLastAppliedSeq = 0;
+let clientBoundKnownRevisions: Record<string, number> | undefined;
 const closedSockets = new WeakSet<TcpSocket>();
 
 type ClientPayloadWaiter = {
@@ -674,7 +679,7 @@ export async function sendLanTcpEvent(url: string | undefined, event: LanSession
     return true;
   }
 
-  await connectLanTcpClient(url);
+  await connectLanTcpClient(url, { playerKey: wireEvent.fromKey && wireEvent.fromKey !== 'master' ? wireEvent.fromKey : undefined });
   if (!clientSocket) throw new Error('Socket TCP indisponivel.');
   const envelopeType = wireEvent.toKey === 'master' ? 'event_propose' : 'event';
   if (sendEnvelope(clientSocket, { type: envelopeType, event: wireEvent })) {
@@ -687,7 +692,7 @@ export async function sendLanTcpEvent(url: string | undefined, event: LanSession
     return true;
   }
 
-  await connectLanTcpClient(url, { forceReconnect: true });
+  await connectLanTcpClient(url, { forceReconnect: true, playerKey: wireEvent.fromKey && wireEvent.fromKey !== 'master' ? wireEvent.fromKey : undefined });
   if (!clientSocket || !sendEnvelope(clientSocket, { type: envelopeType, event: wireEvent })) {
     throw new Error('Socket TCP indisponivel.');
   }
@@ -722,6 +727,7 @@ export async function sendLanTcpAck(url: string | undefined, ack: { sessionId: s
   }
 
   if (clientSocket && clientUrl === url) {
+    if (ack.playerKey) sendClientHello(url, clientSocket, { playerKey: ack.playerKey, lastAppliedSeq: ack.lastAppliedSeq });
     const result = sendEnvelope(clientSocket, { type: 'event_ack', ...ack });
     traceFunctionReturn('sendLanTcpAck', { result }, {
       source: 'lanTcpTransport',
@@ -732,7 +738,7 @@ export async function sendLanTcpAck(url: string | undefined, ack: { sessionId: s
     return result;
   }
 
-  await connectLanTcpClient(url, { forceReconnect: true });
+  await connectLanTcpClient(url, { forceReconnect: true, playerKey: ack.playerKey, lastAppliedSeq: ack.lastAppliedSeq });
   if (!clientSocket) return false;
   const result = sendEnvelope(clientSocket, { type: 'event_ack', ...ack });
   traceFunctionReturn('sendLanTcpAck', { result, reconnected: true }, {
@@ -769,6 +775,7 @@ export async function sendLanTcpNack(url: string | undefined, nack: { sessionId:
   }
 
   if (clientSocket && clientUrl === url) {
+    if (nack.playerKey) sendClientHello(url, clientSocket, { playerKey: nack.playerKey });
     const result = sendEnvelope(clientSocket, { type: 'event_nack', ...nack });
     traceFunctionReturn('sendLanTcpNack', { result }, {
       source: 'lanTcpTransport',
@@ -780,7 +787,7 @@ export async function sendLanTcpNack(url: string | undefined, nack: { sessionId:
     return result;
   }
 
-  await connectLanTcpClient(url, { forceReconnect: true });
+  await connectLanTcpClient(url, { forceReconnect: true, playerKey: nack.playerKey });
   if (!clientSocket) return false;
   const result = sendEnvelope(clientSocket, { type: 'event_nack', ...nack });
   traceFunctionReturn('sendLanTcpNack', { result, reconnected: true }, {
@@ -802,17 +809,41 @@ export async function requestLanTcpResync(url: string | undefined, request: { se
   });
 
   if (clientSocket && clientUrl === url) {
+    if (request.playerKey) {
+      sendClientHello(url, clientSocket, {
+        playerKey: request.playerKey,
+        lastAppliedSeq: request.lastAppliedSeq,
+        knownRevisions: request.knownRevisions,
+      });
+    }
     const result = sendEnvelope(clientSocket, { type: 'resync_request', ...request });
-    traceFunctionReturn('requestLanTcpResync', { result }, {
-      source: 'lanTcpTransport',
-      sessionId: request.sessionId,
-      playerKey: request.playerKey,
-    });
-    return result;
+    if (result) {
+      traceFunctionReturn('requestLanTcpResync', { result }, {
+        source: 'lanTcpTransport',
+        sessionId: request.sessionId,
+        playerKey: request.playerKey,
+      });
+      return true;
+    }
+
+    // Socket aparentemente existe, mas nao aceitou escrita. Recria e reenvia
+    // para evitar voltar da Home/index ou de outro app preso em snapshot.
+    closeClientSocket();
+    clientPayload = null;
   }
 
-  await connectLanTcpClient(url, { forceReconnect: true });
+  await connectLanTcpClient(url, {
+    forceReconnect: true,
+    playerKey: request.playerKey,
+    lastAppliedSeq: request.lastAppliedSeq,
+    knownRevisions: request.knownRevisions,
+  });
   if (!clientSocket) return false;
+  sendClientHello(url, clientSocket, {
+    playerKey: request.playerKey,
+    lastAppliedSeq: request.lastAppliedSeq,
+    knownRevisions: request.knownRevisions,
+  });
   const result = sendEnvelope(clientSocket, { type: 'resync_request', ...request });
   traceFunctionReturn('requestLanTcpResync', { result, reconnected: true }, {
     source: 'lanTcpTransport',
@@ -837,7 +868,7 @@ export async function getLanTcpClientEvents(
       .filter((event) => shouldReturnEventToClient(event, filterOptions))
       .sort(compareEventsAscending);
   }
-  await connectLanTcpClient(url);
+  await connectLanTcpClient(url, { playerKey, lastAppliedSeq: minSeq });
   return clientEvents
     .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) <= 0 || getEventSeq(event) > minSeq))
     .filter((event) => shouldReturnEventToClient(event, filterOptions))
@@ -855,10 +886,32 @@ function isCurrentHostUrl(url?: string) {
   }
 }
 
-async function connectLanTcpClient(url: string, options?: { requestFresh?: boolean; forceReconnect?: boolean }) {
+function rememberClientBinding(options?: { playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
+  if (options?.playerKey) clientBoundPlayerKey = options.playerKey;
+  if (options?.lastAppliedSeq != null) clientBoundLastAppliedSeq = Math.max(0, Math.floor(Number(options.lastAppliedSeq) || 0));
+  if (options?.knownRevisions) clientBoundKnownRevisions = options.knownRevisions;
+}
+
+function sendClientHello(url: string, socket: TcpSocket, options?: { playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
+  rememberClientBinding(options);
+  const target = parseTcpUrl(url);
+  return sendEnvelope(socket, {
+    type: 'hello',
+    sessionId: target.sessionId,
+    playerKey: clientBoundPlayerKey || undefined,
+    lastAppliedSeq: clientBoundLastAppliedSeq || undefined,
+    knownRevisions: clientBoundKnownRevisions,
+  });
+}
+
+async function connectLanTcpClient(url: string, options?: { requestFresh?: boolean; forceReconnect?: boolean; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
   if (!isTcpLanUrl(url)) throw new Error('URL TCP invalida.');
+  rememberClientBinding(options);
 
   if (clientSocket && clientUrl === url && clientPayload && !options?.forceReconnect) {
+    if (options?.playerKey || options?.knownRevisions || options?.lastAppliedSeq != null) {
+      sendClientHello(url, clientSocket, options);
+    }
     if (!options?.requestFresh) return clientPayload;
 
     const target = parseTcpUrl(url);
@@ -868,6 +921,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
     closeClientSocket();
     clientPayload = null;
     clientEvents = [];
+    clientLastPayloadStatus = '';
   }
 
   if (clientConnectPromise && clientUrl === url) return clientConnectPromise;
@@ -876,6 +930,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
   clientUrl = url;
   clientPayload = null;
   clientEvents = [];
+  clientLastPayloadStatus = '';
 
   const TcpSocket = loadTcpSocket();
   const target = parseTcpUrl(url);
@@ -891,7 +946,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       connectTimeout: 5000,
     }, () => {
       configureSocket(socket);
-      sendEnvelope(socket, { type: 'hello', sessionId: target.sessionId });
+      sendClientHello(url, socket, options);
     });
 
     const cleanupClientSocket = (resetUrl = false) => {
@@ -931,12 +986,26 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         });
         return false;
       }
+      const previousStatus = clientLastPayloadStatus || String(clientPayload?.state?.status || '');
       clientPayload = payload;
       clientSocket = socket;
       mergeClientPayloadEvents(payload, target.sessionId);
       resolveClientPayloadWaiters(payload);
+      const nextStatus = String(payload.state?.status || 'active');
+      clientLastPayloadStatus = nextStatus;
       if (updateOptions?.notify !== false) {
         notifyClientUpdates({ reason: 'payload_update', payload });
+      }
+      // Snapshot/payload nao deve atualizar HP/efeitos/inventario, mas status de
+      // ciclo de vida e critico. Se o evento direto perdeu, cria evento sintetico
+      // estavel para a UI entrar em pausa/encerrar sem esperar polling.
+      if (previousStatus && nextStatus && previousStatus !== nextStatus) {
+        const synthetic = makeSyntheticSessionStatusEvent(payload, nextStatus);
+        if (synthetic && !clientSyntheticStatusEventIds.has(synthetic.id)) {
+          clientSyntheticStatusEventIds.add(synthetic.id);
+          upsertByKey(clientEvents, synthetic, 'id');
+          notifyClientUpdates({ reason: 'payload_status', event: synthetic, envelopeType: 'payload_update', payload });
+        }
       }
       traceApp('PAYLOAD_APPLIED', 'PAYLOAD_STRUCTURAL_CACHE_APPLIED', {
         source: 'lanTcpTransport.applyPayloadUpdate',
@@ -1065,11 +1134,11 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
             source: 'lanTcpTransport.resync_events',
             ...getEnvelopeTraceFields({ type: 'event_commit', event: normalizedEvent }),
           });
+          notifyClientUpdates({ reason: 'resync_events', event: normalizedEvent, envelopeType: 'resync_events' });
         }
         if (message.payload) {
           applyPayloadUpdate(message.payload, { notify: false });
         }
-        notifyClientUpdates({ reason: 'resync_events', envelopeType: 'resync_events' });
         return;
       }
 
@@ -1158,6 +1227,65 @@ function fetchLanTcpProbePayload(host: string, timeoutMs: number) {
       finish(null);
     }
   });
+}
+
+
+function makeSyntheticSessionStatusEvent(payload: LanSessionPayload, status: string): LanSessionEvent | null {
+  const sessionId = String(payload.session?.id || '');
+  if (!sessionId) return null;
+  const now = new Date().toISOString();
+  const seq = Date.now();
+  if (status === 'ended') {
+    return normalizeWireEvent({
+      id: `synthetic_session_ended_${sessionId}`,
+      sessionId,
+      type: 'session_ended',
+      fromKey: 'master',
+      fromName: payload.session?.masterName || 'Mestre',
+      toKey: 'all',
+      toName: 'Todos',
+      entityType: 'session',
+      entityId: sessionId,
+      entityRevision: seq,
+      seq,
+      serverSeq: seq,
+      ackRequired: true,
+      sessionEnded: {
+        endedAt: now,
+        reason: 'payload_status_ended',
+        unlinkPlayers: true,
+        allowOfflineAfterEnd: true,
+      },
+      message: 'Sessao encerrada pelo mestre.',
+      createdAt: now,
+    });
+  }
+  if (status === 'paused' || status === 'active') {
+    return normalizeWireEvent({
+      id: `synthetic_session_patch_${sessionId}_${status}`,
+      sessionId,
+      type: 'session_patch',
+      fromKey: 'master',
+      fromName: payload.session?.masterName || 'Mestre',
+      toKey: 'all',
+      toName: 'Todos',
+      entityType: 'session',
+      entityId: sessionId,
+      entityRevision: seq,
+      seq,
+      serverSeq: seq,
+      ackRequired: true,
+      sessionPatch: {
+        status: status as any,
+        reason: 'payload_status_change',
+        keepPlayersLinked: status === 'paused',
+        readOnlyForPlayers: status === 'paused',
+      },
+      message: status === 'paused' ? 'Sessao pausada pelo mestre.' : 'Sessao continuada pelo mestre.',
+      createdAt: now,
+    });
+  }
+  return null;
 }
 
 function makeHostPayload() {
@@ -1997,6 +2125,9 @@ export function resetLanTcpClient() {
   clientPayload = null;
   clientEvents = [];
   clientConnectPromise = null;
+  clientBoundPlayerKey = '';
+  clientBoundLastAppliedSeq = 0;
+  clientBoundKnownRevisions = undefined;
   clearClientPayloadWaiters();
   clearClientJoinAckWaiters(new Error('Cliente LAN resetado.'));
 }

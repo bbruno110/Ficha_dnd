@@ -1062,6 +1062,8 @@ export async function getLocalLanSessionForCharacter(db: SQLiteDatabase, charact
      JOIN lan_sessions s ON s.id = b.session_id
      WHERE b.character_id = ?
        AND COALESCE(b.is_active, 1) = 1
+       AND COALESCE(s.active, 1) = 1
+       AND COALESCE(s.status, 'active') != 'ended'
      ORDER BY COALESCE(b.updated_at, b.joined_at) DESC
      LIMIT 1`,
     [characterId]
@@ -1088,6 +1090,8 @@ export async function getBoundLanCharacter(db: SQLiteDatabase, sessionId: string
      JOIN lan_sessions s ON s.id = b.session_id
      WHERE b.session_id = ?
        AND COALESCE(b.is_active, 1) = 1
+       AND COALESCE(s.active, 1) = 1
+       AND COALESCE(s.status, 'active') != 'ended'
      ORDER BY COALESCE(b.updated_at, b.joined_at) DESC
      LIMIT 1`,
     [sessionId]
@@ -1112,6 +1116,8 @@ export async function getCharacterLanBinding(db: SQLiteDatabase, characterId: nu
      JOIN lan_sessions s ON s.id = b.session_id
      WHERE b.character_id = ?
        AND COALESCE(b.is_active, 1) = 1
+       AND COALESCE(s.active, 1) = 1
+       AND COALESCE(s.status, 'active') != 'ended'
      ORDER BY COALESCE(b.updated_at, b.joined_at) DESC
      LIMIT 1`,
     [characterId]
@@ -2169,7 +2175,7 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
     if (request.kind === 'xp') {
       await updateLanPlayerNumbers(db, playerId, {
         xp: Math.max(0, toNumber(player.xp) + toNumber(request.amount)),
-      });
+      }, { syncPayload: false });
     }
 
     if (request.kind === 'hp') {
@@ -2184,14 +2190,14 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
         await updateLanPlayerNumbers(db, playerId, {
           hpCurrent: damage.nextHpCurrent,
           tempHp: damage.nextTempHp,
-        });
+        }, { syncPayload: false });
         if (damage.absorbedTempHp > 0) {
-          await consumeLanPlayerTempHpAfterDamage(db, playerId, damage.absorbedTempHp);
+          await consumeLanPlayerTempHpAfterDamage(db, playerId, damage.absorbedTempHp, { syncPayload: false });
         }
       } else {
         await updateLanPlayerNumbers(db, playerId, {
           hpCurrent: Math.max(0, Math.min(toNumber(player.hp_max), toNumber(player.hp_current) + amount)),
-        });
+        }, { syncPayload: false });
       }
     }
 
@@ -2199,7 +2205,7 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
       const requestedTempHp = Math.max(0, toNumber(request.amount ?? request.value));
       await updateLanPlayerNumbers(db, playerId, {
         tempHp: Math.max(0, Math.max(toNumber(player.temp_hp), requestedTempHp)),
-      });
+      }, { syncPayload: false });
     }
 
     if (request.kind === 'coin') {
@@ -2207,7 +2213,7 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
       if (coinField) {
         await updateLanPlayerNumbers(db, playerId, {
           [coinField]: Math.max(0, toNumber(player[coinField]) + toNumber(request.amount ?? request.value)),
-        });
+        }, { syncPayload: false });
       }
     }
 
@@ -2223,7 +2229,7 @@ export async function applyLanResourceRequest(db: SQLiteDatabase, event: LanSess
         kind: request.kind === 'condition' ? 'status' : request.field === 'PV_TEMP' ? 'temp_hp' : request.field === 'HP' ? 'hp' : 'stat',
         status: request.kind === 'condition' ? request.field : undefined,
         source: event.fromName,
-      });
+      }, { syncPayload: false });
     }
 
     if (request.kind === 'inventory' && request.item) {
@@ -2315,13 +2321,25 @@ export async function reviewLanPlayerPendingSnapshot(db: SQLiteDatabase, playerI
   await syncLanSessionPayload(db, sessionId);
 }
 
+type LanEffectMutationOptions = {
+  /**
+   * syncPayload=false keeps the LAN hot path fast. The caller can debounce
+   * payload rebuilds later; live state is delivered by event_commit.
+   */
+  syncPayload?: boolean;
+  /** When false, only mutates SQLite/cache and does not create a lan_session_events row. */
+  recordEvent?: boolean;
+};
+
 export async function addLanPlayerEffect(
   db: SQLiteDatabase,
   playerId: number,
-  effect: Omit<LanSessionEffect, 'id'>
+  effect: Omit<LanSessionEffect, 'id'> & { id?: string },
+  options: LanEffectMutationOptions = {},
 ) {
   await ensureLanSchema(db);
   const result = await applyEffectToPlayer(db, playerId, {
+    id: (effect as any).id,
     statusKey: effect.statusKey || effect.status,
     name: effect.name,
     target: effect.target,
@@ -2347,9 +2365,13 @@ export async function addLanPlayerEffect(
   });
   if (!result) return;
 
-  await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.snapshot.name} aplicado em ${result.targetName}.`);
-  await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
-  return result;
+  const event = options.recordEvent === false
+    ? null
+    : await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.snapshot.name} aplicado em ${result.targetName}.`);
+  if (options.syncPayload !== false) {
+    await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
+  }
+  return { ...result, event };
 }
 
 export async function addLanPlayerEffectsBatch(
@@ -2357,6 +2379,7 @@ export async function addLanPlayerEffectsBatch(
   playerId: number,
   effects: Omit<LanSessionEffect, 'id'>[],
   message?: string,
+  options: LanEffectMutationOptions = {},
 ) {
   await ensureLanSchema(db);
   const results = [];
@@ -2403,8 +2426,12 @@ export async function addLanPlayerEffectsBatch(
   const effectCount = patch.add.length + patch.update.length;
   const eventMessage = message || `Mestre aplicou ${effectCount} efeito(s) em ${first.targetName}.`;
 
-  await recordEffectPatchEvent(db, first.sessionId, first.targetKey, first.targetName, patch, eventMessage);
-  await syncLanSessionPayload(db, first.sessionId, { broadcast: false });
+  const event = options.recordEvent === false
+    ? null
+    : await recordEffectPatchEvent(db, first.sessionId, first.targetKey, first.targetName, patch, eventMessage);
+  if (options.syncPayload !== false) {
+    await syncLanSessionPayload(db, first.sessionId, { broadcast: false });
+  }
 
   return {
     sessionId: first.sessionId,
@@ -2412,17 +2439,22 @@ export async function addLanPlayerEffectsBatch(
     targetName: first.targetName,
     patch,
     results,
+    event,
   };
 }
 
-export async function removeLanPlayerEffect(db: SQLiteDatabase, playerId: number, effectId: string) {
+export async function removeLanPlayerEffect(db: SQLiteDatabase, playerId: number, effectId: string, options: LanEffectMutationOptions = {}) {
   await ensureLanSchema(db);
   const result = await removeEffectFromPlayer(db, playerId, effectId);
   if (!result) return;
 
-  await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.removed.name} removido de ${result.targetName}.`);
-  await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
-  return result;
+  const event = options.recordEvent === false
+    ? null
+    : await recordEffectPatchEvent(db, result.sessionId, result.targetKey, result.targetName, result.patch, `${result.removed.name} removido de ${result.targetName}.`);
+  if (options.syncPayload !== false) {
+    await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
+  }
+  return { ...result, event };
 }
 
 export async function removeLanPlayerTempHpEffects(db: SQLiteDatabase, playerId: number) {
@@ -2435,27 +2467,32 @@ export async function removeLanPlayerTempHpEffects(db: SQLiteDatabase, playerId:
   return result;
 }
 
-export async function consumeLanPlayerTempHpAfterDamage(db: SQLiteDatabase, playerId: number, absorbedTempHp: number) {
+export async function consumeLanPlayerTempHpAfterDamage(db: SQLiteDatabase, playerId: number, absorbedTempHp: number, options: LanEffectMutationOptions = {}) {
   await ensureLanSchema(db);
   const result = await consumeTempHpFromPlayer(db, playerId, absorbedTempHp);
   if (!result) return;
 
   const hasPatch = Boolean((result.patch.update?.length || 0) > 0 || (result.patch.remove?.length || 0) > 0);
   if (hasPatch) {
-    await recordEffectPatchEvent(
-      db,
-      result.sessionId,
-      result.targetKey,
-      result.targetName,
-      result.patch,
-      `PV temporario absorveu ${result.absorbed} de dano de ${result.targetName}.`,
-    );
-    await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
+    const event = options.recordEvent === false
+      ? null
+      : await recordEffectPatchEvent(
+        db,
+        result.sessionId,
+        result.targetKey,
+        result.targetName,
+        result.patch,
+        `PV temporario absorveu ${result.absorbed} de dano de ${result.targetName}.`,
+      );
+    if (options.syncPayload !== false) {
+      await syncLanSessionPayload(db, result.sessionId, { broadcast: false });
+    }
+    return { ...result, event };
   }
   return result;
 }
 
-export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: string, unit: LanAdvanceUnit) {
+export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: string, unit: LanAdvanceUnit, options: { syncPayload?: boolean } = {}) {
   await ensureLanSchema(db);
   const session = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT current_turn, elapsed_minutes FROM lan_sessions WHERE id = ?`,
@@ -2516,6 +2553,9 @@ export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: strin
     });
   }
 
+  if (options.syncPayload === false) {
+    return null;
+  }
   return syncLanSessionPayload(db, sessionId);
 }
 
@@ -2526,8 +2566,8 @@ async function recordEffectPatchEvent(
   targetName: string,
   patch: LanEffectPatch,
   message: string,
-) {
-  await rememberLanSessionEvent(db, {
+): Promise<LanSessionEvent> {
+  const event: LanSessionEvent = {
     id: makeLanEventId(),
     sessionId,
     type: 'effect_patch',
@@ -2542,7 +2582,9 @@ async function recordEffectPatchEvent(
     effectPatch: patch,
     message,
     createdAt: new Date().toISOString(),
-  });
+  };
+  const result = await commitLanEvent(db, event);
+  return result.event;
 }
 
 function normalizeJsonColumn(value: unknown) {

@@ -994,8 +994,10 @@ export default function CreateCharacterScreen() {
         router.replace(`/edit?id=${newCharacterId}&levelUpTo=${targetSessionLevel}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(firstParam(joinUrl) || '')}` as any);
       } else if (sessionId && newCharacterId) {
         router.replace(`/sheet?id=${newCharacterId}&sessionId=${sessionId}&joinUrl=${encodeURIComponent(firstParam(joinUrl) || '')}` as any);
+      } else if (newCharacterId) {
+        router.replace(`/sheet?id=${newCharacterId}` as any);
       } else {
-        router.back();
+        router.replace('/' as any);
       }
       traceApp('LAN_JOIN', 'PLAYER_JOIN_FINISHED', {
         screen: 'create',

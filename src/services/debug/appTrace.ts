@@ -71,9 +71,36 @@ let currentCharacterId: string | number | undefined;
 let traceCounter = 0;
 const listeners = new Set<() => void>();
 
+// Em jogo real, console.log em todo evento LAN causa atraso perceptivel,
+// principalmente com 3+ celulares. O trace continua em memoria para exportacao,
+// mas console e notificacao de listeners ficam controlados.
+let consoleTraceEnabled = false;
+let verboseTraceEnabled = false;
+let pendingEmit = false;
+
+const ALWAYS_TRACE_CATEGORIES = new Set([
+  'ERROR',
+  'UI_BUTTON_PRESS',
+  'SCREEN',
+  'LAN_JOIN',
+  'LAN_KICK',
+]);
+
+const ALWAYS_TRACE_ACTION_PATTERNS = [
+  'SESSION',
+  'KICK',
+  'JOIN',
+  'HOST_UNREACHABLE',
+  'NACK',
+  'ERROR',
+  'BUILD',
+];
+
+
 export function traceApp(category: string, action: string, data: AppTraceInput = {}) {
   try {
     if (paused) return null;
+    if (!shouldStoreTrace(category, action, data)) return null;
 
     const timestampMs = Date.now();
     const safeData = sanitizeValue(data) as Record<string, unknown>;
@@ -90,19 +117,71 @@ export function traceApp(category: string, action: string, data: AppTraceInput =
     hydrateRecordFromNestedValues(record);
     updateTraceContext(record);
 
-    logs = [...logs, record].slice(-MAX_TRACE_LOGS);
-    emitTraceChange();
+    // Evita copiar o array inteiro em toda linha de log. Em Android isso reduz
+    // travadas durante eventos LAN em lote.
+    logs.push(record);
+    if (logs.length > MAX_TRACE_LOGS) logs = logs.slice(-MAX_TRACE_LOGS);
+    scheduleTraceChange();
 
-    try {
-      console.log('[APP TRACE]', category, action, record);
-    } catch {
-      // Console logging must never affect the app.
+    if (consoleTraceEnabled) {
+      try {
+        console.log('[APP TRACE]', category, action, record);
+      } catch {
+        // Console logging must never affect the app.
+      }
     }
 
     return record;
   } catch {
     return null;
   }
+}
+
+
+function shouldStoreTrace(category: string, action: string, data: AppTraceInput = {}) {
+  if (verboseTraceEnabled) return true;
+  if (data.level === 'error' || data.level === 'warn') return true;
+  if (ALWAYS_TRACE_CATEGORIES.has(category)) return true;
+  const value = `${category}:${action}`.toUpperCase();
+  if (ALWAYS_TRACE_ACTION_PATTERNS.some((pattern) => value.includes(pattern))) return true;
+
+  // Mantem eventos vivos importantes, mas evita flood de polling/heartbeat/sqlite.
+  if (category === 'EVENT_RECEIVED' || category === 'EVENT_APPLIED' || category === 'EVENT_CREATED') {
+    const eventType = String(data.eventType || data.type || '').toLowerCase();
+    return [
+      'player_patch',
+      'effect_patch',
+      'inventory_patch',
+      'session_patch',
+      'session_ended',
+      'player_kicked',
+      'pending_save_patch',
+    ].includes(eventType);
+  }
+
+  return false;
+}
+
+function scheduleTraceChange() {
+  if (pendingEmit) return;
+  pendingEmit = true;
+  setTimeout(() => {
+    pendingEmit = false;
+    emitTraceChange();
+  }, 100);
+}
+
+export function setTraceVerbose(enabled: boolean) {
+  verboseTraceEnabled = enabled;
+  emitTraceChange();
+}
+
+export function isTraceVerbose() {
+  return verboseTraceEnabled;
+}
+
+export function setTraceConsole(enabled: boolean) {
+  consoleTraceEnabled = enabled;
 }
 
 export function traceButton(screen: string, buttonName: string, data: AppTraceInput = {}) {
