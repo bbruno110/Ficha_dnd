@@ -4,10 +4,10 @@ export const LAN_NETWORK_LIMITS = {
   heartbeatActiveMs: 8000,
   heartbeatPausedMs: 15000,
   heartbeatTimeoutMs: 24000,
-  fallbackPollActiveMs: 15000,
+  fallbackPollActiveMs: 1500,
   reconnectBackoffBaseMs: 1200,
   resyncMinIntervalMs: 10000,
-  maxEventsPerResync: 80,
+  maxEventsPerResync: 40,
   socketQueueMaxPending: 200,
 };
 
@@ -50,6 +50,7 @@ export function getLanEventAudience(event: Pick<LanSessionEvent, 'type' | 'toKey
   if (event.toKey === 'master') return 'master';
   if (event.toKey === 'party' || event.toKey === 'all' || event.toKey === 'session') return 'broadcast';
   if (event.type === 'session_patch' || event.type === 'session_ended') return 'broadcast';
+  if (event.type === 'player_joined' && (event.toKey === 'session' || event.toKey === 'party' || event.toKey === 'all')) return 'broadcast';
   if (event.type === 'timeline_event') return 'broadcast';
   if (event.type.startsWith('trade_')) return 'participants';
   if (event.type === 'send_item' || event.type === 'send_item_request' || event.type === 'send_item_result') return 'participants';

@@ -18,6 +18,8 @@ import {
   ensureLanEventStoreSchema,
   listLanEvents,
 } from './lan/lanEventStore';
+import { enqueueLanEntityMutation, getLanEventQueueKeys, getLanInventoryQueueKey } from './lan/lanEntityQueue';
+import { ensureLanCommandBusSchema } from './lan/lanCommandBus';
 import { ensureLanSyncSchema, saveLanSessionSnapshot } from './lanSyncEngine';
 import {
   fetchLanTcpPayload,
@@ -254,6 +256,7 @@ export type LanSessionEventType =
   | 'send_item_request'
   | 'send_item_result'
   | 'trade_offer'
+  | 'trade_counter'
   | 'trade_accept'
   | 'trade_decline'
   | 'trade_result'
@@ -270,6 +273,7 @@ export type LanSessionEventType =
   | 'resource_request'
   | 'resource_review'
   | 'player_patch'
+  | 'player_progression_patch'
   | 'inventory_patch'
   | 'effect_patch'
   | 'effect_catalog_patch'
@@ -420,6 +424,17 @@ export type LanSessionEvent = {
     hpMax: number;
     tempHp?: number;
     level: number;
+    effects?: Array<{
+      id?: string;
+      name?: string;
+      status?: string;
+      statusKey?: string;
+      remaining?: number;
+      unit?: LanEffectUnit;
+      color?: string;
+      secondaryColor?: string;
+      publicNote?: string;
+    }>;
   };
   spellEffect?: {
     spellName: string;
@@ -453,6 +468,9 @@ export type LanSessionEvent = {
     status?: LanSessionStatus;
     hostInstanceId?: string;
     sessionEpoch?: number;
+    currentTurn?: number;
+    elapsedMinutes?: number;
+    advanceUnit?: LanAdvanceUnit;
     pausedAt?: string;
     resumedAt?: string;
     reason?: string;
@@ -476,6 +494,19 @@ export type LanSessionEvent = {
     grantId?: string;
   };
   numberPatch?: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
+  progressionPatch?: {
+    level?: number;
+    className?: string;
+    race?: string;
+    hpCurrent?: number;
+    hpMax?: number;
+    stats?: Record<string, unknown>;
+    spells?: unknown;
+    saveValues?: unknown;
+    skillValues?: unknown;
+    proficiencies?: unknown;
+    characterSnapshot?: Record<string, unknown>;
+  };
   statsPatch?: Record<string, unknown>;
   tradeId?: string;
   visibility?: 'public' | 'party' | 'private' | string;
@@ -491,6 +522,21 @@ export type PublicLanPlayer = {
   hpCurrent: number;
   hpMax: number;
   tempHp: number;
+  xp?: number;
+  gp?: number;
+  sp?: number;
+  cp?: number;
+  publicEffects?: Array<{
+    id?: string;
+    name?: string;
+    status?: string;
+    statusKey?: string;
+    remaining?: number;
+    unit?: LanEffectUnit;
+    color?: string;
+    secondaryColor?: string;
+    publicNote?: string;
+  }>;
   isSelf: boolean;
 };
 
@@ -970,7 +1016,7 @@ export async function ackLanSessionEvent(joinUrl: string | undefined, ack: { ses
   return false;
 }
 
-export async function requestLanSessionResync(joinUrl: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean }) {
+export async function requestLanSessionResync(joinUrl: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean; forceReconnect?: boolean }) {
   if (!joinUrl) return false;
   if (isTcpLanUrl(joinUrl)) return requestLanTcpResync(joinUrl, request);
   return false;
@@ -1038,7 +1084,210 @@ export async function importLanCatalog(db: SQLiteDatabase, payload: LanSessionPa
 export async function rememberLanSessionEvent(db: SQLiteDatabase, event: LanSessionEvent) {
   await ensureLanSchema(db);
   const result = await commitLanEvent(db, event);
+
+  // Grave histórico apenas. Envio/troca entre jogadores é executado uma única
+  // vez pelo host ativo em lan-session.tsx, com trava idempotente por requestId.
+  // Antes havia dupla execução aqui + handler do host: o primeiro removia o item
+  // e o segundo rejeitava por inventário já alterado, deixando destino/origem sem patch confiável.
   return result.inserted;
+}
+
+
+async function autoProcessMasterInventoryEvent(db: SQLiteDatabase, event: LanSessionEvent) {
+  if (!['send_item_request', 'trade_accept', 'trade_decline'].includes(event.type)) return;
+  if (!event.sessionId || event.toKey !== 'master') return;
+
+  const session = await db.getFirstAsync<{ joinUrl?: string; isMaster?: number; status?: string }>(
+    `SELECT join_url as joinUrl, is_master as isMaster, status FROM lan_sessions WHERE id = ? LIMIT 1`,
+    [event.sessionId]
+  );
+  if (toNumber(session?.isMaster) !== 1) return;
+
+  if (normalizeSessionStatus(session?.status) !== 'active') {
+    await broadcastMasterInventoryResult(db, session?.joinUrl, event, {
+      accepted: false,
+      reason: 'Sessao em leitura.',
+      targetKeys: getInventoryEventParticipants(event),
+    });
+    return;
+  }
+
+  if (event.type === 'send_item_request') {
+    const result = await applyLanSendItemRequest(db, event);
+    await broadcastMasterInventoryResult(db, session?.joinUrl, event, result);
+    return;
+  }
+
+  if (event.type === 'trade_accept') {
+    const result = await applyLanTradeAcceptRequest(db, event);
+    await broadcastMasterInventoryResult(db, session?.joinUrl, event, result);
+    return;
+  }
+
+  if (event.type === 'trade_decline') {
+    await broadcastMasterInventoryResult(db, session?.joinUrl, event, {
+      accepted: false,
+      reason: event.message || 'Troca recusada.',
+      targetKeys: getInventoryEventParticipants(event),
+    }, { declineOnly: true });
+  }
+}
+
+async function broadcastMasterInventoryResult(
+  db: SQLiteDatabase,
+  joinUrl: string | undefined,
+  sourceEvent: LanSessionEvent,
+  result: LanInventoryMutationResult,
+  options?: { declineOnly?: boolean }
+) {
+  const targetKeys = Array.from(new Set((result.targetKeys || []).filter(Boolean)));
+  const now = new Date().toISOString();
+
+  if (!options?.declineOnly) {
+    for (const patchEvent of await buildInventoryPatchEventsForTargets(db, sourceEvent, targetKeys, result.reason)) {
+      await commitAndBroadcastLanHostEvent(db, joinUrl, patchEvent);
+    }
+  }
+
+  if (sourceEvent.type === 'send_item_request') {
+    const request = sourceEvent.sendItemRequest;
+    const fromKey = String(request?.fromKey || sourceEvent.fromKey || '');
+    const toKey = String(request?.toKey || sourceEvent.toKey || '');
+    if (!fromKey || !toKey) return;
+
+    await commitAndBroadcastLanHostEvent(db, joinUrl, {
+      id: makeLanEventId(),
+      sessionId: sourceEvent.sessionId,
+      type: 'send_item_result',
+      fromKey,
+      fromName: sourceEvent.fromName || 'Jogador',
+      toKey,
+      toName: await getLanPlayerDisplayName(db, sourceEvent.sessionId, toKey),
+      entityType: 'inventory',
+      entityId: `${sourceEvent.sessionId}:inventory:${fromKey}:${toKey}`,
+      ackRequired: true,
+      originClientId: 'master',
+      item: request?.item || sourceEvent.item,
+      sendItemResult: {
+        requestId: request?.requestId || sourceEvent.clientMsgId || sourceEvent.id,
+        status: result.accepted ? 'accepted' : 'rejected',
+        reason: result.reason,
+      },
+      message: result.accepted
+        ? 'Item enviado com sucesso.'
+        : (result.reason || 'Envio nao concluido.'),
+      createdAt: now,
+    });
+    return;
+  }
+
+  if (sourceEvent.type === 'trade_accept' || sourceEvent.type === 'trade_decline') {
+    const participants = getInventoryEventParticipants(sourceEvent);
+    const fromKey = participants[0] || sourceEvent.fromKey;
+    const toKey = participants[1] || sourceEvent.toKey;
+    if (!fromKey || !toKey || toKey === 'master') return;
+
+    await commitAndBroadcastLanHostEvent(db, joinUrl, {
+      id: makeLanEventId(),
+      sessionId: sourceEvent.sessionId,
+      type: 'trade_result',
+      fromKey,
+      fromName: await getLanPlayerDisplayName(db, sourceEvent.sessionId, fromKey),
+      toKey,
+      toName: await getLanPlayerDisplayName(db, sourceEvent.sessionId, toKey),
+      entityType: 'inventory',
+      entityId: String(sourceEvent.tradeId || sourceEvent.entityId || sourceEvent.id),
+      ackRequired: true,
+      originClientId: 'master',
+      tradeId: sourceEvent.tradeId || sourceEvent.id,
+      offeredItem: sourceEvent.offeredItem,
+      requestedItem: sourceEvent.requestedItem,
+      tradeResult: {
+        tradeId: sourceEvent.tradeId || sourceEvent.id,
+        status: result.accepted ? 'accepted' : 'rejected',
+        reason: result.reason,
+      },
+      message: result.accepted
+        ? 'Troca concluida com sucesso.'
+        : (result.reason || 'Troca nao concluida.'),
+      createdAt: now,
+    });
+  }
+}
+
+async function buildInventoryPatchEventsForTargets(
+  db: SQLiteDatabase,
+  sourceEvent: LanSessionEvent,
+  targetKeys: string[],
+  reason?: string
+) {
+  const events: LanSessionEvent[] = [];
+  const now = new Date().toISOString();
+  const uniqueTargets = Array.from(new Set(targetKeys.filter(Boolean)));
+
+  for (const targetKey of uniqueTargets) {
+    const player = await getActiveLanPlayerByRemoteKey(db, sourceEvent.sessionId, targetKey);
+    if (!player) continue;
+    const equipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(player.equipment_json, {}));
+    events.push({
+      id: makeLanEventId(),
+      sessionId: sourceEvent.sessionId,
+      type: 'inventory_patch',
+      fromKey: 'master',
+      fromName: 'Sessao LAN',
+      toKey: targetKey,
+      toName: String(player.character_name || targetKey),
+      entityType: 'inventory',
+      entityId: `${sourceEvent.sessionId}:inventory:${targetKey}`,
+      entityRevision: Math.max(toNumber(player.revision_seq), Date.now()),
+      ackRequired: true,
+      originClientId: 'master',
+      inventoryPatch: {
+        targetKey,
+        equipment,
+        reason: reason || sourceEvent.message || 'Inventario sincronizado.',
+        action: sourceEvent.type === 'send_item_request'
+          ? (targetKey === String(sourceEvent.sendItemRequest?.fromKey || sourceEvent.fromKey) ? 'transfer_out' : 'transfer_in')
+          : 'trade_commit',
+      },
+      message: reason || sourceEvent.message || 'Inventario sincronizado.',
+      createdAt: now,
+    });
+  }
+
+  return events;
+}
+
+async function commitAndBroadcastLanHostEvent(db: SQLiteDatabase, joinUrl: string | undefined, event: LanSessionEvent) {
+  const result = await commitLanEvent(db, event);
+  if (result.inserted && joinUrl) {
+    await sendLanSessionEvent(joinUrl, result.event).catch(() => false);
+  }
+  return result.event;
+}
+
+async function getLanPlayerDisplayName(db: SQLiteDatabase, sessionId: string, remoteKey: string) {
+  const row = await db.getFirstAsync<{ characterName?: string; playerName?: string }>(
+    `SELECT character_name as characterName, player_name as playerName
+     FROM lan_session_players
+     WHERE session_id = ? AND remote_key = ?
+     LIMIT 1`,
+    [sessionId, remoteKey]
+  );
+  return String(row?.characterName || row?.playerName || remoteKey || 'Jogador');
+}
+
+function getInventoryEventParticipants(event: LanSessionEvent) {
+  if (event.type === 'send_item_request') {
+    return [
+      String(event.sendItemRequest?.fromKey || event.fromKey || ''),
+      String(event.sendItemRequest?.toKey || event.toKey || ''),
+    ].filter((key) => key && key !== 'master');
+  }
+
+  const tradeFrom = String(event.tradeAccept?.fromKey || event.fromKey || '');
+  const tradeTo = String(event.tradeAccept?.toKey || (event.toKey !== 'master' ? event.toKey : '') || '');
+  return [tradeFrom, tradeTo].filter((key) => key && key !== 'master');
 }
 
 export async function getLanSessionEvents(db: SQLiteDatabase, sessionId: string, limit = 30): Promise<LanSessionEvent[]> {
@@ -1185,6 +1434,28 @@ async function deactivateLocalPlayerSessionIfNoActiveBindings(db: SQLiteDatabase
   );
 }
 
+function summarizePublicLanEffects(effects: LanSessionEffect[] | undefined) {
+  return (effects || [])
+    .filter((effect) => effect.visibleToPlayer !== false)
+    .filter((effect) => {
+      const kind = String(effect.kind || '').toLowerCase();
+      const status = String(effect.status || effect.statusKey || '').trim();
+      const target = String(effect.target || '').toUpperCase();
+      return Boolean(status) || kind === 'status' || target === 'PV_TEMP' || kind === 'temp_hp';
+    })
+    .map((effect) => ({
+      id: effect.id,
+      name: effect.name || effect.status || effect.statusKey || 'Efeito',
+      status: effect.status,
+      statusKey: effect.statusKey,
+      remaining: effect.remaining,
+      unit: effect.unit,
+      color: effect.color,
+      secondaryColor: effect.secondaryColor,
+      publicNote: effect.publicNote,
+    }));
+}
+
 export function getPublicLanPlayers(payload: LanSessionPayload, selfKey?: string): PublicLanPlayer[] {
   return (payload.state?.players || []).map((player) => {
     const key = player.remoteKey || `${payload.session.id}:${player.sourceCharacterId || player.characterId || player.characterName}:${player.characterName}`;
@@ -1196,6 +1467,11 @@ export function getPublicLanPlayers(payload: LanSessionPayload, selfKey?: string
       hpCurrent: player.hpCurrent,
       hpMax: player.hpMax,
       tempHp: player.tempHp || 0,
+      xp: player.xp || 0,
+      gp: player.gp || 0,
+      sp: player.sp || 0,
+      cp: player.cp || 0,
+      publicEffects: summarizePublicLanEffects(player.effects),
       isSelf: Boolean(selfKey && key === selfKey),
     };
   });
@@ -1550,7 +1826,32 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
       return null;
     }
 
-    const pendingDiff = entry.reviewSnapshot ? describeCharacterDiff(existing, normalized) : [];
+    const fullDiff = describeCharacterDiff(existing, normalized);
+
+    // v36: level up é uma alteração autônoma do jogador, desde que o XP oficial
+    // já autorize o novo nível. Não dependa de reviewSnapshot, porque em alguns
+    // caminhos de reconnect/level-up o campo chega como falso/ausente. Também não
+    // sobrescreva XP/moedas/inventário vivos do mestre com snapshot local.
+    if (await canAutoAcceptLevelUpSnapshot(db, existing, normalized, fullDiff)) {
+      await updateLanPlayerProgressionFromNormalizedSnapshot(db, Number(existing.id), character, normalized, existing);
+      debugLanFlow('MASTER_PLAYER_LEVEL_UP_AUTO_ACCEPTED_V36', {
+        sessionId,
+        remoteKey,
+        clientId,
+        playerName,
+        characterName: normalized.characterName,
+        previousLevel: toNumber(existing.level, 1),
+        nextLevel: normalized.level,
+        officialXp: toNumber(existing.xp),
+        incomingXp: normalized.xp,
+        fullDiff,
+        reviewSnapshot: Boolean(entry.reviewSnapshot),
+      });
+      return Number(existing.id);
+    }
+
+    const pendingDiff = entry.reviewSnapshot ? fullDiff : [];
+
     if (pendingDiff.length > 0) {
       const existingPendingSnapshot = String(existing.pending_character_snapshot || '');
       const existingPendingDiff = String(existing.notes || '');
@@ -1570,20 +1871,16 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
 
       if (await canAutoAcceptLevelUpSnapshot(db, existing, normalized, pendingDiff)) {
         await updateLanPlayerFromNormalizedSnapshot(db, Number(existing.id), character, normalized);
-        await rememberLanSessionEvent(db, {
-          id: makeLanEventId(),
+        debugLanFlow('MASTER_PLAYER_LEVEL_UP_AUTO_ACCEPTED', {
           sessionId,
-          type: 'character_update_review',
-          fromKey: 'master',
-          fromName: 'Mestre',
-          toKey: remoteKey,
-          toName: normalized.characterName,
-          entityType: 'request',
-          entityId: remoteKey,
-          ackRequired: true,
-          originClientId: 'master',
-          message: `${normalized.characterName} subiu de nivel e a ficha foi sincronizada com a sessao.`,
-          createdAt: new Date().toISOString(),
+          remoteKey,
+          clientId,
+          playerName,
+          characterName: normalized.characterName,
+          previousLevel: toNumber(existing.level, 1),
+          nextLevel: normalized.level,
+          xp: normalized.xp,
+          pendingDiff,
         });
         return Number(existing.id);
       }
@@ -1941,7 +2238,11 @@ export async function applyLanSendItemRequest(db: SQLiteDatabase, event: LanSess
     return { accepted: false, reason: 'Pedido de envio invalido.', targetKeys: [fromKey].filter(Boolean) };
   }
 
-  const result = await runLanDbTransaction(db, async () => {
+  const result = await enqueueLanEntityMutation(
+    getLanEventQueueKeys(event).length > 0
+      ? getLanEventQueueKeys(event)
+      : [getLanInventoryQueueKey(event.sessionId, fromKey), getLanInventoryQueueKey(event.sessionId, toKey)],
+    () => runLanDbTransaction(db, async () => {
     const status = await getLanSessionStatus(db, event.sessionId);
     if (status !== 'active') return { accepted: false, reason: 'Sessao em leitura.', targetKeys: [fromKey] };
 
@@ -1954,16 +2255,24 @@ export async function applyLanSendItemRequest(db: SQLiteDatabase, event: LanSess
 
     const fromEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(fromPlayer.equipment_json, {}));
     const toEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(toPlayer.equipment_json, {}));
-    if (!removeTradeItemFromEquipment(fromEquipment, transferItem)) {
-      return { accepted: false, reason: 'Quantidade insuficiente no inventario de origem.', targetKeys: [fromKey] };
-    }
-
+    const removedFromAuthoritativeBag = removeTradeItemFromEquipment(fromEquipment, transferItem, { forcePartial: true });
+    debugLanFlow('LAN_SEND_ITEM_SOURCE_REMOVAL_RESULT', {
+      sessionId: event.sessionId,
+      fromKey,
+      toKey,
+      itemName: transferItem.name,
+      qty: transferItem.qty,
+      removedFromAuthoritativeBag,
+    });
+    // O cache do host pode estar atrasado quando o jogador acabou de equipar,
+    // receber ou remover algo antes do envio. Como a ação é autônoma, não rejeite
+    // por cache stale: aceite o pedido assinado pelo jogador e publique snapshot oficial.
     const nextToEquipment = addTradeItemToEquipment(toEquipment, transferItem);
     await writeLanPlayerEquipmentSnapshot(db, fromPlayer, fromEquipment);
     await writeLanPlayerEquipmentSnapshot(db, toPlayer, nextToEquipment);
 
     return { accepted: true, targetKeys: [fromKey, toKey], reason: event.message };
-  });
+  }), { sessionId: event.sessionId, eventId: event.id, type: event.type, fromKey, toKey });
 
   if (result.accepted) await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
   return result;
@@ -1988,7 +2297,11 @@ export async function applyLanTradeAcceptRequest(db: SQLiteDatabase, event: LanS
     return { accepted: false, reason: 'Participantes da troca invalidos.', targetKeys: [acceptingKey].filter(Boolean) };
   }
 
-  const result = await runLanDbTransaction(db, async () => {
+  const result = await enqueueLanEntityMutation(
+    getLanEventQueueKeys(event).length > 0
+      ? getLanEventQueueKeys(event)
+      : [getLanInventoryQueueKey(event.sessionId, offeringKey), getLanInventoryQueueKey(event.sessionId, acceptingKey)],
+    () => runLanDbTransaction(db, async () => {
     const status = await getLanSessionStatus(db, event.sessionId);
     if (status !== 'active') return { accepted: false, reason: 'Sessao em leitura.', targetKeys: [offeringKey, acceptingKey] };
 
@@ -2000,13 +2313,25 @@ export async function applyLanTradeAcceptRequest(db: SQLiteDatabase, event: LanS
 
     const offeringEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(offeringPlayer.equipment_json, {}));
     const acceptingEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(acceptingPlayer.equipment_json, {}));
-    if (!removeTradeItemFromEquipment(offeringEquipment, offeredItem)) {
-      return { accepted: false, reason: 'O item oferecido nao esta mais disponivel.', targetKeys: [offeringKey, acceptingKey] };
-    }
+    const removedOfferedFromAuthoritativeBag = removeTradeItemFromEquipment(offeringEquipment, offeredItem, { forcePartial: true });
 
-    if (requestedItem && !removeTradeItemFromEquipment(acceptingEquipment, requestedItem)) {
-      return { accepted: false, reason: 'O item de contraoferta nao esta mais disponivel.', targetKeys: [offeringKey, acceptingKey] };
+    let removedRequestedFromAuthoritativeBag = false;
+    if (requestedItem) {
+      removedRequestedFromAuthoritativeBag = removeTradeItemFromEquipment(acceptingEquipment, requestedItem, { forcePartial: true });
     }
+    debugLanFlow('LAN_TRADE_SOURCE_REMOVAL_RESULT', {
+      sessionId: event.sessionId,
+      tradeId: event.tradeId,
+      offeringKey,
+      acceptingKey,
+      offeredItem: offeredItem.name,
+      requestedItem: requestedItem?.name,
+      removedOfferedFromAuthoritativeBag,
+      removedRequestedFromAuthoritativeBag,
+    });
+    // Não rejeite troca por inventário stale no host. O jogador que aceita já
+    // validou a posse local na UI; o host gera os dois snapshots oficiais e os
+    // clientes convergem pelo inventory_patch.
 
     await writeLanPlayerEquipmentSnapshot(
       db,
@@ -2016,7 +2341,7 @@ export async function applyLanTradeAcceptRequest(db: SQLiteDatabase, event: LanS
     await writeLanPlayerEquipmentSnapshot(db, acceptingPlayer, addTradeItemToEquipment(acceptingEquipment, offeredItem));
 
     return { accepted: true, targetKeys: [offeringKey, acceptingKey], reason: event.message };
-  });
+  }), { sessionId: event.sessionId, eventId: event.id, type: event.type, offeringKey, acceptingKey });
 
   if (result.accepted) await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
   return result;
@@ -2086,11 +2411,15 @@ export async function applyLanPlayerNumberPatch(
 
   if (nextCoinValue > currentCoinValue) return false;
 
-  const allowedPatch: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>> = {};
+  const allowedPatch: Partial<Pick<LanSessionPlayerState, 'xp' | 'gp' | 'sp' | 'cp'>> = {};
+  // v34: XP/level progression is player-owned. The host only mirrors the
+  // value into the official roster and broadcasts it back as an authoritative patch.
+  if (patch.xp != null) allowedPatch.xp = Math.max(0, toNumber(patch.xp));
   if (patch.gp != null) allowedPatch.gp = nextGp;
   if (patch.sp != null) allowedPatch.sp = nextSp;
   if (patch.cp != null) allowedPatch.cp = nextCp;
-  await updateLanPlayerNumbers(db, Number(player.id), allowedPatch);
+  if (Object.keys(allowedPatch).length === 0) return false;
+  await updateLanPlayerNumbers(db, Number(player.id), allowedPatch, { syncPayload: false });
   return true;
 }
 
@@ -2503,10 +2832,35 @@ export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: strin
   const nextTurn = unit === 'turn' ? currentTurn + 1 : currentTurn;
   const minuteDelta = unit === 'minute' ? 1 : unit === 'hour' || unit === 'shortRest' ? 60 : unit === 'longRest' ? 480 : 0;
 
+  const nextElapsedMinutes = elapsedMinutes + minuteDelta;
+
   await db.runAsync(
     `UPDATE lan_sessions SET current_turn = ?, elapsed_minutes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [nextTurn, elapsedMinutes + minuteDelta, sessionId]
+    [nextTurn, nextElapsedMinutes, sessionId]
   );
+
+  await rememberLanSessionEvent(db, {
+    id: makeLanEventId(),
+    sessionId,
+    type: 'session_patch',
+    fromKey: 'master',
+    fromName: 'Mestre',
+    toKey: 'all',
+    toName: 'Todos',
+    entityType: 'session',
+    entityId: sessionId,
+    entityRevision: Date.now(),
+    ackRequired: true,
+    originClientId: 'master',
+    sessionPatch: {
+      currentTurn: nextTurn,
+      elapsedMinutes: nextElapsedMinutes,
+      advanceUnit: unit,
+      reason: 'advance_time',
+    },
+    message: `Tempo da sessao avancou: ${unit}.`,
+    createdAt: new Date().toISOString(),
+  });
 
   const tickResult = await tickTurnEffects(db, sessionId, unit);
 
@@ -2965,6 +3319,7 @@ async function ensureLanSchema(db: SQLiteDatabase) {
 
   await ensureLanSyncSchema(db);
   await ensureLanEventStoreSchema(db);
+  await ensureLanCommandBusSchema(db);
 
   const columns: [string, string, string][] = [
     ['lan_sessions', 'status', "TEXT NOT NULL DEFAULT 'active'"],
@@ -3094,6 +3449,9 @@ async function ensureLanSchema(db: SQLiteDatabase) {
 
 function normalizeCharacterState(character: Record<string, unknown>) {
   const characterName = String(character.name || 'Personagem');
+  const className = String(character.class || character.className || '-');
+  const explicitLevel = toNumber(character.level, 0);
+  const inferredLevel = inferTotalLevelFromClassName(className);
 
   // Aceita snake_case e camelCase porque snapshots podem vir do SQLite,
   // do estado React, de payload LAN ou de versões anteriores do app.
@@ -3117,8 +3475,8 @@ function normalizeCharacterState(character: Record<string, unknown>) {
     playerName: characterName,
     characterName,
     sourceCharacterId: character.id == null ? null : toNumber(character.id),
-    level: toNumber(character.level, 1),
-    className: String(character.class || character.className || '-'),
+    level: Math.max(1, explicitLevel || inferredLevel || 1),
+    className,
     race: String(character.race || '-'),
     hpCurrent,
     hpMax,
@@ -3192,6 +3550,78 @@ async function updateLanPlayerFromNormalizedSnapshot(
   );
 }
 
+async function updateLanPlayerProgressionFromNormalizedSnapshot(
+  db: SQLiteDatabase,
+  playerId: number,
+  snapshot: Record<string, unknown>,
+  normalized: ReturnType<typeof normalizeCharacterState>,
+  current: Record<string, unknown>
+) {
+  const currentXp = toNumber(current.xp);
+  const currentGp = toNumber(current.gp);
+  const currentSp = toNumber(current.sp);
+  const currentCp = toNumber(current.cp);
+  const currentEquipment = parseJsonValue<Record<string, unknown>>(current.equipment_json, normalized.equipment);
+
+  // Progressão de nível atualiza ficha/roster e HP máximo, mas não deve
+  // rebaixar XP oficial nem sobrescrever moedas/inventário controlados pela mesa.
+  const nextXp = Math.max(currentXp, normalized.xp);
+  const nextHpMax = Math.max(toNumber(current.hp_max), normalized.hpMax);
+  const nextHpCurrent = Math.max(0, Math.min(
+    nextHpMax,
+    normalized.hpCurrent > 0 ? normalized.hpCurrent : toNumber(current.hp_current)
+  ));
+
+  const snapshotForRoster = {
+    ...snapshot,
+    xp: nextXp,
+    hp_max: nextHpMax,
+    hp_current: nextHpCurrent,
+    gp: currentGp,
+    sp: currentSp,
+    cp: currentCp,
+    equipment: currentEquipment,
+  };
+
+  await db.runAsync(
+    `UPDATE lan_session_players
+     SET character_name = ?,
+         character_snapshot = ?,
+         pending_character_snapshot = NULL,
+         notes = NULL,
+         level = ?,
+         class_name = ?,
+         race = ?,
+         hp_current = ?,
+         hp_max = ?,
+         temp_hp = ?,
+         xp = ?,
+         gp = ?,
+         sp = ?,
+         cp = ?,
+         stats_json = ?,
+         revision_seq = COALESCE(revision_seq, 0) + 1,
+         last_seen_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [
+      normalized.characterName,
+      JSON.stringify(snapshotForRoster),
+      normalized.level,
+      normalized.className,
+      normalized.race,
+      nextHpCurrent,
+      nextHpMax,
+      Math.max(0, normalized.tempHp || toNumber(current.temp_hp)),
+      nextXp,
+      currentGp,
+      currentSp,
+      currentCp,
+      JSON.stringify(normalized.stats),
+      playerId,
+    ]
+  );
+}
+
 async function canAutoAcceptLevelUpSnapshot(
   db: SQLiteDatabase,
   current: Record<string, unknown>,
@@ -3199,25 +3629,51 @@ async function canAutoAcceptLevelUpSnapshot(
   diffs: string[]
 ) {
   const currentSnapshot = normalizeCharacterState(parseJsonValue<Record<string, unknown>>(current.character_snapshot, {}));
-  const currentLevel = toNumber(current.level, currentSnapshot.level);
+  const currentClassLabel = String(current.class_name || currentSnapshot.className || '');
+  const currentLevel = Math.max(toNumber(current.level, currentSnapshot.level), inferTotalLevelFromClassName(currentClassLabel), 1);
+  const incomingLevel = Math.max(incoming.level, inferTotalLevelFromClassName(incoming.className), 1);
   const currentXp = toNumber(current.xp, currentSnapshot.xp);
   const bestKnownXp = Math.max(currentXp, incoming.xp);
+  const expectedByXp = await getExpectedLevelForXp(db, bestKnownXp);
+  const currentRace = String(current.race || currentSnapshot.race || '');
 
-  // O level up pode chegar do jogador logo apos o mestre enviar XP. Em redes LAN
-  // lentas, o roster oficial ainda pode estar com XP antigo no exato momento do
-  // reviewSnapshot. Por isso a autorizacao considera o maior XP conhecido entre
-  // o mestre e a ficha do jogador. Ainda bloqueamos inventario, moedas e mudanca
-  // de raca para nao aceitar alteracoes sensiveis sem revisao.
-  const levelIsAuthorizedByXp =
-    incoming.level > currentLevel &&
-    incoming.level <= await getExpectedLevelForXp(db, bestKnownXp);
+  const currentHpMax = toNumber(current.hp_max, currentSnapshot.hpMax);
+  const levelIsProgression = incoming.level > currentLevel && incoming.level <= 20;
+  const hpMaxIsProgression = incoming.level >= currentLevel && incoming.hpMax > currentHpMax;
+  const classLabelIsProgression = incoming.level >= currentLevel &&
+    String(incoming.className || '').trim() !== String(current.class_name || currentSnapshot.className || '').trim() &&
+    new RegExp(`\\b${incoming.level}\\b`).test(String(incoming.className || ''));
+  // v38: se o JOIN chegou antes do evento oficial, o mestre pode ja estar com level=2
+  // mas ainda com hpMax antigo. Nesse caso ainda precisa aceitar hpMax/classe do level up.
+  const progressionShape = levelIsProgression || hpMaxIsProgression || classLabelIsProgression;
+  const levelIsAuthorizedByXp = progressionShape && incomingLevel <= Math.max(expectedByXp, currentLevel);
+  const raceChanged = currentRace && incoming.race && incoming.race !== currentRace;
   const hasBlockedDiff = diffs.some((diff) => (
     diff.startsWith('Invent') ||
     diff.startsWith('Moedas') ||
     diff.startsWith('Ra')
   ));
 
-  return levelIsAuthorizedByXp && !hasBlockedDiff;
+  const accepted = levelIsAuthorizedByXp && !raceChanged && !hasBlockedDiff;
+  debugLanFlow('MASTER_LEVEL_UP_AUTO_ACCEPT_CHECK', {
+    playerId: current.id,
+    currentLevel,
+    incomingLevel,
+    currentXp,
+    incomingXp: incoming.xp,
+    currentHpMax,
+    incomingHpMax: incoming.hpMax,
+    bestKnownXp,
+    expectedByXp,
+    levelIsProgression,
+    hpMaxIsProgression,
+    classLabelIsProgression,
+    raceChanged,
+    hasBlockedDiff,
+    diffs,
+    accepted,
+  });
+  return accepted;
 }
 
 function describeCharacterDiff(current: Record<string, unknown>, incoming: ReturnType<typeof normalizeCharacterState>) {
@@ -3228,6 +3684,8 @@ function describeCharacterDiff(current: Record<string, unknown>, incoming: Retur
     level: toNumber(current.level, currentSnapshot.level),
     className: String(current.class_name || currentSnapshot.className || '-'),
     race: String(current.race || currentSnapshot.race || '-'),
+    hpMax: toNumber(current.hp_max, currentSnapshot.hpMax),
+    hpCurrent: toNumber(current.hp_current, currentSnapshot.hpCurrent),
     stats: parseJsonValue<Record<string, unknown>>(current.stats_json, currentSnapshot.stats),
     equipment: parseJsonValue<Record<string, unknown>>(current.equipment_json, currentSnapshot.equipment),
   };
@@ -3248,6 +3706,14 @@ function describeCharacterDiff(current: Record<string, unknown>, incoming: Retur
     diffs.push(`Raça alterada: ${currentValues.race} -> ${incoming.race}`);
   }
 
+  if (incoming.hpMax > currentValues.hpMax) {
+    diffs.push(`PV máximo aumentou ${currentValues.hpMax} -> ${incoming.hpMax}`);
+  }
+
+  if (incoming.hpCurrent > currentValues.hpCurrent && incoming.hpMax >= currentValues.hpMax) {
+    diffs.push(`PV atual aumentou ${currentValues.hpCurrent} -> ${incoming.hpCurrent}`);
+  }
+
   if (JSON.stringify(incoming.stats) !== JSON.stringify(currentValues.stats)) {
     diffs.push('Atributos alterados');
   }
@@ -3258,6 +3724,171 @@ function describeCharacterDiff(current: Record<string, unknown>, incoming: Retur
   // O controle/validação acontece por inventory_patch/send_item/trade.
 
   return diffs;
+}
+
+export async function applyLanPlayerProgressionPatchFromEvent(
+  db: SQLiteDatabase,
+  sessionId: string,
+  event: LanSessionEvent
+) {
+  await ensureLanSchema(db);
+  const patch = event.progressionPatch;
+  if (!patch) return null;
+
+  const freshEvent = await rememberLanSessionEvent(db, event).catch(() => true);
+  // v38: nao retorne cedo em evento duplicado. Em alguns fluxos o evento entra no
+  // historico antes de aplicar a mutacao no roster. A aplicacao abaixo é idempotente:
+  // se o mestre ja tiver nivel/hpMax igual ou maior, nada perigoso acontece.
+  if (!freshEvent) {
+    debugLanFlow('MASTER_LEVEL_UP_PATCH_DUPLICATE_RECHECK_V38', {
+      sessionId,
+      eventId: event.id,
+      fromKey: event.fromKey,
+    });
+  }
+
+  const fromKey = String(event.fromKey || '').trim();
+  const fromName = String(event.fromName || '').trim();
+  const player = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_session_players
+     WHERE session_id = ?
+       AND COALESCE(is_active, 1) = 1
+       AND (
+         remote_key = ?
+         OR (? != '' AND character_name = ?)
+       )
+     ORDER BY id DESC
+     LIMIT 1`,
+    [sessionId, fromKey, fromName, fromName]
+  );
+
+  if (!player) {
+    debugLanFlow('MASTER_LEVEL_UP_PATCH_PLAYER_NOT_FOUND', {
+      sessionId,
+      eventId: event.id,
+      fromKey,
+      fromName,
+      patch,
+    });
+    return null;
+  }
+
+  const currentClassName = String(player.class_name || '').trim();
+  const currentLevel = Math.max(toNumber(player.level, 1), inferTotalLevelFromClassName(currentClassName), 1);
+  const currentXp = toNumber(player.xp, 0);
+  const currentHpMax = toNumber(player.hp_max, 0);
+  const incomingClassName = String(patch.className || player.class_name || '').trim();
+  const incomingLevel = Math.max(1, Math.floor(Number(patch.level || 0) || 0), inferTotalLevelFromClassName(incomingClassName));
+  const incomingHpMax = Math.max(0, Math.floor(Number(patch.hpMax || 0) || 0));
+  const expectedByXp = await getExpectedLevelForXp(db, currentXp);
+  const incomingRace = String(patch.race || player.race || '').trim();
+  const currentRace = String(player.race || '').trim();
+  const raceChanged = Boolean(incomingRace && currentRace && incomingRace !== currentRace);
+  const hasProgressionShape =
+    incomingLevel > currentLevel ||
+    (incomingLevel >= currentLevel && incomingHpMax > currentHpMax) ||
+    (incomingLevel >= currentLevel && incomingClassName && incomingClassName !== currentClassName && new RegExp(`\\b${incomingLevel}\\b`).test(incomingClassName));
+  const authorized = hasProgressionShape && incomingLevel <= Math.max(expectedByXp, currentLevel);
+
+  debugLanFlow('MASTER_LEVEL_UP_PATCH_CHECK_V38', {
+    sessionId,
+    eventId: event.id,
+    playerId: player.id,
+    fromKey,
+    fromName,
+    currentLevel,
+    incomingLevel,
+    currentXp,
+    currentHpMax,
+    incomingHpMax,
+    expectedByXp,
+    raceChanged,
+    hasProgressionShape,
+    authorized,
+    className: incomingClassName,
+  });
+
+  if (!authorized || raceChanged) {
+    await rememberLanSessionEvent(db, {
+      ...event,
+      type: 'character_update_review',
+      toKey: 'master',
+      toName: 'Mestre',
+      entityType: 'request',
+      entityId: fromKey || String(player.remote_key || ''),
+      message: !authorized
+        ? `${fromName || player.character_name || 'Jogador'} tentou subir para nivel ${incomingLevel}, mas o XP oficial (${currentXp}) ainda nao autoriza.`
+        : `${fromName || player.character_name || 'Jogador'} alterou raca durante progressao e precisa de revisao.`,
+    }).catch(() => false);
+    return null;
+  }
+
+  const currentHp = toNumber(player.hp_current, 0);
+  const nextHpMax = Math.max(currentHpMax, incomingHpMax);
+  const nextHpCurrent = Math.max(0, Math.min(
+    Math.max(nextHpMax, 1),
+    Math.max(currentHp, Math.floor(Number(patch.hpCurrent || 0) || 0))
+  ));
+
+  const currentSnapshot = parseJsonValue<Record<string, unknown>>(player.character_snapshot, {});
+  const nextSnapshot: Record<string, unknown> = {
+    ...currentSnapshot,
+    ...(patch.characterSnapshot || {}),
+    level: incomingLevel,
+    class: incomingClassName || String(player.class_name || ''),
+    race: incomingRace || String(player.race || ''),
+    hp_max: nextHpMax,
+    hp_current: nextHpCurrent,
+    xp: currentXp,
+    gp: toNumber(player.gp),
+    sp: toNumber(player.sp),
+    cp: toNumber(player.cp),
+  };
+
+  const statsJson = patch.stats ? JSON.stringify(patch.stats) : String(player.stats_json || '{}');
+
+  await db.runAsync(
+    `UPDATE lan_session_players
+     SET level = ?,
+         class_name = ?,
+         race = ?,
+         hp_current = ?,
+         hp_max = ?,
+         xp = ?,
+         stats_json = ?,
+         character_snapshot = ?,
+         pending_character_snapshot = NULL,
+         notes = NULL,
+         revision_seq = COALESCE(revision_seq, 0) + 1,
+         last_seen_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [
+      incomingLevel,
+      incomingClassName || String(player.class_name || ''),
+      incomingRace || String(player.race || ''),
+      nextHpCurrent,
+      nextHpMax,
+      currentXp,
+      statsJson,
+      JSON.stringify(nextSnapshot),
+      Number(player.id),
+    ]
+  );
+
+  debugLanFlow('MASTER_LEVEL_UP_PATCH_APPLIED_V38', {
+    sessionId,
+    eventId: event.id,
+    playerId: player.id,
+    fromKey,
+    fromName,
+    level: incomingLevel,
+    className: incomingClassName,
+    hpCurrent: nextHpCurrent,
+    hpMax: nextHpMax,
+    xp: currentXp,
+  });
+
+  return Number(player.id);
 }
 
 function normalizeEquipment(value: unknown): Record<string, unknown> {
@@ -3383,22 +4014,51 @@ function addTradeItemToEquipment(equipment: Record<string, unknown>, tradeItem: 
   return { ...nextEquipment, bag };
 }
 
-function removeTradeItemFromEquipment(equipment: Record<string, unknown>, tradeItem: LanTradeItem) {
-  const bag = Array.isArray((equipment as any).bag) ? [...(equipment as any).bag] : [];
+function removeTradeItemFromEquipment(
+  equipment: Record<string, unknown>,
+  tradeItem: LanTradeItem,
+  options?: { forcePartial?: boolean },
+) {
+  const normalized = normalizeEquipment(equipment);
+  const bag = Array.isArray((normalized as any).bag) ? [...(normalized as any).bag] : [];
+  const slots = (normalized as any).slots && typeof (normalized as any).slots === 'object'
+    ? { ...(normalized as any).slots }
+    : {};
   const itemName = String(tradeItem.name || '').trim().toLowerCase();
   const qty = Math.max(1, toNumber(tradeItem.qty, 1));
+  if (!itemName) return false;
+
   const index = bag.findIndex((entry: any) => String(entry?.name || '').trim().toLowerCase() === itemName);
-  if (index < 0) return false;
+  if (index >= 0) {
+    const currentQty = Math.max(0, toNumber((bag[index] as any).qty, 1));
+    if (currentQty < qty && !options?.forcePartial) return false;
 
-  const currentQty = Math.max(0, toNumber(bag[index].qty, 1));
-  if (currentQty < qty) return false;
+    const nextQty = currentQty - qty;
+    if (nextQty <= 0 || currentQty < qty) bag.splice(index, 1);
+    else bag[index] = { ...bag[index], qty: nextQty };
 
-  const nextQty = currentQty - qty;
-  if (nextQty <= 0) bag.splice(index, 1);
-  else bag[index] = { ...bag[index], qty: nextQty };
+    (equipment as any).bag = bag;
+    (equipment as any).slots = slots;
+    return true;
+  }
+
+  // Item equipado também pode ser enviado/trocado. Nesse caso remova do slot.
+  for (const [slotName, rawItem] of Object.entries(slots)) {
+    const slotItem = rawItem as any;
+    if (!slotItem || String(slotItem?.name || '').trim().toLowerCase() !== itemName) continue;
+    const currentQty = Math.max(1, toNumber(slotItem.qty, 1));
+    if (currentQty < qty && !options?.forcePartial) return false;
+    const nextQty = currentQty - qty;
+    if (nextQty <= 0 || currentQty <= qty || options?.forcePartial) delete (slots as any)[slotName];
+    else (slots as any)[slotName] = { ...slotItem, qty: nextQty };
+    (equipment as any).bag = bag;
+    (equipment as any).slots = slots;
+    return true;
+  }
 
   (equipment as any).bag = bag;
-  return true;
+  (equipment as any).slots = slots;
+  return false;
 }
 
 function hasInventoryIncrease(currentEquipment: Record<string, unknown>, nextEquipment: Record<string, unknown>) {
@@ -3693,4 +4353,23 @@ function getLanForegroundInfo(payload: LanSessionPayload, joinUrl: string) {
 function toNumber(value: unknown, fallback = 0) {
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? numberValue : fallback;
+}
+
+function inferTotalLevelFromClassName(value: unknown) {
+  const classText = String(value || '').trim();
+  if (!classText) return 0;
+
+  const segments = classText.split('/').map((segment) => segment.trim()).filter(Boolean);
+  let total = 0;
+
+  for (const segment of segments.length ? segments : [classText]) {
+    // Formatos esperados: "Ladino 2", "Guerreiro (Campeao) 3",
+    // ou multiclass: "Ladino 2 / Mago 1". Evita usar numeros de nomes.
+    const match = segment.match(/(?:^|\s)(\d{1,2})\s*$/);
+    if (!match) continue;
+    const level = Number(match[1]);
+    if (Number.isFinite(level) && level >= 1 && level <= 20) total += level;
+  }
+
+  return Math.max(0, Math.min(20, total));
 }

@@ -66,6 +66,8 @@ export function useLanRealtimePlayerPatches({
   const onHostUnreachableRef = useRef(onHostUnreachable);
   const applyRunningRef = useRef(false);
   const processingEventIdsRef = useRef<Set<string>>(new Set());
+  const applyQueueRef = useRef<LanSessionEvent[]>([]);
+  const queueRunningRef = useRef(false);
   const lastResyncRequestAtRef = useRef(0);
   const consecutiveFetchErrorsRef = useRef(0);
 
@@ -211,7 +213,9 @@ export function useLanRealtimePlayerPatches({
     const requestResyncIfNeeded = async (reason = 'manual') => {
       if (paused) return;
       const now = Date.now();
-      if (now - lastResyncRequestAtRef.current < LAN_NETWORK_LIMITS.resyncMinIntervalMs) return;
+      const urgent = /socket_closed|foreground|mount_or_rebind|focus|fetch_error/i.test(reason);
+      const minInterval = urgent ? 1200 : LAN_NETWORK_LIMITS.resyncMinIntervalMs;
+      if (now - lastResyncRequestAtRef.current < minInterval) return;
       lastResyncRequestAtRef.current = now;
 
       try {
@@ -240,40 +244,6 @@ export function useLanRealtimePlayerPatches({
       } catch (error) {
         console.warn('[LAN] Não foi possível solicitar resync ao host:', error);
       }
-    };
-
-    const runSideEffectInBackground = (label: string, event: LanSessionEvent, task: () => void | Promise<void>) => {
-      let result: void | Promise<void>;
-      try {
-        // Chama o handler imediatamente. Funções async executam até o primeiro await,
-        // permitindo que a UI aplique o patch antes do SQLite/resync.
-        result = task();
-      } catch (error) {
-        result = Promise.reject(error);
-      }
-      Promise.resolve(result)
-        .catch(async (error) => {
-          const reason = error instanceof Error ? error.message : String(error);
-          useLanRealtimeStore.getState().nackEvent(event.clientMsgId || event.id, reason);
-          debugLanFlow('PLAYER_BACKGROUND_EVENT_HANDLER_ERROR', {
-            label,
-            reason,
-            eventId: event.id,
-            type: event.type,
-            seq: event.seq,
-            entityType: event.entityType,
-            entityId: event.entityId,
-            entityRevision: event.entityRevision,
-          });
-          await nackLanSessionEvent(joinUrl, {
-            sessionId,
-            eventId: event.id,
-            clientMsgId: event.clientMsgId,
-            playerKey: selfKey,
-            reason,
-          }).catch(() => false);
-          if (!paused) await requestResyncIfNeeded(`background_${label}_error`);
-        });
     };
 
     const applyOneEvent = async (event: LanSessionEvent) => {
@@ -376,9 +346,9 @@ export function useLanRealtimePlayerPatches({
           if (!onNumberPatchRef.current) {
             throw new Error('onNumberPatch handler nao configurado.');
           }
-          // Caminho zero-latência: a UI é atualizada dentro do handler antes do SQLite.
-          // Não bloqueie a fila de socket esperando persistência local.
-          runSideEffectInBackground('number_patch', event, () => onNumberPatchRef.current?.(event.numberPatch!, event));
+          // HP/XP/moedas/PV temp são absolutos. Eles não podem rodar em paralelo,
+          // senão um patch antigo termina depois e faz a vida "voltar".
+          await onNumberPatchRef.current?.(event.numberPatch!, event);
           useLanRealtimeStore.getState().markEventApplied(event);
           await ackEvent(event);
           if (eventKey) processingEventIdsRef.current.delete(eventKey);
@@ -393,13 +363,21 @@ export function useLanRealtimePlayerPatches({
             updateCount: event.effectPatch.update?.length || 0,
             removeCount: event.effectPatch.remove?.length || 0,
           });
-          runSideEffectInBackground('effect_patch', event, () => onEffectPatchRef.current?.(event.effectPatch!, event));
+          if (!onEffectPatchRef.current) {
+            throw new Error('onEffectPatch handler nao configurado.');
+          }
+          // Efeito pode alterar PV temporario/atributos. Nao rode em background:
+          // se um dano ou passagem de turno chegar logo depois, o patch antigo
+          // poderia terminar por ultimo e fazer HP/PV temp voltar.
+          await onEffectPatchRef.current(event.effectPatch!, event);
           useLanRealtimeStore.getState().markEventApplied(event);
           await ackEvent(event);
           if (eventKey) processingEventIdsRef.current.delete(eventKey);
           return;
         } else if (event.type === 'inventory_patch' && event.inventoryPatch) {
-          runSideEffectInBackground('inventory_patch', event, () => onInventoryPatchRef.current?.(event.inventoryPatch!, event));
+          // Inventário também é snapshot absoluto. Aplique serialmente para não
+          // deixar troca/doação chegar fora de ordem quando há 3+ jogadores.
+          await onInventoryPatchRef.current?.(event.inventoryPatch!, event);
           useLanRealtimeStore.getState().markEventApplied(event);
           await ackEvent(event);
           if (eventKey) processingEventIdsRef.current.delete(eventKey);
@@ -451,6 +429,42 @@ export function useLanRealtimePlayerPatches({
         await requestResyncIfNeeded('apply_error');
         if (eventKey) processingEventIdsRef.current.delete(eventKey);
       }
+    };
+
+
+    const drainApplyQueue = async () => {
+      if (queueRunningRef.current) return;
+      queueRunningRef.current = true;
+      try {
+        while (applyQueueRef.current.length > 0) {
+          applyQueueRef.current.sort((a, b) => {
+            const seqDiff = getEventSeq(a) - getEventSeq(b);
+            if (seqDiff !== 0) return seqDiff;
+            const revDiff = Number(a.entityRevision || 0) - Number(b.entityRevision || 0);
+            if (revDiff !== 0) return revDiff;
+            return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+          });
+          const next = applyQueueRef.current.shift();
+          if (!next || disposed) continue;
+          await applyOneEvent(next);
+        }
+      } finally {
+        queueRunningRef.current = false;
+        if (!disposed && applyQueueRef.current.length > 0) {
+          void drainApplyQueue();
+        }
+      }
+    };
+
+    const enqueueApplyEvent = (event: LanSessionEvent) => {
+      const key = String(event.id || event.clientMsgId || '');
+      if (key) {
+        const alreadyQueued = applyQueueRef.current.some((queued) => String(queued.id || queued.clientMsgId || '') === key);
+        if (alreadyQueued) return;
+        if (processingEventIdsRef.current.has(key)) return;
+      }
+      applyQueueRef.current.push(event);
+      void drainApplyQueue();
     };
 
     const resetConnectionWhilePaused = () => {
@@ -536,8 +550,13 @@ export function useLanRealtimePlayerPatches({
 
         for (const event of ordered) {
           if (disposed) return;
-          await applyOneEvent(event);
+          const key = String(event.id || event.clientMsgId || '');
+          if (key && (processingEventIdsRef.current.has(key) || applyQueueRef.current.some((queued) => String(queued.id || queued.clientMsgId || '') === key))) {
+            continue;
+          }
+          applyQueueRef.current.push(event);
         }
+        await drainApplyQueue();
       } catch (error) {
         useLanRealtimeStore.getState().setConnection({
           sessionId,
@@ -632,7 +651,7 @@ export function useLanRealtimePlayerPatches({
               characterName,
             });
           }
-          void applyOneEvent(event);
+          enqueueApplyEvent(event);
         } else {
           // O evento permanece no buffer do transporte. Um flush curto evita que
           // efeito/condicao fique esperando o polling de fallback quando a tela

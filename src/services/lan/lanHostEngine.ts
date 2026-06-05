@@ -1,6 +1,7 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import { traceFunctionCall, traceFunctionReturn, traceLanEvent, traceStateChange } from '../debug/appTrace';
+import { enqueueLanEntityMutation, getLanPlayerQueueKey } from './lanEntityQueue';
 import {
   getLanSessionState,
   makeLanEventId,
@@ -19,24 +20,16 @@ export type LanHostPlayerPatchResult = {
   event: LanSessionEvent | null;
 };
 
-const hostMutationQueues = new Map<string, Promise<unknown>>();
-
-export function enqueueLanHostMutation<T>(sessionId: string, task: () => Promise<T>) {
-  traceFunctionCall('enqueueLanHostMutation', { sessionId }, {
+export function enqueueLanHostMutation<T>(sessionId: string, task: () => Promise<T>, keys?: string[]) {
+  traceFunctionCall('enqueueLanHostMutation', { sessionId, keys }, {
     source: 'lanHostEngine',
     sessionId,
   });
-  const currentQueue = hostMutationQueues.get(sessionId) || Promise.resolve();
-  const run = currentQueue.catch(() => undefined).then(task);
-
-  hostMutationQueues.set(
-    sessionId,
-    run.catch((error) => {
-      console.warn('[LAN HOST ENGINE] Mutacao falhou:', error);
-    })
+  return enqueueLanEntityMutation(
+    keys && keys.length > 0 ? keys : [`${sessionId}:host`],
+    task,
+    { source: 'lanHostEngine', sessionId },
   );
-
-  return run;
 }
 
 export function commitHostPlayerNumberPatch(
@@ -55,7 +48,11 @@ export function commitHostPlayerNumberPatch(
     playerId: input.playerId,
     patch: input.patch,
   });
-  return enqueueLanHostMutation(input.sessionId, () => applyHostPlayerNumberPatch(db, input));
+  return enqueueLanHostMutation(
+    input.sessionId,
+    () => applyHostPlayerNumberPatch(db, input),
+    [getLanPlayerQueueKey(input.sessionId, input.playerId)],
+  );
 }
 
 export function commitHostPlayerNumberDelta(
@@ -100,7 +97,7 @@ export function commitHostPlayerNumberDelta(
       after: { [input.field]: nextValue },
     });
     return result;
-  });
+  }, [getLanPlayerQueueKey(input.sessionId, input.playerId)]);
 }
 
 async function applyHostPlayerNumberPatch(

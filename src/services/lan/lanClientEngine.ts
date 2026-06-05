@@ -22,6 +22,7 @@ const LIVE_EVENT_TYPES = new Set<LanSessionEvent['type']>([
   'send_item',
   'send_item_result',
   'trade_offer',
+  'trade_counter',
   'trade_accept',
   'trade_decline',
   'trade_result',
@@ -60,6 +61,7 @@ export function isLanSessionGlobalEvent(event: LanSessionEvent) {
   if (event.toKey === 'all' || event.toKey === 'party' || event.toKey === 'session') return true;
   if (event.entityType === 'session') return true;
   if (event.type === 'effect_catalog_patch' || event.type === 'public_status') return true;
+  if (event.type === 'player_joined' && (event.toKey === 'session' || event.toKey === 'party' || event.toKey === 'all')) return true;
   return false;
 }
 

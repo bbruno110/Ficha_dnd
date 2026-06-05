@@ -3,6 +3,7 @@ import { NativeModules } from 'react-native';
 
 import { traceApp, traceError, traceFunctionCall, traceFunctionReturn, traceSocket } from './debug/appTrace';
 import { shouldPlayerProcessLanEvent } from './lan/lanClientEngine';
+import { getLanEventEntityId, getLanEventEntityType } from './lan/lanEntityQueue';
 import {
   getHeartbeatIntervalForSessionStatus,
   getLanEventAudience,
@@ -89,6 +90,8 @@ let hostUpdateListeners = new Set<(update?: HostUpdate) => void>();
 let hostKickedJoinKeys = new Set<string>();
 let lastHostPayloadBroadcastAt = 0;
 let lastHostPayloadBroadcastSignature = '';
+const semanticTraceThrottle = new Map<string, { at: number; signature: string }>();
+const SEMANTIC_TRACE_THROTTLE_MS = 1500;
 
 let clientSocket: TcpSocket | null = null;
 let clientUrl = '';
@@ -105,6 +108,7 @@ let clientHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let clientBoundPlayerKey = '';
 let clientBoundLastAppliedSeq = 0;
 let clientBoundKnownRevisions: Record<string, number> | undefined;
+let clientHelloBindingSignature = '';
 const closedSockets = new WeakSet<TcpSocket>();
 
 type ClientPayloadWaiter = {
@@ -208,14 +212,15 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           receivedEventIds: message.receivedEventIds || [],
           receivedAt: new Date().toISOString(),
         });
-        notifyHostUpdates({ reason: 'ack' });
+        // ACK e heartbeat sao caminho quente. Nao acorde a UI do mestre para cada ACK,
+        // senao um jogador que reabre a ficha e confirma dezenas de eventos congela a mesa.
         return;
       }
 
       if (message.type === 'event_ack') {
         bindHostConnection(socket, { playerKey: message.playerKey });
         rememberHostAck({ ...message, receivedAt: new Date().toISOString() });
-        notifyHostUpdates({ reason: 'event_ack' });
+        // ACK por evento nao muda estado de mesa; manter apenas em memoria para debug/retry.
         return;
       }
 
@@ -230,9 +235,12 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         bindHostConnection(socket, { playerKey: message.playerKey });
         if (!isEnvelopeForCurrentSession(message.sessionId)) return;
         const lastAppliedSeq = Number(message.lastAppliedSeq || 0);
+        const replayEvents = lastAppliedSeq > 0
+          ? getEventsAfterSeq(lastAppliedSeq, message.sessionId)
+          : getColdStartResyncEvents(message.sessionId);
         const events = filterEventsForPlayer(
           mergeEventsById(
-            getEventsAfterSeq(lastAppliedSeq, message.sessionId),
+            replayEvents,
             getEventsForRevisionGaps(message.sessionId, message.knownRevisions || {})
           ),
           {
@@ -241,10 +249,21 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
             includeGlobal: message.includeGlobal !== false,
           }
         );
+        const limitedEvents = events.slice(-LAN_NETWORK_LIMITS.maxEventsPerResync);
+        traceApp('RESYNC_RECEIVED', 'RESYNC_RESPONSE_PREPARED', {
+          source: 'lanTcpTransport.resync_request',
+          sessionId: message.sessionId,
+          playerKey: message.playerKey,
+          lastAppliedSeq,
+          replayCount: replayEvents.length,
+          totalCount: events.length,
+          sentCount: limitedEvents.length,
+          coldStart: lastAppliedSeq <= 0,
+        });
         sendEnvelope(socket, {
           type: 'resync_events',
           sessionId: message.sessionId,
-          events: events.slice(-LAN_NETWORK_LIMITS.maxEventsPerResync),
+          events: limitedEvents,
           payload: makeHostPayload(),
         });
         return;
@@ -374,6 +393,18 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
             payload: bootstrapPayload,
             structural: true,
           });
+          const publicJoinedEvent = makePublicPlayerJoinedEvent(joinedEvent, bootstrapPayload);
+          upsertByKey(hostEvents, publicJoinedEvent, 'id');
+          broadcastEnvelope({ type: 'event_commit', event: publicJoinedEvent });
+          notifyHostUpdates({ reason: 'player_joined_public', event: publicJoinedEvent, envelopeType: 'event_commit' });
+          traceApp('LAN_JOIN', 'MASTER_JOIN_PUBLIC_EVENT_BROADCAST', {
+            source: 'lanTcpTransport.join',
+            sessionId: entrySessionId,
+            remoteKey,
+            clientId,
+            playerName,
+            playerCount: bootstrapPayload.state?.players?.length || 0,
+          });
           traceApp('LAN_JOIN', 'MASTER_JOIN_BOOTSTRAP_PAYLOAD_WITH_PLAYER', {
             source: 'lanTcpTransport.join',
             sessionId: entrySessionId,
@@ -410,7 +441,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
             playerName,
           });
           rejectJoin('JOIN_UPSERT_TIMEOUT');
-        }, 3000);
+        }, 8000);
 
         notifyHostUpdates({
           reason: 'join',
@@ -716,7 +747,6 @@ export async function sendLanTcpAck(url: string | undefined, ack: { sessionId: s
 
   if (isCurrentHostUrl(url)) {
     rememberHostAck({ ...ack, type: 'event_ack', receivedAt: new Date().toISOString() });
-    notifyHostUpdates();
     traceFunctionReturn('sendLanTcpAck', { result: true, mode: 'host_memory' }, {
       source: 'lanTcpTransport',
       sessionId: ack.sessionId,
@@ -727,7 +757,8 @@ export async function sendLanTcpAck(url: string | undefined, ack: { sessionId: s
   }
 
   if (clientSocket && clientUrl === url) {
-    if (ack.playerKey) sendClientHello(url, clientSocket, { playerKey: ack.playerKey, lastAppliedSeq: ack.lastAppliedSeq });
+    // Nao envie hello junto com ACK. O host responde hello com session_snapshot;
+    // em resyncs grandes isso causava dezenas de snapshots e travava todos.
     const result = sendEnvelope(clientSocket, { type: 'event_ack', ...ack });
     traceFunctionReturn('sendLanTcpAck', { result }, {
       source: 'lanTcpTransport',
@@ -775,7 +806,7 @@ export async function sendLanTcpNack(url: string | undefined, nack: { sessionId:
   }
 
   if (clientSocket && clientUrl === url) {
-    if (nack.playerKey) sendClientHello(url, clientSocket, { playerKey: nack.playerKey });
+    // NACK tambem nao precisa de hello; a propria mensagem carrega playerKey.
     const result = sendEnvelope(clientSocket, { type: 'event_nack', ...nack });
     traceFunctionReturn('sendLanTcpNack', { result }, {
       source: 'lanTcpTransport',
@@ -800,7 +831,7 @@ export async function sendLanTcpNack(url: string | undefined, nack: { sessionId:
   return result;
 }
 
-export async function requestLanTcpResync(url: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean }) {
+export async function requestLanTcpResync(url: string | undefined, request: { sessionId: string; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number>; includeGlobal?: boolean; forceReconnect?: boolean }) {
   if (!url) return false;
   traceFunctionCall('requestLanTcpResync', request, {
     source: 'lanTcpTransport',
@@ -808,15 +839,24 @@ export async function requestLanTcpResync(url: string | undefined, request: { se
     playerKey: request.playerKey,
   });
 
+  const resyncEnvelope: Extract<TcpEnvelope, { type: 'resync_request' }> = {
+    type: 'resync_request',
+    sessionId: request.sessionId,
+    playerKey: request.playerKey,
+    lastAppliedSeq: request.lastAppliedSeq,
+    knownRevisions: request.knownRevisions,
+    includeGlobal: request.includeGlobal,
+  };
+
+  if (request.forceReconnect && clientSocket && clientUrl === url) {
+    closeClientSocket();
+    clientPayload = null;
+  }
+
   if (clientSocket && clientUrl === url) {
-    if (request.playerKey) {
-      sendClientHello(url, clientSocket, {
-        playerKey: request.playerKey,
-        lastAppliedSeq: request.lastAppliedSeq,
-        knownRevisions: request.knownRevisions,
-      });
-    }
-    const result = sendEnvelope(clientSocket, { type: 'resync_request', ...request });
+    // O resync_request ja carrega playerKey/knownRevisions e o host faz bind por ele.
+    // Evita hello extra, que geraria session_snapshot desnecessario.
+    const result = sendEnvelope(clientSocket, resyncEnvelope);
     if (result) {
       traceFunctionReturn('requestLanTcpResync', { result }, {
         source: 'lanTcpTransport',
@@ -839,12 +879,8 @@ export async function requestLanTcpResync(url: string | undefined, request: { se
     knownRevisions: request.knownRevisions,
   });
   if (!clientSocket) return false;
-  sendClientHello(url, clientSocket, {
-    playerKey: request.playerKey,
-    lastAppliedSeq: request.lastAppliedSeq,
-    knownRevisions: request.knownRevisions,
-  });
-  const result = sendEnvelope(clientSocket, { type: 'resync_request', ...request });
+  // connectLanTcpClient ja enviou hello na abertura da conexao; envie apenas o pedido real.
+  const result = sendEnvelope(clientSocket, resyncEnvelope);
   traceFunctionReturn('requestLanTcpResync', { result, reconnected: true }, {
     source: 'lanTcpTransport',
     sessionId: request.sessionId,
@@ -892,16 +928,23 @@ function rememberClientBinding(options?: { playerKey?: string; lastAppliedSeq?: 
   if (options?.knownRevisions) clientBoundKnownRevisions = options.knownRevisions;
 }
 
+function getClientHelloBindingSignature(url: string) {
+  const target = parseTcpUrl(url);
+  return `${target.sessionId}:${clientBoundPlayerKey || ''}`;
+}
+
 function sendClientHello(url: string, socket: TcpSocket, options?: { playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
   rememberClientBinding(options);
   const target = parseTcpUrl(url);
-  return sendEnvelope(socket, {
+  const result = sendEnvelope(socket, {
     type: 'hello',
     sessionId: target.sessionId,
     playerKey: clientBoundPlayerKey || undefined,
     lastAppliedSeq: clientBoundLastAppliedSeq || undefined,
     knownRevisions: clientBoundKnownRevisions,
   });
+  if (result) clientHelloBindingSignature = getClientHelloBindingSignature(url);
+  return result;
 }
 
 async function connectLanTcpClient(url: string, options?: { requestFresh?: boolean; forceReconnect?: boolean; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
@@ -909,7 +952,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
   rememberClientBinding(options);
 
   if (clientSocket && clientUrl === url && clientPayload && !options?.forceReconnect) {
-    if (options?.playerKey || options?.knownRevisions || options?.lastAppliedSeq != null) {
+    if (options?.playerKey && getClientHelloBindingSignature(url) !== clientHelloBindingSignature) {
       sendClientHello(url, clientSocket, options);
     }
     if (!options?.requestFresh) return clientPayload;
@@ -963,6 +1006,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
 
       if (clientSocket === socket) {
         clientSocket = null;
+        clientHelloBindingSignature = '';
       }
 
       clientPayload = null;
@@ -1260,31 +1304,10 @@ function makeSyntheticSessionStatusEvent(payload: LanSessionPayload, status: str
       createdAt: now,
     });
   }
-  if (status === 'paused' || status === 'active') {
-    return normalizeWireEvent({
-      id: `synthetic_session_patch_${sessionId}_${status}`,
-      sessionId,
-      type: 'session_patch',
-      fromKey: 'master',
-      fromName: payload.session?.masterName || 'Mestre',
-      toKey: 'all',
-      toName: 'Todos',
-      entityType: 'session',
-      entityId: sessionId,
-      entityRevision: seq,
-      seq,
-      serverSeq: seq,
-      ackRequired: true,
-      sessionPatch: {
-        status: status as any,
-        reason: 'payload_status_change',
-        keepPlayersLinked: status === 'paused',
-        readOnlyForPlayers: status === 'paused',
-      },
-      message: status === 'paused' ? 'Sessao pausada pelo mestre.' : 'Sessao continuada pelo mestre.',
-      createdAt: now,
-    });
-  }
+  // v39: pausa/continuação não podem nascer de payload/snapshot sintético.
+  // O payload é cache estrutural e pode chegar atrasado; se ele gerar session_patch,
+  // o jogador alterna entre active/paused mesmo depois do evento real.
+  // Somente eventos session_patch oficiais do mestre mudam active/paused.
   return null;
 }
 
@@ -1478,6 +1501,7 @@ function getEnvelopePriority(message: TcpEnvelope) {
     const eventType = message.event?.type;
     if (eventType === 'session_ended') return 100;
     if (eventType === 'session_patch' || eventType === 'player_kicked') return 95;
+    if (eventType === 'player_progression_patch') return 94;
     if (eventType === 'player_patch' || eventType === 'effect_patch' || eventType === 'inventory_patch' || eventType === 'pending_save_patch') return 90;
     if (eventType === 'send_item_result' || eventType === 'trade_result' || eventType === 'send_item_request' || String(eventType || '').startsWith('trade_')) return 80;
     return 40;
@@ -1489,6 +1513,9 @@ function getEnvelopePriority(message: TcpEnvelope) {
 
 function enqueueHostEnvelope(socket: TcpSocket, message: TcpEnvelope) {
   const connection = registerHostConnection(socket);
+  if (message.type === 'session_snapshot' || message.type === 'payload_update') {
+    connection.queue = connection.queue.filter((queued) => queued.type !== 'session_snapshot' && queued.type !== 'payload_update');
+  }
   if (connection.queue.length >= LAN_NETWORK_LIMITS.socketQueueMaxPending) {
     connection.queue.shift();
     traceSocket('SOCKET_QUEUE_DROPPED_OLDEST', {
@@ -1628,6 +1655,7 @@ function traceSemanticEnvelopeReceive(message: TcpEnvelope) {
   if (!shouldTraceLanEnvelope(message.type, 'event' in message ? message.event?.type : undefined)) return;
   const fields = getEnvelopeTraceFields(message);
   if (message.type === 'session_snapshot') {
+    if (!shouldTraceRepeatedStructuralEnvelope(message, fields)) return;
     traceApp('SNAPSHOT_RECEIVED', 'SESSION_SNAPSHOT_RECEIVED', {
       source: 'lanTcpTransport.createLineReader',
       ...fields,
@@ -1635,6 +1663,7 @@ function traceSemanticEnvelopeReceive(message: TcpEnvelope) {
     return;
   }
   if (message.type === 'payload_update') {
+    if (!shouldTraceRepeatedStructuralEnvelope(message, fields)) return;
     traceApp('PAYLOAD_RECEIVED', 'PAYLOAD_UPDATE_RECEIVED', {
       source: 'lanTcpTransport.createLineReader',
       ...fields,
@@ -1679,6 +1708,34 @@ function traceSemanticEnvelopeReceive(message: TcpEnvelope) {
       ...fields,
     });
   }
+}
+
+function shouldTraceRepeatedStructuralEnvelope(message: TcpEnvelope, fields: Record<string, any>) {
+  if (message.type !== 'session_snapshot' && message.type !== 'payload_update') return true;
+  const payload = 'payload' in message ? message.payload : undefined;
+  const signature = [
+    message.type,
+    fields.sessionId || '',
+    payload?.state?.players?.length || 0,
+    payload?.events?.length || 0,
+    payload?.state?.status || '',
+    payload?.state?.currentTurn || 0,
+    payload?.state?.elapsedMinutes || 0,
+  ].join(':');
+  const key = `${message.type}:${fields.sessionId || ''}`;
+  const now = Date.now();
+  const previous = semanticTraceThrottle.get(key);
+  if (previous && previous.signature === signature && now - previous.at < SEMANTIC_TRACE_THROTTLE_MS) {
+    return false;
+  }
+  semanticTraceThrottle.set(key, { at: now, signature });
+  if (semanticTraceThrottle.size > 40) {
+    const cutoff = now - SEMANTIC_TRACE_THROTTLE_MS * 4;
+    for (const [entryKey, entry] of semanticTraceThrottle) {
+      if (entry.at < cutoff) semanticTraceThrottle.delete(entryKey);
+    }
+  }
+  return true;
 }
 
 function getEnvelopeTraceFields(message: TcpEnvelope) {
@@ -1763,6 +1820,60 @@ function summarizeEnvelopePayload(message: TcpEnvelope, event?: LanSessionEvent,
   return message;
 }
 
+
+function summarizePlayerForPublicStatus(player: any) {
+  const effects = Array.isArray(player?.effects) ? player.effects : [];
+  return {
+    hpCurrent: Math.max(0, Math.floor(Number(player?.hpCurrent ?? player?.hp_current ?? 0) || 0)),
+    hpMax: Math.max(0, Math.floor(Number(player?.hpMax ?? player?.hp_max ?? 0) || 0)),
+    tempHp: Math.max(0, Math.floor(Number(player?.tempHp ?? player?.temp_hp ?? 0) || 0)),
+    level: Math.max(1, Math.floor(Number(player?.level ?? 1) || 1)),
+    effects: effects
+      .filter((effect: any) => effect?.visibleToPlayer !== false)
+      .filter((effect: any) => {
+        const kind = String(effect?.kind || '').toLowerCase();
+        const status = String(effect?.status || effect?.statusKey || '').trim();
+        const target = String(effect?.target || '').toUpperCase();
+        return Boolean(status) || kind === 'status' || kind === 'temp_hp' || target === 'PV_TEMP';
+      })
+      .map((effect: any) => ({
+        id: effect.id,
+        name: effect.name || effect.status || effect.statusKey || 'Efeito',
+        status: effect.status,
+        statusKey: effect.statusKey,
+        remaining: effect.remaining,
+        unit: effect.unit,
+        color: effect.color,
+        secondaryColor: effect.secondaryColor,
+        publicNote: effect.publicNote,
+      })),
+  };
+}
+
+function makePublicPlayerJoinedEvent(base: LanSessionEvent, payload: LanSessionPayload): LanSessionEvent {
+  const player = (payload.state?.players || []).find((entry: any) => (
+    (base.fromKey && entry.remoteKey === base.fromKey) ||
+    (base.fromName && entry.characterName === base.fromName)
+  ));
+  const now = new Date().toISOString();
+  const seq = Date.now();
+  return normalizeWireEvent({
+    ...base,
+    id: `${base.id}_public`,
+    seq,
+    serverSeq: seq,
+    toKey: 'session',
+    toName: 'Sessao',
+    entityType: 'session',
+    entityId: base.sessionId,
+    entityRevision: seq,
+    ackRequired: false,
+    publicState: summarizePlayerForPublicStatus(player || {}),
+    message: base.message || `${base.fromName} entrou na sessao.`,
+    createdAt: base.createdAt || now,
+  });
+}
+
 function configureSocket(socket: TcpSocket) {
   socket.setNoDelay?.(true);
   socket.setKeepAlive?.(true, 1000);
@@ -1838,20 +1949,11 @@ function normalizeWireEvent(event: LanSessionEvent): LanSessionEvent {
 }
 
 function inferWireEventEntityType(event: LanSessionEvent) {
-  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
-  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
-  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (
-    event.type === 'resource_request' ||
-    event.type === 'resource_review' ||
-    event.type === 'pending_save_patch' ||
-    event.type === 'character_update_review'
-  ) return 'request';
-  return 'player';
+  return getLanEventEntityType(event);
 }
 
 function inferWireEventEntityId(event: LanSessionEvent) {
-  return event.toKey || event.fromKey || event.tradeId || event.sessionId;
+  return getLanEventEntityId(event);
 }
 
 function shouldWireEventRequireAck(event: LanSessionEvent) {
@@ -1881,6 +1983,28 @@ function getEventsAfterSeq(seq: number, sessionId?: string) {
     .sort(compareEventsAscending);
 }
 
+function getColdStartResyncEvents(sessionId?: string) {
+  // Quando um jogador reabre a ficha ou entra tarde na mesa, nao faça replay de
+  // todo historico vivo (HP, efeito e inventario). Esses estados sao cobertos por
+  // checkpoints autoritativos em getEventsForRevisionGaps. Mantemos apenas eventos
+  // de fluxo que ainda podem precisar aparecer na UI, como propostas de troca.
+  return mergeRecentEvents(hostPayload?.events || [], hostEvents)
+    .filter((event) => !sessionId || event.sessionId === sessionId)
+    .filter((event) => !isStateReplayCoveredByCheckpoint(event))
+    .slice(-20)
+    .sort(compareEventsAscending);
+}
+
+function isStateReplayCoveredByCheckpoint(event: LanSessionEvent) {
+  if (event.type === 'player_patch') return true;
+  if (event.type === 'effect_patch' || event.type === 'effect_expired') return true;
+  if (event.type === 'inventory_patch') return true;
+  if (event.type === 'pending_save_patch') return true;
+  if (event.type === 'public_status') return true;
+  if (event.type === 'timeline_event') return true;
+  return false;
+}
+
 function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions: Record<string, number>) {
   const events = mergeRecentEvents(hostPayload?.events || [], hostEvents)
     .filter((event) => !sessionId || event.sessionId === sessionId);
@@ -1907,9 +2031,11 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
     if (!targetKey) continue;
 
     const effectEntityKey = `${player.sessionId || sessionId}:effect:${targetKey}`;
+    // v32: efeito tem revisão própria. Não use player.revisionSeq como fallback,
+    // senão qualquer dano/XP gera checkpoint de efeito novamente no resync.
     const latestEffectRevision = Math.max(
-      Number(player.revisionSeq || 0),
       latestRevisionByEntity.get(effectEntityKey) || 0,
+      0,
     );
     const knownEffectRevision = Number(knownRevisions[effectEntityKey] || 0);
     if (latestEffectRevision > 0 && knownEffectRevision < latestEffectRevision) {
@@ -1952,10 +2078,15 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
     }
 
     const playerEntityKey = `${player.sessionId || sessionId}:player:${targetKey}`;
-    const latestPlayerRevision = Math.max(
-      Number(player.revisionSeq || 0),
-      latestRevisionByEntity.get(playerEntityKey) || 0,
-    );
+    // v33: NUNCA use player.revisionSeq como revision de player_patch.
+    // revision_seq da tabela também sobe em join/equip/inventário e pode ser Date.now() em runtime,
+    // fazendo checkpoints com revisão gigantesca bloquearem danos reais revision=1..N no jogador.
+    // Para HP/XP/moedas/PV temp, a revision confiável é a maior revision dos eventos player_patch já criados.
+    const rawLatestPlayerRevision = latestRevisionByEntity.get(playerEntityKey) || 0;
+    // v34: if an old build stored a Date.now() value as player revision, never create
+    // a player checkpoint from it. It would poison the client again and make XP/HP/level
+    // events with normal revisions look stale.
+    const latestPlayerRevision = rawLatestPlayerRevision > 1000000 ? 0 : rawLatestPlayerRevision;
     const knownPlayerRevision = Number(knownRevisions[playerEntityKey] || 0);
     if (latestPlayerRevision > 0 && knownPlayerRevision < latestPlayerRevision) {
       const seq = syntheticSeq++;
@@ -1984,6 +2115,42 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
           cp: Number(player.cp || 0),
         },
         message: 'Checkpoint de recursos do jogador.',
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    const inventoryEntityKey = `${player.sessionId || sessionId}:inventory:${targetKey}`;
+    // v32: inventário tem revisão própria. Não use player.revisionSeq como fallback,
+    // senão todo patch de HP vira checkpoint de inventário e congestiona envio/troca.
+    const latestInventoryRevision = Math.max(
+      latestRevisionByEntity.get(inventoryEntityKey) || 0,
+      0,
+    );
+    const knownInventoryRevision = Number(knownRevisions[inventoryEntityKey] || 0);
+    if (latestInventoryRevision > 0 && knownInventoryRevision < latestInventoryRevision) {
+      const seq = syntheticSeq++;
+      checkpointEvents.push({
+        id: `checkpoint_inventory_${targetKey}_${latestInventoryRevision}_${seq}`,
+        sessionId: String(player.sessionId || sessionId || ''),
+        type: 'inventory_patch',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: targetKey,
+        toName: String(player.characterName || player.playerName || targetKey),
+        entityType: 'inventory',
+        entityId: targetKey,
+        entityRevision: latestInventoryRevision,
+        seq,
+        serverSeq: seq,
+        ackRequired: true,
+        originClientId: 'master',
+        inventoryPatch: {
+          targetKey,
+          equipment: (player as any).equipment || { bag: [], slots: {} },
+          reason: 'Checkpoint de inventario.',
+          action: 'replace',
+        },
+        message: 'Checkpoint de inventario.',
         createdAt: new Date().toISOString(),
       });
     }
@@ -2030,22 +2197,9 @@ function shouldReturnEventToClient(
 }
 
 function getRuntimeEntityKey(event: LanSessionEvent) {
-  const entityType = event.entityType || inferEventEntityType(event);
-  const entityId = event.entityId || event.toKey || event.fromKey || event.tradeId || event.sessionId;
+  const entityType = event.entityType || getLanEventEntityType(event);
+  const entityId = event.entityId || getLanEventEntityId({ ...event, entityType });
   return `${event.sessionId}:${entityType}:${entityId}`;
-}
-
-function inferEventEntityType(event: LanSessionEvent) {
-  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
-  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
-  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (
-    event.type === 'resource_request' ||
-    event.type === 'resource_review' ||
-    event.type === 'pending_save_patch' ||
-    event.type === 'character_update_review'
-  ) return 'request';
-  return 'player';
 }
 
 function rememberHostAck(ack: Record<string, unknown>) {
@@ -2088,6 +2242,7 @@ function closeClientSocket() {
   }
   closedSockets.add(clientSocket);
   clientSocket = null;
+  clientHelloBindingSignature = '';
   clearClientPayloadWaiters();
   stopClientHeartbeat();
 }
@@ -2128,6 +2283,7 @@ export function resetLanTcpClient() {
   clientBoundPlayerKey = '';
   clientBoundLastAppliedSeq = 0;
   clientBoundKnownRevisions = undefined;
+  clientHelloBindingSignature = '';
   clearClientPayloadWaiters();
   clearClientJoinAckWaiters(new Error('Cliente LAN resetado.'));
 }

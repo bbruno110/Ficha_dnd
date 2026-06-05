@@ -26,6 +26,7 @@ import {
   applyLanInventoryTransferEvent,
   applyLanPlayerInventoryPatch,
   applyLanPlayerNumberPatch,
+  applyLanPlayerProgressionPatchFromEvent,
   applyLanResourceRequest,
   applyLanSendItemRequest,
   applyLanTradeAcceptRequest,
@@ -48,6 +49,7 @@ import {
   keysFromSelection,
   kickLanSessionPlayer,
   makeInviteCode,
+  makeLanCharacterKey,
   makeLanEventId,
   makeLanHostInstanceId,
   makeSessionId,
@@ -79,6 +81,7 @@ import {
   type LanEffectTarget,
   type LanEffectUnit,
   type LanSessionEvent,
+  type LanSessionEffect,
   type LanSessionHostUpdate,
   type LanSessionPayload,
   type LanSessionPlayerState,
@@ -87,7 +90,9 @@ import {
   type LanTradeItem,
 } from '@/services/lanSession';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
+import { executeLanHostCommandOnce } from '@/services/lan/lanCommandBus';
 import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
+import { enqueueLanEntityMutation, getLanPlayerQueueKey, getLanSessionQueueKey } from '@/services/lan/lanEntityQueue';
 import {
   applyHostEffectPatchRuntime,
   applyHostNumberDeltaRuntime,
@@ -188,6 +193,10 @@ export default function LanSessionScreen() {
   const db = useSQLiteContext();
   const masterMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const silentPayloadRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reloadSessionStateRunningRef = useRef(false);
+  const reloadSessionStateQueuedRef = useRef<string | null>(null);
+  const reloadSessionStateLastRunAtRef = useRef(0);
+  const sessionLifecycleLockUntilRef = useRef(0);
   const endingSessionRef = useRef(false);
   const pauseToggleRunningRef = useRef(false);
   const pendingMasterActionIdsRef = useRef<Set<string>>(new Set());
@@ -468,6 +477,89 @@ export default function LanSessionScreen() {
     return Math.max(0, Math.floor(Number(row?.revisionSeq || 0)));
   }, [db]);
 
+
+  const summarizePlayerPublicEffects = useCallback((effects: LanSessionPlayerState['effects'] | undefined) => (
+    (effects || [])
+      .filter((effect) => effect.visibleToPlayer !== false)
+      .filter((effect) => {
+        const kind = String(effect.kind || '').toLowerCase();
+        const status = String(effect.status || effect.statusKey || '').trim();
+        const target = String(effect.target || '').toUpperCase();
+        return Boolean(status) || kind === 'status' || target === 'PV_TEMP' || kind === 'temp_hp';
+      })
+      .map((effect) => ({
+        id: effect.id,
+        name: effect.name || effect.status || effect.statusKey || 'Efeito',
+        status: effect.status,
+        statusKey: effect.statusKey,
+        remaining: effect.remaining,
+        unit: effect.unit,
+        color: effect.color,
+        secondaryColor: effect.secondaryColor,
+        publicNote: effect.publicNote,
+      }))
+  ), []);
+
+  const sendPublicPlayerStatus = useCallback(async (
+    sessionId: string,
+    player: LanSessionPlayerState,
+    reason: string,
+    numberPatch?: NumberPatch,
+  ) => {
+    const playerKey = player.remoteKey || '';
+    if (!joinUrl || !sessionId || !playerKey) return null;
+    const hpCurrent = Math.max(0, Math.floor(Number(numberPatch?.hpCurrent ?? player.hpCurrent) || 0));
+    const hpMax = Math.max(0, Math.floor(Number(numberPatch?.hpMax ?? player.hpMax) || 0));
+    const tempHp = Math.max(0, Math.floor(Number(numberPatch?.tempHp ?? player.tempHp) || 0));
+    const seq = Date.now();
+    const event: LanSessionEvent = {
+      id: makeLanEventId(),
+      sessionId,
+      seq,
+      serverSeq: seq,
+      type: 'public_status',
+      fromKey: playerKey,
+      fromName: player.characterName,
+      toKey: 'session',
+      toName: 'session',
+      entityType: 'public_status',
+      entityId: playerKey,
+      entityRevision: seq,
+      ackRequired: false,
+      originClientId: 'master',
+      publicState: {
+        hpCurrent,
+        hpMax,
+        tempHp,
+        level: player.level,
+        effects: summarizePlayerPublicEffects(player.effects),
+      },
+      message: `${player.characterName} atualizou status publico (${reason}).`,
+      createdAt: new Date().toISOString(),
+    };
+    try {
+      await sendLanSessionEvent(joinUrl, event);
+      debugLanFlow('MASTER_PUBLIC_STATUS_SENT', {
+        sessionId,
+        playerKey,
+        reason,
+        hpCurrent,
+        hpMax,
+        tempHp,
+        effectCount: event.publicState?.effects?.length || 0,
+      });
+      return event;
+    } catch (error) {
+      debugLanFlow('MASTER_PUBLIC_STATUS_SEND_FAILED', {
+        sessionId,
+        playerKey,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }, [joinUrl, summarizePlayerPublicEffects]);
+
   const sendLiveEventToClients = useCallback(async (event: LanSessionEvent | null | undefined) => {
     if (!event || !joinUrl) return false;
 
@@ -533,6 +625,8 @@ export default function LanSessionScreen() {
       sessionStateRef.current = runtimeResult.state;
       setSessionState(runtimeResult.state);
       setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
+      const publicPlayer = runtimeResult.state.players.find((entry) => entry.remoteKey === result.targetKey);
+      if (publicPlayer) void sendPublicPlayerStatus(sessionId, publicPlayer, 'effect_patch');
     }
 
     if (result.event) {
@@ -544,7 +638,7 @@ export default function LanSessionScreen() {
       event.type === 'effect_patch' && event.toKey === result.targetKey
     ));
     return fallback;
-  }, [sendLatestLiveEvent, sendLiveEventToClients]);
+  }, [sendLatestLiveEvent, sendLiveEventToClients, sendPublicPlayerStatus]);
 
   const rememberSentEventInTimeline = useCallback((event: LanSessionEvent | null | undefined) => {
     if (!event) return;
@@ -591,8 +685,9 @@ export default function LanSessionScreen() {
       entityRevision,
     });
     rememberSentEventInTimeline(event);
+    void sendPublicPlayerStatus(sessionId, player, 'inventory_patch');
     return event;
-  }, [db, getPlayerRevision, joinUrl, rememberSentEventInTimeline]);
+  }, [db, getPlayerRevision, joinUrl, rememberSentEventInTimeline, sendPublicPlayerStatus]);
 
 
   const applyHostInventoryRuntimePatch = useCallback((
@@ -625,24 +720,25 @@ export default function LanSessionScreen() {
     };
 
     if (!updatedPlayer) return null;
+    const patchedPlayer = updatedPlayer as LanSessionPlayerState;
 
     sessionStateRef.current = nextState;
     setSessionState(nextState);
     setPayload((current) => current ? ({ ...current, state: nextState }) : current);
-    setInventoryModalPlayer((current) => current?.remoteKey === updatedPlayer?.remoteKey ? updatedPlayer : current);
-    setDetailPlayer((current) => current?.remoteKey === updatedPlayer?.remoteKey ? updatedPlayer : current);
+    setInventoryModalPlayer((current) => current?.remoteKey === patchedPlayer.remoteKey ? patchedPlayer : current);
+    setDetailPlayer((current) => current?.remoteKey === patchedPlayer.remoteKey ? patchedPlayer : current);
 
     debugLanFlow('MASTER_INVENTORY_RUNTIME_PATCH_APPLIED', {
       sessionId: activeSessionId,
       targetKey,
-      playerId: updatedPlayer.id,
-      playerName: updatedPlayer.characterName,
+      playerId: patchedPlayer.id,
+      playerName: patchedPlayer.characterName,
       bagCount: Array.isArray((normalizedEquipment as any).bag) ? (normalizedEquipment as any).bag.length : 0,
       slotKeys: Object.keys((normalizedEquipment as any).slots || {}),
       hasStatsPatch: Boolean(statsPatch),
     });
 
-    return updatedPlayer;
+    return patchedPlayer;
   }, [activeSessionId]);
 
   const sendItemTransferResult = useCallback(async (
@@ -949,33 +1045,75 @@ export default function LanSessionScreen() {
   }, [db]);
 
   const reloadSessionState = useCallback(async (sessionId: string, syncPayload = false) => {
-    const startedAt = Date.now();
-    traceFunctionCall('reloadSessionState', { sessionId, syncPayload }, {
-      screen: 'lan-session',
-      source: 'reloadSessionState',
-      sessionId,
-    });
-    const nextState = await getLanSessionState(db, sessionId);
-    applyExternalSessionState(sessionId, nextState, 'sqlite');
-    setSessionEvents(await getLanSessionEvents(db, sessionId, 20));
-    setPendingSaves(await listPendingSaves(db, sessionId));
-
-    if (syncPayload) {
-      const nextPayload = await syncLanSessionPayload(db, sessionId, { broadcast: false });
-      if (nextPayload) applyExternalPayload(nextPayload, 'sqlite');
+    const now = Date.now();
+    // v32: reload do SQLite é caro e estava competindo com comandos vivos.
+    // Para eventos LAN normais, runtime/socket já atualiza a UI; o reload fica só como
+    // reconciliação leve. Chamadas não-críticas muito próximas são descartadas.
+    if (!syncPayload && now - reloadSessionStateLastRunAtRef.current < 2500) {
+      debugLanFlow('MASTER_RELOAD_SESSION_STATE_SKIPPED_COOLDOWN', {
+        sessionId,
+        syncPayload,
+        sinceLastMs: now - reloadSessionStateLastRunAtRef.current,
+      });
+      return;
     }
-    traceFunctionReturn('reloadSessionState', {
-      sessionId,
-      playerCount: nextState.players.length,
-      currentTurn: nextState.currentTurn,
-      elapsedMinutes: nextState.elapsedMinutes,
-    }, {
-      screen: 'lan-session',
-      source: 'reloadSessionState',
-      sessionId,
-      durationMs: Date.now() - startedAt,
-    });
-  }, [applyExternalPayload, applyExternalSessionState, db]);
+    if (reloadSessionStateRunningRef.current) {
+      if (syncPayload) reloadSessionStateQueuedRef.current = sessionId;
+      debugLanFlow('MASTER_RELOAD_SESSION_STATE_DEBOUNCED', {
+        sessionId,
+        syncPayload,
+        reason: 'reload_already_running',
+      });
+      return;
+    }
+
+    reloadSessionStateRunningRef.current = true;
+    reloadSessionStateLastRunAtRef.current = Date.now();
+    const startedAt = Date.now();
+    try {
+      traceFunctionCall('reloadSessionState', { sessionId, syncPayload }, {
+        screen: 'lan-session',
+        source: 'reloadSessionState',
+        sessionId,
+      });
+      let nextState = await getLanSessionState(db, sessionId);
+      const currentStatus = sessionStateRef.current?.status;
+      if (Date.now() < sessionLifecycleLockUntilRef.current && currentStatus && nextState.status !== currentStatus) {
+        debugLanFlow('MASTER_RELOAD_SESSION_STATE_LIFECYCLE_STATUS_LOCKED', {
+          sessionId,
+          sqliteStatus: nextState.status,
+          keptStatus: currentStatus,
+        });
+        nextState = { ...nextState, status: currentStatus };
+      }
+      applyExternalSessionState(sessionId, nextState, 'sqlite');
+      setSessionEvents(await getLanSessionEvents(db, sessionId, 20));
+      setPendingSaves(await listPendingSaves(db, sessionId));
+
+      if (syncPayload) {
+        const nextPayload = await syncLanSessionPayload(db, sessionId, { broadcast: false });
+        if (nextPayload) applyExternalPayload(nextPayload, 'sqlite');
+      }
+      traceFunctionReturn('reloadSessionState', {
+        sessionId,
+        playerCount: nextState.players.length,
+        currentTurn: nextState.currentTurn,
+        elapsedMinutes: nextState.elapsedMinutes,
+      }, {
+        screen: 'lan-session',
+        source: 'reloadSessionState',
+        sessionId,
+        durationMs: Date.now() - startedAt,
+      });
+    } finally {
+      reloadSessionStateRunningRef.current = false;
+      const queuedSessionId = reloadSessionStateQueuedRef.current;
+      reloadSessionStateQueuedRef.current = null;
+      if (queuedSessionId && queuedSessionId === sessionId) {
+        scheduleSilentPayloadRefresh(queuedSessionId);
+      }
+    }
+  }, [applyExternalPayload, applyExternalSessionState, db, scheduleSilentPayloadRefresh]);
 
   const resumeMasterHost = useCallback(async () => {
   if (!payload?.session?.id) return;
@@ -1030,7 +1168,9 @@ useEffect(() => {
     });
     void resumeMasterHost();
   });
-  return unsubscribe;
+  return () => {
+    unsubscribe();
+  };
 }, [joinUrl, payload?.session?.id, resumeMasterHost]);
 
   useEffect(() => {
@@ -1757,6 +1897,16 @@ useEffect(() => {
               next: event.coinPatchRequest.next,
             });
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+            const commandGate = await executeLanHostCommandOnce(db, event, async () => ({ gated: true }));
+            if (commandGate.status === 'duplicate') {
+              debugLanFlow('HOST_COMMAND_DUPLICATE_SKIP_EVENT', {
+                sessionId: activeSessionId,
+                eventId: event.id,
+                type: event.type,
+                reason: commandGate.reason || 'persistent_command_duplicate',
+              });
+              continue;
+            }
             if (!fresh) {
               debugLanFlow('HOST_STORED_DUPLICATE_BUT_PROCESSING_REQUEST', {
                 sessionId: activeSessionId,
@@ -1779,6 +1929,9 @@ useEffect(() => {
 
             const result = await applyLanCoinSelfPatchRequest(db, event);
             const nextState = await getLanSessionState(db, activeSessionId);
+            sessionStateRef.current = nextState;
+            setSessionState(nextState);
+            setPayload((current) => current ? ({ ...current, state: nextState }) : current);
             const targetPlayer = nextState.players.find((entry) => (
               entry.remoteKey === event.fromKey ||
               entry.characterName === event.fromName
@@ -1837,6 +1990,16 @@ useEffect(() => {
               fresh,
             });
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+            const commandGate = await executeLanHostCommandOnce(db, event, async () => ({ gated: true }));
+            if (commandGate.status === 'duplicate') {
+              debugLanFlow('HOST_COMMAND_DUPLICATE_SKIP_EVENT', {
+                sessionId: activeSessionId,
+                eventId: event.id,
+                type: event.type,
+                reason: commandGate.reason || 'persistent_command_duplicate',
+              });
+              continue;
+            }
             if (!fresh) {
               debugLanFlow('HOST_STORED_DUPLICATE_BUT_PROCESSING_REQUEST', {
                 sessionId: activeSessionId,
@@ -1858,6 +2021,7 @@ useEffect(() => {
 
             const result = await applyLanSendItemRequest(db, event);
             const nextState = await getLanSessionState(db, activeSessionId);
+            sessionStateRef.current = nextState;
             setSessionState(nextState);
             setPayload((current) => current ? ({ ...current, state: nextState }) : current);
             const affectedPlayers = nextState.players.filter((entry) => result.targetKeys.includes(entry.remoteKey || ''));
@@ -1876,15 +2040,18 @@ useEffect(() => {
               }
             }
 
-            const originPlayer = nextState.players.find((entry) => entry.remoteKey === event.fromKey);
-            await sendItemTransferResult(
-              activeSessionId,
-              event.fromKey,
-              originPlayer?.characterName || event.fromName,
-              event.sendItemRequest.requestId || event.id,
-              result.accepted,
-              reason
-            );
+            const resultKeys = result.targetKeys.length > 0 ? result.targetKeys : [event.fromKey];
+            for (const key of Array.from(new Set(resultKeys))) {
+              const target = nextState.players.find((entry) => entry.remoteKey === key);
+              await sendItemTransferResult(
+                activeSessionId,
+                key,
+                target?.characterName || (key === event.fromKey ? event.fromName : key),
+                event.sendItemRequest.requestId || event.id,
+                result.accepted,
+                reason
+              );
+            }
 
             scheduleSilentPayloadRefresh(activeSessionId);
             continue;
@@ -1900,6 +2067,16 @@ useEffect(() => {
               fresh,
             });
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+            const commandGate = await executeLanHostCommandOnce(db, event, async () => ({ gated: true }));
+            if (commandGate.status === 'duplicate') {
+              debugLanFlow('HOST_COMMAND_DUPLICATE_SKIP_EVENT', {
+                sessionId: activeSessionId,
+                eventId: event.id,
+                type: event.type,
+                reason: commandGate.reason || 'persistent_command_duplicate',
+              });
+              continue;
+            }
             if (!fresh) {
               debugLanFlow('HOST_STORED_DUPLICATE_BUT_PROCESSING_REQUEST', {
                 sessionId: activeSessionId,
@@ -1952,8 +2129,11 @@ useEffect(() => {
               }
             }
 
-            await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
-            shouldReloadSessionState = true;
+            sessionStateRef.current = nextState;
+            setSessionState(nextState);
+            setPayload((current) => current ? ({ ...current, state: nextState }) : current);
+            scheduleSilentPayloadRefresh(activeSessionId);
+            shouldReloadSessionState = false;
             continue;
           }
 
@@ -2013,6 +2193,16 @@ useEffect(() => {
               fresh,
             });
             await ensurePendingRemotePlayerFromEvent(db, activeSessionId, event);
+            const commandGate = await executeLanHostCommandOnce(db, event, async () => ({ gated: true }));
+            if (commandGate.status === 'duplicate') {
+              debugLanFlow('HOST_COMMAND_DUPLICATE_SKIP_EVENT', {
+                sessionId: activeSessionId,
+                eventId: event.id,
+                type: event.type,
+                reason: commandGate.reason || 'persistent_command_duplicate',
+              });
+              continue;
+            }
             if (fresh) {
               await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
               shouldReloadSessionState = true;
@@ -2123,6 +2313,19 @@ useEffect(() => {
               await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
               shouldReloadSessionState = true;
             }
+          }
+
+          if (event.type === 'player_progression_patch' && event.progressionPatch) {
+            const appliedPlayerId = await applyLanPlayerProgressionPatchFromEvent(db, activeSessionId, event);
+            if (appliedPlayerId) {
+              const syncedPayload = await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+              if (syncedPayload) {
+                applyExternalPayload(syncedPayload, 'sqlite');
+              }
+              setSessionEvents(await getLanSessionEvents(db, activeSessionId, 20));
+              shouldReloadSessionState = false;
+            }
+            continue;
           }
 
           if (event.type === 'player_patch' && event.numberPatch) {
@@ -2414,6 +2617,31 @@ useEffect(() => {
         })();
         return;
       }
+      if (update?.event?.sessionId === activeSessionId && update.event.type === 'player_progression_patch' && update.event.progressionPatch) {
+        void (async () => {
+          const event = update.event!;
+          traceApp('EVENT_RECEIVED', 'MASTER_LEVEL_UP_PATCH_RECEIVED_IMMEDIATE', {
+            screen: 'lan-session',
+            source: 'subscribeLanSessionHostUpdates',
+            sessionId: activeSessionId,
+            eventId: event.id,
+            eventType: event.type,
+            fromKey: event.fromKey,
+            playerName: event.fromName,
+            payload: event.progressionPatch,
+          });
+          const appliedPlayerId = await applyLanPlayerProgressionPatchFromEvent(db, activeSessionId, event);
+          if (appliedPlayerId) {
+            const syncedPayload = await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
+            if (syncedPayload) {
+              applyExternalPayload(syncedPayload, 'sqlite');
+              setSessionEvents(await getLanSessionEvents(db, activeSessionId, 20));
+            }
+          }
+        })();
+        return;
+      }
+
       if (update?.event?.sessionId === activeSessionId && update.event.type === 'resource_request') {
         void (async () => {
           const event = update.event!;
@@ -3015,6 +3243,7 @@ useEffect(() => {
     const applyPauseToggle = async () => {
       if (pauseToggleRunningRef.current) return;
       pauseToggleRunningRef.current = true;
+      sessionLifecycleLockUntilRef.current = Date.now() + 8000;
       try {
       const resumedHostInstanceId = wasPaused ? makeLanHostInstanceId() : payload.session.hostInstanceId;
       if (wasPaused) {
@@ -3129,6 +3358,7 @@ useEffect(() => {
         const syncedPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
         applyExternalPayload(payloadForUi || syncedPayload, 'sqlite');
       }
+      sessionLifecycleLockUntilRef.current = Date.now() + 8000;
       traceApp('SQLITE_WRITE_DONE', wasPaused ? 'MASTER_SESSION_RESUMED_DB_DONE' : 'MASTER_SESSION_PAUSED_DB_DONE', {
         screen: 'lan-session',
         source: 'handleTogglePause',
@@ -3167,6 +3397,9 @@ useEffect(() => {
 
   const handleAdvanceTime = async (unit: LanAdvanceUnit) => {
     if (!payload) return;
+    const sessionId = payload.session.id;
+    const playerQueueKeys = (sessionStateRef.current?.players || []).map((player) => getLanPlayerQueueKey(sessionId, player.id));
+    await enqueueLanEntityMutation([getLanSessionQueueKey(sessionId), ...playerQueueKeys], async () => {
     const startedAt = Date.now();
     traceButton('lan-session', `ADVANCE_TIME_${unit}`, {
       source: 'master_click',
@@ -3215,6 +3448,7 @@ useEffect(() => {
       sessionId: payload.session.id,
       durationMs: Date.now() - startedAt,
     });
+    }, { screen: 'lan-session', source: 'handleAdvanceTime', sessionId, unit, players: playerQueueKeys.length });
   };
 
   const handleApplyCatalogSelection = async () => {
@@ -3259,7 +3493,7 @@ useEffect(() => {
     });
   };
 
-  const persistHostNumberPatch = useCallback((playerId: number, patch: NumberPatch, message: string) => {
+  const persistHostNumberPatch = useCallback(async (playerId: number, patch: NumberPatch, message: string) => {
     if (!payload?.session?.id || endingSessionRef.current) return;
     const sessionId = payload.session.id;
     const targetPlayer = sessionStateRef.current?.players.find((entry) => entry.id === playerId);
@@ -3382,6 +3616,7 @@ useEffect(() => {
         setSessionEvents((current) =>
           [liveEvent, ...current.filter((item) => item.id !== liveEvent.id)].slice(0, 20)
         );
+        void sendPublicPlayerStatus(sessionId, targetPlayer, 'number_patch', authoritativePatch);
       })
       .catch((error) => {
         traceError('SOCKET_SEND_START', 'MASTER_PLAYER_PATCH_SOCKET_SEND_ERROR', error, {
@@ -3399,8 +3634,7 @@ useEffect(() => {
         console.warn('[LAN MASTER] Falha ao enviar evento vivo imediato:', error);
       });
 
-    void (async () => {
-      try {
+    try {
         debugLanFlow('MASTER_SQLITE_PERSIST_START', { sessionId, playerId, patch });
         traceSqlite('SQLITE_WRITE_START', {
           screen: 'lan-session',
@@ -3433,11 +3667,10 @@ useEffect(() => {
         });
 
         scheduleSilentPayloadRefresh(sessionId);
-      } catch (error) {
-        console.warn('[LAN MASTER] Falha ao persistir patch vivo no SQLite:', error);
-      }
-    })();
-  }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh]);
+    } catch (error) {
+      console.warn('[LAN MASTER] Falha ao persistir patch vivo no SQLite:', error);
+    }
+  }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh, sendPublicPlayerStatus]);
 
 
 
@@ -3561,6 +3794,7 @@ useEffect(() => {
           entityRevision: liveEvent.entityRevision,
         });
         setSessionEvents((current) => [liveEvent, ...current.filter((item) => item.id !== liveEvent.id)].slice(0, 20));
+        void sendPublicPlayerStatus(sessionId, runtimeResult.player, 'effect_patch');
       })
       .catch((error) => {
         traceError('SOCKET_SEND_START', 'MASTER_FAST_EFFECT_PATCH_SOCKET_SEND_ERROR', error, {
@@ -3592,7 +3826,7 @@ useEffect(() => {
     })();
 
     return liveEvent;
-  }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh]);
+  }, [db, joinUrl, payload?.session?.id, scheduleSilentPayloadRefresh, sendPublicPlayerStatus]);
 
   const applyMasterPlayerPatchInternal = async (
     player: LanSessionPlayerState,
@@ -3647,7 +3881,7 @@ useEffect(() => {
       revision: runtimeResult.revision,
     });
 
-    void persistHostNumberPatch(player.id, runtimeResult.patch, message);
+    await persistHostNumberPatch(player.id, runtimeResult.patch, message);
     traceFunctionReturn('applyMasterPlayerPatchInternal', {
       playerId: player.id,
       patch: runtimeResult.patch,
@@ -3677,6 +3911,10 @@ useEffect(() => {
     messagePrefix?: string
   ) => {
     if (!payload || endingSessionRef.current) return;
+    const sessionId = payload.session.id;
+    await enqueueLanEntityMutation([getLanPlayerQueueKey(sessionId, player.id)], async () => {
+    const latestPlayer = sessionStateRef.current?.players.find((entry) => entry.id === player.id) || player;
+    player = latestPlayer;
     const buttonName = field === 'hpCurrent' && delta < 0
       ? 'MASTER_CLICK_HP_MINUS'
       : field === 'hpCurrent' && delta > 0
@@ -3776,7 +4014,7 @@ useEffect(() => {
       revision: runtimeResult.revision,
     });
 
-    persistHostNumberPatch(
+    await persistHostNumberPatch(
       player.id,
       runtimeResult.patch,
       messagePrefix || `Mestre ajustou ${formatPlayerField(field as any)} de ${runtimeResult.player.characterName}.`
@@ -3797,6 +4035,7 @@ useEffect(() => {
     });
     return;
 
+    }, { screen: 'lan-session', source: 'handleUpdatePlayerDelta', sessionId, playerId: player.id, field, delta });
   };
 
   const syncTempHpEffectsAfterDamage = async (sessionId: string, playerId: number, absorbedTempHp: number) => {
@@ -3824,7 +4063,8 @@ useEffect(() => {
 
   const handleApplyDamageToPlayer = async (player: LanSessionPlayerState, damage: number) => {
     if (!payload) return;
-    await runMasterAction(`damage:${player.id}`, async () => {
+    const sessionId = payload.session.id;
+    await enqueueLanEntityMutation([getLanPlayerQueueKey(sessionId, player.id)], async () => {
     const latestPlayer = sessionStateRef.current?.players.find((entry) => entry.id === player.id) || player;
     const cleanDamage = Math.max(0, Math.floor(Number(damage) || 0));
     if (cleanDamage <= 0) return;
@@ -3874,7 +4114,7 @@ useEffect(() => {
       });
       await syncTempHpEffectsAfterDamage(payload.session.id, latestPlayer.id, damageResult.absorbedTempHp);
     }
-    });
+    }, { screen: 'lan-session', source: 'handleApplyDamageToPlayer', sessionId, playerId: player.id, field: 'hpCurrent' });
   };
 
   const handleUpdatePlayer = async (
@@ -3882,12 +4122,17 @@ useEffect(() => {
     field: 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp',
     value: number
   ) => {
-    const cleanValue = Math.max(0, Math.floor(Number(value) || 0));
-    await handleUpdatePlayerPatch(
-      player,
-      { [field]: cleanValue },
-      `Mestre ajustou ${formatPlayerField(field)} de ${player.characterName} para ${cleanValue}.`
-    );
+    if (!payload?.session?.id) return;
+    const sessionId = payload.session.id;
+    await enqueueLanEntityMutation([getLanPlayerQueueKey(sessionId, player.id)], async () => {
+      const latestPlayer = sessionStateRef.current?.players.find((entry) => entry.id === player.id) || player;
+      const cleanValue = Math.max(0, Math.floor(Number(value) || 0));
+      await handleUpdatePlayerPatch(
+        latestPlayer,
+        { [field]: cleanValue },
+        `Mestre ajustou ${formatPlayerField(field)} de ${latestPlayer.characterName} para ${cleanValue}.`
+      );
+    }, { screen: 'lan-session', source: 'handleUpdatePlayer', sessionId, playerId: player.id, field });
   };
 
   const handleKickPlayer = (player: LanSessionPlayerState) => {
@@ -4166,7 +4411,8 @@ useEffect(() => {
     ));
 
     setReviewedRequestEventIds((current) => Array.from(new Set([...current, event.id])));
-    await reloadSessionState(payload.session.id, false);
+    // v34: the accepted resource patch has already been persisted and sent as a live
+    // player_patch above. Do not block the master UI or delay the player with a full reload.
     scheduleSilentPayloadRefresh(payload.session.id);
   });
 
@@ -4544,23 +4790,29 @@ useEffect(() => {
     });
 
     if (type === 'XP') {
-       await handleUpdatePlayer(player, 'xp', player.xp + val);
-    } else if (type === 'COIN') {
-       const gp = parseInt(qeGP, 10) || 0;
-       const sp = parseInt(qeSP, 10) || 0;
-       const cp = parseInt(qeCP, 10) || 0;
-       const currentCopper = player.gp * 100 + player.sp * 10 + player.cp;
-       const nextCopper = Math.max(0, currentCopper + gp * 100 + sp * 10 + cp);
-       const patchedGp = Math.floor(nextCopper / 100);
-       const patchedSp = Math.floor((nextCopper % 100) / 10);
-       const patchedCp = nextCopper % 10;
-
-       await handleUpdatePlayerPatch(
-         player,
-         { gp: patchedGp, sp: patchedSp, cp: patchedCp },
-         `Mestre ajustou moedas de ${player.characterName} para ${patchedGp} PO, ${patchedSp} PP, ${patchedCp} PC.`
-       );
+       // v35: fecha o modal antes da persistencia/broadcast para nunca ficar
+       // preso visualmente em "SALVANDO..." se o socket/SQLite estiverem lentos.
        setQuickEdit(null);
+       await handleUpdatePlayer(player, 'xp', Math.max(0, player.xp + val));
+       return;
+    } else if (type === 'COIN') {
+       const addGp = parseInt(qeGP, 10) || 0;
+       const addSp = parseInt(qeSP, 10) || 0;
+       const addCp = parseInt(qeCP, 10) || 0;
+       const latestPlayer = sessionStateRef.current?.players.find((entry) => entry.id === player.id) || player;
+       const patchedGp = Math.max(0, Math.floor(Number(latestPlayer.gp || 0) + addGp));
+       const patchedSp = Math.max(0, Math.floor(Number(latestPlayer.sp || 0) + addSp));
+       const patchedCp = Math.max(0, Math.floor(Number(latestPlayer.cp || 0) + addCp));
+
+       // v40: não normalize PP/PC para PO. O mestre deve conseguir entregar
+       // exatamente a denominação escolhida: +20 PP aumenta sp, não converte
+       // automaticamente para +2 PO.
+       setQuickEdit(null);
+       await handleUpdatePlayerPatch(
+         latestPlayer,
+         { gp: patchedGp, sp: patchedSp, cp: patchedCp },
+         `Mestre ajustou moedas de ${latestPlayer.characterName} para ${patchedGp} PO, ${patchedSp} PP, ${patchedCp} PC.`
+       );
     } else if (type === 'STAT' && stat && !qeIsTemp) {
        if (!payload?.session?.id) return;
        const normalizedTarget = String(stat).toUpperCase() as LanEffectTarget;

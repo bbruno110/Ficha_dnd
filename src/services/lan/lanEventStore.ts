@@ -1,6 +1,7 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import type { LanSessionEvent } from '../lanSession';
+import { getLanEventEntityId, getLanEventEntityType } from './lanEntityQueue';
 
 export type LanEventCommitResult = {
   event: LanSessionEvent;
@@ -55,6 +56,18 @@ export async function ensureLanEventStoreSchema(db: SQLiteDatabase) {
   }
 
   await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS lan_aggregate_versions (
+      session_id TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 0,
+      last_event_id TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (session_id, entity_type, entity_id)
+    );
+  `);
+
+  await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_seq ON lan_session_events(session_id, seq);
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_server_seq ON lan_session_events(session_id, server_seq);
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_client_msg ON lan_session_events(session_id, client_msg_id);
@@ -90,8 +103,8 @@ export async function commitLanEvent(
     }
   }
 
-  const entityType = event.entityType || inferLanEventEntityType(event);
-  const entityId = String(event.entityId || inferLanEventEntityId(event));
+  const entityType = event.entityType || getLanEventEntityType(event);
+  const entityId = String(event.entityId || getLanEventEntityId({ ...event, entityType }));
   const serverSeq = await resolveServerSeq(db, event);
   const entityRevision = await nextEntityRevision(db, event, entityType, entityId);
   const committedEvent: LanSessionEvent = {
@@ -104,6 +117,13 @@ export async function commitLanEvent(
     entityRevision,
     ackRequired: event.ackRequired ?? shouldRequireLanAck(event),
   };
+
+  if (toNumber(event.baseRevision) > 0) {
+    const current = await getAggregateRevision(db, event.sessionId, entityType, entityId);
+    if (current > 0 && toNumber(event.baseRevision) < current) {
+      return { event: { ...event, entityType, entityId, entityRevision: current }, inserted: false };
+    }
+  }
 
   await db.runAsync(
     `INSERT INTO lan_session_events (
@@ -129,6 +149,7 @@ export async function commitLanEvent(
     ]
   );
 
+  await updateAggregateRevision(db, committedEvent);
   return { event: committedEvent, inserted: true };
 }
 
@@ -214,41 +235,42 @@ async function nextEntityRevision(
 ) {
   const provided = toNumber(event.entityRevision);
   if (provided > 0) return provided;
+  return (await getAggregateRevision(db, event.sessionId, entityType, entityId)) + 1;
+}
 
+async function getAggregateRevision(db: SQLiteDatabase, sessionId: string, entityType: string, entityId: string) {
   const row = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT revision FROM lan_aggregate_versions
+     WHERE session_id = ? AND entity_type = ? AND entity_id = ?
+     LIMIT 1`,
+    [sessionId, entityType, entityId]
+  );
+  if (row) return toNumber(row.revision);
+
+  const fallback = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT MAX(entity_revision) as maxRevision
      FROM lan_session_events
      WHERE session_id = ? AND entity_type = ? AND entity_id = ?`,
-    [event.sessionId, entityType, entityId]
+    [sessionId, entityType, entityId]
   );
-
-  return toNumber(row?.maxRevision) + 1;
+  return toNumber(fallback?.maxRevision);
 }
 
-function inferLanEventEntityType(event: LanSessionEvent) {
-  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
-  if (event.type.includes('save')) return 'save';
-  if (event.type.includes('action') || event.type.includes('skill') || event.type.includes('spell') || event.type.includes('ability')) return 'action';
-  if (
-    event.type === 'inventory_patch' ||
-    event.type === 'send_item' ||
-    event.type === 'send_item_request' ||
-    event.type === 'send_item_result' ||
-    event.type.startsWith('trade_')
-  ) return 'inventory';
-  if (event.type === 'coin_self_patch_request') return 'player';
-  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (
-    event.type === 'resource_request' ||
-    event.type === 'resource_review' ||
-    event.type === 'pending_save_patch' ||
-    event.type === 'character_update_review'
-  ) return 'request';
-  return 'player';
-}
+async function updateAggregateRevision(db: SQLiteDatabase, event: LanSessionEvent) {
+  const entityType = event.entityType || getLanEventEntityType(event);
+  const entityId = String(event.entityId || getLanEventEntityId({ ...event, entityType }));
+  const revision = toNumber(event.entityRevision);
+  if (!event.sessionId || !entityType || !entityId || revision <= 0) return;
 
-function inferLanEventEntityId(event: LanSessionEvent) {
-  return event.toKey || event.fromKey || event.tradeId || event.sessionId;
+  await db.runAsync(
+    `INSERT INTO lan_aggregate_versions (session_id, entity_type, entity_id, revision, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(session_id, entity_type, entity_id) DO UPDATE SET
+       revision = MAX(revision, excluded.revision),
+       last_event_id = CASE WHEN excluded.revision >= revision THEN excluded.last_event_id ELSE last_event_id END,
+       updated_at = CURRENT_TIMESTAMP`,
+    [event.sessionId, entityType, entityId, revision, event.id]
+  );
 }
 
 function shouldRequireLanAck(event: LanSessionEvent) {

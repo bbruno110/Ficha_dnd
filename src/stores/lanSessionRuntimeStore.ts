@@ -299,7 +299,33 @@ function calculateStandardTempHpFromEffects(effects: any[]) {
 
 function preserveLivePlayerFields(currentPlayer: LanSessionPlayerState, incomingPlayer: LanSessionPlayerState) {
   const next: LanSessionPlayerState = { ...incomingPlayer };
+  const currentLevel = Math.max(1, Number((currentPlayer as any).level || 1));
+  const incomingLevel = Math.max(1, Number((incomingPlayer as any).level || 1));
+  const currentHpMax = Math.max(0, Number((currentPlayer as any).hpMax || 0));
+  const incomingHpMax = Math.max(0, Number((incomingPlayer as any).hpMax || 0));
+  const incomingLooksLikeProgression = incomingLevel > currentLevel || incomingHpMax > currentHpMax;
+  const currentIsNewerProgression = currentLevel > incomingLevel || currentHpMax > incomingHpMax;
+
+  // v39: HP máximo e nível não são apenas "campos vivos" de combate.
+  // Eles também carregam progressão de nível. Se preservarmos cegamente hpMax
+  // do runtime antigo, o mestre continua mandando nível 1/hpMax antigo após o
+  // jogador subir. Se o incoming é progressão, aceite hpCurrent/hpMax dele.
+  // Se o current é a progressão mais nova, proteja level/class/hpMax contra
+  // reload/snapshot antigo.
+  if (currentIsNewerProgression) {
+    (next as any).level = (currentPlayer as any).level;
+    (next as any).className = (currentPlayer as any).className;
+    (next as any).race = (currentPlayer as any).race;
+  }
+
   for (const field of LIVE_FIELDS) {
+    if (incomingLooksLikeProgression && (field === 'hpMax' || field === 'hpCurrent')) {
+      continue;
+    }
+    if (currentIsNewerProgression && (field === 'hpMax' || field === 'hpCurrent')) {
+      (next as any)[field] = (currentPlayer as any)[field];
+      continue;
+    }
     (next as any)[field] = (currentPlayer as any)[field];
   }
   next.revisionSeq = Math.max(Number(currentPlayer.revisionSeq || 0), Number(incomingPlayer.revisionSeq || 0));
@@ -308,6 +334,15 @@ function preserveLivePlayerFields(currentPlayer: LanSessionPlayerState, incoming
 
 function shouldPreserveLive(meta: RuntimeMeta | undefined, incomingPlayer: LanSessionPlayerState) {
   if (!meta) return false;
+
+  // Enquanto a mesa esta viva, o estado em memoria do mestre e a fonte de verdade
+  // para HP/XP/moedas/PV temporario/efeitos. O SQLite pode receber uma revisao
+  // maior por reconstrução de efeitos ou passagem de turno antes de todos os
+  // patches numericos assíncronos terminarem de persistir; se aceitarmos esse
+  // snapshot bruto, a vida volta. Portanto, qualquer entidade tocada em runtime
+  // preserva os campos vivos contra payload/snapshot/reload estrutural.
+  if (meta.source === 'runtime' || meta.source === 'event') return true;
+
   return meta.revision >= Number(incomingPlayer.revisionSeq || 0);
 }
 

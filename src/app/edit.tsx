@@ -9,7 +9,7 @@ import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, Text, TextInput,
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
 import SpellSelector from '../components/SpellSelector';
 
-import { joinLanSessionWithCharacter, makeLanCharacterKey, notifyMasterJoin, requestLanSessionResync } from '@/services/lanSession';
+import { joinLanSessionWithCharacter, makeLanCharacterKey, makeLanEventId, notifyMasterJoin, requestLanSessionResync, sendLanSessionEvent, type LanSessionEvent } from '@/services/lanSession';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 import { appColors, appGradients, editStyles as styles } from '@/styles/globalStyles';
 
@@ -18,6 +18,17 @@ const STEPS = ['Níveis & Vida', 'Atributos', 'Proficiências', 'Magias & Hab.',
 
 type ClassEntry = { id: string; name: string; subclass: string; level: number };
 type SpellProgression = { cantrips_known: number, spells_known: number, slot_1: number, slot_2: number, slot_3: number, slot_4: number, slot_5: number, slot_6: number, slot_7: number, slot_8: number, slot_9: number };
+
+function inferTotalLevelFromClassName(value: unknown) {
+  const classText = String(value || '').trim();
+  if (!classText) return 0;
+  return classText
+    .split('/')
+    .map((segment) => segment.trim().match(/(?:^|\s)(\d{1,2})\s*$/)?.[1])
+    .map((value) => Number(value || 0))
+    .filter((level) => Number.isFinite(level) && level >= 1 && level <= 20)
+    .reduce((sum, level) => sum + level, 0);
+}
 
 // Tabela Padrão de Nível de Magia vs Nível de Classe de Conjurador Total (D&D 5e)
 const getHighestSpellLevelAllowed = (casterLevel: number) => {
@@ -141,7 +152,9 @@ export default function EditCharacterScreen() {
 
         if (char) {
           setCharacter(char);
-          const tLevel = levelUpTo ? Number(levelUpTo) : (char as any).level;
+          const explicitLevel = Number((char as any).level || 1);
+          const inferredClassLevel = inferTotalLevelFromClassName((char as any).class);
+          const tLevel = levelUpTo ? Number(levelUpTo) : Math.max(explicitLevel, inferredClassLevel || explicitLevel);
           setTargetLevel(tLevel);
           
           const parsedClasses = parseClassString((char as any).class, (char as any).level);
@@ -518,9 +531,16 @@ export default function EditCharacterScreen() {
       const baseHpMax = Number(liveCharacter?.hp_max ?? character.hp_max ?? 0);
       const baseHpCurrent = Number(liveCharacter?.hp_current ?? character.hp_current ?? 0);
 
+      const previousClass = String((character as any).class || '');
+      const previousLevel = Math.max(Number((character as any).level || 1), inferTotalLevelFromClassName(previousClass), 1);
+      const finalClassLevel = inferTotalLevelFromClassName(finalClassStr);
+      const nextLevel = Math.max(Number(targetLevel || 0), finalClassLevel, previousLevel, 1);
+      const nextHpMax = baseHpMax + addedHp;
+      const nextHpCurrent = baseHpCurrent + addedHp;
+
       await db.runAsync(
         `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=? WHERE id=?`,
-        [targetLevel, finalClassStr, baseHpMax + addedHp, baseHpCurrent + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
+        [nextLevel, finalClassStr, nextHpMax, nextHpCurrent, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
       );
 
       if (sessionId) {
@@ -535,15 +555,64 @@ export default function EditCharacterScreen() {
             [character.id]
           );
 
+          const playerKey = makeLanCharacterKey(sessionValue, updatedCharacter || character);
+          const updatedClass = String((updatedCharacter as any)?.class || finalClassStr || '');
+          const updatedLevel = Math.max(Number((updatedCharacter as any)?.level || nextLevel || 1), inferTotalLevelFromClassName(updatedClass), 1);
+          const updatedHpMax = Number((updatedCharacter as any)?.hp_max || nextHpMax || 0);
+          const updatedHpCurrent = Number((updatedCharacter as any)?.hp_current || nextHpCurrent || 0);
+
+          // v38: o evento oficial de progressao nao pode depender do parametro levelUpTo.
+          // Em alguns fluxos o jogador salva a progressao com a classe/hp atualizados,
+          // mas levelUpTo chega vazio/0; nesse caso a v37 so enviava JOIN e o mestre
+          // mantinha hpMax/classe antigos. Compare o estado salvo contra a ficha anterior.
+          const shouldSendProgressionPatch = Boolean(updatedCharacter) && (
+            updatedLevel > previousLevel ||
+            updatedHpMax > baseHpMax ||
+            (updatedClass && updatedClass !== previousClass && /\b\d+\b/.test(updatedClass))
+          );
+
+          if (shouldSendProgressionPatch && updatedCharacter) {
+            const progressionEvent: LanSessionEvent = {
+              id: makeLanEventId(),
+              clientMsgId: makeLanEventId(),
+              sessionId: sessionValue,
+              type: 'player_progression_patch',
+              fromKey: playerKey,
+              fromName: String((updatedCharacter as any).name || ''),
+              toKey: 'master',
+              toName: 'Mestre',
+              entityType: 'player',
+              entityId: playerKey,
+              ackRequired: true,
+              progressionPatch: {
+                level: updatedLevel,
+                className: updatedClass,
+                race: String((updatedCharacter as any).race || ''),
+                hpCurrent: updatedHpCurrent,
+                hpMax: updatedHpMax,
+                stats: statsToSave,
+                spells: (updatedCharacter as any).spells,
+                saveValues: (updatedCharacter as any).save_values,
+                skillValues: (updatedCharacter as any).skill_values,
+                proficiencies: (updatedCharacter as any).proficiencies,
+                characterSnapshot: updatedCharacter,
+              },
+              message: `${String((updatedCharacter as any).name || 'Jogador')} subiu para nivel ${updatedLevel}.`,
+              createdAt: new Date().toISOString(),
+            };
+            await sendLanSessionEvent(joinUrlValue, progressionEvent).catch((progressionError) => {
+              console.warn('Falha ao enviar progressao LAN:', progressionError);
+            });
+          }
+
           await notifyMasterJoin(
             joinUrlValue,
             sessionValue,
             updatedCharacter || character,
             '',
-            { reviewSnapshot: true }
+            { reviewSnapshot: !shouldSendProgressionPatch }
           );
 
-          const playerKey = makeLanCharacterKey(sessionValue, updatedCharacter || character);
           const runtime = useLanRealtimeStore.getState();
           runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
           await requestLanSessionResync(joinUrlValue, {

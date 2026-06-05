@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 import { traceApp } from '@/services/debug/appTrace';
+import { getLanEventEntityId, getLanEventEntityType } from '@/services/lan/lanEntityQueue';
 import type { LanSessionEvent, LanSessionPlayerState } from '@/services/lanSession';
 
 export const LAN_REALTIME_STORE_VERSION = 'gap-checkpoint-v3';
@@ -78,28 +79,25 @@ export type LanRealtimeState = {
   resetSession: (sessionId?: string) => void;
 };
 
-const inferEntityType = (event: LanSessionEvent) => {
-  if (event.type === 'session_patch' || event.type === 'session_ended' || event.type === 'timeline_event') return 'session';
-  if (event.type === 'inventory_patch' || event.type === 'send_item' || event.type.startsWith('trade_')) return 'inventory';
-  if (event.type === 'effect_patch' || event.type === 'effect_catalog_patch' || event.type === 'effect_expired') return 'effect';
-  if (event.type === 'effect_save_request' || event.type === 'effect_save_result') return 'save';
-  if (event.type.includes('action') || event.type.includes('skill') || event.type.includes('spell') || event.type.includes('ability')) return 'action';
-  if (
-    event.type === 'resource_request' ||
-    event.type === 'resource_review' ||
-    event.type === 'pending_save_patch' ||
-    event.type === 'character_update_review'
-  ) return 'request';
-  return 'player';
-};
-
 export const getLanRuntimeEntityKey = (event: LanSessionEvent) => {
-  const entityType = event.entityType || inferEntityType(event);
-  const entityId = event.entityId || event.toKey || event.fromKey || event.tradeId || event.sessionId;
+  const entityType = event.entityType || getLanEventEntityType(event);
+  const entityId = event.entityId || getLanEventEntityId({ ...event, entityType });
   return `${event.sessionId}:${entityType}:${entityId}`;
 };
 
-const getRevision = (event: LanSessionEvent) => Number(event.entityRevision ?? event.seq ?? 0) || 0;
+const isLegacyPlayerCheckpoint = (event: LanSessionEvent) => (
+  event.type === 'player_patch' &&
+  String(event.id || '').startsWith('checkpoint_player_') &&
+  Number(event.entityRevision || 0) > 1000000
+);
+
+// v33: snapshots/checkpoints antigos de player vieram com entityRevision baseado em Date.now().
+// Isso fazia o runtime gravar revision ~1780... e ignorar os player_patch reais do host (revision 1,2,3...).
+// Checkpoint legado não pode avançar a revision do agregado player.
+const getRevision = (event: LanSessionEvent) => {
+  if (isLegacyPlayerCheckpoint(event)) return 0;
+  return Number(event.entityRevision ?? event.seq ?? 0) || 0;
+};
 const getSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
 
 export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
