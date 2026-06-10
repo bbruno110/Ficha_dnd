@@ -1,0 +1,210 @@
+// ================= index.tsx =================
+import { Ionicons } from '@expo/vector-icons';
+import Constants from 'expo-constants'; // 1. Importar o Constants
+import { LinearGradient } from 'expo-linear-gradient';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useSQLiteContext } from 'expo-sqlite';
+import React, { useCallback, useRef, useState } from 'react';
+import { Alert, FlatList, Text, TouchableOpacity, View } from 'react-native';
+import CharacterCard, { Character } from '../components/CharacterCard';
+
+import { traceButton, traceError, traceScreen, traceSqlite } from '@/services/debug/appTrace';
+import { prepareLanSessionStorage, unlinkCharacterFromLanSession } from '@/services/lanSession';
+import { appColors, appGradients, homeStyles as styles } from '@/styles/globalStyles';
+
+export default function HomeScreen() {
+  const router = useRouter();
+  const db = useSQLiteContext();
+  const [charactersList, setCharactersList] = useState<Character[]>([]);
+  const navigationGateRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
+
+  const runNavigationOnce = (key: string, navigate: () => void) => {
+    const now = Date.now();
+    const gate = navigationGateRef.current;
+    if (gate.key === key && now - gate.at < 1200) {
+      return false;
+    }
+
+    navigationGateRef.current = { key, at: now };
+    requestAnimationFrame(navigate);
+    setTimeout(() => {
+      if (navigationGateRef.current.key === key) {
+        navigationGateRef.current = { key: '', at: 0 };
+      }
+    }, 1500);
+    return true;
+  };
+
+  const appVersion = Constants.expoConfig?.version || '1.0.0';
+
+  const loadCharacters = async () => {
+    traceSqlite('SQLITE_READ_START', {
+      screen: 'home',
+      source: 'loadCharacters',
+      functionName: 'loadCharacters',
+      table: 'characters/lan_sessions/lan_local_character_bindings',
+      operation: 'HOME_CHARACTERS_LOAD',
+    });
+    try {
+      await prepareLanSessionStorage(db);
+      const result = await db.getAllAsync<Character>(
+        `SELECT c.id, c.name, c.level, c.class, c.race,
+                s.id as sessionId, s.name as sessionName,
+                COALESCE(b.join_url, s.join_url) as joinUrl
+         FROM characters c
+         LEFT JOIN lan_local_character_bindings b
+           ON b.character_id = c.id
+          AND COALESCE(b.is_active, 1) = 1
+         LEFT JOIN lan_sessions s
+           ON s.id = b.session_id
+          AND COALESCE(s.active, 1) = 1
+          AND COALESCE(s.status, 'active') != 'ended'
+         GROUP BY c.id
+         ORDER BY c.created_at DESC`
+      );
+      setCharactersList(result);
+      traceSqlite('SQLITE_READ_DONE', {
+        screen: 'home',
+        source: 'loadCharacters',
+        functionName: 'loadCharacters',
+        table: 'characters/lan_sessions/lan_local_character_bindings',
+        operation: 'HOME_CHARACTERS_LOAD',
+        result: { count: result.length },
+      });
+    } catch (error) {
+      console.error("Erro ao carregar: ", error);
+      traceError('SQLITE_READ_DONE', 'HOME_CHARACTERS_LOAD_ERROR', error, {
+        screen: 'home',
+        source: 'loadCharacters',
+        functionName: 'loadCharacters',
+      });
+    }
+  };
+
+  useFocusEffect(
+    useCallback(() => {
+      traceScreen('home', 'HOME_SCREEN_FOCUS');
+      loadCharacters();
+    }, [db])
+  );
+
+  const handleDeleteCharacter = async (id: number) => {
+    traceButton('home', 'DELETE_CHARACTER', { characterId: id });
+    try {
+      await db.runAsync(`DELETE FROM characters WHERE id = ?`, [id]);
+      loadCharacters();
+    } catch (error) {
+      Alert.alert("Erro", "Não foi possível excluir o personagem.");
+    }
+  };
+
+  const handleEditCharacter = (id: number) => {
+    traceButton('home', 'EDIT_CHARACTER', { characterId: id });
+    router.push({
+      pathname: '/edit' as any,
+      params: { id: id }
+    });
+  };
+
+  const handleUnlinkSession = async (id: number) => {
+    traceButton('home', 'UNLINK_SESSION', { characterId: id });
+    try {
+      await unlinkCharacterFromLanSession(db, id);
+      await loadCharacters();
+    } catch (error) {
+      Alert.alert("Erro", "Nao foi possivel desvincular este personagem da sessao.");
+    }
+  };
+
+  const handleOpenSheet = (character: Character) => {
+    const routeKey = `sheet:${character.id}:${character.sessionId || 'offline'}`;
+    const accepted = runNavigationOnce(routeKey, () => {
+      if (character.sessionId) {
+        router.replace(`/sheet?id=${character.id}&sessionId=${character.sessionId}&joinUrl=${encodeURIComponent(character.joinUrl || '')}` as any);
+        return;
+      }
+      router.replace(`/sheet?id=${character.id}` as any);
+    });
+
+    traceButton('home', accepted ? 'OPEN_CHARACTER_SHEET' : 'OPEN_CHARACTER_SHEET_IGNORED_IN_FLIGHT', {
+      characterId: character.id,
+      characterName: character.name,
+      sessionId: character.sessionId,
+      source: character.sessionId ? 'lan_binding' : 'offline',
+    });
+  };
+
+  return (
+    <LinearGradient colors={appGradients.main} style={styles.container}>
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>Meus Personagens</Text>
+      </View>
+
+      {charactersList.length > 0 ? (
+        <FlatList
+          data={charactersList}
+          keyExtractor={(item) => item.id.toString()}
+          renderItem={({ item }) => (
+            <CharacterCard 
+              character={item} 
+              onPress={() => handleOpenSheet(item)}
+              onDelete={handleDeleteCharacter}
+              onEdit={handleEditCharacter}
+              onUnlinkSession={handleUnlinkSession}
+            />
+          )}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+        />
+      ) : (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyIcon}>🛡️</Text>
+          <Text style={styles.emptyTitle}>Nenhum tav encontrado</Text>
+          <Text style={styles.emptyText}>Sua jornada ainda não começou. Crie seu primeiro personagem para iniciar a aventura!</Text>
+        </View>
+      )}
+
+      <View style={styles.footer}>
+        <TouchableOpacity style={styles.advancedButton} activeOpacity={0.8} onPress={() => {
+          traceButton('home', 'OPEN_MASTER_TOOLS');
+          router.push('/advanced');
+        }}>
+          <Ionicons name="construct-outline" size={20} color={appColors.primary} style={styles.buttonIconGap} />
+          <Text style={styles.advancedButtonText}>FERRAMENTAS DO MESTRE</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.advancedButton}
+          activeOpacity={0.8}
+          onPress={() => {
+            traceButton('home', 'OPEN_DEBUG_TRACE');
+            router.push('/debug-trace' as any);
+          }}
+        >
+          <Ionicons name="bug-outline" size={20} color={appColors.warning} style={styles.buttonIconGap} />
+          <Text style={styles.advancedButtonText}>TRACE</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => {
+          traceButton('home', 'OPEN_LAN_SESSION');
+          runNavigationOnce('lan-session', () => router.replace('/lan-session' as any));
+        }}>
+          <Ionicons name="wifi-outline" size={20} color={appColors.success} style={styles.buttonIconGap} />
+          <Text style={styles.lanButtonText}>SESSAO LAN</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => {
+          traceButton('home', 'CREATE_CHARACTER');
+          runNavigationOnce('create-character', () => router.replace('/create' as any));
+        }}>
+          <Text style={styles.createButtonIcon}>+</Text>
+          <Text style={styles.createButtonText}>NOVO PERSONAGEM</Text>
+        </TouchableOpacity>
+
+        <View style={styles.versionContainer}>
+          <Text style={styles.versionText}>v{appVersion}</Text>
+        </View>
+      </View>
+    </LinearGradient>
+  );
+}

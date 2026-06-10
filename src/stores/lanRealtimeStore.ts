@@ -36,7 +36,8 @@ export type LanEventApplyDecisionReason =
   | 'stored_duplicate_but_apply_needed'
   | 'stored_duplicate_and_already_applied'
   | 'new_event'
-  | 'revision_checkpoint';
+  | 'revision_checkpoint'
+  | 'legacy_timestamp_checkpoint_ignored';
 
 export type LanEventApplyDecision = {
   apply: boolean;
@@ -80,22 +81,27 @@ export type LanRealtimeState = {
 };
 
 export const getLanRuntimeEntityKey = (event: LanSessionEvent) => {
-  const entityType = event.entityType || getLanEventEntityType(event);
-  const entityId = event.entityId || getLanEventEntityId({ ...event, entityType });
+  // v84: o tipo da entidade precisa ser derivado do tipo real do evento.
+  // Builds anteriores podiam enviar public_status/player_patch e inventory_patch
+  // com o mesmo entityId/remoteKey; se a revision de player contaminasse inventário,
+  // a troca seguinte chegava no socket mas era ignorada antes do PLAYER_APPLY_EVENT_START.
+  const derivedType = getLanEventEntityType(event);
+  const entityType = derivedType || event.entityType || 'player';
+  const entityId = getLanEventEntityId({ ...event, entityType });
   return `${event.sessionId}:${entityType}:${entityId}`;
 };
 
-const isLegacyPlayerCheckpoint = (event: LanSessionEvent) => (
-  event.type === 'player_patch' &&
-  String(event.id || '').startsWith('checkpoint_player_') &&
+const isLegacyTimestampCheckpoint = (event: LanSessionEvent) => (
+  String(event.id || '').startsWith('checkpoint_') &&
   Number(event.entityRevision || 0) > 1000000
 );
 
-// v33: snapshots/checkpoints antigos de player vieram com entityRevision baseado em Date.now().
-// Isso fazia o runtime gravar revision ~1780... e ignorar os player_patch reais do host (revision 1,2,3...).
-// Checkpoint legado não pode avançar a revision do agregado player.
+// v55: snapshots/checkpoints antigos de player/inventory/effect podiam vir com
+// entityRevision baseado em Date.now(). Isso fazia o runtime gravar revision ~1780...
+// e ignorar/sobrescrever os patches reais do host (revision 1,2,3...).
+// Checkpoint legado não pode avançar a revision de nenhum agregado.
 const getRevision = (event: LanSessionEvent) => {
-  if (isLegacyPlayerCheckpoint(event)) return 0;
+  if (isLegacyTimestampCheckpoint(event)) return 0;
   return Number(event.entityRevision ?? event.seq ?? 0) || 0;
 };
 const getSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
@@ -149,6 +155,20 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
         reason: 'duplicate_id',
         entityKey,
         currentRevision: current?.revision,
+        nextRevision,
+        lastAppliedSeq: state.lastAppliedSeq,
+        lastSeenSeq: state.lastSeenSeq,
+      });
+    }
+
+    // v55: checkpoint legado com Date.now() como revision não pode sobrescrever
+    // um agregado que já recebeu patch autoritativo do host.
+    if (current && isLegacyTimestampCheckpoint(event)) {
+      return traceDecision({
+        apply: false,
+        reason: 'legacy_timestamp_checkpoint_ignored',
+        entityKey,
+        currentRevision: current.revision,
         nextRevision,
         lastAppliedSeq: state.lastAppliedSeq,
         lastSeenSeq: state.lastSeenSeq,

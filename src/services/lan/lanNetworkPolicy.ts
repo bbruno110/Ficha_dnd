@@ -1,12 +1,12 @@
 import type { LanSessionEvent, LanSessionEventType } from '../lanSession';
 
 export const LAN_NETWORK_LIMITS = {
-  heartbeatActiveMs: 8000,
-  heartbeatPausedMs: 15000,
-  heartbeatTimeoutMs: 24000,
-  fallbackPollActiveMs: 1500,
-  reconnectBackoffBaseMs: 1200,
-  resyncMinIntervalMs: 10000,
+  heartbeatActiveMs: 5000,
+  heartbeatPausedMs: 10000,
+  heartbeatTimeoutMs: 18000,
+  fallbackPollActiveMs: 350,
+  reconnectBackoffBaseMs: 700,
+  resyncMinIntervalMs: 3500,
   maxEventsPerResync: 40,
   socketQueueMaxPending: 200,
 };

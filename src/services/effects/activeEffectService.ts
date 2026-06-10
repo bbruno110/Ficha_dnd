@@ -94,7 +94,10 @@ export async function applyEffectToPlayer(
   // Se o novo valor for menor/igual ao PV temporário ativo, mantém o atual.
   // Se for maior, substitui todas as fontes antigas por esta nova fonte.
   if (isTempHpEffect) {
-    const currentTempHp = currentTempHpEffects.reduce((max, effect) => Math.max(max, getTempHpValue(effect)), 0);
+    const currentTempHp = Math.max(
+      Math.max(0, toNumber(player.temp_hp)),
+      currentTempHpEffects.reduce((max, effect) => Math.max(max, getTempHpValue(effect)), 0)
+    );
 
     if (input.sourceId) {
       const duplicatedSource = currentTempHpEffects.find((effect) => effect.sourceId === input.sourceId);
@@ -712,9 +715,7 @@ export async function rebuildPlayerEffectsCache(
   const activeTempHpTotal = effects
     .filter(isTempHpSnapshot)
     .reduce((max, effect) => Math.max(max, getTempHpValue(effect)), 0);
-  const nextTempHp = options?.tempHpMode === 'sum_active'
-    ? activeTempHpTotal
-    : Math.max(0, toNumber(player.temp_hp) + tempHpDelta);
+  const preservedTempHp = Math.max(0, toNumber(player.temp_hp));
 
   traceSqlite('SQLITE_WRITE_START', {
     source: 'activeEffectService',
@@ -726,29 +727,29 @@ export async function rebuildPlayerEffectsCache(
     playerKey: player.target_key,
     playerName: player.target_name,
     before,
-    after: { tempHp: nextTempHp, effectCount: effects.length },
+    after: { tempHp: preservedTempHp, activeTempHpTotal, effectCount: effects.length, tempHpDelta, tempHpMode: options?.tempHpMode || 'preserve' },
   });
   await db.runAsync(
     `UPDATE lan_session_players
-     SET effects_json = ?, temp_hp = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
+     SET effects_json = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
          last_seen_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
-    [JSON.stringify(effects), nextTempHp, Number(player.id)],
+    [JSON.stringify(effects), Number(player.id)],
   );
 
   if (player.character_id) {
     await db.runAsync(
       `UPDATE characters
-       SET temp_hp = ?, active_effects_json = ?, updated_at = CURRENT_TIMESTAMP
+       SET active_effects_json = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [nextTempHp, JSON.stringify(effects), Number(player.character_id)],
+      [JSON.stringify(effects), Number(player.character_id)],
     );
   }
 
-  player.temp_hp = nextTempHp;
   player.effects_json = JSON.stringify(effects);
   traceStateChange('STATE_CHANGE', 'PLAYER_EFFECTS_CACHE_REBUILT', before, {
-    tempHp: nextTempHp,
+    tempHp: preservedTempHp,
+    activeTempHpTotal,
     effectsJson: player.effects_json,
     effectCount: effects.length,
   }, {

@@ -211,6 +211,18 @@ export type LanSessionSummary = LanSessionRules & {
 };
 
 export type LanTradeItem = {
+  id?: string | number;
+  inventoryItemId?: string | number;
+  inventory_item_id?: string | number;
+  itemId?: string | number;
+  item_id?: string | number;
+  catalogItemId?: string | number;
+  catalog_item_id?: string | number;
+  sourceItemId?: string | number;
+  source_item_id?: string | number;
+  dbId?: string | number;
+  stackKey?: string;
+  stack_key?: string;
   name: string;
   qty: number;
   weight?: number;
@@ -300,6 +312,13 @@ export type LanSessionEvent = {
   baseRevision?: number;
   ackRequired?: boolean;
   originClientId?: string;
+  /**
+   * Classifica o motivo do numberPatch. Usado para impedir que ecos
+   * absolutos antigos de HP/XP sobrescrevam moedas alteradas localmente.
+   */
+  numberPatchIntent?: 'hp' | 'temp_hp' | 'xp' | 'coins' | 'self_coin' | 'mixed' | string;
+  /** ID do comando original do jogador quando o host ecoa uma acao autonoma. */
+  sourceClientMsgId?: string;
   item?: LanTradeItem;
   offeredItem?: LanTradeItem;
   requestedItem?: LanTradeItem;
@@ -395,6 +414,8 @@ export type LanSessionEvent = {
     next?: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>>;
     currentTotalCopper?: number;
     nextTotalCopper?: number;
+    /** Sequencia local monotônica do jogador para coalescer cliques rápidos de moeda. */
+    opSeq?: number;
     reason?: string;
   };
   sendItemRequest?: {
@@ -403,6 +424,8 @@ export type LanSessionEvent = {
     toKey?: string;
     item?: LanTradeItem;
     qty?: number;
+    sourceEquipmentBefore?: Record<string, unknown>;
+    sourceEquipmentAfter?: Record<string, unknown>;
   };
   sendItemResult?: {
     requestId?: string;
@@ -413,22 +436,47 @@ export type LanSessionEvent = {
     tradeId?: string;
     fromKey?: string;
     toKey?: string;
+    sourceEquipmentBefore?: Record<string, unknown>;
+    sourceEquipmentAfter?: Record<string, unknown>;
   };
   tradeResult?: {
     tradeId?: string;
     status: 'accepted' | 'rejected';
     reason?: string;
+    /**
+     * Fallback autoritativo para concluir a troca no cliente mesmo se o
+     * inventory_patch individual nao for aplicado/ackado por uma oscilacao.
+     */
+    tradeCommit?: {
+      tradeId?: string;
+      offeringKey?: string;
+      acceptingKey?: string;
+      targetKey?: string;
+      itemDeltas?: Array<{
+        mode?: 'add' | 'remove' | 'set' | string;
+        item?: Record<string, unknown>;
+        qty?: number;
+        stackKey?: string;
+      }>;
+    };
   };
   publicState?: {
     hpCurrent: number;
     hpMax: number;
     tempHp?: number;
     level: number;
+    stats?: Record<string, unknown>;
+    effectiveStats?: Record<string, number>;
+    equipment?: Record<string, unknown>;
     effects?: Array<{
       id?: string;
       name?: string;
       status?: string;
       statusKey?: string;
+      target?: string;
+      value?: number | string | null;
+      kind?: string | null;
+      source?: string | null;
       remaining?: number;
       unit?: LanEffectUnit;
       color?: string;
@@ -489,6 +537,46 @@ export type LanSessionEvent = {
   inventoryPatch?: {
     targetKey?: string;
     equipment: Record<string, unknown>;
+    baseEquipment?: Record<string, unknown>;
+    /**
+     * Delta opcional e idempotente para grants/envios.
+     * A UI usa o equipment como estado final autoritativo, mas o itemDelta permite
+     * recuperar rapidamente quando o snapshot completo chega stale ou sem stack.
+     */
+    itemDelta?: {
+      mode?: 'add' | 'remove' | 'set' | string;
+      item?: Record<string, unknown>;
+      qty?: number;
+      stackKey?: string;
+    };
+    /**
+     * Lista de deltas oficiais para operações compostas, como troca:
+     * remove item A e adiciona item B no mesmo jogador. O cliente aplica estes
+     * deltas de forma idempotente quando o snapshot completo vier stale.
+     */
+    itemDeltas?: Array<{
+      mode?: 'add' | 'remove' | 'set' | string;
+      item?: Record<string, unknown>;
+      qty?: number;
+      stackKey?: string;
+    }>;
+    /**
+     * Transacao atomica de troca para o cliente aplicar de forma generica.
+     * Ela evita depender de snapshot parcial e funciona para qualquer item:
+     * arma, ferramenta, kit, consumivel, item customizado, pilha ou equipamento.
+     */
+    tradeCommit?: {
+      tradeId?: string;
+      offeringKey?: string;
+      acceptingKey?: string;
+      targetKey?: string;
+      itemDeltas?: Array<{
+        mode?: 'add' | 'remove' | 'set' | string;
+        item?: Record<string, unknown>;
+        qty?: number;
+        stackKey?: string;
+      }>;
+    };
     reason?: string;
     action?: 'grant' | 'remove' | 'set_quantity' | 'replace' | 'self_update' | 'transfer_in' | 'transfer_out' | string;
     grantId?: string;
@@ -526,6 +614,8 @@ export type PublicLanPlayer = {
   gp?: number;
   sp?: number;
   cp?: number;
+  publicSeq?: number;
+  publicRevision?: number;
   publicEffects?: Array<{
     id?: string;
     name?: string;
@@ -1144,7 +1234,7 @@ async function broadcastMasterInventoryResult(
   const now = new Date().toISOString();
 
   if (!options?.declineOnly) {
-    for (const patchEvent of await buildInventoryPatchEventsForTargets(db, sourceEvent, targetKeys, result.reason)) {
+    for (const patchEvent of await buildInventoryPatchEventsForTargets(db, sourceEvent, targetKeys, result.reason, result.itemDeltasByTarget)) {
       await commitAndBroadcastLanHostEvent(db, joinUrl, patchEvent);
     }
   }
@@ -1185,33 +1275,44 @@ async function broadcastMasterInventoryResult(
     const participants = getInventoryEventParticipants(sourceEvent);
     const fromKey = participants[0] || sourceEvent.fromKey;
     const toKey = participants[1] || sourceEvent.toKey;
-    if (!fromKey || !toKey || toKey === 'master') return;
+    const targetKeys = Array.from(new Set((result.targetKeys?.length ? result.targetKeys : participants).filter((key) => key && key !== 'master')));
+    if (!fromKey || !toKey || toKey === 'master' || targetKeys.length === 0) return;
 
-    await commitAndBroadcastLanHostEvent(db, joinUrl, {
-      id: makeLanEventId(),
-      sessionId: sourceEvent.sessionId,
-      type: 'trade_result',
-      fromKey,
-      fromName: await getLanPlayerDisplayName(db, sourceEvent.sessionId, fromKey),
-      toKey,
-      toName: await getLanPlayerDisplayName(db, sourceEvent.sessionId, toKey),
-      entityType: 'inventory',
-      entityId: String(sourceEvent.tradeId || sourceEvent.entityId || sourceEvent.id),
-      ackRequired: true,
-      originClientId: 'master',
-      tradeId: sourceEvent.tradeId || sourceEvent.id,
-      offeredItem: sourceEvent.offeredItem,
-      requestedItem: sourceEvent.requestedItem,
-      tradeResult: {
+    for (const targetKey of targetKeys) {
+      const targetDeltas = (result.itemDeltasByTarget?.[targetKey] || []).filter(Boolean) as NonNullable<LanInventoryItemDelta>[];
+      await commitAndBroadcastLanHostEvent(db, joinUrl, {
+        id: makeLanEventId(),
+        sessionId: sourceEvent.sessionId,
+        type: 'trade_result',
+        fromKey: 'master',
+        fromName: 'Mestre',
+        toKey: targetKey,
+        toName: await getLanPlayerDisplayName(db, sourceEvent.sessionId, targetKey),
+        entityType: 'inventory',
+        entityId: String(sourceEvent.tradeId || sourceEvent.entityId || sourceEvent.id),
+        ackRequired: true,
+        originClientId: 'master',
         tradeId: sourceEvent.tradeId || sourceEvent.id,
-        status: result.accepted ? 'accepted' : 'rejected',
-        reason: result.reason,
-      },
-      message: result.accepted
-        ? 'Troca concluida com sucesso.'
-        : (result.reason || 'Troca nao concluida.'),
-      createdAt: now,
-    });
+        offeredItem: sourceEvent.offeredItem,
+        requestedItem: sourceEvent.requestedItem,
+        tradeResult: {
+          tradeId: sourceEvent.tradeId || sourceEvent.id,
+          status: result.accepted ? 'accepted' : 'rejected',
+          reason: result.reason,
+          tradeCommit: result.accepted && targetDeltas.length > 0 ? {
+            tradeId: sourceEvent.tradeId || sourceEvent.id,
+            offeringKey: fromKey,
+            acceptingKey: toKey,
+            targetKey,
+            itemDeltas: targetDeltas,
+          } : undefined,
+        },
+        message: result.accepted
+          ? 'Troca concluida com sucesso.'
+          : (result.reason || 'Troca nao concluida.'),
+        createdAt: now,
+      });
+    }
   }
 }
 
@@ -1219,16 +1320,22 @@ async function buildInventoryPatchEventsForTargets(
   db: SQLiteDatabase,
   sourceEvent: LanSessionEvent,
   targetKeys: string[],
-  reason?: string
+  reason?: string,
+  itemDeltasByTarget?: Record<string, LanInventoryItemDelta[]>
 ) {
   const events: LanSessionEvent[] = [];
   const now = new Date().toISOString();
   const uniqueTargets = Array.from(new Set(targetKeys.filter(Boolean)));
 
+  const participants = sourceEvent.type === 'trade_accept' ? getInventoryEventParticipants(sourceEvent) : [];
+  const offeringKey = participants[0] || String(sourceEvent.tradeAccept?.fromKey || '');
+  const acceptingKey = participants[1] || String(sourceEvent.tradeAccept?.toKey || '');
+
   for (const targetKey of uniqueTargets) {
     const player = await getActiveLanPlayerByRemoteKey(db, sourceEvent.sessionId, targetKey);
     if (!player) continue;
     const equipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(player.equipment_json, {}));
+    const itemDeltas = (itemDeltasByTarget?.[targetKey] || []).filter(Boolean) as NonNullable<LanInventoryItemDelta>[];
     events.push({
       id: makeLanEventId(),
       sessionId: sourceEvent.sessionId,
@@ -1238,13 +1345,22 @@ async function buildInventoryPatchEventsForTargets(
       toKey: targetKey,
       toName: String(player.character_name || targetKey),
       entityType: 'inventory',
-      entityId: `${sourceEvent.sessionId}:inventory:${targetKey}`,
-      entityRevision: Math.max(toNumber(player.revision_seq), Date.now()),
+      entityId: targetKey,
+      entityRevision: Math.max(1, toNumber(player.revision_seq)),
       ackRequired: true,
       originClientId: 'master',
       inventoryPatch: {
         targetKey,
         equipment,
+        itemDelta: itemDeltas[0],
+        itemDeltas,
+        tradeCommit: sourceEvent.type === 'trade_accept' ? {
+          tradeId: sourceEvent.tradeId || sourceEvent.id,
+          offeringKey,
+          acceptingKey,
+          targetKey,
+          itemDeltas,
+        } : undefined,
         reason: reason || sourceEvent.message || 'Inventario sincronizado.',
         action: sourceEvent.type === 'send_item_request'
           ? (targetKey === String(sourceEvent.sendItemRequest?.fromKey || sourceEvent.fromKey) ? 'transfer_out' : 'transfer_in')
@@ -1302,11 +1418,13 @@ export async function getLocalLanSessionForCharacter(db: SQLiteDatabase, charact
     joinUrl?: string;
     payloadJson?: string;
     remoteKey?: string;
+    status?: LanSessionStatus;
   }>(
     `SELECT s.id as sessionId,
             COALESCE(b.join_url, s.join_url) as joinUrl,
             s.payload_json as payloadJson,
-            b.remote_key as remoteKey
+            b.remote_key as remoteKey,
+            COALESCE(s.status, 'active') as status
      FROM lan_local_character_bindings b
      JOIN lan_sessions s ON s.id = b.session_id
      WHERE b.character_id = ?
@@ -1328,13 +1446,15 @@ export async function getBoundLanCharacter(db: SQLiteDatabase, sessionId: string
     joinUrl?: string;
     payloadJson?: string;
     remoteKey?: string;
+    status?: LanSessionStatus;
   }>(
     `SELECT b.character_id as characterId,
             s.id as sessionId,
             s.name as sessionName,
             COALESCE(b.join_url, s.join_url) as joinUrl,
             s.payload_json as payloadJson,
-            b.remote_key as remoteKey
+            b.remote_key as remoteKey,
+            COALESCE(s.status, 'active') as status
      FROM lan_local_character_bindings b
      JOIN lan_sessions s ON s.id = b.session_id
      WHERE b.session_id = ?
@@ -1966,6 +2086,16 @@ export async function upsertLanSessionPlayerFromNetwork(db: SQLiteDatabase, entr
     ]
   );
 
+  const insertedPlayerId = Number((result as any)?.lastInsertRowId || (result as any)?.insertId || 0);
+  if (insertedPlayerId > 0) {
+    await syncNormalizedLanInventoryForPlayer(db, {
+      id: insertedPlayerId,
+      session_id: sessionId,
+      remote_key: remoteKey,
+      character_id: normalized.sourceCharacterId,
+    }, normalized.equipment);
+  }
+
   await rememberLanSessionEvent(db, {
     id: makeLanEventId(),
     sessionId,
@@ -2107,17 +2237,22 @@ export async function updateLanPlayerEquipment(
   );
   if (!player) return false;
 
+  const normalizedEquipment = normalizeEquipment(equipment);
+
   await db.runAsync(
     `UPDATE lan_session_players
      SET equipment_json = ?, revision_seq = COALESCE(revision_seq, 0) + 1,
          last_seen_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
-    [JSON.stringify(normalizeEquipment(equipment)), playerId]
+    [JSON.stringify(normalizedEquipment), playerId]
   );
 
   if (player.character_id) {
-    await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [JSON.stringify(normalizeEquipment(equipment)), Number(player.character_id)]);
+    const characterId = Number(player.character_id);
+    await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [JSON.stringify(normalizedEquipment), characterId]);
+    await syncCharacterInventoryForEquipment(db, characterId, normalizedEquipment).catch(() => undefined);
   }
+  await syncNormalizedLanInventoryForPlayer(db, player, normalizedEquipment).catch(() => undefined);
 
   if (message) {
     await rememberLanSessionEvent(db, {
@@ -2152,7 +2287,8 @@ export async function applyLanPlayerInventoryPatch(
   sessionId: string,
   remoteKey: string,
   equipment: Record<string, unknown>,
-  allowIncreases = false
+  allowIncreases = false,
+  baseEquipment?: Record<string, unknown>
 ) {
   await ensureLanSchema(db);
   const status = await getLanSessionStatus(db, sessionId);
@@ -2167,15 +2303,22 @@ export async function applyLanPlayerInventoryPatch(
 
   const currentEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(player.equipment_json, {}));
   const nextEquipment = normalizeEquipment(equipment);
-  if (!allowIncreases && hasInventoryIncrease(currentEquipment, nextEquipment)) return false;
+  const validationBaseEquipment = baseEquipment ? normalizeEquipment(baseEquipment) : currentEquipment;
+  // O jogador pode reduzir, equipar, dropar, doar e trocar o que ja possuia.
+  // Valide aumentos contra o snapshot local antes da acao quando ele foi enviado,
+  // porque o cache do mestre pode estar atrasado depois de equipar/trocar rapidamente.
+  if (!allowIncreases && hasInventoryIncrease(validationBaseEquipment, nextEquipment)) return false;
 
   return updateLanPlayerEquipment(db, Number(player.id), nextEquipment);
 }
+
+type LanInventoryItemDelta = NonNullable<LanSessionEvent['inventoryPatch']>['itemDelta'];
 
 type LanInventoryMutationResult = {
   accepted: boolean;
   reason?: string;
   targetKeys: string[];
+  itemDeltasByTarget?: Record<string, LanInventoryItemDelta[]>;
 };
 
 export async function applyLanCoinSelfPatchRequest(db: SQLiteDatabase, event: LanSessionEvent) {
@@ -2253,25 +2396,58 @@ export async function applyLanSendItemRequest(db: SQLiteDatabase, event: LanSess
     const transferItem = normalizeTradeItemForMutation(item);
     if (!transferItem) return { accepted: false, reason: 'Item invalido.', targetKeys: [fromKey] };
 
-    const fromEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(fromPlayer.equipment_json, {}));
+    let fromEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(fromPlayer.equipment_json, {}));
     const toEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(toPlayer.equipment_json, {}));
-    const removedFromAuthoritativeBag = removeTradeItemFromEquipment(fromEquipment, transferItem, { forcePartial: true });
+    const sourceBefore = request?.sourceEquipmentBefore ? normalizeEquipment(request.sourceEquipmentBefore) : fromEquipment;
+    const sourceAfter = request?.sourceEquipmentAfter ? normalizeEquipment(request.sourceEquipmentAfter) : null;
+
+    let removedFromAuthoritativeBag = false;
+    const clientSnapshotAlreadyRemovedItem = hasTradeItemRemoval(sourceBefore, sourceAfter, transferItem);
+    if (sourceAfter && clientSnapshotAlreadyRemovedItem) {
+      fromEquipment = sourceAfter;
+      removedFromAuthoritativeBag = true;
+    } else {
+      removedFromAuthoritativeBag = removeTradeItemFromEquipment(fromEquipment, transferItem);
+    }
+    if (!removedFromAuthoritativeBag) {
+      return { accepted: false, reason: `${fromPlayer.character_name || 'Jogador'} nao possui mais ${transferItem.qty}x ${transferItem.name}.`, targetKeys: [fromKey, toKey] };
+    }
     debugLanFlow('LAN_SEND_ITEM_SOURCE_REMOVAL_RESULT', {
       sessionId: event.sessionId,
       fromKey,
       toKey,
       itemName: transferItem.name,
       qty: transferItem.qty,
+      usedClientSourceAfter: Boolean(sourceAfter && clientSnapshotAlreadyRemovedItem),
       removedFromAuthoritativeBag,
     });
     // O cache do host pode estar atrasado quando o jogador acabou de equipar,
-    // receber ou remover algo antes do envio. Como a ação é autônoma, não rejeite
-    // por cache stale: aceite o pedido assinado pelo jogador e publique snapshot oficial.
+    // receber ou remover algo antes do envio. Se o cliente mandou o snapshot
+    // pós-ação sem aumento líquido, ele vira a fonte da verdade do inventário de origem.
     const nextToEquipment = addTradeItemToEquipment(toEquipment, transferItem);
     await writeLanPlayerEquipmentSnapshot(db, fromPlayer, fromEquipment);
     await writeLanPlayerEquipmentSnapshot(db, toPlayer, nextToEquipment);
+    await recordLanInventoryMovement(db, {
+      sessionId: event.sessionId,
+      type: 'send_item',
+      sourceEventId: event.id,
+      fromKey,
+      toKey,
+      item: transferItem,
+      qty: transferItem.qty,
+      before: { from: sourceBefore, to: toEquipment },
+      after: { from: fromEquipment, to: nextToEquipment },
+    });
 
-    return { accepted: true, targetKeys: [fromKey, toKey], reason: event.message };
+    return {
+      accepted: true,
+      targetKeys: [fromKey, toKey],
+      reason: event.message,
+      itemDeltasByTarget: {
+        [fromKey]: [{ mode: 'remove', item: { ...transferItem, qty: transferItem.qty }, qty: transferItem.qty }],
+        [toKey]: [{ mode: 'add', item: { ...transferItem, qty: transferItem.qty }, qty: transferItem.qty }],
+      },
+    };
   }), { sessionId: event.sessionId, eventId: event.id, type: event.type, fromKey, toKey });
 
   if (result.accepted) await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
@@ -2313,11 +2489,17 @@ export async function applyLanTradeAcceptRequest(db: SQLiteDatabase, event: LanS
 
     const offeringEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(offeringPlayer.equipment_json, {}));
     const acceptingEquipment = normalizeEquipment(parseJsonValue<Record<string, unknown>>(acceptingPlayer.equipment_json, {}));
-    const removedOfferedFromAuthoritativeBag = removeTradeItemFromEquipment(offeringEquipment, offeredItem, { forcePartial: true });
+    const removedOfferedFromAuthoritativeBag = removeTradeItemFromEquipment(offeringEquipment, offeredItem);
+    if (!removedOfferedFromAuthoritativeBag) {
+      return { accepted: false, reason: `${offeringPlayer.character_name || 'Jogador'} nao possui mais ${offeredItem.qty}x ${offeredItem.name}.`, targetKeys: [offeringKey, acceptingKey] };
+    }
 
     let removedRequestedFromAuthoritativeBag = false;
     if (requestedItem) {
-      removedRequestedFromAuthoritativeBag = removeTradeItemFromEquipment(acceptingEquipment, requestedItem, { forcePartial: true });
+      removedRequestedFromAuthoritativeBag = removeTradeItemFromEquipment(acceptingEquipment, requestedItem);
+      if (!removedRequestedFromAuthoritativeBag) {
+        return { accepted: false, reason: `${acceptingPlayer.character_name || 'Jogador'} nao possui mais ${requestedItem.qty}x ${requestedItem.name}.`, targetKeys: [offeringKey, acceptingKey] };
+      }
     }
     debugLanFlow('LAN_TRADE_SOURCE_REMOVAL_RESULT', {
       sessionId: event.sessionId,
@@ -2333,14 +2515,58 @@ export async function applyLanTradeAcceptRequest(db: SQLiteDatabase, event: LanS
     // validou a posse local na UI; o host gera os dois snapshots oficiais e os
     // clientes convergem pelo inventory_patch.
 
-    await writeLanPlayerEquipmentSnapshot(
-      db,
-      offeringPlayer,
-      requestedItem ? addTradeItemToEquipment(offeringEquipment, requestedItem) : offeringEquipment,
-    );
-    await writeLanPlayerEquipmentSnapshot(db, acceptingPlayer, addTradeItemToEquipment(acceptingEquipment, offeredItem));
+    const nextOfferingEquipment = requestedItem ? addTradeItemToEquipment(offeringEquipment, requestedItem) : offeringEquipment;
+    const nextAcceptingEquipment = addTradeItemToEquipment(acceptingEquipment, offeredItem);
 
-    return { accepted: true, targetKeys: [offeringKey, acceptingKey], reason: event.message };
+    await writeLanPlayerEquipmentSnapshot(db, offeringPlayer, nextOfferingEquipment);
+    await writeLanPlayerEquipmentSnapshot(db, acceptingPlayer, nextAcceptingEquipment);
+    await recordLanInventoryMovement(db, {
+      sessionId: event.sessionId,
+      type: 'trade_offered_item',
+      sourceEventId: event.id,
+      tradeId: event.tradeId,
+      fromKey: offeringKey,
+      toKey: acceptingKey,
+      item: offeredItem,
+      qty: offeredItem.qty,
+      before: { offering: offeringEquipment, accepting: acceptingEquipment },
+      after: { offering: nextOfferingEquipment, accepting: nextAcceptingEquipment },
+    });
+    if (requestedItem) {
+      await recordLanInventoryMovement(db, {
+        sessionId: event.sessionId,
+        type: 'trade_counter_item',
+        sourceEventId: event.id,
+        tradeId: event.tradeId,
+        fromKey: acceptingKey,
+        toKey: offeringKey,
+        item: requestedItem,
+        qty: requestedItem.qty,
+        before: { offering: offeringEquipment, accepting: acceptingEquipment },
+        after: { offering: nextOfferingEquipment, accepting: nextAcceptingEquipment },
+      });
+    }
+
+    const offeringDeltas: LanInventoryItemDelta[] = [
+      { mode: 'remove', item: { ...offeredItem, qty: offeredItem.qty }, qty: offeredItem.qty },
+    ];
+    const acceptingDeltas: LanInventoryItemDelta[] = [
+      { mode: 'add', item: { ...offeredItem, qty: offeredItem.qty }, qty: offeredItem.qty },
+    ];
+    if (requestedItem) {
+      offeringDeltas.push({ mode: 'add', item: { ...requestedItem, qty: requestedItem.qty }, qty: requestedItem.qty });
+      acceptingDeltas.unshift({ mode: 'remove', item: { ...requestedItem, qty: requestedItem.qty }, qty: requestedItem.qty });
+    }
+
+    return {
+      accepted: true,
+      targetKeys: [offeringKey, acceptingKey],
+      reason: event.message,
+      itemDeltasByTarget: {
+        [offeringKey]: offeringDeltas,
+        [acceptingKey]: acceptingDeltas,
+      },
+    };
   }), { sessionId: event.sessionId, eventId: event.id, type: event.type, offeringKey, acceptingKey });
 
   if (result.accepted) await syncLanSessionPayload(db, event.sessionId, { broadcast: false });
@@ -2395,7 +2621,8 @@ export async function applyLanPlayerNumberPatch(
   db: SQLiteDatabase,
   sessionId: string,
   remoteKey: string,
-  patch: LanSessionEvent['numberPatch']
+  patch: LanSessionEvent['numberPatch'],
+  event?: LanSessionEvent
 ) {
   await ensureLanSchema(db);
   if (!patch) return false;
@@ -2408,13 +2635,20 @@ export async function applyLanPlayerNumberPatch(
   const nextSp = patch.sp == null ? toNumber(player.sp) : Math.max(0, toNumber(patch.sp));
   const nextCp = patch.cp == null ? toNumber(player.cp) : Math.max(0, toNumber(patch.cp));
   const nextCoinValue = nextGp * 100 + nextSp * 10 + nextCp;
+  const clientBaseCoinValue = Math.max(
+    toNumber(event?.coinPatchRequest?.currentTotalCopper),
+    event?.coinPatchRequest?.current ? coinsToCopper(event.coinPatchRequest.current) : 0
+  );
+  const validationCoinValue = Math.max(currentCoinValue, clientBaseCoinValue);
 
-  if (nextCoinValue > currentCoinValue) return false;
+  // Moedas do jogador: reduzir/converter é autônomo; aumentar precisa passar
+  // por resource_request e aprovação do mestre. Use também o total local antes
+  // da ação para evitar falso aumento quando o cache do mestre está atrasado.
+  if (nextCoinValue > validationCoinValue) return false;
 
-  const allowedPatch: Partial<Pick<LanSessionPlayerState, 'xp' | 'gp' | 'sp' | 'cp'>> = {};
-  // v34: XP/level progression is player-owned. The host only mirrors the
-  // value into the official roster and broadcasts it back as an authoritative patch.
-  if (patch.xp != null) allowedPatch.xp = Math.max(0, toNumber(patch.xp));
+  const allowedPatch: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>> = {};
+  // XP não é autônomo: jogador pede XP e só recebe após aceite do mestre.
+  // Progressão de nível usa player_progression_patch separado.
   if (patch.gp != null) allowedPatch.gp = nextGp;
   if (patch.sp != null) allowedPatch.sp = nextSp;
   if (patch.cp != null) allowedPatch.cp = nextCp;
@@ -2821,7 +3055,20 @@ export async function consumeLanPlayerTempHpAfterDamage(db: SQLiteDatabase, play
   return result;
 }
 
-export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: string, unit: LanAdvanceUnit, options: { syncPayload?: boolean } = {}) {
+export async function advanceLanSessionTime(
+  db: SQLiteDatabase,
+  sessionId: string,
+  unit: LanAdvanceUnit,
+  options: {
+    syncPayload?: boolean;
+    skipSessionPatchEvent?: boolean;
+    /** v55: quando o runtime do mestre ja avancou a mesa, persista exatamente esse alvo. */
+    nextCurrentTurn?: number;
+    nextElapsedMinutes?: number;
+    /** v55: evita ticar efeitos 2x quando o runtime ja enviou os effect_patch vivos. */
+    skipEffectTick?: boolean;
+  } = {},
+) {
   await ensureLanSchema(db);
   const session = await db.getFirstAsync<Record<string, unknown>>(
     `SELECT current_turn, elapsed_minutes FROM lan_sessions WHERE id = ?`,
@@ -2829,40 +3076,50 @@ export async function advanceLanSessionTime(db: SQLiteDatabase, sessionId: strin
   );
   const currentTurn = toNumber(session?.current_turn, 1);
   const elapsedMinutes = toNumber(session?.elapsed_minutes);
-  const nextTurn = unit === 'turn' ? currentTurn + 1 : currentTurn;
+  const computedNextTurn = unit === 'turn' ? currentTurn + 1 : currentTurn;
   const minuteDelta = unit === 'minute' ? 1 : unit === 'hour' || unit === 'shortRest' ? 60 : unit === 'longRest' ? 480 : 0;
+  const computedNextElapsedMinutes = elapsedMinutes + minuteDelta;
 
-  const nextElapsedMinutes = elapsedMinutes + minuteDelta;
+  const nextTurn = Number.isFinite(Number(options.nextCurrentTurn))
+    ? Math.max(1, Math.floor(Number(options.nextCurrentTurn)))
+    : computedNextTurn;
+  const nextElapsedMinutes = Number.isFinite(Number(options.nextElapsedMinutes))
+    ? Math.max(0, Math.floor(Number(options.nextElapsedMinutes)))
+    : computedNextElapsedMinutes;
 
   await db.runAsync(
     `UPDATE lan_sessions SET current_turn = ?, elapsed_minutes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [nextTurn, nextElapsedMinutes, sessionId]
   );
 
-  await rememberLanSessionEvent(db, {
-    id: makeLanEventId(),
-    sessionId,
-    type: 'session_patch',
-    fromKey: 'master',
-    fromName: 'Mestre',
-    toKey: 'all',
-    toName: 'Todos',
-    entityType: 'session',
-    entityId: sessionId,
-    entityRevision: Date.now(),
-    ackRequired: true,
-    originClientId: 'master',
-    sessionPatch: {
-      currentTurn: nextTurn,
-      elapsedMinutes: nextElapsedMinutes,
-      advanceUnit: unit,
-      reason: 'advance_time',
-    },
-    message: `Tempo da sessao avancou: ${unit}.`,
-    createdAt: new Date().toISOString(),
-  });
+  if (!options.skipSessionPatchEvent) {
+    await rememberLanSessionEvent(db, {
+      id: makeLanEventId(),
+      sessionId,
+      type: 'session_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: 'all',
+      toName: 'Todos',
+      entityType: 'session',
+      entityId: sessionId,
+      entityRevision: Date.now(),
+      ackRequired: true,
+      originClientId: 'master',
+      sessionPatch: {
+        currentTurn: nextTurn,
+        elapsedMinutes: nextElapsedMinutes,
+        advanceUnit: unit,
+        reason: 'advance_time',
+      },
+      message: `Tempo da sessao avancou: ${unit}.`,
+      createdAt: new Date().toISOString(),
+    });
+  }
 
-  const tickResult = await tickTurnEffects(db, sessionId, unit);
+  const tickResult = options.skipEffectTick
+    ? { patches: [], expired: [], restored: [], pendingSaves: [] }
+    : await tickTurnEffects(db, sessionId, unit);
 
   for (const patch of tickResult.patches) {
     const target = tickResult.expired.find((entry) => entry.targetKey === patch.targetKey)
@@ -3276,6 +3533,67 @@ async function ensureLanSchema(db: SQLiteDatabase) {
       processed INTEGER NOT NULL DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS lan_inventory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      player_key TEXT NOT NULL,
+      player_id INTEGER,
+      catalog_item_id INTEGER,
+      inventory_item_id TEXT,
+      stack_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      equipped_slot TEXT,
+      item_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_inventory_movements (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      source_event_id TEXT,
+      trade_id TEXT,
+      from_key TEXT,
+      to_key TEXT,
+      item_stack_key TEXT,
+      item_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      before_json TEXT NOT NULL DEFAULT '{}',
+      after_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS character_inventory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_id INTEGER NOT NULL,
+      catalog_item_id INTEGER,
+      inventory_item_id TEXT,
+      stack_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      equipped_slot TEXT,
+      item_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS character_inventory_movements (
+      id TEXT PRIMARY KEY,
+      character_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      source_event_id TEXT,
+      trade_id TEXT,
+      from_key TEXT,
+      to_key TEXT,
+      item_stack_key TEXT,
+      item_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      before_json TEXT NOT NULL DEFAULT '{}',
+      after_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
     CREATE TABLE IF NOT EXISTS lan_local_character_bindings (
       session_id TEXT NOT NULL,
@@ -3363,6 +3681,25 @@ async function ensureLanSchema(db: SQLiteDatabase) {
     ['lan_session_events', 'to_key', 'TEXT'],
     ['lan_session_events', 'client_msg_id', 'TEXT'],
     ['lan_session_events', 'processed', 'INTEGER NOT NULL DEFAULT 0'],
+    ['lan_inventory_items', 'player_id', 'INTEGER'],
+    ['lan_inventory_items', 'catalog_item_id', 'INTEGER'],
+    ['lan_inventory_items', 'inventory_item_id', 'TEXT'],
+    ['lan_inventory_items', 'equipped_slot', 'TEXT'],
+    ['lan_inventory_items', 'item_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['lan_inventory_items', 'updated_at', 'DATETIME'],
+    ['lan_inventory_movements', 'source_event_id', 'TEXT'],
+    ['lan_inventory_movements', 'trade_id', 'TEXT'],
+    ['lan_inventory_movements', 'before_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['lan_inventory_movements', 'after_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['character_inventory_items', 'catalog_item_id', 'INTEGER'],
+    ['character_inventory_items', 'inventory_item_id', 'TEXT'],
+    ['character_inventory_items', 'equipped_slot', 'TEXT'],
+    ['character_inventory_items', 'item_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['character_inventory_items', 'updated_at', 'DATETIME'],
+    ['character_inventory_movements', 'source_event_id', 'TEXT'],
+    ['character_inventory_movements', 'trade_id', 'TEXT'],
+    ['character_inventory_movements', 'before_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['character_inventory_movements', 'after_json', "TEXT NOT NULL DEFAULT '{}'"],
     ['lan_session_events', 'entity_type', 'TEXT'],
     ['lan_session_events', 'entity_id', 'TEXT'],
     ['lan_session_events', 'entity_revision', 'INTEGER NOT NULL DEFAULT 0'],
@@ -3408,6 +3745,14 @@ async function ensureLanSchema(db: SQLiteDatabase) {
     CREATE INDEX IF NOT EXISTS idx_lan_events_session_created ON lan_session_events(session_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_lan_requests_session_status ON lan_session_pending_requests(session_id, status);
     CREATE INDEX IF NOT EXISTS idx_lan_trades_session_status ON lan_session_trades(session_id, status);
+    CREATE INDEX IF NOT EXISTS idx_lan_inventory_items_owner ON lan_inventory_items(session_id, player_key);
+    CREATE INDEX IF NOT EXISTS idx_lan_inventory_items_stack ON lan_inventory_items(session_id, player_key, stack_key);
+    CREATE INDEX IF NOT EXISTS idx_lan_inventory_items_slot ON lan_inventory_items(session_id, player_key, equipped_slot);
+    CREATE INDEX IF NOT EXISTS idx_lan_inventory_movements_session ON lan_inventory_movements(session_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_items_owner ON character_inventory_items(character_id);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_items_stack ON character_inventory_items(character_id, stack_key);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_items_slot ON character_inventory_items(character_id, equipped_slot);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_movements_character ON character_inventory_movements(character_id, created_at);
   `);
 
   try {
@@ -3548,6 +3893,12 @@ async function updateLanPlayerFromNormalizedSnapshot(
       playerId,
     ]
   );
+
+  const playerRow = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT id, session_id, remote_key, character_id FROM lan_session_players WHERE id = ?`,
+    [playerId],
+  );
+  if (playerRow) await syncNormalizedLanInventoryForPlayer(db, playerRow, normalized.equipment);
 }
 
 async function updateLanPlayerProgressionFromNormalizedSnapshot(
@@ -3891,20 +4242,64 @@ export async function applyLanPlayerProgressionPatchFromEvent(
   return Number(player.id);
 }
 
+function normalizeInventoryStackText(value: unknown) {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw === '[]' || raw === '{}' || raw.toLowerCase() === 'null' || raw.toLowerCase() === 'undefined') return '';
+  return raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+function getInventoryStackKey(item: Record<string, any>) {
+  return [
+    normalizeInventoryStackText(item.name || item.nome || item.label),
+    normalizeInventoryStackText(item.damage || item.dano || ''),
+    normalizeInventoryStackText(item.damage_type || item.tipo_dano || ''),
+    normalizeInventoryStackText(item.properties || item.propriedades || ''),
+    normalizeInventoryStackText(item.effect_json || item.effectJson || ''),
+    normalizeInventoryStackText(item.duration_unit || ''),
+    String(item.duration_value ?? ''),
+  ].join('|');
+}
+
+function compactInventoryBagStacks(rawBag: unknown[]) {
+  const byKey = new Map<string, Record<string, any>>();
+  const result: Record<string, any>[] = [];
+  for (const rawItem of rawBag) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const item = { ...(rawItem as Record<string, any>) };
+    const stackKey = getTradeItemStackIdentity(item as any) || getInventoryStackKey(item);
+    const itemId = getTradeItemIdentityId(item as any);
+    const key = stackKey ? `stack:${stackKey}` : `id:${itemId}`;
+    const current = byKey.get(key);
+    if (!current) {
+      item.qty = Math.max(1, Number(item.qty) || 1);
+      byKey.set(key, item);
+      result.push(item);
+    } else {
+      current.qty = Math.max(1, Number(current.qty) || 1) + Math.max(1, Number(item.qty) || 1);
+    }
+  }
+  return result;
+}
+
 function normalizeEquipment(value: unknown): Record<string, unknown> {
   const equipment = parseJsonValue<any>(value, {});
-  if (Array.isArray(equipment)) return { bag: equipment, slots: {} };
+  if (Array.isArray(equipment)) return { bag: compactInventoryBagStacks(equipment), slots: {} };
   if (!equipment || typeof equipment !== 'object') return { bag: [], slots: {} };
   return {
     ...equipment,
-    bag: Array.isArray(equipment.bag) ? equipment.bag : [],
+    bag: compactInventoryBagStacks(Array.isArray(equipment.bag) ? equipment.bag : []),
     slots: equipment.slots || {},
   };
 }
 
 async function getActiveLanPlayerByRemoteKey(db: SQLiteDatabase, sessionId: string, remoteKey: string) {
   return db.getFirstAsync<Record<string, unknown>>(
-    `SELECT id, remote_key, character_name, character_id, equipment_json, revision_seq, gp, sp, cp
+    `SELECT id, session_id, remote_key, character_name, character_id, equipment_json, revision_seq, gp, sp, cp
      FROM lan_session_players
      WHERE session_id = ? AND remote_key = ? AND COALESCE(is_active, 1) = 1`,
     [sessionId, remoteKey]
@@ -3913,7 +4308,7 @@ async function getActiveLanPlayerByRemoteKey(db: SQLiteDatabase, sessionId: stri
 
 async function getActiveLanPlayerForMutation(db: SQLiteDatabase, sessionId: string, remoteKey: string) {
   return db.getFirstAsync<Record<string, unknown>>(
-    `SELECT id, remote_key, character_name, character_id, equipment_json, revision_seq
+    `SELECT id, session_id, remote_key, character_name, character_id, equipment_json, revision_seq
      FROM lan_session_players
      WHERE session_id = ? AND remote_key = ? AND COALESCE(is_active, 1) = 1`,
     [sessionId, remoteKey]
@@ -3945,6 +4340,288 @@ async function runLanDbTransaction<T>(db: SQLiteDatabase, task: () => Promise<T>
   }
 }
 
+function getLanInventoryCatalogId(item?: Partial<LanTradeItem> | Record<string, any> | null) {
+  const raw = (item as any)?.catalogItemId ?? (item as any)?.catalog_item_id ??
+    (item as any)?.itemId ?? (item as any)?.item_id ??
+    (item as any)?.sourceItemId ?? (item as any)?.source_item_id ??
+    (item as any)?.dbId ?? (item as any)?.id;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+function getLanInventoryItemInstanceId(item?: Partial<LanTradeItem> | Record<string, any> | null) {
+  const raw = (item as any)?.inventoryItemId ?? (item as any)?.inventory_item_id;
+  const text = String(raw ?? '').trim();
+  return text && text !== '0' ? text : null;
+}
+
+function getLanInventoryRowsFromEquipment(
+  sessionId: string,
+  playerKey: string,
+  playerId: number,
+  equipment: Record<string, unknown>,
+) {
+  const normalized = normalizeEquipment(equipment);
+  const rows: Array<{
+    sessionId: string;
+    playerKey: string;
+    playerId: number;
+    catalogItemId: number | null;
+    inventoryItemId: string | null;
+    stackKey: string;
+    name: string;
+    qty: number;
+    equippedSlot: string | null;
+    itemJson: string;
+  }> = [];
+
+  const pushItem = (rawItem: any, equippedSlot: string | null) => {
+    if (!rawItem || typeof rawItem !== 'object') return;
+    const name = String(rawItem.name || rawItem.nome || rawItem.label || '').trim();
+    if (!name) return;
+    const qty = Math.max(1, Math.floor(toNumber(rawItem.qty, 1)));
+    const stackKey = getTradeItemStackIdentity(rawItem) || getInventoryStackKey(rawItem);
+    const itemJson = JSON.stringify({ ...rawItem, name, qty });
+    rows.push({
+      sessionId,
+      playerKey,
+      playerId,
+      catalogItemId: getLanInventoryCatalogId(rawItem),
+      inventoryItemId: getLanInventoryItemInstanceId(rawItem),
+      stackKey: stackKey || normalizeInventoryIdentityText(name),
+      name,
+      qty,
+      equippedSlot,
+      itemJson,
+    });
+  };
+
+  const bag = Array.isArray((normalized as any).bag) ? (normalized as any).bag : [];
+  bag.forEach((item: any) => pushItem(item, null));
+
+  const slots = (normalized as any).slots && typeof (normalized as any).slots === 'object' ? (normalized as any).slots : {};
+  Object.entries(slots).forEach(([slot, rawItem]) => {
+    if (rawItem) pushItem(rawItem, slot);
+  });
+
+  return rows;
+}
+
+async function syncNormalizedLanInventoryForPlayer(
+  db: SQLiteDatabase,
+  player: Record<string, unknown>,
+  equipment: Record<string, unknown>,
+) {
+  const sessionId = String(player.session_id || '');
+  const playerKey = String(player.remote_key || '');
+  const playerId = Number(player.id);
+  if (!sessionId || !playerKey || !Number.isFinite(playerId)) return;
+
+  const rows = getLanInventoryRowsFromEquipment(sessionId, playerKey, playerId, equipment);
+  await db.runAsync(`DELETE FROM lan_inventory_items WHERE session_id = ? AND player_key = ?`, [sessionId, playerKey]);
+  for (const row of rows) {
+    await db.runAsync(
+      `INSERT INTO lan_inventory_items (
+        session_id, player_key, player_id, catalog_item_id, inventory_item_id, stack_key, name, qty, equipped_slot, item_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [
+        row.sessionId,
+        row.playerKey,
+        row.playerId,
+        row.catalogItemId,
+        row.inventoryItemId,
+        row.stackKey,
+        row.name,
+        row.qty,
+        row.equippedSlot,
+        row.itemJson,
+      ],
+    );
+  }
+}
+
+
+async function ensureCharacterInventorySchema(db: SQLiteDatabase) {
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS character_inventory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_id INTEGER NOT NULL,
+      catalog_item_id INTEGER,
+      inventory_item_id TEXT,
+      stack_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      equipped_slot TEXT,
+      item_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS character_inventory_movements (
+      id TEXT PRIMARY KEY,
+      character_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      source_event_id TEXT,
+      trade_id TEXT,
+      from_key TEXT,
+      to_key TEXT,
+      item_stack_key TEXT,
+      item_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      before_json TEXT NOT NULL DEFAULT '{}',
+      after_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_items_owner ON character_inventory_items(character_id);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_items_stack ON character_inventory_items(character_id, stack_key);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_items_slot ON character_inventory_items(character_id, equipped_slot);
+    CREATE INDEX IF NOT EXISTS idx_character_inventory_movements_character ON character_inventory_movements(character_id, created_at);
+  `);
+}
+
+function getCharacterInventoryRowsFromEquipment(characterId: number, equipment: Record<string, unknown>) {
+  const normalized = normalizeEquipment(equipment);
+  const rows: Array<{
+    characterId: number;
+    catalogItemId: number | null;
+    inventoryItemId: string | null;
+    stackKey: string;
+    name: string;
+    qty: number;
+    equippedSlot: string | null;
+    itemJson: string;
+  }> = [];
+
+  const pushItem = (rawItem: any, equippedSlot: string | null) => {
+    if (!rawItem || typeof rawItem !== 'object') return;
+    const item = { ...rawItem };
+    const name = String(item.name || item.nome || item.label || '').trim();
+    if (!name) return;
+    const qty = equippedSlot ? 1 : Math.max(1, Math.floor(toNumber(item.qty, 1)));
+    const stackKey = getTradeItemStackIdentity(item as any) || getInventoryStackKey(item) || normalizeInventoryIdentityText(name);
+    rows.push({
+      characterId,
+      catalogItemId: getLanInventoryCatalogId(item),
+      inventoryItemId: getLanInventoryItemInstanceId(item),
+      stackKey,
+      name,
+      qty,
+      equippedSlot,
+      itemJson: JSON.stringify({ ...item, qty }),
+    });
+  };
+
+  const bag = Array.isArray((normalized as any).bag) ? (normalized as any).bag : [];
+  bag.forEach((item: any) => pushItem(item, null));
+
+  const slots = (normalized as any).slots && typeof (normalized as any).slots === 'object' ? (normalized as any).slots : {};
+  Object.entries(slots).forEach(([slot, rawItem]) => {
+    if (rawItem) pushItem(rawItem, slot);
+  });
+
+  return rows;
+}
+
+export async function syncCharacterInventoryForEquipment(
+  db: SQLiteDatabase,
+  characterId: number,
+  equipment: Record<string, unknown>,
+) {
+  const id = Number(characterId);
+  if (!Number.isFinite(id) || id <= 0) return;
+  await ensureCharacterInventorySchema(db);
+  const rows = getCharacterInventoryRowsFromEquipment(id, equipment);
+  await db.runAsync(`DELETE FROM character_inventory_items WHERE character_id = ?`, [id]);
+  for (const row of rows) {
+    await db.runAsync(
+      `INSERT INTO character_inventory_items (
+        character_id, catalog_item_id, inventory_item_id, stack_key, name, qty, equipped_slot, item_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [row.characterId, row.catalogItemId, row.inventoryItemId, row.stackKey, row.name, row.qty, row.equippedSlot, row.itemJson],
+    );
+  }
+}
+
+export async function recordCharacterInventoryMovement(
+  db: SQLiteDatabase,
+  params: {
+    characterId: number;
+    type: string;
+    sourceEventId?: string;
+    tradeId?: string;
+    fromKey?: string;
+    toKey?: string;
+    item?: LanTradeItem | null;
+    qty?: number;
+    before?: unknown;
+    after?: unknown;
+  },
+) {
+  const characterId = Number(params.characterId);
+  if (!Number.isFinite(characterId) || characterId <= 0) return;
+  await ensureCharacterInventorySchema(db);
+  const item = params.item || null;
+  const qty = Math.max(1, Math.floor(toNumber(params.qty ?? item?.qty, 1)));
+  await db.runAsync(
+    `INSERT OR REPLACE INTO character_inventory_movements (
+      id, character_id, type, source_event_id, trade_id, from_key, to_key, item_stack_key, item_name, qty, before_json, after_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      makeLanEventId(),
+      characterId,
+      params.type,
+      params.sourceEventId || null,
+      params.tradeId || null,
+      params.fromKey || null,
+      params.toKey || null,
+      item ? (getTradeItemStackIdentity(item) || getInventoryStackKey(item as any)) : null,
+      item?.name || null,
+      qty,
+      JSON.stringify(params.before ?? {}),
+      JSON.stringify(params.after ?? {}),
+    ],
+  );
+}
+
+async function recordLanInventoryMovement(
+  db: SQLiteDatabase,
+  params: {
+    sessionId: string;
+    type: string;
+    sourceEventId?: string;
+    tradeId?: string;
+    fromKey?: string;
+    toKey?: string;
+    item?: LanTradeItem | null;
+    qty?: number;
+    before?: unknown;
+    after?: unknown;
+  },
+) {
+  const item = params.item || null;
+  const qty = Math.max(1, Math.floor(toNumber(params.qty ?? item?.qty, 1)));
+  await db.runAsync(
+    `INSERT OR REPLACE INTO lan_inventory_movements (
+      id, session_id, type, source_event_id, trade_id, from_key, to_key, item_stack_key, item_name, qty, before_json, after_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      makeLanEventId(),
+      params.sessionId,
+      params.type,
+      params.sourceEventId || null,
+      params.tradeId || null,
+      params.fromKey || null,
+      params.toKey || null,
+      item ? (getTradeItemStackIdentity(item) || getInventoryStackKey(item as any)) : null,
+      item?.name || null,
+      qty,
+      JSON.stringify(params.before ?? {}),
+      JSON.stringify(params.after ?? {}),
+    ],
+  );
+}
+
 async function writeLanPlayerEquipmentSnapshot(
   db: SQLiteDatabase,
   player: Record<string, unknown>,
@@ -3962,11 +4639,15 @@ async function writeLanPlayerEquipmentSnapshot(
   );
 
   if (player.character_id) {
+    const characterId = Number(player.character_id);
     await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [
       JSON.stringify(normalized),
-      Number(player.character_id),
+      characterId,
     ]);
+    await syncCharacterInventoryForEquipment(db, characterId, normalized).catch(() => undefined);
   }
+
+  await syncNormalizedLanInventoryForPlayer(db, player, normalized);
 
   return normalized;
 }
@@ -3982,6 +4663,54 @@ async function getStoredLanTradeOffer(db: SQLiteDatabase, sessionId: string, tra
   return parseJsonValue<LanSessionEvent | null>(row?.payload_json, null);
 }
 
+function normalizeInventoryIdentityText(value: unknown) {
+  return String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+function getTradeItemIdentityId(item?: Partial<LanTradeItem> | null) {
+  const raw = item?.inventoryItemId ?? item?.inventory_item_id ?? item?.itemId ?? item?.item_id ?? item?.catalogItemId ?? item?.catalog_item_id ??
+    item?.sourceItemId ?? item?.source_item_id ?? item?.dbId ?? item?.id;
+  const normalized = normalizeInventoryIdentityText(raw);
+  return normalized && normalized !== '0' ? normalized : '';
+}
+
+function getTradeItemStackIdentity(item?: Partial<LanTradeItem> | null) {
+  const explicit = normalizeInventoryIdentityText(item?.stackKey || item?.stack_key);
+  if (explicit) return explicit;
+  return [
+    normalizeInventoryIdentityText((item as any)?.name || (item as any)?.nome || (item as any)?.label),
+    normalizeInventoryIdentityText((item as any)?.damage || (item as any)?.dano || ''),
+    normalizeInventoryIdentityText((item as any)?.damage_type || (item as any)?.tipo_dano || ''),
+    normalizeInventoryIdentityText((item as any)?.properties || (item as any)?.propriedades || ''),
+    normalizeInventoryIdentityText((item as any)?.effect_json || (item as any)?.effectJson || ''),
+    normalizeInventoryIdentityText((item as any)?.duration_unit || ''),
+    String((item as any)?.duration_value ?? ''),
+  ].join('|');
+}
+
+function isSameTradeInventoryItem(entry?: Partial<LanTradeItem> | null, item?: Partial<LanTradeItem> | null) {
+  if (!entry || !item) return false;
+  const entryId = getTradeItemIdentityId(entry);
+  const itemId = getTradeItemIdentityId(item);
+  if (entryId && itemId && entryId === itemId) return true;
+
+  // IDs de inventario podem representar a pilha original/local do jogador.
+  // Para destino de troca/doacao, duas pilhas equivalentes devem somar mesmo
+  // quando esses IDs locais diferem. Por isso o fallback por stackKey/nome
+  // continua sendo avaliado em vez de retornar false logo no ID divergente.
+  const entryStack = getTradeItemStackIdentity(entry);
+  const itemStack = getTradeItemStackIdentity(item);
+  if (entryStack && itemStack && entryStack === itemStack) return true;
+  const entryName = normalizeInventoryIdentityText((entry as any)?.name || (entry as any)?.nome || (entry as any)?.label);
+  const itemName = normalizeInventoryIdentityText((item as any)?.name || (item as any)?.nome || (item as any)?.label);
+  return Boolean(entryName && itemName && entryName === itemName);
+}
+
 function normalizeTradeItemForMutation(item?: LanTradeItem | null): LanTradeItem | null {
   const name = String(item?.name || '').trim();
   if (!name) return null;
@@ -3990,6 +4719,39 @@ function normalizeTradeItemForMutation(item?: LanTradeItem | null): LanTradeItem
     name,
     qty: Math.max(1, Math.floor(toNumber(item?.qty, 1))),
   };
+}
+
+
+function getTradeItemQtyFromEquipment(equipment: Record<string, unknown>, tradeItem: LanTradeItem | null | undefined) {
+  if (!tradeItem?.name) return 0;
+  const normalized = normalizeEquipment(equipment);
+  let total = 0;
+  const bag = Array.isArray((normalized as any).bag) ? (normalized as any).bag : [];
+  for (const entry of bag) {
+    if (isSameTradeInventoryItem(entry as any, tradeItem)) {
+      total += Math.max(0, toNumber((entry as any).qty, 1));
+    }
+  }
+  const slots = (normalized as any).slots && typeof (normalized as any).slots === 'object' ? (normalized as any).slots : {};
+  for (const rawItem of Object.values(slots)) {
+    const slotItem = rawItem as any;
+    if (slotItem && isSameTradeInventoryItem(slotItem, tradeItem)) {
+      total += Math.max(1, toNumber(slotItem.qty, 1));
+    }
+  }
+  return total;
+}
+
+function hasTradeItemRemoval(
+  beforeEquipment: Record<string, unknown> | null | undefined,
+  afterEquipment: Record<string, unknown> | null | undefined,
+  tradeItem: LanTradeItem | null | undefined,
+) {
+  if (!beforeEquipment || !afterEquipment || !tradeItem?.name) return false;
+  const beforeQty = getTradeItemQtyFromEquipment(beforeEquipment, tradeItem);
+  const afterQty = getTradeItemQtyFromEquipment(afterEquipment, tradeItem);
+  const requiredQty = Math.max(1, toNumber(tradeItem.qty, 1));
+  return beforeQty - afterQty >= requiredQty;
 }
 
 function coinsToCopper(coins: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>>) {
@@ -4003,7 +4765,7 @@ function addTradeItemToEquipment(equipment: Record<string, unknown>, tradeItem: 
   const bag = Array.isArray((nextEquipment as any).bag) ? [...(nextEquipment as any).bag] : [];
   const itemName = String(tradeItem.name || '').trim();
   const qty = Math.max(1, toNumber(tradeItem.qty, 1));
-  const existingIndex = bag.findIndex((entry: any) => String(entry?.name || '').trim().toLowerCase() === itemName.toLowerCase());
+  const existingIndex = bag.findIndex((entry: any) => isSameTradeInventoryItem(entry, tradeItem));
 
   if (existingIndex >= 0) {
     bag[existingIndex] = { ...bag[existingIndex], qty: Math.max(0, toNumber(bag[existingIndex].qty)) + qty };
@@ -4024,11 +4786,11 @@ function removeTradeItemFromEquipment(
   const slots = (normalized as any).slots && typeof (normalized as any).slots === 'object'
     ? { ...(normalized as any).slots }
     : {};
-  const itemName = String(tradeItem.name || '').trim().toLowerCase();
+  const itemName = String(tradeItem.name || '').trim();
   const qty = Math.max(1, toNumber(tradeItem.qty, 1));
   if (!itemName) return false;
 
-  const index = bag.findIndex((entry: any) => String(entry?.name || '').trim().toLowerCase() === itemName);
+  const index = bag.findIndex((entry: any) => isSameTradeInventoryItem(entry, tradeItem));
   if (index >= 0) {
     const currentQty = Math.max(0, toNumber((bag[index] as any).qty, 1));
     if (currentQty < qty && !options?.forcePartial) return false;
@@ -4042,14 +4804,13 @@ function removeTradeItemFromEquipment(
     return true;
   }
 
-  // Item equipado também pode ser enviado/trocado. Nesse caso remova do slot.
   for (const [slotName, rawItem] of Object.entries(slots)) {
     const slotItem = rawItem as any;
-    if (!slotItem || String(slotItem?.name || '').trim().toLowerCase() !== itemName) continue;
+    if (!slotItem || !isSameTradeInventoryItem(slotItem, tradeItem)) continue;
     const currentQty = Math.max(1, toNumber(slotItem.qty, 1));
     if (currentQty < qty && !options?.forcePartial) return false;
     const nextQty = currentQty - qty;
-    if (nextQty <= 0 || currentQty <= qty || options?.forcePartial) delete (slots as any)[slotName];
+    if (nextQty <= 0 || currentQty <= qty || options?.forcePartial) (slots as any)[slotName] = null;
     else (slots as any)[slotName] = { ...slotItem, qty: nextQty };
     (equipment as any).bag = bag;
     (equipment as any).slots = slots;

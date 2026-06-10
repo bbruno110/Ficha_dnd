@@ -7,6 +7,7 @@ import {
   requestLanSessionResync,
   subscribeLanSessionClientUpdates,
   type LanSessionEvent,
+  type LanSessionPayload,
 } from '@/services/lanSession';
 import {
   isLanSessionGlobalEvent,
@@ -21,6 +22,16 @@ import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRea
 type LanNumberPatch = NonNullable<LanSessionEvent['numberPatch']>;
 type LanEffectPatch = NonNullable<LanSessionEvent['effectPatch']>;
 type LanInventoryPatch = NonNullable<LanSessionEvent['inventoryPatch']>;
+type LanStatsPatch = NonNullable<LanSessionEvent['statsPatch']>;
+
+// v56: telas duplicadas/rebind podem receber o mesmo evento no mesmo milissegundo.
+// Este lock global impede aplicar o mesmo effect_patch/session_patch duas vezes
+// antes que o store consiga marcar o evento como aplicado.
+const GLOBAL_LAN_EVENT_APPLY_IN_FLIGHT = new Set<string>();
+// Seq no transporte TCP geralmente é Date.now(). Uma pequena janela de overlap
+// evita perder patches vivos quando a tela/rebind perde a notificação do socket,
+// mas outro evento posterior já avançou o lastAppliedSeq global.
+const POLL_OVERLAP_SEQ_WINDOW = 10000;
 
 export type UseLanRealtimePlayerPatchesParams = {
   enabled: boolean;
@@ -34,9 +45,11 @@ export type UseLanRealtimePlayerPatchesParams = {
   onNumberPatch?: (patch: LanNumberPatch, event: LanSessionEvent) => void | Promise<void>;
   onEffectPatch?: (patch: LanEffectPatch, event: LanSessionEvent) => void | Promise<void>;
   onInventoryPatch?: (patch: LanInventoryPatch, event: LanSessionEvent) => void | Promise<void>;
+  onStatsPatch?: (patch: LanStatsPatch, event: LanSessionEvent) => void | Promise<void>;
   onEvent?: (event: LanSessionEvent) => void | Promise<void>;
   onSessionPatch?: (event: LanSessionEvent) => void | Promise<void>;
   onKicked?: (event: LanSessionEvent) => void | Promise<void>;
+  onPayloadUpdate?: (payload: LanSessionPayload, reason?: string) => void | Promise<void>;
 
   onHostUnreachable?: (reason: string) => void | Promise<void>;
 };
@@ -52,34 +65,45 @@ export function useLanRealtimePlayerPatches({
   onNumberPatch,
   onEffectPatch,
   onInventoryPatch,
+  onStatsPatch,
   onEvent,
   onSessionPatch,
   onKicked,
+  onPayloadUpdate,
   onHostUnreachable,
 }: UseLanRealtimePlayerPatchesParams) {
   const onNumberPatchRef = useRef(onNumberPatch);
   const onEffectPatchRef = useRef(onEffectPatch);
   const onInventoryPatchRef = useRef(onInventoryPatch);
+  const onStatsPatchRef = useRef(onStatsPatch);
   const onSessionPatchRef = useRef(onSessionPatch);
   const onEventRef = useRef(onEvent);
   const onKickedRef = useRef(onKicked);
+  const onPayloadUpdateRef = useRef(onPayloadUpdate);
   const onHostUnreachableRef = useRef(onHostUnreachable);
   const applyRunningRef = useRef(false);
   const processingEventIdsRef = useRef<Set<string>>(new Set());
+  // Eventos destinados a outros jogadores não podem ficar reaparecendo a cada
+  // polling/forceFullDrain. Sem essa lista, o cliente buscava tudo de novo e o
+  // tracer chegava a 2000 logs para uma sequência curta da mesa.
+  const ignoredForeignEventIdsRef = useRef<Set<string>>(new Set());
   const applyQueueRef = useRef<LanSessionEvent[]>([]);
   const queueRunningRef = useRef(false);
   const lastResyncRequestAtRef = useRef(0);
   const consecutiveFetchErrorsRef = useRef(0);
+  const hostUnreachableNotifiedRef = useRef(false);
 
   useEffect(() => {
     onNumberPatchRef.current = onNumberPatch;
     onEffectPatchRef.current = onEffectPatch;
     onInventoryPatchRef.current = onInventoryPatch;
+    onStatsPatchRef.current = onStatsPatch;
     onSessionPatchRef.current = onSessionPatch;
     onEventRef.current = onEvent;
     onKickedRef.current = onKicked;
+    onPayloadUpdateRef.current = onPayloadUpdate;
     onHostUnreachableRef.current = onHostUnreachable;
-  }, [onEffectPatch, onEvent, onHostUnreachable, onInventoryPatch, onKicked, onNumberPatch, onSessionPatch]);
+  }, [onEffectPatch, onEvent, onHostUnreachable, onInventoryPatch, onStatsPatch, onKicked, onPayloadUpdate, onNumberPatch, onSessionPatch]);
 
   useEffect(() => {
     if (!enabled || !joinUrl || !sessionId) return;
@@ -210,36 +234,54 @@ export function useLanRealtimePlayerPatches({
       }
     };
 
-    const requestResyncIfNeeded = async (reason = 'manual') => {
+    const ackEventInBackground = (event: LanSessionEvent) => {
+      // v82: ACK nunca pode segurar a fila de aplicação local.
+      // O log da v81 mostrou a 1ª troca aplicando, e as próximas inventory_patch
+      // chegando no socket sem PLAYER_APPLY_EVENT_START. O ponto mais provável era
+      // a fila presa aguardando ACK/reconnect após PLAYER_INVENTORY_PATCH_EVENT_APPLY_OK.
+      // A ficha já está atualizada e o evento já foi marcado aplicado localmente;
+      // se o ACK falhar, o host pode reenviar e a idempotência local bloqueia duplicidade.
+      void ackEvent(event).catch(() => undefined);
+    };
+
+    const requestResyncIfNeeded = async (
+      reason = 'manual',
+      options?: { force?: boolean; forceReconnect?: boolean; coldStart?: boolean; includeGlobal?: boolean },
+    ) => {
       if (paused) return;
       const now = Date.now();
-      const urgent = /socket_closed|foreground|mount_or_rebind|focus|fetch_error/i.test(reason);
+      const urgent = /socket_closed|foreground|mount_or_rebind|focus|fetch_error|background|resume|recovery/i.test(reason);
       const minInterval = urgent ? 1200 : LAN_NETWORK_LIMITS.resyncMinIntervalMs;
-      if (now - lastResyncRequestAtRef.current < minInterval) return;
+      if (!options?.force && now - lastResyncRequestAtRef.current < minInterval) return;
       lastResyncRequestAtRef.current = now;
 
       try {
         const runtime = useLanRealtimeStore.getState();
-        const lastAppliedSeq = runtime.lastAppliedSeq;
-        debugLanFlow('PLAYER_SEQ_GAP_RESYNC_START', {
+        const lastAppliedSeq = options?.coldStart ? 0 : runtime.lastAppliedSeq;
+        debugLanFlow(options?.coldStart ? 'PLAYER_FOREGROUND_COLD_RESYNC_START' : 'PLAYER_SEQ_GAP_RESYNC_START', {
           reason,
           sessionId,
           selfKey,
           lastAppliedSeq,
+          force: Boolean(options?.force),
+          forceReconnect: Boolean(options?.forceReconnect),
+          coldStart: Boolean(options?.coldStart),
         });
         await requestLanSessionResync(joinUrl, {
           sessionId,
           playerKey: selfKey,
           lastAppliedSeq,
           knownRevisions: getKnownLanEntityRevisions(sessionId),
+          includeGlobal: options?.includeGlobal !== false,
+          forceReconnect: Boolean(options?.forceReconnect),
         });
-        debugLanFlow('PLAYER_SEQ_GAP_RESYNC_DONE', {
+        debugLanFlow(options?.coldStart ? 'PLAYER_FOREGROUND_COLD_RESYNC_DONE' : 'PLAYER_SEQ_GAP_RESYNC_DONE', {
           reason,
           sessionId,
           selfKey,
         });
         setTimeout(() => {
-          if (!disposed) void applyEvents();
+          if (!disposed) void applyEvents({ forceFullDrain: Boolean(options?.coldStart), reason: `after_resync:${reason}` });
         }, 300);
       } catch (error) {
         console.warn('[LAN] Não foi possível solicitar resync ao host:', error);
@@ -248,8 +290,23 @@ export function useLanRealtimePlayerPatches({
 
     const applyOneEvent = async (event: LanSessionEvent) => {
       const eventKey = String(event.id || event.clientMsgId || '');
+      const globalEventKey = eventKey ? `${sessionId}:${selfKey || characterName || 'player'}:${eventKey}` : '';
       if (eventKey && processingEventIdsRef.current.has(eventKey)) return;
+      if (globalEventKey && GLOBAL_LAN_EVENT_APPLY_IN_FLIGHT.has(globalEventKey)) {
+        debugLanFlow('PLAYER_EVENT_DUPLICATE_IN_FLIGHT_SKIPPED', {
+          eventId: event.id,
+          type: event.type,
+          sessionId,
+          selfKey,
+        });
+        return;
+      }
+      const releaseEventKey = () => {
+        if (eventKey) processingEventIdsRef.current.delete(eventKey);
+        if (globalEventKey) GLOBAL_LAN_EVENT_APPLY_IN_FLIGHT.delete(globalEventKey);
+      };
       if (eventKey) processingEventIdsRef.current.add(eventKey);
+      if (globalEventKey) GLOBAL_LAN_EVENT_APPLY_IN_FLIGHT.add(globalEventKey);
       const runtime = useLanRealtimeStore.getState();
       const criticalSessionEvent = isCriticalSessionEvent(event);
       const decision = runtime.getEventApplyDecision(event);
@@ -272,7 +329,48 @@ export function useLanRealtimePlayerPatches({
         lastAppliedSeq: decision.lastAppliedSeq,
       });
 
-      if (!decision.apply) {
+      const isSelfInventoryPatch = Boolean(
+        event.type === 'inventory_patch' &&
+        event.inventoryPatch &&
+        isExplicitlyTargetedToSelf(event)
+      );
+      const hasInventoryDeltas = Boolean(
+        Array.isArray((event.inventoryPatch as any)?.itemDeltas) && (event.inventoryPatch as any).itemDeltas.length > 0 ||
+        Array.isArray((event.inventoryPatch as any)?.tradeCommit?.itemDeltas) && (event.inventoryPatch as any).tradeCommit.itemDeltas.length > 0 ||
+        (event.inventoryPatch as any)?.itemDelta
+      );
+      const isTradeLikeInventoryPatch = Boolean(
+        isSelfInventoryPatch &&
+        (
+          String(event.inventoryPatch?.action || '') === 'trade_commit' ||
+          Boolean((event.inventoryPatch as any)?.tradeCommit) ||
+          /aceitou trocar|troca conclu/i.test(String(event.message || ''))
+        )
+      );
+      const forceSelfInventoryTransaction = Boolean(
+        isSelfInventoryPatch &&
+        hasInventoryDeltas &&
+        decision.reason !== 'duplicate_id' &&
+        (isTradeLikeInventoryPatch || decision.reason === 'old_entity_revision' || decision.reason === 'old_seq' || decision.reason === 'seq_gap')
+      );
+
+      if (!decision.apply && forceSelfInventoryTransaction) {
+        debugLanFlow('PLAYER_FORCE_APPLY_SELF_TRADE_COMMIT_DESPITE_DECISION', {
+          reason: decision.reason,
+          eventId: event.id,
+          type: event.type,
+          seq: event.seq,
+          entityType: event.entityType,
+          entityId: event.entityId,
+          entityRevision: event.entityRevision,
+          currentRevision: decision.currentRevision,
+          inventoryTargetKey: event.inventoryPatch?.targetKey,
+          selfKey,
+          characterName,
+        });
+      }
+
+      if (!decision.apply && !forceSelfInventoryTransaction) {
         if (criticalSessionEvent && decision.reason !== 'duplicate_id') {
           debugLanFlow('PLAYER_FORCE_APPLY_CRITICAL_SESSION_EVENT', {
             reason: decision.reason,
@@ -302,7 +400,7 @@ export function useLanRealtimePlayerPatches({
           if (shouldRequestLanResync(decision)) {
             await requestResyncIfNeeded(decision.reason);
           }
-          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          releaseEventKey();
           return;
         }
       }
@@ -327,9 +425,30 @@ export function useLanRealtimePlayerPatches({
             entityRevision: event.entityRevision,
             lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
           });
-          await ackEvent(event);
+          releaseEventKey();
+          ackEventInBackground(event);
           await onSessionPatchRef.current?.(event);
-          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          return;
+        }
+
+        if (event.type === 'player_patch' && event.statsPatch && !event.numberPatch) {
+          debugLanFlow('PLAYER_STATS_PATCH_RECEIVED_LIVE', {
+            eventId: event.id,
+            seq: event.seq,
+            serverSeq: event.serverSeq,
+            entityRevision: event.entityRevision,
+            toKey: event.toKey,
+            toName: event.toName,
+            patch: event.statsPatch,
+          });
+          if (onStatsPatchRef.current) {
+            await onStatsPatchRef.current(event.statsPatch, event);
+          } else {
+            await onEventRef.current?.(event);
+          }
+          useLanRealtimeStore.getState().markEventApplied(event);
+          releaseEventKey();
+          ackEventInBackground(event);
           return;
         }
 
@@ -342,6 +461,7 @@ export function useLanRealtimePlayerPatches({
             toKey: event.toKey,
             toName: event.toName,
             patch: event.numberPatch,
+            hasStatsPatch: Boolean(event.statsPatch),
           });
           if (!onNumberPatchRef.current) {
             throw new Error('onNumberPatch handler nao configurado.');
@@ -349,9 +469,18 @@ export function useLanRealtimePlayerPatches({
           // HP/XP/moedas/PV temp são absolutos. Eles não podem rodar em paralelo,
           // senão um patch antigo termina depois e faz a vida "voltar".
           await onNumberPatchRef.current?.(event.numberPatch!, event);
+          // Um player_patch pode carregar statsPatch junto com numberPatch (ex.: CON permanente
+          // altera atributo e HP no mesmo commit). Antes o retorno aqui ignorava statsPatch.
+          if (event.statsPatch) {
+            if (onStatsPatchRef.current) {
+              await onStatsPatchRef.current(event.statsPatch, event);
+            } else {
+              await onEventRef.current?.(event);
+            }
+          }
           useLanRealtimeStore.getState().markEventApplied(event);
-          await ackEvent(event);
-          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          releaseEventKey();
+          ackEventInBackground(event);
           return;
         } else if (event.type === 'effect_patch' && event.effectPatch) {
           debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_START', {
@@ -362,25 +491,46 @@ export function useLanRealtimePlayerPatches({
             addCount: event.effectPatch.add?.length || 0,
             updateCount: event.effectPatch.update?.length || 0,
             removeCount: event.effectPatch.remove?.length || 0,
+            hasBundledNumberPatch: Boolean(event.numberPatch),
           });
           if (!onEffectPatchRef.current) {
             throw new Error('onEffectPatch handler nao configurado.');
+          }
+          // v74: efeito de PV temporario pode vir com numberPatch no mesmo evento.
+          // Aplique o numero primeiro e o efeito depois, em um unico ACK. Isso evita
+          // dois eventos separados competindo/reordenando tempHp e borda/efeito.
+          if (event.numberPatch) {
+            if (!onNumberPatchRef.current) {
+              throw new Error('onNumberPatch handler nao configurado para effect_patch com numberPatch.');
+            }
+            await onNumberPatchRef.current(event.numberPatch, event);
           }
           // Efeito pode alterar PV temporario/atributos. Nao rode em background:
           // se um dano ou passagem de turno chegar logo depois, o patch antigo
           // poderia terminar por ultimo e fazer HP/PV temp voltar.
           await onEffectPatchRef.current(event.effectPatch!, event);
           useLanRealtimeStore.getState().markEventApplied(event);
-          await ackEvent(event);
-          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          releaseEventKey();
+          ackEventInBackground(event);
           return;
         } else if (event.type === 'inventory_patch' && event.inventoryPatch) {
           // Inventário também é snapshot absoluto. Aplique serialmente para não
           // deixar troca/doação chegar fora de ordem quando há 3+ jogadores.
-          await onInventoryPatchRef.current?.(event.inventoryPatch!, event);
+          if (!onInventoryPatchRef.current) {
+            throw new Error('onInventoryPatch handler nao configurado.');
+          }
+          await onInventoryPatchRef.current(event.inventoryPatch!, event);
           useLanRealtimeStore.getState().markEventApplied(event);
-          await ackEvent(event);
-          if (eventKey) processingEventIdsRef.current.delete(eventKey);
+          debugLanFlow('PLAYER_INVENTORY_PATCH_EVENT_APPLY_OK', {
+            eventId: event.id,
+            type: event.type,
+            seq: event.seq,
+            entityRevision: event.entityRevision,
+            action: event.inventoryPatch?.action,
+            targetKey: event.inventoryPatch?.targetKey,
+          });
+          releaseEventKey();
+          ackEventInBackground(event);
           return;
         } else if (event.type === 'session_patch') {
           await onSessionPatchRef.current?.(event);
@@ -407,8 +557,8 @@ export function useLanRealtimePlayerPatches({
           entityRevision: event.entityRevision,
           lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
         });
-        await ackEvent(event);
-        if (eventKey) processingEventIdsRef.current.delete(eventKey);
+        releaseEventKey();
+        ackEventInBackground(event);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         useLanRealtimeStore.getState().nackEvent(event.clientMsgId || event.id, reason);
@@ -427,7 +577,7 @@ export function useLanRealtimePlayerPatches({
           error,
         });
         await requestResyncIfNeeded('apply_error');
-        if (eventKey) processingEventIdsRef.current.delete(eventKey);
+        releaseEventKey();
       }
     };
 
@@ -481,11 +631,22 @@ export function useLanRealtimePlayerPatches({
 
       try {
         const runtimeBeforeFetch = useLanRealtimeStore.getState();
+        const pollAfterSeq = options?.forceFullDrain
+          ? 0
+          : Math.max(0, Number(runtimeBeforeFetch.lastAppliedSeq || 0) - POLL_OVERLAP_SEQ_WINDOW);
         const events = await fetchLanSessionEvents(joinUrl, sessionId, {
-          afterSeq: options?.forceFullDrain ? 0 : runtimeBeforeFetch.lastAppliedSeq,
+          afterSeq: pollAfterSeq,
           playerKey: selfKey,
           includeGlobal: true,
         });
+        if (hostUnreachableNotifiedRef.current) {
+          debugLanFlow('PLAYER_HOST_REACHABLE_AGAIN', {
+            sessionId,
+            selfKey,
+            previousConsecutiveFetchErrors: consecutiveFetchErrorsRef.current,
+          });
+        }
+        hostUnreachableNotifiedRef.current = false;
         consecutiveFetchErrorsRef.current = 0;
         useLanRealtimeStore.getState().setConnection({
           sessionId,
@@ -493,7 +654,10 @@ export function useLanRealtimePlayerPatches({
           connected: true,
         });
         const runtimeAfterFetch = useLanRealtimeStore.getState();
-        const freshEvents = events.filter((event) => !runtimeAfterFetch.appliedEventIds[event.id]);
+        const freshEvents = events.filter((event) => (
+          !runtimeAfterFetch.appliedEventIds[event.id] &&
+          !ignoredForeignEventIdsRef.current.has(event.id)
+        ));
         const duplicateCount = events.length - freshEvents.length;
         if (duplicateCount > 0) {
           debugLanFlow('PLAYER_EVENT_POLL_DUPLICATES_SKIPPED_COUNT', {
@@ -505,29 +669,49 @@ export function useLanRealtimePlayerPatches({
           });
         }
         let foreignSkippedCount = 0;
-        const ordered = [...freshEvents]
-          .map((event) => {
-            debugLanFlow('PLAYER_EVENT_RECEIVED', {
+        const acceptedEvents: typeof freshEvents = [];
+        for (const event of freshEvents) {
+          const accepted = shouldProcessEvent(event);
+          const explicitSelfTarget = isExplicitlyTargetedToSelf(event);
+          if (!accepted && !explicitSelfTarget) {
+            foreignSkippedCount += 1;
+            if (selfKey) ignoredForeignEventIdsRef.current.add(event.id);
+            continue;
+          }
+          if (!accepted && explicitSelfTarget) {
+            debugLanFlow('PLAYER_FORCE_PROCESS_EXPLICIT_SELF_TARGET_EVENT_FROM_POLL', {
+              sessionId,
               eventId: event.id,
               type: event.type,
-              seq: event.seq,
-              serverSeq: event.serverSeq,
               toKey: event.toKey,
               toName: event.toName,
-              fromKey: event.fromKey,
-              selfKey,
-              characterName,
               entityType: event.entityType,
               entityId: event.entityId,
-              entityRevision: event.entityRevision,
+              effectTargetKey: event.effectPatch?.targetKey,
+              inventoryTargetKey: event.inventoryPatch?.targetKey,
+              selfKey,
+              characterName,
             });
-            return event;
-          })
-          .filter((event) => {
-            const accepted = shouldProcessEvent(event);
-            if (!accepted) foreignSkippedCount += 1;
-            return accepted;
-          })
+          }
+          acceptedEvents.push(event);
+        }
+        if (acceptedEvents.length > 0) {
+          const first = acceptedEvents[0];
+          const last = acceptedEvents[acceptedEvents.length - 1];
+          debugLanFlow('PLAYER_EVENTS_BATCH_RECEIVED', {
+            sessionId,
+            selfKey,
+            characterName,
+            count: acceptedEvents.length,
+            firstEventId: first?.id,
+            firstType: first?.type,
+            firstSeq: first?.seq,
+            lastEventId: last?.id,
+            lastType: last?.type,
+            lastSeq: last?.seq,
+          });
+        }
+        const ordered = acceptedEvents
           .sort((a, b) => {
             const seqDiff = getEventSeq(a) - getEventSeq(b);
             if (seqDiff !== 0) return seqDiff;
@@ -579,18 +763,32 @@ export function useLanRealtimePlayerPatches({
             resetConnectionWhilePaused();
             return;
           }
-          debugLanFlow('PLAYER_HOST_UNREACHABLE_DETECTED', {
-            sessionId,
-            selfKey,
-            consecutiveFetchErrors: consecutiveFetchErrorsRef.current,
-            reason,
-          });
-          await onHostUnreachableRef.current?.(reason);
+          // Host temporariamente inalcançável não encerra sessão. Notifique a UI
+          // uma vez e continue tentando polling/reconnect nas próximas rodadas.
+          // Isso cobre mestre/jogador abrindo outro app, hotspot oscilando ou
+          // Android suspendendo o socket por alguns segundos.
+          if (!hostUnreachableNotifiedRef.current) {
+            hostUnreachableNotifiedRef.current = true;
+            debugLanFlow('PLAYER_HOST_UNREACHABLE_DETECTED', {
+              sessionId,
+              selfKey,
+              consecutiveFetchErrors: consecutiveFetchErrorsRef.current,
+              reason,
+            });
+            await onHostUnreachableRef.current?.(reason);
+          } else {
+            debugLanFlow('PLAYER_HOST_STILL_UNREACHABLE_KEEP_RETRYING', {
+              sessionId,
+              selfKey,
+              consecutiveFetchErrors: consecutiveFetchErrorsRef.current,
+              reason,
+            });
+          }
           return;
         }
 
         if (!paused) {
-          await requestResyncIfNeeded('fetch_error');
+          await requestResyncIfNeeded('fetch_error', { forceReconnect: consecutiveFetchErrorsRef.current >= 2, includeGlobal: true });
         }
       } finally {
         applyRunningRef.current = false;
@@ -605,8 +803,40 @@ export function useLanRealtimePlayerPatches({
       setTimeout(() => { if (!disposed) void applyEvents({ reason: 'mount_or_reconnect' }); }, 120);
       setTimeout(() => { if (!disposed) void applyEvents({ reason: 'post_mount_buffer_flush_650ms' }); }, 650);
       if (reconnectEpoch > 0) {
-        setTimeout(() => { if (!disposed) void requestResyncIfNeeded('foreground_reconnect'); }, 120);
-        setTimeout(() => { if (!disposed) void applyEvents({ reason: 'foreground_reconnect_buffer_flush' }); }, 450);
+        // v86: voltar de outro app/tela bloqueada precisa de recuperacao pesada.
+        // O socket pode parecer aberto, mas estar sem binding real no host. Fazemos:
+        // 1) reconnect TCP forcado; 2) resync incremental; 3) cold resync/checkpoints;
+        // 4) full drain do buffer local. Assim HP, inventario, efeitos e turnos convergem
+        // mesmo depois de varios minutos em background.
+        setTimeout(() => {
+          if (!disposed) void requestResyncIfNeeded('foreground_reconnect_force_socket', {
+            force: true,
+            forceReconnect: true,
+            includeGlobal: true,
+          });
+        }, 80);
+        setTimeout(() => {
+          if (!disposed) void applyEvents({ forceFullDrain: true, reason: 'foreground_reconnect_full_drain_450ms' });
+        }, 450);
+        setTimeout(() => {
+          if (!disposed) void requestResyncIfNeeded('foreground_reconnect_cold_checkpoint', {
+            force: true,
+            forceReconnect: false,
+            coldStart: true,
+            includeGlobal: true,
+          });
+        }, 950);
+        setTimeout(() => {
+          if (!disposed) void applyEvents({ forceFullDrain: true, reason: 'foreground_reconnect_full_drain_1600ms' });
+        }, 1600);
+        setTimeout(() => {
+          if (!disposed) void requestResyncIfNeeded('foreground_reconnect_confirm_checkpoint', {
+            force: true,
+            forceReconnect: false,
+            coldStart: true,
+            includeGlobal: true,
+          });
+        }, 2800);
       }
     } else {
       useLanRealtimeStore.getState().setConnection({ sessionId, playerKey: selfKey, connected: true });
@@ -625,11 +855,17 @@ export function useLanRealtimePlayerPatches({
       if (update?.reason === 'socket_closed' && !paused) {
         useLanRealtimeStore.getState().setConnection({ sessionId, playerKey: selfKey, connected: false });
         setTimeout(() => {
-          if (!disposed) void requestResyncIfNeeded('socket_closed');
+          if (!disposed) void requestResyncIfNeeded('socket_closed', { force: true, forceReconnect: true, includeGlobal: true });
         }, 150);
         setTimeout(() => {
-          if (!disposed) void applyEvents({ forceFullDrain: true, reason: 'socket_closed_recovery_flush' });
+          if (!disposed) void applyEvents({ forceFullDrain: false, reason: 'socket_closed_recovery_flush' });
         }, 700);
+      }
+      if (update?.payload) {
+        // Snapshot/payload agora também serve como reconciliação autoritativa de roster/inventário.
+        // Ele não substitui eventos vivos; apenas corrige a mochila se um inventory_patch/trade_result
+        // foi recebido pelo transporte, mas perdeu a janela do listener durante reconnect/rebind.
+        void Promise.resolve(onPayloadUpdateRef.current?.(update.payload, update.reason)).catch(() => undefined);
       }
       if (update?.event) {
         const event = update.event;
@@ -653,10 +889,9 @@ export function useLanRealtimePlayerPatches({
           }
           enqueueApplyEvent(event);
         } else {
-          // O evento permanece no buffer do transporte. Um flush curto evita que
-          // efeito/condicao fique esperando o polling de fallback quando a tela
-          // acabou de remontar ou o selfKey ainda estava inicializando.
-          setTimeout(() => { if (!disposed) void applyEvents({ forceFullDrain: true, reason: 'socket_event_not_accepted_retry' }); }, 200);
+          // Evento de outro jogador. Marque como ignorado localmente para não gerar
+          // loop de polling/resync nem inundar o tracer do jogador.
+          if (selfKey && event?.id) ignoredForeignEventIdsRef.current.add(event.id);
         }
       }
     });

@@ -53,6 +53,8 @@ export function useLanAppLifecycle({
       if (cameToForeground) {
         try {
           notifyLanForegroundRecovery('app_foreground');
+          setTimeout(() => notifyLanForegroundRecovery('app_foreground_confirm_700ms'), 700);
+          setTimeout(() => notifyLanForegroundRecovery('app_foreground_confirm_1800ms'), 1800);
           await safeForeground();
         } catch (error) {
           console.warn('[LAN] Erro ao retomar ciclo de vida LAN:', error);

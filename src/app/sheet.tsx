@@ -2,6 +2,8 @@
 import DiceRoller3D, { type DiceRollRequest, type DiceRollResult } from '@/components/DiceRoller3D';
 import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
 import { useLanRealtimePlayerPatches } from '@/hooks/useLanRealtimePlayerPatches';
+import { applyDamageWithTempHp } from '@/services/combat/hpDamageService';
+import { resolveSavingThrow } from '@/services/combat/saveResolverService';
 import {
   traceApp,
   traceButton,
@@ -12,9 +14,8 @@ import {
   traceSqlite,
   traceStateChange,
 } from '@/services/debug/appTrace';
-import { applyDamageWithTempHp } from '@/services/combat/hpDamageService';
-import { resolveSavingThrow } from '@/services/combat/saveResolverService';
 import { getCurrentBreathColor, getVisibleEffects } from '@/services/effects/effectVisualService';
+import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import {
   debugLanFlow,
   getSheetRuntimeMode,
@@ -23,7 +24,6 @@ import {
   splitLanPlayerAuthoritativeUpdates,
 } from '@/services/lanRuntimeMode';
 import {
-  fetchLanSessionEvents,
   fetchLanSessionPayload,
   getLocalLanSessionForCharacter,
   getPublicLanPlayers,
@@ -31,11 +31,12 @@ import {
   makeLanEventId,
   notifyMasterJoin,
   rememberLanSessionEvent,
-  resetLanClientConnection,
   requestLanSessionResync,
+  resetLanClientConnection,
   resolveLanSessionUrlByInviteCode,
   saveLanSession,
   sendLanSessionEvent,
+  syncCharacterInventoryForEquipment,
   unlinkCharacterFromLanSession,
   type LanEffectTarget,
   type LanEffectUnit,
@@ -44,14 +45,13 @@ import {
   type LanSessionPayload,
   type LanSessionStatus,
   type LanTradeItem,
-  type PublicLanPlayer,
+  type PublicLanPlayer
 } from '@/services/lanSession';
 import {
   getLanPayloadSnapshotSeq,
   markLanConnectionStatus,
   markLanEventsApplied,
-  markLanSnapshotApplied,
-  shouldApplyLanSnapshot,
+  markLanSnapshotApplied
 } from '@/services/lanSyncEngine';
 import {
   getExpectedLevelForXp as getExpectedLevelForXpFromDb,
@@ -59,9 +59,9 @@ import {
   seedDefaultXpProgression,
 } from '@/services/xpProgressionService';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
-import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import { appColors, appGradients, sheetStyles as styles } from '@/styles/globalStyles';
 import { Ionicons } from '@expo/vector-icons';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -77,10 +77,27 @@ const DEFAULT_SLOTS = {
 const SPELL_LEVELS = ['Todos', 'Passiva', 'Habilidade', 'Truque', 'Nível 1', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6', 'Nível 7', 'Nível 8', 'Nível 9'];
 const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 
+// Protecao global porque, ao voltar de foreground/rebind, a tela pode ter
+// duas assinaturas vivas por alguns milissegundos. Sem isso, o mesmo pause
+// gera dois Alert.alert no jogador.
+const GLOBAL_SESSION_PAUSE_ALERT_KEYS = new Set<string>();
+// Dedupe global do proprio session_patch; evita que hooks duplicados apliquem pause/resume 2-3x antes do estado local atualizar.
+const GLOBAL_SESSION_PATCH_EVENT_KEYS = new Set<string>();
+
 // Regra da mesa/app: 1 PO = 10 PP = 100 PC.
 const COIN_RATES = { gp: 100, sp: 10, cp: 1 };
 const COIN_NAMES = { gp: 'Ouro', sp: 'Prata', cp: 'Cobre' };
 const COIN_COLORS = { gp: appColors.warning, sp: appColors.silver, cp: appColors.copper };
+const getCoinTotalCopperValue = (coins: Partial<Record<'gp' | 'sp' | 'cp', unknown>>) => (
+  Math.max(0, Math.floor(Number(coins.gp || 0))) * COIN_RATES.gp +
+  Math.max(0, Math.floor(Number(coins.sp || 0))) * COIN_RATES.sp +
+  Math.max(0, Math.floor(Number(coins.cp || 0))) * COIN_RATES.cp
+);
+const sanitizeCoins = (coins: Partial<Record<'gp' | 'sp' | 'cp', unknown>>) => ({
+  gp: Math.max(0, Math.floor(Number(coins.gp || 0))),
+  sp: Math.max(0, Math.floor(Number(coins.sp || 0))),
+  cp: Math.max(0, Math.floor(Number(coins.cp || 0))),
+});
 
 function inferTotalLevelFromClassName(value: unknown) {
   const classText = String(value || '').trim();
@@ -132,6 +149,34 @@ const getTempHpEffectValue = (effect: any) => isTempHpEffectSnapshot(effect)
 const calculateStandardTempHpFromEffects = (effects: any[]) => (Array.isArray(effects) ? effects : [])
   .filter((effect) => isTempHpEffectSnapshot(effect) && getTempHpEffectValue(effect) > 0)
   .reduce((max, effect) => Math.max(max, getTempHpEffectValue(effect)), 0);
+
+const removeTempHpEffectsLocally = (effects: any[]) => {
+  const safeEffects = Array.isArray(effects) ? effects : [];
+  const nextEffects = safeEffects.filter((effect) => !isTempHpEffectSnapshot(effect));
+  return { effects: nextEffects, changed: nextEffects.length !== safeEffects.length };
+};
+
+const syncTempHpEffectsLocallyWithNumber = (effects: any[], tempHp: number) => {
+  const safeEffects = Array.isArray(effects) ? effects : [];
+  const cleanTempHp = Math.max(0, Math.floor(Number(tempHp) || 0));
+  const tempEntries = safeEffects
+    .map((effect, index) => ({ effect, index }))
+    .filter(({ effect }) => isTempHpEffectSnapshot(effect));
+
+  if (tempEntries.length === 0) return { effects: safeEffects, changed: false };
+  if (cleanTempHp <= 0) return removeTempHpEffectsLocally(safeEffects);
+
+  const selected = tempEntries.reduce((best, entry) => (
+    getTempHpEffectValue(entry.effect) > getTempHpEffectValue(best.effect) ? entry : best
+  ));
+  const nextEffects = safeEffects.flatMap((effect, index) => {
+    if (!isTempHpEffectSnapshot(effect)) return [effect];
+    if (index !== selected.index) return [];
+    return [{ ...effect, value: cleanTempHp }];
+  });
+  const changed = nextEffects.length !== safeEffects.length || getTempHpEffectValue(selected.effect) !== cleanTempHp;
+  return { effects: nextEffects, changed };
+};
 
 const getTempHpUnitWeight = (unit: unknown) => {
   const value = String(unit || '').toLowerCase();
@@ -185,12 +230,319 @@ const consumeTempHpEffectsLocally = (effects: any[], amount: number) => {
   };
 };
 
+const normalizeSheetStackText = (value: unknown) => {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw === '[]' || raw === '{}' || raw.toLowerCase() === 'null' || raw.toLowerCase() === 'undefined') return '';
+  return raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+};
+
+const getSheetInventoryItemId = (item: Record<string, any> | null | undefined) => {
+  if (!item || typeof item !== 'object') return '';
+  const raw = item.inventoryItemId ?? item.inventory_item_id ?? item.itemId ?? item.item_id ?? item.catalogItemId ?? item.catalog_item_id ?? item.sourceItemId ?? item.source_item_id ?? item.dbId ?? item.id;
+  const normalized = normalizeSheetStackText(raw);
+  return normalized && normalized !== '0' ? normalized : '';
+};
+
+const getSheetInventoryStackKey = (item: Record<string, any>) => [
+  normalizeSheetStackText(item.name || item.nome || item.label),
+  normalizeSheetStackText(item.damage || item.dano || ''),
+  normalizeSheetStackText(item.damage_type || item.tipo_dano || ''),
+  normalizeSheetStackText(item.properties || item.propriedades || ''),
+  normalizeSheetStackText(item.effect_json || item.effectJson || ''),
+  normalizeSheetStackText(item.duration_unit || ''),
+  String(item.duration_value ?? ''),
+].join('|');
+
+const getSheetInventoryIdentity = (item: Record<string, any> | null | undefined) => {
+  if (!item || typeof item !== 'object') return { id: '', stackKey: '', name: '' };
+  const stackKey = normalizeSheetStackText(item.stackKey || item.stack_key) || getSheetInventoryStackKey(item);
+  return {
+    id: getSheetInventoryItemId(item),
+    stackKey,
+    name: normalizeSheetStackText(item.name || item.nome || item.label),
+  };
+};
+
+const isSameSheetInventoryItem = (entry: Record<string, any>, rawItem: Record<string, any>) => {
+  const entryIdentity = getSheetInventoryIdentity(entry);
+  const itemIdentity = getSheetInventoryIdentity(rawItem);
+  if (entryIdentity.id && itemIdentity.id && entryIdentity.id === itemIdentity.id) return true;
+
+  // inventoryItemId/id pode vir da pilha original do outro jogador.
+  // Se for diferente, ainda comparamos stackKey/nome para somar itens iguais
+  // recebidos por troca/doacao em vez de criar pilha duplicada.
+  if (entryIdentity.stackKey && itemIdentity.stackKey && entryIdentity.stackKey === itemIdentity.stackKey) return true;
+  return Boolean(entryIdentity.name && itemIdentity.name && entryIdentity.name === itemIdentity.name);
+};
+
+const compactSheetInventoryBag = (rawBag: unknown[]) => {
+  const byKey = new Map<string, Record<string, any>>();
+  const result: Record<string, any>[] = [];
+
+  for (const rawItem of rawBag) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const item = { ...(rawItem as Record<string, any>) };
+    const identity = getSheetInventoryIdentity(item);
+    const key = identity.stackKey ? `stack:${identity.stackKey}` : (identity.name ? `name:${identity.name}` : `id:${identity.id}`);
+    const current = byKey.get(key);
+    if (!current) {
+      item.qty = Math.max(1, Number(item.qty) || 1);
+      byKey.set(key, item);
+      result.push(item);
+    } else {
+      current.qty = Math.max(1, Number(current.qty) || 1) + Math.max(1, Number(item.qty) || 1);
+    }
+  }
+
+  return result;
+};
+
+const findSheetInventoryItemIndex = (bag: Record<string, any>[], rawItem: Record<string, any>) => {
+  const item = rawItem || {};
+  const byIdentity = bag.findIndex((entry) => isSameSheetInventoryItem(entry, item));
+  return byIdentity;
+};
+
+const mergeSheetInventoryItemIntoBag = (rawBag: unknown[], rawItem: Record<string, any>, rawQty = 1) => {
+  const bag = compactSheetInventoryBag(Array.isArray(rawBag) ? rawBag : []);
+  const item: Record<string, any> = { ...(rawItem || {}), qty: Math.max(1, Math.floor(Number(rawQty) || 1)) };
+  const existingIndex = findSheetInventoryItemIndex(bag, item);
+
+  if (existingIndex >= 0) {
+    bag[existingIndex] = {
+      ...item,
+      ...bag[existingIndex],
+      qty: Math.max(1, Number(bag[existingIndex].qty) || 1) + Math.max(1, Number(item.qty) || 1),
+    };
+    return bag;
+  }
+
+  return [...bag, item];
+};
+
+const removeSheetInventoryItemFromBag = (rawBag: unknown[], rawItem: Record<string, any>, rawQty = 1) => {
+  const bag = compactSheetInventoryBag(Array.isArray(rawBag) ? rawBag : []);
+  const item: Record<string, any> = { ...(rawItem || {}), qty: Math.max(1, Math.floor(Number(rawQty) || 1)) };
+  const existingIndex = findSheetInventoryItemIndex(bag, item);
+
+  if (existingIndex < 0) return bag;
+
+  const currentQty = Math.max(0, Number(bag[existingIndex]?.qty) || 0);
+  const removeQty = Math.max(1, Number(rawQty) || 1);
+  const nextQty = currentQty - removeQty;
+
+  if (nextQty <= 0) {
+    return bag.filter((_, index) => index !== existingIndex);
+  }
+
+  bag[existingIndex] = { ...bag[existingIndex], qty: nextQty };
+  return bag;
+};
+
+
+const removeSheetInventoryItemFromEquipment = (rawEquipment: unknown, rawItem: Record<string, any>, rawQty = 1) => {
+  const equipment = normalizeSheetEquipment(rawEquipment);
+  const item: Record<string, any> = { ...(rawItem || {}), qty: Math.max(1, Math.floor(Number(rawQty) || 1)) };
+  const removeQty = Math.max(1, Number(rawQty) || 1);
+  const bag = compactSheetInventoryBag(equipment.bag || []);
+  const existingIndex = findSheetInventoryItemIndex(bag, item);
+  const slots = equipment.slots && typeof equipment.slots === 'object' ? { ...equipment.slots } : {};
+
+  if (existingIndex >= 0) {
+    const currentQty = Math.max(0, Number(bag[existingIndex]?.qty) || 0);
+    const nextQty = currentQty - removeQty;
+    if (nextQty <= 0) bag.splice(existingIndex, 1);
+    else bag[existingIndex] = { ...bag[existingIndex], qty: nextQty };
+    return { ...equipment, bag, slots };
+  }
+
+  const normalizedName = normalizeSheetStackText(item.name || item.nome || item.label);
+  for (const [slotName, rawSlotItem] of Object.entries(slots)) {
+    const slotItem = rawSlotItem as any;
+    if (!slotItem || normalizeSheetStackText(slotItem.name || slotItem.nome || slotItem.label) !== normalizedName) continue;
+    const currentQty = Math.max(1, Number(slotItem.qty) || 1);
+    const nextQty = currentQty - removeQty;
+    if (nextQty <= 0) (slots as any)[slotName] = null;
+    else (slots as any)[slotName] = { ...slotItem, qty: nextQty };
+    return { ...equipment, bag, slots };
+  }
+
+  return { ...equipment, bag, slots };
+};
+
+const applySheetInventoryDeltaToEquipment = (
+  rawEquipment: unknown,
+  delta: { mode?: string; item?: Record<string, any>; qty?: number } | null | undefined,
+) => {
+  const equipment = normalizeSheetEquipment(rawEquipment);
+  if (!delta?.item || typeof delta.item !== 'object') return equipment;
+  const mode = String(delta.mode || '').toLowerCase();
+  const qty = Math.max(1, Math.floor(Number(delta.qty ?? (delta.item as any).qty ?? 1) || 1));
+  if (mode === 'add' || mode === 'transfer_in') {
+    return {
+      ...equipment,
+      bag: mergeSheetInventoryItemIntoBag(equipment.bag, delta.item, qty),
+    };
+  }
+  if (mode === 'remove' || mode === 'transfer_out') {
+    return removeSheetInventoryItemFromEquipment(equipment, delta.item, qty);
+  }
+  return equipment;
+};
+
+const getSheetInventoryItemQtyFromEquipment = (rawEquipment: unknown, rawItem: Record<string, any> | null | undefined) => {
+  if (!rawItem || typeof rawItem !== 'object') return 0;
+  const equipment = normalizeSheetEquipment(rawEquipment);
+  const bag = compactSheetInventoryBag(Array.isArray(equipment.bag) ? equipment.bag : []);
+  let total = 0;
+  for (const entry of bag) {
+    if (isSameSheetInventoryItem(entry, rawItem)) total += Math.max(0, Number(entry.qty) || 0);
+  }
+  const slots = equipment.slots && typeof equipment.slots === 'object' ? equipment.slots : {};
+  for (const rawSlotItem of Object.values(slots)) {
+    const slotItem = rawSlotItem as any;
+    if (slotItem && isSameSheetInventoryItem(slotItem, rawItem)) total += Math.max(1, Number(slotItem.qty) || 1);
+  }
+  return total;
+};
+
+const getSheetTradeDeltaSignedQty = (delta: { mode?: string; item?: Record<string, any>; qty?: number } | null | undefined) => {
+  if (!delta?.item || typeof delta.item !== 'object') return 0;
+  const qty = Math.max(1, Math.floor(Number(delta.qty ?? (delta.item as any).qty ?? 1) || 1));
+  const mode = String(delta.mode || '').toLowerCase();
+  if (mode === 'add' || mode === 'transfer_in') return qty;
+  if (mode === 'remove' || mode === 'transfer_out') return -qty;
+  return 0;
+};
+
+const repairTradeCommitEquipmentFromDeltas = (
+  currentEquipment: unknown,
+  _incomingEquipment: unknown,
+  deltas: Array<{ mode?: string; item?: Record<string, any>; qty?: number }>,
+) => {
+  const current = normalizeSheetEquipment(currentEquipment);
+  if (!Array.isArray(deltas) || deltas.length === 0) return current;
+
+  const validDeltas = deltas.filter((delta) => (
+    delta?.item &&
+    typeof delta.item === 'object' &&
+    getSheetTradeDeltaSignedQty(delta) !== 0
+  ));
+  if (validDeltas.length === 0) return current;
+
+  // v74: trade_commit/trade_result sao transacoes deterministicas.
+  // O snapshot/equipment do evento pode estar atrasado, compactado ou misturado
+  // com outro estado. A fonte de verdade da troca sao os deltas oficiais.
+  return normalizeSheetEquipment(
+    validDeltas.reduce((equipment, delta) => (
+      applySheetInventoryDeltaToEquipment(equipment, delta)
+    ), current)
+  );
+};
+
+
+const resolveSheetInventoryPatchEquipment = (
+  currentEquipment: unknown,
+  incomingEquipment: unknown,
+  deltas: Array<{ mode?: string; item?: Record<string, any>; qty?: number }>,
+) => {
+  const current = normalizeSheetEquipment(currentEquipment);
+  const incoming = normalizeSheetEquipment(incomingEquipment);
+  const deltaBased = repairTradeCommitEquipmentFromDeltas(current, incoming, deltas);
+  const validDeltas = Array.isArray(deltas)
+    ? deltas.filter((delta) => delta?.item && typeof delta.item === 'object' && getSheetTradeDeltaSignedQty(delta) !== 0)
+    : [];
+
+  if (validDeltas.length === 0) return incoming;
+
+  const incomingHasAnyState = incoming.bag.length > 0 || Object.values(incoming.slots || {}).some(Boolean);
+  if (!incomingHasAnyState) return deltaBased;
+
+  let incomingSatisfiesDeltas = true;
+  for (const delta of validDeltas) {
+    const item = delta.item as Record<string, any>;
+    const signedQty = getSheetTradeDeltaSignedQty(delta);
+    const qty = Math.abs(signedQty);
+    const currentQty = getSheetInventoryItemQtyFromEquipment(current, item);
+    const incomingQty = getSheetInventoryItemQtyFromEquipment(incoming, item);
+
+    if (signedQty > 0) {
+      const expectedMin = currentQty > 0 ? currentQty + qty : qty;
+      if (incomingQty < expectedMin) {
+        incomingSatisfiesDeltas = false;
+        break;
+      }
+    } else if (signedQty < 0) {
+      const expectedMax = currentQty >= qty ? currentQty - qty : currentQty;
+      if (incomingQty > expectedMax) {
+        incomingSatisfiesDeltas = false;
+        break;
+      }
+    }
+  }
+
+  return incomingSatisfiesDeltas ? incoming : deltaBased;
+};
+
+
+const findSelfLanPlayerInPayload = (
+  payload: LanSessionPayload | null | undefined,
+  sessionId: string,
+  characterLike: { id?: unknown; name?: unknown } | null | undefined,
+) => {
+  const players = payload?.state?.players || [];
+  if (!payload || !sessionId || !characterLike || players.length <= 0) return null;
+  const selfKey = makeLanCharacterKey(sessionId, characterLike as any);
+  const characterName = String((characterLike as any)?.name || '').trim();
+
+  // Em cada celular o personagem local frequentemente tem id=1.
+  // Portanto, sourceCharacterId/characterId sozinho NÃO identifica o jogador na LAN
+  // quando existem 2+ jogadores. A identidade estável é remoteKey; depois nome.
+  return (
+    players.find((player: any) => player?.remoteKey && player.remoteKey === selfKey) ||
+    (characterName ? players.find((player: any) => String(player?.characterName || player?.playerName || '') === characterName) : null) ||
+    (players.length === 1
+      ? players.find((player: any) => (
+          player?.sourceCharacterId === Number((characterLike as any).id) ||
+          player?.characterId === Number((characterLike as any).id)
+        ))
+      : null) ||
+    null
+  );
+};
+
+const inferSheetInventoryItemDelta = (baseEquipment: any, nextEquipment: any) => {
+  const base = normalizeSheetEquipment(baseEquipment);
+  const next = normalizeSheetEquipment(nextEquipment);
+  const nextByKey = new Map(next.bag.map((item: any) => [getSheetInventoryStackKey(item), item]));
+  for (const baseItem of base.bag) {
+    const key = getSheetInventoryStackKey(baseItem);
+    const nextItem = nextByKey.get(key) as any;
+    const beforeQty = Math.max(0, Number((baseItem as any)?.qty || 0));
+    const afterQty = Math.max(0, Number(nextItem?.qty || 0));
+    if (afterQty < beforeQty) {
+      return {
+        mode: 'remove' as const,
+        item: { ...(baseItem as any), qty: beforeQty - afterQty },
+        qty: beforeQty - afterQty,
+        stackKey: key,
+      };
+    }
+  }
+  return null;
+};
+
 
 const normalizeSheetEquipment = (value: unknown) => {
   const parsed = safeJsonParse<any>(value, {});
 
   if (Array.isArray(parsed)) {
-    return { bag: parsed, slots: { ...DEFAULT_SLOTS } };
+    return { bag: compactSheetInventoryBag(parsed), slots: { ...DEFAULT_SLOTS } };
   }
 
   if (!parsed || typeof parsed !== 'object') {
@@ -199,9 +551,82 @@ const normalizeSheetEquipment = (value: unknown) => {
 
   return {
     ...parsed,
-    bag: Array.isArray(parsed.bag) ? parsed.bag : [],
+    bag: compactSheetInventoryBag(Array.isArray(parsed.bag) ? parsed.bag : []),
     slots: { ...DEFAULT_SLOTS, ...(parsed.slots || {}) },
   };
+};
+
+
+
+const addSheetEquipBonus = (target: Record<string, number>, attrRaw: unknown, rawValue: unknown) => {
+  const attr = String(attrRaw || '').toUpperCase();
+  if (!['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(attr)) return;
+  const value = Number(rawValue || 0);
+  if (!Number.isFinite(value) || value === 0) return;
+  target[attr] = (target[attr] || 0) + value;
+};
+
+const getSheetEquipBonusFromItem = (item: any) => {
+  const bonuses: Record<string, number> = {};
+  if (!item || typeof item !== 'object') return bonuses;
+
+  const parsed = safeJsonParse<any>(item.effect_json || item.effectJson, null);
+  const effects = Array.isArray(parsed?.effects) ? parsed.effects : Array.isArray(parsed) ? parsed : [];
+  const hasStructuredEquipEffects = effects.some((effect: any) => {
+    const target = String(effect?.target || '').toUpperCase();
+    if (!target || target === 'CHOOSE_STAT' || effect?.chooseStat) return false;
+    const kind = String(effect?.kind || effect?.type || '').toLowerCase();
+    return ['stat', 'attribute', 'atributo'].includes(kind) || ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(target);
+  });
+
+  // v54: itens criados no avançado duplicam o bônus no texto e no effect_json.
+  // Para equipamento, effect_json vence; texto é fallback para itens antigos.
+  if (!hasStructuredEquipEffects) {
+    const text = String(item.damage || item.effect || '');
+    const lower = text.toLowerCase();
+    if (!lower.includes('perm') && !lower.includes('temp')) {
+      const statRegex = /(CA|FOR|DES|CON|INT|SAB|CAR)\s*([+-]?\d+)/gi;
+      for (const match of text.matchAll(statRegex)) {
+        addSheetEquipBonus(bonuses, match[1], parseInt(String(match[2]).replace('+', ''), 10));
+      }
+    }
+  }
+
+  for (const effect of effects) {
+    const target = String(effect?.target || '').toUpperCase();
+    if (!target || target === 'CHOOSE_STAT' || effect?.chooseStat) continue;
+    const kind = String(effect?.kind || effect?.type || '').toLowerCase();
+    if (!['stat', 'attribute', 'atributo'].includes(kind) && !['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(target)) continue;
+    const durationText = String(effect?.durationText || '').toLowerCase();
+    const durationUnit = String(effect?.durationUnit || effect?.duration_unit || '').toLowerCase();
+    // Equipamento só deriva bônus enquanto equipado quando o efeito não tem duração.
+    // Consumíveis permanentes/temporários são tratados no fluxo de consumo.
+    if (durationText.includes('temp') || durationText.includes('perm') || ['turn', 'round', 'minute', 'hour', 'day', 'rest', 'short_rest', 'long_rest', 'permanent'].includes(durationUnit)) continue;
+    addSheetEquipBonus(bonuses, target, effect?.value ?? effect?.amount);
+  }
+  return bonuses;
+};
+
+const deriveSheetEquipModsFromEquipment = (equipment: any) => {
+  const mods: Record<string, number> = {};
+  const slots = equipment?.slots && typeof equipment.slots === 'object' ? equipment.slots : {};
+  for (const item of Object.values(slots)) {
+    if (!item) continue;
+    const bonuses = getSheetEquipBonusFromItem(item);
+    for (const [stat, value] of Object.entries(bonuses)) {
+      mods[stat] = (mods[stat] || 0) + Number(value || 0);
+    }
+  }
+  Object.keys(mods).forEach((key) => { if (!mods[key]) delete mods[key]; });
+  return mods;
+};
+
+const buildSheetStatsWithDerivedEquipMods = (stats: Record<string, any> | null | undefined, equipment: any) => {
+  const nextStats: Record<string, any> = { ...(stats || {}) };
+  const derived = deriveSheetEquipModsFromEquipment(normalizeSheetEquipment(equipment));
+  if (Object.keys(derived).length > 0) nextStats.equip_mods = derived;
+  else delete nextStats.equip_mods;
+  return nextStats;
 };
 
 export default function CharacterSheetScreen() {
@@ -255,6 +680,7 @@ export default function CharacterSheetScreen() {
   const [lanReconnectEpoch, setLanReconnectEpoch] = useState(0);
   const lanSessionStatusRef = useRef<LanSessionStatus | null>(null);
   const [lanPlayers, setLanPlayers] = useState<PublicLanPlayer[]>([]);
+  const [publicEffectsModalPlayer, setPublicEffectsModalPlayer] = useState<PublicLanPlayer | null>(null);
   const sheetRuntimeMode = getSheetRuntimeMode({
     lanInfo,
     routeSessionId,
@@ -266,14 +692,39 @@ export default function CharacterSheetScreen() {
   const sessionTerminatedRef = useRef<string | null>(null);
   const handledSessionEventIdsRef = useRef<Set<string>>(new Set());
   const lastPausedAlertKeyRef = useRef<string>('');
+  const lastHostUnavailableAlertKeyRef = useRef<{ sessionId: string; at: number }>({ sessionId: '', at: 0 });
   const lastLevelUpPromptKeyRef = useRef<string>('');
   const pendingOutgoingItemSendsRef = useRef<Set<string>>(new Set());
+  const pendingSelfCoinStateRef = useRef<{ gp: number; sp: number; cp: number; totalCopper: number; at: number; clientMsgId?: string; opSeq?: number } | null>(null);
+  const coinPatchDebounceRef = useRef<{ timer: ReturnType<typeof setTimeout> | null; event: LanSessionEvent | null; opSeq: number } | null>(null);
+  const coinOptimisticSeqRef = useRef(0);
+  const pendingSelfInventoryStateRef = useRef<{ equipment: any; statsPatch?: Record<string, unknown>; at: number; clientMsgId?: string } | null>(null);
+  const inventoryPersistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const appliedInventoryTransactionIdsRef = useRef<Set<string>>(new Set());
+  const lastAuthoritativeSnapshotInventoryRef = useRef<Record<string, { revision: number; fingerprint: string; at: number }>>({});
+  const lastAuthoritativeSnapshotPlayerRef = useRef<Record<string, { revision: number; fingerprint: string; at: number }>>({});
+  const pendingLanOutboundEventsRef = useRef<Record<string, LanSessionEvent>>({});
+  const pendingLanOutboundFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastInventoryPatchSentRef = useRef<{ fingerprint: string; at: number; clientMsgId?: string }>({ fingerprint: '', at: 0 });
   const lanRecoveryGateRef = useRef<{ at: number; reason: string }>({ at: 0, reason: '' });
+
+  useEffect(() => {
+    if (!publicEffectsModalPlayer) return;
+    const latest = lanPlayers.find((player) => (
+      player.key === publicEffectsModalPlayer.key ||
+      player.characterName === publicEffectsModalPlayer.characterName
+    ));
+    if (latest && latest !== publicEffectsModalPlayer) {
+      setPublicEffectsModalPlayer(latest);
+    }
+  }, [lanPlayers, publicEffectsModalPlayer]);
+
   const lastAuthoritativePlayerPatchRef = useRef<{ seq: number; entityRevision: number; appliedAt: number }>({
     seq: 0,
     entityRevision: 0,
     appliedAt: 0,
   });
+  const lastAuthoritativeTempHpPatchRef = useRef<{ value: number; seq: number; entityRevision: number; appliedAt: number } | null>(null);
   const normalizeLanPlayerPatchRevision = useCallback((event?: LanSessionEvent) => {
     const raw = Number(event?.entityRevision || 0) || 0;
     const id = String(event?.id || '');
@@ -283,6 +734,21 @@ export default function CharacterSheetScreen() {
       return 0;
     }
     return raw;
+  }, []);
+
+  const getAuthoritativeTempHpPatchForEffectEvent = useCallback((event?: LanSessionEvent) => {
+    const lastPatch = lastAuthoritativeTempHpPatchRef.current;
+    if (!lastPatch) return null;
+
+    const eventRevision = Number(event?.entityRevision || 0) || 0;
+    const eventSeq = Number(event?.seq ?? event?.serverSeq ?? 0) || 0;
+    if (eventRevision > 0 && lastPatch.entityRevision > 0) {
+      return eventRevision <= lastPatch.entityRevision ? lastPatch : null;
+    }
+    if (eventSeq > 0 && lastPatch.seq > 0) {
+      return eventSeq <= lastPatch.seq ? lastPatch : null;
+    }
+    return null;
   }, []);
 
   const [incomingTrades, setIncomingTrades] = useState<LanSessionEvent[]>([]);
@@ -310,6 +776,37 @@ export default function CharacterSheetScreen() {
   const [tempBuffModalVisible, setTempBuffModalVisible] = useState(false);
   const [activeBuffStat, setActiveBuffStat] = useState('');
   const [tempBuffValue, setTempBuffValue] = useState('');
+
+  useEffect(() => {
+    const tag = 'ficha-dnd-lan-player-active';
+    const shouldKeepAwake = Boolean(
+      lanInfo?.sessionId &&
+      lanSessionStatus !== 'paused' &&
+      lanSessionStatus !== 'ended'
+    );
+
+    if (!shouldKeepAwake) return;
+
+    void activateKeepAwakeAsync(tag).catch((error) => {
+      debugLanFlow('PLAYER_KEEP_AWAKE_ACTIVATE_FAILED', {
+        sessionId: lanInfo?.sessionId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    debugLanFlow('PLAYER_KEEP_AWAKE_ACTIVE', {
+      sessionId: lanInfo?.sessionId,
+      status: lanSessionStatus,
+    });
+
+    return () => {
+      try {
+        deactivateKeepAwake(tag);
+      } catch {
+        // keep-awake cleanup is best-effort.
+      }
+    };
+  }, [lanInfo?.sessionId, lanSessionStatus]);
 
   // Filtros de Magia
   const [spellSearch, setSpellSearch] = useState('');
@@ -408,6 +905,28 @@ export default function CharacterSheetScreen() {
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string}[]) => {
     setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: appColors.primary }] });
   };
+
+  const isLanSessionLocallyPaused = useCallback(async (sessionId: string, fallbackPayloadJson?: string | null) => {
+    if (lanSessionStatusRef.current === 'paused') return true;
+
+    const cachedPayload = safeJsonParse<LanSessionPayload | null>(fallbackPayloadJson, null);
+    if (cachedPayload?.state?.status === 'paused') return true;
+
+    try {
+      const row = await db.getFirstAsync<{ status?: string; payloadJson?: string }>(
+        `SELECT COALESCE(status, 'active') as status, payload_json as payloadJson
+         FROM lan_sessions
+         WHERE id = ?
+         LIMIT 1`,
+        [sessionId]
+      );
+      if (row?.status === 'paused') return true;
+      const dbPayload = safeJsonParse<LanSessionPayload | null>(row?.payloadJson, null);
+      return dbPayload?.state?.status === 'paused';
+    } catch {
+      return false;
+    }
+  }, [db]);
 
   const fetchLanPayloadWithRecovery = useCallback(async (
     info: { sessionId: string; joinUrl: string },
@@ -666,26 +1185,62 @@ export default function CharacterSheetScreen() {
       cp: unknown;
     },
     event: LanSessionEvent,
+    options?: { publicEffects?: unknown[] },
   ) => {
     const currentCharacter = characterRef.current;
     if (!currentCharacter?.id || !sessionValue) return;
 
     const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
-    setLanPlayers((current) => current.map((player) => (
-      player.isSelf || player.key === selfKey || player.characterName === currentCharacter.name
-        ? {
+    const incomingPublicSeq = Number(event.serverSeq ?? event.seq ?? event.entityRevision ?? 0) || Date.now();
+    const incomingPublicRevision = Number(event.entityRevision ?? event.serverSeq ?? event.seq ?? 0) || incomingPublicSeq;
+    const nextSelfValues = {
+      hpCurrent: Math.max(0, Math.floor(Number(nextValues.hp_current) || 0)),
+      hpMax: Math.max(0, Math.floor(Number(nextValues.hp_max) || 0)),
+      tempHp: Math.max(0, Math.floor(Number(nextValues.temp_hp) || 0)),
+      level: Math.max(1, Math.floor(Number(currentCharacter.level) || 1)),
+      xp: Math.max(0, Math.floor(Number(nextValues.xp ?? 0) || 0)),
+      gp: Math.max(0, Math.floor(Number(nextValues.gp ?? 0) || 0)),
+      sp: Math.max(0, Math.floor(Number(nextValues.sp ?? 0) || 0)),
+      cp: Math.max(0, Math.floor(Number(nextValues.cp ?? 0) || 0)),
+      publicSeq: incomingPublicSeq,
+      publicRevision: incomingPublicRevision,
+    };
+    const hasPublicEffectsOption = Array.isArray(options?.publicEffects);
+    const nextPublicEffects = hasPublicEffectsOption
+      ? summarizeEffectsForPublicRoster(options?.publicEffects || [])
+      : null;
+
+    setLanPlayers((current) => {
+      let matched = false;
+      const next = current.map((player) => {
+        if (!(player.isSelf || player.key === selfKey || player.characterName === currentCharacter.name)) return player;
+        matched = true;
+        return {
           ...player,
-          hpCurrent: Number(nextValues.hp_current) || 0,
-          hpMax: Number(nextValues.hp_max) || 0,
-          tempHp: Number(nextValues.temp_hp) || 0,
-          level: Number(currentCharacter.level) || player.level,
-          xp: Number(nextValues.xp ?? player.xp ?? 0) || 0,
-          gp: Number(nextValues.gp ?? player.gp ?? 0) || 0,
-          sp: Number(nextValues.sp ?? player.sp ?? 0) || 0,
-          cp: Number(nextValues.cp ?? player.cp ?? 0) || 0,
-        }
-        : player
-    )));
+          ...nextSelfValues,
+          ...(hasPublicEffectsOption ? { publicEffects: nextPublicEffects || [] } : {}),
+          key: player.key || selfKey,
+          playerName: player.playerName || String(currentCharacter.playerName || currentCharacter.name || 'Jogador'),
+          characterName: player.characterName || String(currentCharacter.name || 'Jogador'),
+          isSelf: true,
+        };
+      });
+
+      // Se o roster publico ainda nao nasceu do payload, crie a propria entrada aqui.
+      // Sem isso, o primeiro PV temporario pode atualizar a ficha privada, mas nao o
+      // card publico ate o proximo snapshot.
+      if (!matched) {
+        next.push({
+          key: selfKey,
+          playerName: String(currentCharacter.playerName || currentCharacter.name || 'Jogador'),
+          characterName: String(currentCharacter.name || 'Jogador'),
+          ...nextSelfValues,
+          isSelf: true,
+          publicEffects: nextPublicEffects || [],
+        });
+      }
+      return next;
+    });
     traceApp('UI_UPDATE', 'LAN_PLAYER_BAR_UPDATED_FROM_AUTHORITATIVE_PATCH', {
       screen: 'sheet',
       source: 'updateSelfLanBarFromAuthoritativePatch',
@@ -735,6 +1290,271 @@ export default function CharacterSheetScreen() {
     });
   }, []);
 
+
+  const updateSelfPublicEffectsFromLocalEffects = useCallback((
+    sessionValue: string,
+    effects: unknown[],
+    tempHp: unknown,
+    event?: LanSessionEvent,
+  ) => {
+    const currentCharacter = characterRef.current;
+    if (!currentCharacter?.id || !sessionValue) return;
+    const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
+    const publicEffects = summarizeEffectsForPublicRoster(effects);
+    const incomingPublicSeq = Number(event?.serverSeq ?? event?.seq ?? event?.entityRevision ?? 0) || Date.now();
+    const incomingPublicRevision = Number(event?.entityRevision ?? event?.serverSeq ?? event?.seq ?? 0) || incomingPublicSeq;
+    setLanPlayers((current) => {
+      let matched = false;
+      const next = current.map((player) => {
+        if (!(player.isSelf || player.key === selfKey || player.characterName === currentCharacter.name)) return player;
+        matched = true;
+        const existingSeq = Number((player as any).publicSeq || (player as any).publicRevision || 0) || 0;
+        if (existingSeq > 0 && incomingPublicSeq > 0 && incomingPublicSeq < existingSeq) return player;
+        return {
+          ...player,
+          key: player.key || selfKey,
+          playerName: player.playerName || String(currentCharacter.playerName || currentCharacter.name || 'Jogador'),
+          characterName: player.characterName || String(currentCharacter.name || 'Jogador'),
+          level: Math.max(1, Math.floor(Number((characterRef.current as any)?.level || player.level || 1) || 1)),
+          hpCurrent: Math.max(0, Math.floor(Number((characterRef.current as any)?.hp_current ?? (characterRef.current as any)?.hpCurrent ?? player.hpCurrent ?? 0) || 0)),
+          hpMax: Math.max(0, Math.floor(Number((characterRef.current as any)?.hp_max ?? (characterRef.current as any)?.hpMax ?? player.hpMax ?? 0) || 0)),
+          tempHp: Math.max(0, Math.floor(Number(tempHp ?? (characterRef.current as any)?.temp_hp ?? player.tempHp ?? 0) || 0)),
+          publicEffects,
+          isSelf: true,
+          publicSeq: Math.max(existingSeq, incomingPublicSeq),
+          publicRevision: incomingPublicRevision,
+        };
+      });
+      if (matched) return next;
+      return [...next, {
+        key: selfKey,
+        playerName: String(currentCharacter.playerName || currentCharacter.name || 'Jogador'),
+        characterName: String(currentCharacter.name || 'Jogador'),
+        level: Math.max(1, Math.floor(Number((characterRef.current as any)?.level || 1) || 1)),
+        hpCurrent: Math.max(0, Math.floor(Number((characterRef.current as any)?.hp_current ?? (characterRef.current as any)?.hpCurrent ?? 0) || 0)),
+        hpMax: Math.max(0, Math.floor(Number((characterRef.current as any)?.hp_max ?? (characterRef.current as any)?.hpMax ?? 0) || 0)),
+        tempHp: Math.max(0, Math.floor(Number(tempHp ?? (characterRef.current as any)?.temp_hp ?? 0) || 0)),
+        publicEffects,
+        isSelf: true,
+        publicSeq: incomingPublicSeq,
+        publicRevision: incomingPublicRevision,
+      }];
+    });
+  }, []);
+
+
+
+  const syncSelfLanRosterFromCharacter = useCallback((sessionValue: string, source: string) => {
+    const currentCharacter = characterRef.current as any;
+    if (!currentCharacter?.id || !sessionValue) return;
+    const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
+    const currentEffects = Array.isArray(currentCharacter.active_effects)
+      ? currentCharacter.active_effects
+      : safeJsonParse<any[]>(currentCharacter.active_effects_json, []);
+    const publicEffects = summarizeEffectsForPublicRoster(currentEffects);
+    const nextSelfValues = {
+      level: Math.max(1, Math.floor(Number(currentCharacter.level || 1) || 1), inferTotalLevelFromClassName(currentCharacter.class)),
+      hpCurrent: Math.max(0, Math.floor(Number(currentCharacter.hp_current ?? currentCharacter.hpCurrent ?? 0) || 0)),
+      hpMax: Math.max(0, Math.floor(Number(currentCharacter.hp_max ?? currentCharacter.hpMax ?? 0) || 0)),
+      tempHp: Math.max(0, Math.floor(Number(currentCharacter.temp_hp ?? currentCharacter.tempHp ?? 0) || 0)),
+      xp: Math.max(0, Math.floor(Number(currentCharacter.xp || 0) || 0)),
+      gp: Math.max(0, Math.floor(Number(currentCharacter.gp || 0) || 0)),
+      sp: Math.max(0, Math.floor(Number(currentCharacter.sp || 0) || 0)),
+      cp: Math.max(0, Math.floor(Number(currentCharacter.cp || 0) || 0)),
+      publicEffects,
+    };
+
+    setLanPlayers((current) => {
+      let matched = false;
+      const next = current.map((player) => {
+        if (!(player.isSelf || player.key === selfKey || player.characterName === currentCharacter.name)) return player;
+        matched = true;
+        return {
+          ...player,
+          ...nextSelfValues,
+          key: player.key || selfKey,
+          playerName: player.playerName || String(currentCharacter.playerName || currentCharacter.name || 'Jogador'),
+          characterName: player.characterName || String(currentCharacter.name || 'Jogador'),
+          isSelf: true,
+        };
+      });
+      if (matched) return next;
+      return [...next, {
+        key: selfKey,
+        playerName: String(currentCharacter.playerName || currentCharacter.name || 'Jogador'),
+        characterName: String(currentCharacter.name || 'Jogador'),
+        ...nextSelfValues,
+        isSelf: true,
+        publicSeq: 0,
+        publicRevision: 0,
+      }];
+    });
+
+    debugLanFlow('PLAYER_SELF_PUBLIC_ROSTER_PROJECTED_FROM_CHARACTER_V92', {
+      source,
+      sessionId: sessionValue,
+      selfKey,
+      level: nextSelfValues.level,
+      hpCurrent: nextSelfValues.hpCurrent,
+      hpMax: nextSelfValues.hpMax,
+      tempHp: nextSelfValues.tempHp,
+      effectCount: publicEffects.length,
+    });
+  }, []);
+
+  const mergeLanPlayersFromPayloadCache = useCallback((incomingPayload: LanSessionPayload, selfKey: string, source: string, options?: { forceNumbers?: boolean }) => {
+    const currentCharacter = characterRef.current as any;
+    const localLevel = Math.max(1, Math.floor(Number(currentCharacter?.level || 1) || 1));
+    const localHpMax = Math.max(0, Math.floor(Number(currentCharacter?.hp_max || currentCharacter?.hpMax || 0) || 0));
+    const localHpCurrent = Math.max(0, Math.floor(Number(currentCharacter?.hp_current || currentCharacter?.hpCurrent || 0) || 0));
+    const localXp = Math.max(0, Math.floor(Number(currentCharacter?.xp || 0) || 0));
+    const incomingPlayers = getPublicLanPlayers(incomingPayload, selfKey).map((player: any) => {
+      if (!selfKey || player.key !== selfKey) return player;
+      const incomingLevel = Math.max(1, Math.floor(Number(player.level || 1) || 1));
+      const incomingHpMax = Math.max(0, Math.floor(Number(player.hpMax || 0) || 0));
+      const payloadLooksOlderThanLocalLevelUp = localLevel > incomingLevel || localHpMax > incomingHpMax;
+      if (!payloadLooksOlderThanLocalLevelUp) return player;
+      debugLanFlow('PLAYER_PUBLIC_PAYLOAD_SELF_PROGRESS_OLDER_SKIPPED_V90', {
+        source,
+        selfKey,
+        incomingLevel,
+        localLevel,
+        incomingHpMax,
+        localHpMax,
+      });
+      return {
+        ...player,
+        level: Math.max(incomingLevel, localLevel),
+        hpMax: Math.max(incomingHpMax, localHpMax),
+        hpCurrent: Math.max(Math.max(0, Number(player.hpCurrent || 0)), Math.min(Math.max(localHpMax, 1), localHpCurrent)),
+        xp: Math.max(Math.max(0, Number(player.xp || 0)), localXp),
+      };
+    });
+    setLanPlayers((current) => {
+      if (!current.length) {
+        return incomingPlayers.map((player) => ({
+          ...player,
+          publicSeq: 0,
+          publicRevision: 0,
+        }));
+      }
+
+      let changed = false;
+      const next = [...current];
+      for (const incoming of incomingPlayers) {
+        const index = next.findIndex((player) => (
+          player.key === incoming.key ||
+          (incoming.characterName && player.characterName === incoming.characterName)
+        ));
+
+        if (index < 0) {
+          next.push({ ...incoming, publicSeq: 0, publicRevision: 0 });
+          changed = true;
+          continue;
+        }
+
+        const existing = next[index] as PublicLanPlayer & { publicSeq?: number; publicRevision?: number };
+        // Snapshot/payload é cache estrutural. Durante sessão ativa ele NÃO pode voltar
+        // HP público para um valor antigo depois de um public_status/player_patch vivo.
+        // v86: durante recuperação pós-background, o payload do host vira reconciliação
+        // autoritativa e precisa corrigir o roster completo.
+        const preserveLiveNumbers = !options?.forceNumbers && Number(existing.publicSeq || existing.publicRevision || 0) > 0;
+        next[index] = {
+          ...incoming,
+          ...(preserveLiveNumbers ? {
+            hpCurrent: existing.hpCurrent,
+            hpMax: existing.hpMax,
+            tempHp: existing.tempHp,
+            xp: existing.xp,
+            gp: existing.gp,
+            sp: existing.sp,
+            cp: existing.cp,
+            publicEffects: existing.publicEffects,
+          } : {}),
+          playerName: incoming.playerName || existing.playerName,
+          characterName: incoming.characterName || existing.characterName,
+          isSelf: incoming.isSelf,
+          publicSeq: existing.publicSeq || 0,
+          publicRevision: existing.publicRevision || 0,
+        };
+        changed = true;
+      }
+
+      if (changed) {
+        debugLanFlow('PLAYER_PUBLIC_ROSTER_MERGED_FROM_PAYLOAD_CACHE', {
+          source,
+          playerCount: incomingPlayers.length,
+          preservedLiveNumbers: current.some((player: any) => Number(player.publicSeq || player.publicRevision || 0) > 0),
+        });
+      }
+      return changed ? next : current;
+    });
+  }, []);
+
+
+
+  useEffect(() => {
+    if (!lanInfo?.sessionId || !character?.id) return;
+    syncSelfLanRosterFromCharacter(lanInfo.sessionId, 'character_runtime_projection');
+  }, [
+    lanInfo?.sessionId,
+    character?.id,
+    character?.name,
+    character?.level,
+    character?.class,
+    character?.hp_current,
+    character?.hp_max,
+    character?.temp_hp,
+    character?.xp,
+    character?.gp,
+    character?.sp,
+    character?.cp,
+    character?.active_effects_json,
+    syncSelfLanRosterFromCharacter,
+  ]);
+
+  const purgeLocalTempHpEffectsAfterAuthoritativeZero = useCallback((event?: LanSessionEvent) => {
+    const currentCharacter = characterRef.current;
+    if (!currentCharacter?.id) return;
+    const currentEffects = Array.isArray((currentCharacter as any).active_effects)
+      ? [...((currentCharacter as any).active_effects || [])]
+      : safeJsonParse<any[]>((currentCharacter as any).active_effects_json, []);
+    const purgeResult = removeTempHpEffectsLocally(currentEffects);
+    if (!purgeResult.changed) return;
+
+    const nextEffectsJson = JSON.stringify(purgeResult.effects);
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = {
+        ...prev,
+        active_effects: purgeResult.effects,
+        active_effects_json: nextEffectsJson,
+        temp_hp: 0,
+      };
+      characterRef.current = merged;
+      return merged;
+    });
+
+    void db.runAsync(
+      `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
+      [nextEffectsJson, 0, Number(currentCharacter.id)]
+    ).catch((error) => {
+      debugLanFlow('PLAYER_TEMP_HP_EFFECT_PURGE_PERSIST_FAILED', {
+        eventId: event?.id,
+        characterId: currentCharacter.id,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    debugLanFlow('PLAYER_TEMP_HP_EFFECTS_PURGED_BY_AUTHORITATIVE_ZERO', {
+      eventId: event?.id,
+      characterId: currentCharacter.id,
+      removedCount: currentEffects.length - purgeResult.effects.length,
+      seq: event?.seq,
+      entityRevision: event?.entityRevision,
+    });
+  }, [db]);
+
   const applyLanNumberPatchToCharacter = useCallback(async (patch: LanSessionEvent['numberPatch'], event?: LanSessionEvent) => {
     const currentCharacter = characterRef.current;
     if (!currentCharacter?.id || !patch) return null;
@@ -761,6 +1581,83 @@ export default function CharacterSheetScreen() {
       });
       return null;
     }
+    const selfKeyForNumberPatch = event?.sessionId ? makeLanCharacterKey(event.sessionId, currentCharacter) : '';
+    let effectivePatch = { ...patch };
+    const incomingHasCoinFields = effectivePatch.gp != null || effectivePatch.sp != null || effectivePatch.cp != null;
+    const incomingHasNonCoinFields = effectivePatch.hpCurrent != null || effectivePatch.hpMax != null || effectivePatch.tempHp != null || effectivePatch.xp != null;
+    if (incomingHasCoinFields) {
+      const localCoins = sanitizeCoins({
+        gp: currentCharacter.gp,
+        sp: currentCharacter.sp,
+        cp: currentCharacter.cp,
+      });
+      const incomingCoins = sanitizeCoins({
+        gp: effectivePatch.gp == null ? localCoins.gp : effectivePatch.gp,
+        sp: effectivePatch.sp == null ? localCoins.sp : effectivePatch.sp,
+        cp: effectivePatch.cp == null ? localCoins.cp : effectivePatch.cp,
+      });
+      const localTotalCopper = getCoinTotalCopperValue(localCoins);
+      const incomingTotalCopper = getCoinTotalCopperValue(incomingCoins);
+      const pendingSelfCoins = pendingSelfCoinStateRef.current;
+      const isRecentSelfCoinMutation = Boolean(
+        pendingSelfCoins &&
+        Date.now() - pendingSelfCoins.at < 20000
+      );
+      const isOwnCoinEcho = Boolean(
+        event?.coinPatchRequest?.targetKey &&
+        selfKeyForNumberPatch &&
+        event.coinPatchRequest.targetKey === selfKeyForNumberPatch
+      );
+      const intent = String((event as any)?.numberPatchIntent || '');
+      const sourceClientMsgId = String((event as any)?.sourceClientMsgId || '');
+      const matchesPendingCommand = Boolean(
+        pendingSelfCoins?.clientMsgId &&
+        sourceClientMsgId &&
+        sourceClientMsgId === pendingSelfCoins.clientMsgId
+      );
+      const matchesPendingValue = Boolean(
+        pendingSelfCoins &&
+        incomingTotalCopper === pendingSelfCoins.totalCopper
+      );
+      const isExplicitMasterCoinGrant = intent === 'coins' && !sourceClientMsgId;
+      const shouldProtectLocalCoins = Boolean(
+        isRecentSelfCoinMutation &&
+        !isExplicitMasterCoinGrant &&
+        !(matchesPendingCommand && matchesPendingValue) &&
+        (intent === 'self_coin' || isOwnCoinEcho || incomingHasNonCoinFields || incomingTotalCopper !== pendingSelfCoins?.totalCopper)
+      );
+
+      if (shouldProtectLocalCoins) {
+        delete effectivePatch.gp;
+        delete effectivePatch.sp;
+        delete effectivePatch.cp;
+        debugLanFlow('PLAYER_IGNORED_STALE_COIN_ECHO', {
+          eventId: event?.id,
+          intent,
+          sourceClientMsgId,
+          isOwnCoinEcho,
+          localCoins,
+          incomingCoins,
+          localTotalCopper,
+          incomingTotalCopper,
+          pendingTotalCopper: pendingSelfCoins?.totalCopper,
+          pendingClientMsgId: pendingSelfCoins?.clientMsgId,
+        });
+      } else if (isRecentSelfCoinMutation && (matchesPendingCommand || matchesPendingValue)) {
+        pendingSelfCoinStateRef.current = null;
+      }
+    }
+
+    if (Object.keys(effectivePatch).length === 0) {
+      debugLanFlow('PLAYER_NUMBER_PATCH_EMPTY_AFTER_SANITIZE_SKIPPED', {
+        eventId: event?.id,
+        originalPatch: patch,
+      });
+      return null;
+    }
+
+    patch = effectivePatch;
+
     traceFunctionCall('applyLanNumberPatchToCharacter', { patch, event }, {
       screen: 'sheet',
       source: 'event_commit',
@@ -1015,6 +1912,48 @@ export default function CharacterSheetScreen() {
       entityRevision: event?.entityRevision,
     });
     if (patch.tempHp != null) {
+      const cleanTempHp = Math.max(0, Math.floor(Number(patch.tempHp) || 0));
+      lastAuthoritativeTempHpPatchRef.current = {
+        value: cleanTempHp,
+        seq: Number(event?.seq ?? event?.serverSeq ?? 0) || incomingSeq,
+        entityRevision: incomingRevision,
+        appliedAt: Date.now(),
+      };
+      const currentForEffects = characterRef.current || currentCharacter;
+      const currentEffects = Array.isArray((currentForEffects as any).active_effects)
+        ? [...((currentForEffects as any).active_effects || [])]
+        : safeJsonParse<any[]>((currentForEffects as any).active_effects_json, []);
+      const syncedEffects = syncTempHpEffectsLocallyWithNumber(currentEffects, cleanTempHp);
+      if (syncedEffects.changed) {
+        const nextEffectsJson = JSON.stringify(syncedEffects.effects);
+        setCharacter((prev: any) => {
+          if (!prev) return prev;
+          const merged = {
+            ...prev,
+            active_effects: syncedEffects.effects,
+            active_effects_json: nextEffectsJson,
+            temp_hp: cleanTempHp,
+          };
+          characterRef.current = merged;
+          return merged;
+        });
+        void db.runAsync(
+          `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
+          [nextEffectsJson, cleanTempHp, Number(currentCharacter.id)]
+        ).catch((error) => {
+          debugLanFlow('PLAYER_TEMP_HP_EFFECT_SYNC_PERSIST_FAILED', {
+            eventId: event?.id,
+            characterId: currentCharacter.id,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+        debugLanFlow('PLAYER_TEMP_HP_EFFECTS_SYNCED_BY_AUTHORITATIVE_PATCH', {
+          eventId: event?.id,
+          characterId: currentCharacter.id,
+          tempHp: cleanTempHp,
+          removedCount: currentEffects.length - syncedEffects.effects.length,
+        });
+      }
       traceApp('EVENT_RECEIVED', 'PLAYER_TEMP_HP_PATCH_RECEIVED', {
         screen: 'sheet',
         source: 'applyLanNumberPatchToCharacter',
@@ -1099,7 +2038,7 @@ export default function CharacterSheetScreen() {
       durationMs: Date.now() - startedAt,
     });
     return nextValues;
-  }, [db, normalizeLanPlayerPatchRevision, levelUpModalVisible]);
+  }, [db, normalizeLanPlayerPatchRevision, levelUpModalVisible, purgeLocalTempHpEffectsAfterAuthoritativeZero]);
 
   const applyLanEffectPatchToCharacter = useCallback(async (patch: LanSessionEvent['effectPatch'], event?: LanSessionEvent) => {
     const currentCharacter = characterRef.current;
@@ -1141,13 +2080,41 @@ export default function CharacterSheetScreen() {
 
     // Caminho rápido: aplica visualmente o patch de efeito antes de qualquer leitura SQLite.
     // Isso cobre PV temporário expirando, atributo temporário, condição, cegueira/lentidão etc.
+    const bundledTempHpPatch = event?.numberPatch?.tempHp != null
+      ? Math.max(0, Math.floor(Number(event.numberPatch.tempHp) || 0))
+      : null;
+    const authoritativeTempHpPatch = bundledTempHpPatch != null
+      ? {
+        value: bundledTempHpPatch,
+        seq: Number(event?.seq ?? event?.serverSeq ?? 0) || Date.now(),
+        entityRevision: Number(event?.entityRevision || 0) || 0,
+        appliedAt: Date.now(),
+      }
+      : getAuthoritativeTempHpPatchForEffectEvent(event);
+    const shouldGuardStaleTempHpEffects = Boolean(authoritativeTempHpPatch);
+    const shouldProtectExistingTempHpEffect = shouldGuardStaleTempHpEffects && Number(authoritativeTempHpPatch?.value || 0) > 0;
+    const shouldSkipStaleTempHpEffect = (effect: any) => (
+      shouldGuardStaleTempHpEffects &&
+      isTempHpEffectSnapshot(effect) &&
+      (
+        Number(authoritativeTempHpPatch?.value || 0) <= 0 ||
+        getTempHpEffectValue(effect) !== Number(authoritativeTempHpPatch?.value || 0)
+      )
+    );
     const optimisticCurrentEffects = Array.isArray((currentCharacter as any).active_effects)
       ? [...((currentCharacter as any).active_effects || [])]
       : safeJsonParse<any[]>((currentCharacter as any).active_effects_json, []);
-    const optimisticRemoveSet = new Set((patch.remove || []).map(String));
+    const optimisticCurrentTempHpIds = new Set(optimisticCurrentEffects
+      .filter((effect) => isTempHpEffectSnapshot(effect))
+      .flatMap((effect) => [String(effect?.id || ''), String(effect?.lanEffectId || effect?.lanEffectID || '')])
+      .filter(Boolean));
+    const optimisticRemoveSet = new Set((patch.remove || [])
+      .map(String)
+      .filter((id) => !(shouldProtectExistingTempHpEffect && optimisticCurrentTempHpIds.has(id))));
     const optimisticById = new Map<string, any>();
     if (patch.replace === true) {
       for (const effect of patch.add || []) {
+        if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
         if (!id || optimisticRemoveSet.has(id)) continue;
         optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
@@ -1161,17 +2128,26 @@ export default function CharacterSheetScreen() {
         }
       }
       for (const effect of patch.update || []) {
+        if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
-        if (id && !optimisticRemoveSet.has(id)) optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+        if (id && !optimisticRemoveSet.has(id) && optimisticById.has(id)) {
+          optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+        }
       }
       for (const effect of patch.add || []) {
+        if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
         if (!id || optimisticRemoveSet.has(id)) continue;
         optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
       }
     }
     const optimisticNextEffects = Array.from(optimisticById.values());
-    const optimisticTempHp = calculateStandardTempHpFromEffects(optimisticNextEffects);
+    const optimisticTempHp = bundledTempHpPatch != null
+      ? bundledTempHpPatch
+      : Math.max(
+        0,
+        Math.floor(Number((characterRef.current as any)?.temp_hp ?? currentCharacter.temp_hp ?? 0) || 0)
+      );
     setCharacter((prev: any) => {
       if (!prev) return prev;
       const merged = {
@@ -1183,6 +2159,9 @@ export default function CharacterSheetScreen() {
       characterRef.current = merged;
       return merged;
     });
+    if (event?.sessionId) {
+      updateSelfPublicEffectsFromLocalEffects(event.sessionId, optimisticNextEffects, optimisticTempHp, event);
+    }
     debugLanFlow('PLAYER_EFFECT_PATCH_UI_OPTIMISTIC_APPLIED', {
       eventId: event?.id,
       characterId: currentCharacter.id,
@@ -1192,6 +2171,38 @@ export default function CharacterSheetScreen() {
       updateCount: patch.update?.length || 0,
       removeCount: patch.remove?.length || 0,
     });
+
+    const optimisticEffectsJson = JSON.stringify(optimisticNextEffects);
+    void db.runAsync(
+      `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
+      [optimisticEffectsJson, optimisticTempHp, Number(currentCharacter.id)]
+    ).then(() => {
+      debugLanFlow('PLAYER_EFFECT_PATCH_SQLITE_BACKGROUND_DONE_V92', {
+        eventId: event?.id,
+        characterId: currentCharacter.id,
+        effectCount: optimisticNextEffects.length,
+      });
+    }).catch((error) => {
+      debugLanFlow('PLAYER_EFFECT_PATCH_SQLITE_BACKGROUND_ERROR_V92', {
+        eventId: event?.id,
+        characterId: currentCharacter.id,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    traceFunctionReturn('applyLanEffectPatchToCharacter', {
+      effectCount: optimisticNextEffects.length,
+      persistedInBackground: true,
+    }, {
+      screen: 'sheet',
+      source: 'event_commit',
+      sessionId: event?.sessionId,
+      characterId: currentCharacter.id,
+      characterName: currentCharacter.name,
+      eventId: event?.id,
+      durationMs: Date.now() - startedAt,
+    });
+    return;
 
     traceSqlite('SQLITE_READ_START', {
       screen: 'sheet',
@@ -1220,11 +2231,18 @@ export default function CharacterSheetScreen() {
     });
 
     const currentEffects = safeJsonParse<any[]>((current as any)?.active_effects_json, []);
-    const removeSet = new Set((patch.remove || []).map(String));
+    const currentTempHpIds = new Set(currentEffects
+      .filter((effect) => isTempHpEffectSnapshot(effect))
+      .flatMap((effect) => [String(effect?.id || ''), String(effect?.lanEffectId || effect?.lanEffectID || '')])
+      .filter(Boolean));
+    const removeSet = new Set((patch.remove || [])
+      .map(String)
+      .filter((id) => !(shouldProtectExistingTempHpEffect && currentTempHpIds.has(id))));
     const byId = new Map<string, any>();
 
     if (patch.replace === true) {
       for (const effect of patch.add || []) {
+        if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
         if (!id || removeSet.has(id)) continue;
         byId.set(id, markLanEffectForLocalCharacter(effect, event));
@@ -1243,13 +2261,15 @@ export default function CharacterSheetScreen() {
       }
 
       for (const effect of patch.update || []) {
+        if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
-        if (id && !removeSet.has(id)) {
+        if (id && !removeSet.has(id) && byId.has(id)) {
           byId.set(id, markLanEffectForLocalCharacter(effect, event));
         }
       }
 
       for (const effect of patch.add || []) {
+        if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
         if (!id || removeSet.has(id)) continue;
 
@@ -1270,7 +2290,25 @@ export default function CharacterSheetScreen() {
     }
 
     const nextEffects = Array.from(byId.values());
-    const nextTempHpFromEffects = calculateStandardTempHpFromEffects(nextEffects);
+    if (shouldGuardStaleTempHpEffects) {
+      const droppedIncomingCount = [...(patch.add || []), ...(patch.update || [])].filter(shouldSkipStaleTempHpEffect).length;
+      if (droppedIncomingCount > 0) {
+        debugLanFlow('PLAYER_EFFECT_PATCH_TEMP_HP_DROPPED_AFTER_AUTHORITATIVE_PATCH', {
+          eventId: event?.id,
+          characterId: currentCharacter.id,
+          droppedCount: droppedIncomingCount,
+          authoritativeTempHp: authoritativeTempHpPatch?.value,
+          seq: event?.seq,
+          entityRevision: event?.entityRevision,
+        });
+      }
+    }
+    const preservedTempHp = bundledTempHpPatch != null
+      ? bundledTempHpPatch
+      : Math.max(
+        0,
+        Math.floor(Number((characterRef.current as any)?.temp_hp ?? currentCharacter.temp_hp ?? 0) || 0)
+      );
     traceStateChange('STATE_CHANGE', 'PLAYER_CHARACTER_EFFECT_PATCH_COMPUTED', {
       effectCount: currentEffects.length,
       effects: currentEffects,
@@ -1296,11 +2334,14 @@ export default function CharacterSheetScreen() {
         ...prev,
         active_effects: nextEffects,
         active_effects_json: JSON.stringify(nextEffects),
-        temp_hp: nextTempHpFromEffects,
+        temp_hp: preservedTempHp,
       };
       characterRef.current = merged;
       return merged;
     });
+    if (event?.sessionId) {
+      updateSelfPublicEffectsFromLocalEffects(event.sessionId, nextEffects, preservedTempHp, event);
+    }
     debugLanFlow('PLAYER_RUNTIME_PATCH_APPLIED', {
       eventId: event?.id,
       type: event?.type,
@@ -1334,7 +2375,7 @@ export default function CharacterSheetScreen() {
     });
     await db.runAsync(
       `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
-      [JSON.stringify(nextEffects), nextTempHpFromEffects, Number(currentCharacter.id)]
+      [JSON.stringify(nextEffects), preservedTempHp, Number(currentCharacter.id)]
     );
     traceSqlite('SQLITE_WRITE_DONE', {
       screen: 'sheet',
@@ -1353,12 +2394,17 @@ export default function CharacterSheetScreen() {
       field: 'active_effects_json',
     });
 
-    setCharacter((prev: any) => prev ? ({
-      ...prev,
-      active_effects: nextEffects,
-      active_effects_json: JSON.stringify(nextEffects),
-      temp_hp: nextTempHpFromEffects,
-    }) : prev);
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = {
+        ...prev,
+        active_effects: nextEffects,
+        active_effects_json: JSON.stringify(nextEffects),
+        temp_hp: preservedTempHp,
+      };
+      characterRef.current = merged;
+      return merged;
+    });
     debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_DONE', {
       characterId: currentCharacter.id,
       characterName: currentCharacter.name,
@@ -1400,7 +2446,7 @@ export default function CharacterSheetScreen() {
       eventId: event?.id,
       durationMs: Date.now() - startedAt,
     });
-  }, [db]);
+  }, [db, getAuthoritativeTempHpPatchForEffectEvent, updateSelfPublicEffectsFromLocalEffects]);
 
   const clearLanSessionEffectsFromCharacter = useCallback(async (sessionValue: string) => {
     const currentCharacter = characterRef.current;
@@ -1451,26 +2497,485 @@ export default function CharacterSheetScreen() {
     });
   }, [db]);
 
-  const applyLanInventoryPatchToCharacter = useCallback(async (patch: LanSessionEvent['inventoryPatch']) => {
+  const applyLanInventoryPatchToCharacter = useCallback(async (patch: LanSessionEvent['inventoryPatch'], event?: LanSessionEvent) => {
     const currentCharacter = characterRef.current;
     if (!currentCharacter?.id || !patch?.equipment) return;
 
-    const nextEquipment = normalizeSheetEquipment(patch.equipment);
+    const incomingEquipment = normalizeSheetEquipment(patch.equipment);
+    const itemDelta = patch.itemDelta;
+    const rawTradeDeltas = Array.isArray((patch as any).tradeCommit?.itemDeltas)
+      ? ((patch as any).tradeCommit.itemDeltas as Array<{ mode?: string; item?: Record<string, any>; qty?: number }>).filter(Boolean)
+      : [];
+    const itemDeltas = rawTradeDeltas.length > 0
+      ? rawTradeDeltas
+      : Array.isArray((patch as any).itemDeltas)
+        ? ((patch as any).itemDeltas as Array<{ mode?: string; item?: Record<string, any>; qty?: number }>).filter(Boolean)
+        : itemDelta
+          ? [itemDelta as any]
+          : [];
+    const currentEquipment = normalizeSheetEquipment(currentCharacter.equipment);
+    const action = String(patch.action || 'replace');
+    const eventId = String(event?.id || '');
+    const isMasterAuthoritativeInventory = Boolean(
+      event?.fromKey === 'master' ||
+      event?.originClientId === 'master' ||
+      event?.fromName === 'Mestre' ||
+      event?.fromName === 'Sessao LAN'
+    );
+    const shouldTrustAuthoritativeSnapshot = Boolean(
+      isMasterAuthoritativeInventory &&
+      !eventId.startsWith('checkpoint_inventory_') &&
+      patch.equipment &&
+      ['trade_commit', 'transfer_out', 'transfer_in', 'grant', 'remove', 'consume', 'replace', 'self_update'].includes(action)
+    );
+    let nextEquipment = incomingEquipment;
+    const pendingInventory = pendingSelfInventoryStateRef.current;
+    const pendingIsRecent = Boolean(pendingInventory && Date.now() - pendingInventory.at < 15000);
+    const sourceClientMsgId = String((event as any)?.sourceClientMsgId || '');
+    const matchesPendingCommand = Boolean(
+      pendingInventory?.clientMsgId &&
+      sourceClientMsgId &&
+      sourceClientMsgId === pendingInventory.clientMsgId
+    );
+    const tradeCommit = (patch as any).tradeCommit && typeof (patch as any).tradeCommit === 'object'
+      ? (patch as any).tradeCommit
+      : null;
+    const inventoryTransactionId = action === 'trade_commit'
+      ? [
+          event?.sessionId || lanInfo?.sessionId || '',
+          tradeCommit?.targetKey || patch.targetKey || '',
+          // v84: tradeId pode ser reaproveitado pela UI entre os mesmos jogadores.
+          // Use commitId quando o host fornecer; se não existir, use o event.id para
+          // permitir várias trocas em sequência sem o dedupe bloquear a segunda.
+          tradeCommit?.commitId || event?.id || event?.sourceClientMsgId || event?.clientMsgId || tradeCommit?.tradeId || '',
+        ].filter(Boolean).join(':')
+      : '';
+    if (inventoryTransactionId && appliedInventoryTransactionIdsRef.current.has(inventoryTransactionId)) {
+      debugLanFlow('PLAYER_INVENTORY_TRANSACTION_DUPLICATE_SKIPPED', {
+        eventId: event?.id,
+        sourceClientMsgId,
+        action,
+        transactionId: inventoryTransactionId,
+        tradeId: tradeCommit?.tradeId,
+        targetKey: tradeCommit?.targetKey || patch.targetKey,
+      });
+      return;
+    }
+    const actionUsesAuthoritativeDeltas = Boolean(
+      shouldTrustAuthoritativeSnapshot &&
+      itemDeltas.length > 0 &&
+      ['transfer_in', 'grant'].includes(action)
+    );
+    const actionUsesTradeCommitReconciliation = Boolean(
+      shouldTrustAuthoritativeSnapshot &&
+      action === 'trade_commit' &&
+      itemDeltas.length > 0
+    );
+    const actionUsesSafeRemovalResolution = Boolean(
+      shouldTrustAuthoritativeSnapshot &&
+      itemDeltas.length > 0 &&
+      ['transfer_out', 'remove', 'consume'].includes(action)
+    );
 
-    // Multiplayer: inventario recebido do host deve aparecer na UI imediatamente.
+    // v71: inventory_patch com itemDeltas deve ser tratado como transacao.
+    // O log mostrou transfer_in com delta correto, mas snapshot/equipment sem o item novo;
+    // por isso doacao/envio falhava. Para add/trade_commit nao dependemos mais do snapshot.
+    if (actionUsesTradeCommitReconciliation) {
+      // v81: trade_commit é sempre determinístico por itemDeltas.
+      // Não use snapshot para decidir a troca, porque com 5+ jogadores/snapshots
+      // simultâneos ele pode estar correto para um lado e stale para o outro.
+      nextEquipment = repairTradeCommitEquipmentFromDeltas(currentEquipment, incomingEquipment, itemDeltas);
+      debugLanFlow('PLAYER_TRADE_COMMIT_APPLIED_FROM_AUTHORITATIVE_DELTAS', {
+        eventId: event?.id,
+        sourceClientMsgId,
+        action,
+        targetKey: (patch as any).tradeCommit?.targetKey || patch.targetKey,
+        deltaCount: itemDeltas.length,
+        incomingSnapshotQty: itemDeltas.map((delta: any) => ({
+          mode: delta?.mode,
+          name: delta?.item?.name,
+          qty: getSheetInventoryItemQtyFromEquipment(incomingEquipment, delta?.item),
+        })),
+        finalQty: itemDeltas.map((delta: any) => ({
+          mode: delta?.mode,
+          name: delta?.item?.name,
+          qty: getSheetInventoryItemQtyFromEquipment(nextEquipment, delta?.item),
+        })),
+      });
+    } else if (actionUsesAuthoritativeDeltas) {
+      nextEquipment = resolveSheetInventoryPatchEquipment(currentEquipment, incomingEquipment, itemDeltas);
+      debugLanFlow('PLAYER_INVENTORY_PATCH_APPLIED_FROM_AUTHORITATIVE_DELTAS', {
+        eventId: event?.id,
+        sourceClientMsgId,
+        action,
+        targetKey: (patch as any).tradeCommit?.targetKey || patch.targetKey,
+        deltaCount: itemDeltas.length,
+        itemDeltas: itemDeltas.map((delta: any) => ({
+          mode: delta?.mode,
+          name: delta?.item?.name,
+          qty: delta?.qty || delta?.item?.qty || 1,
+          stackKey: delta?.stackKey || delta?.item?.stackKey,
+        })),
+      });
+    } else if (actionUsesSafeRemovalResolution) {
+      // Para saidas/consumo, pode existir remocao otimista local. Se esse patch
+      // for o ACK da propria acao, nao reaplicamos o delta para nao subtrair 2x.
+      nextEquipment = matchesPendingCommand && pendingInventory?.equipment
+        ? normalizeSheetEquipment(pendingInventory.equipment)
+        : itemDeltas.reduce((equipment, delta) => (
+            applySheetInventoryDeltaToEquipment(equipment, delta)
+          ), currentEquipment);
+      if (matchesPendingCommand) {
+        debugLanFlow('PLAYER_INVENTORY_PATCH_MATCHED_PENDING_REMOVAL_NO_DOUBLE_APPLY', {
+          eventId: event?.id,
+          sourceClientMsgId,
+          action,
+          deltaCount: itemDeltas.length,
+        });
+      }
+    } else if (shouldTrustAuthoritativeSnapshot) {
+      nextEquipment = incomingEquipment;
+    } else if (itemDeltas.length > 0) {
+      nextEquipment = itemDeltas.reduce((equipment, delta) => (
+        applySheetInventoryDeltaToEquipment(equipment, delta)
+      ), currentEquipment);
+    } else if (String(patch.action || '') === 'grant' && itemDelta?.mode === 'add' && itemDelta.item && typeof itemDelta.item === 'object') {
+      const deltaItem = itemDelta.item as Record<string, any>;
+      const deltaQty = Math.max(1, Math.floor(Number(itemDelta.qty) || 1));
+      nextEquipment = {
+        ...currentEquipment,
+        bag: mergeSheetInventoryItemIntoBag(currentEquipment.bag, deltaItem, deltaQty),
+      };
+    } else if ((String(patch.action || '') === 'remove' || itemDelta?.mode === 'remove') && itemDelta?.item && typeof itemDelta.item === 'object') {
+      const deltaItem = itemDelta.item as Record<string, any>;
+      const deltaQty = Math.max(1, Math.floor(Number(itemDelta.qty) || 1));
+      nextEquipment = removeSheetInventoryItemFromEquipment(currentEquipment, deltaItem, deltaQty);
+    }
+
+    const pendingJson = pendingInventory ? JSON.stringify(normalizeSheetEquipment(pendingInventory.equipment)) : '';
+    const incomingJson = JSON.stringify(nextEquipment);
+
+    if (
+      pendingIsRecent &&
+      !matchesPendingCommand &&
+      !shouldTrustAuthoritativeSnapshot &&
+      pendingJson &&
+      pendingJson !== incomingJson &&
+      (eventId.startsWith('checkpoint_inventory_') || action === 'replace' || action === 'self_update')
+    ) {
+      debugLanFlow('PLAYER_IGNORED_STALE_INVENTORY_ECHO', {
+        eventId: event?.id,
+        action,
+        sourceClientMsgId,
+        pendingClientMsgId: pendingInventory?.clientMsgId,
+        reason: patch.reason,
+      });
+      return;
+    }
+
+    if (matchesPendingCommand || (pendingIsRecent && pendingJson === incomingJson)) {
+      pendingSelfInventoryStateRef.current = null;
+    }
+
+    const rawStatsPatch = event?.statsPatch && typeof event.statsPatch === 'object'
+      ? event.statsPatch as Record<string, any>
+      : null;
+    const nextStatsPatch = buildSheetStatsWithDerivedEquipMods(
+      rawStatsPatch ? { ...(currentCharacter.stats || {}), ...rawStatsPatch } : currentCharacter.stats,
+      nextEquipment,
+    );
+    const previousBaseCon = Math.floor(Number(currentCharacter.stats?.CON || 10)) || 10;
+    const nextBaseCon = Math.floor(Number(nextStatsPatch?.CON || previousBaseCon)) || previousBaseCon;
+    const baseConHpDelta = (Math.floor((nextBaseCon - 10) / 2) - Math.floor((previousBaseCon - 10) / 2)) * Math.max(1, Number(currentCharacter.level || 1));
+    const nextHpMaxFromBaseCon = baseConHpDelta ? Math.max(1, Number(currentCharacter.hp_max || 0) + baseConHpDelta) : Number(currentCharacter.hp_max || 0);
+    const nextHpCurrentFromBaseCon = baseConHpDelta ? Math.max(0, Number(currentCharacter.hp_current || 0) + baseConHpDelta) : Number(currentCharacter.hp_current || 0);
+
+    // Multiplayer: inventario/atributos recebidos do host devem aparecer na UI imediatamente.
     // SQLite e persistencia local nao podem bloquear a sensacao de tempo real.
     setCharacter((prev: any) => {
       if (!prev) return prev;
-      const merged = { ...prev, equipment: nextEquipment };
+      const merged = { ...prev, equipment: nextEquipment, stats: nextStatsPatch, hp_max: nextHpMaxFromBaseCon, hp_current: nextHpCurrentFromBaseCon };
       characterRef.current = merged;
       return merged;
     });
 
-    await db.runAsync(
-      `UPDATE characters SET equipment = ? WHERE id = ?`,
-      [JSON.stringify(nextEquipment), Number(currentCharacter.id)]
+    if (inventoryTransactionId) {
+      appliedInventoryTransactionIdsRef.current.add(inventoryTransactionId);
+      debugLanFlow('PLAYER_INVENTORY_TRANSACTION_MARKED_APPLIED', {
+        eventId: event?.id,
+        action,
+        transactionId: inventoryTransactionId,
+        tradeId: tradeCommit?.tradeId,
+      });
+    }
+
+    const persistCharacterId = Number(currentCharacter.id);
+    const persistEquipment = normalizeSheetEquipment(nextEquipment);
+    const persistStats = nextStatsPatch;
+    const persistHpMax = nextHpMaxFromBaseCon;
+    const persistHpCurrent = nextHpCurrentFromBaseCon;
+    const persistEventId = event?.id;
+    inventoryPersistenceQueueRef.current = inventoryPersistenceQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        await db.runAsync(
+          `UPDATE characters SET equipment = ?, stats = ?, hp_max = ?, hp_current = ? WHERE id = ?`,
+          [JSON.stringify(persistEquipment), JSON.stringify(persistStats), persistHpMax, persistHpCurrent, persistCharacterId]
+        );
+        await syncCharacterInventoryForEquipment(db, persistCharacterId, persistEquipment).catch(() => undefined);
+        debugLanFlow('PLAYER_INVENTORY_PATCH_PERSISTED_ASYNC', {
+          eventId: persistEventId,
+          action,
+          characterId: persistCharacterId,
+        });
+      })
+      .catch((error) => {
+        debugLanFlow('PLAYER_INVENTORY_PATCH_PERSIST_ASYNC_FAILED', {
+          eventId: persistEventId,
+          action,
+          characterId: persistCharacterId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [db, lanInfo?.sessionId]);
+
+  const applyAuthoritativeSelfInventoryFromPayload = useCallback((
+    nextPayload: LanSessionPayload | null | undefined,
+    sessionValue: string,
+    source: string,
+  ) => {
+    const currentCharacter = characterRef.current;
+    if (!currentCharacter?.id || !nextPayload?.state?.players?.length || !sessionValue) return;
+
+    const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
+    const officialSelf: any = findSelfLanPlayerInPayload(nextPayload, sessionValue, currentCharacter);
+    if (!officialSelf?.equipment) return;
+
+    const officialEquipment = normalizeSheetEquipment(officialSelf.equipment);
+    const currentEquipment = normalizeSheetEquipment(currentCharacter.equipment);
+    const officialFingerprint = JSON.stringify(officialEquipment);
+    const currentFingerprint = JSON.stringify(currentEquipment);
+    if (!officialFingerprint || officialFingerprint === currentFingerprint) return;
+
+    const revision = Math.max(
+      0,
+      Math.floor(Number(officialSelf.revisionSeq ?? officialSelf.revision_seq ?? officialSelf.revision ?? 0)) || 0
     );
+    const cacheKey = `${sessionValue}:${selfKey}`;
+    const last = lastAuthoritativeSnapshotInventoryRef.current[cacheKey];
+    if (last && revision > 0 && revision < last.revision) {
+      debugLanFlow('PLAYER_SNAPSHOT_INVENTORY_RECONCILE_SKIPPED_OLDER_REVISION', {
+        sessionId: sessionValue,
+        selfKey,
+        source,
+        revision,
+        lastRevision: last.revision,
+      });
+      return;
+    }
+    if (last && revision === last.revision && last.fingerprint === officialFingerprint) return;
+
+    const nextStatsPatch = buildSheetStatsWithDerivedEquipMods(currentCharacter.stats, officialEquipment);
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = { ...prev, equipment: officialEquipment, stats: nextStatsPatch };
+      characterRef.current = merged;
+      return merged;
+    });
+
+    lastAuthoritativeSnapshotInventoryRef.current[cacheKey] = {
+      revision: Math.max(revision, last?.revision || 0),
+      fingerprint: officialFingerprint,
+      at: Date.now(),
+    };
+
+    const persistCharacterId = Number(currentCharacter.id);
+    inventoryPersistenceQueueRef.current = inventoryPersistenceQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        await db.runAsync(
+          `UPDATE characters SET equipment = ?, stats = ? WHERE id = ?`,
+          [JSON.stringify(officialEquipment), JSON.stringify(nextStatsPatch), persistCharacterId]
+        );
+        await syncCharacterInventoryForEquipment(db, persistCharacterId, officialEquipment).catch(() => undefined);
+        debugLanFlow('PLAYER_SNAPSHOT_INVENTORY_RECONCILED_FROM_HOST', {
+          sessionId: sessionValue,
+          selfKey,
+          source,
+          revision,
+          characterId: persistCharacterId,
+          bagCount: officialEquipment.bag.length,
+        });
+      })
+      .catch((error) => {
+        debugLanFlow('PLAYER_SNAPSHOT_INVENTORY_RECONCILE_PERSIST_FAILED', {
+          sessionId: sessionValue,
+          selfKey,
+          source,
+          revision,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
   }, [db]);
+
+
+  const applyAuthoritativeSelfStateFromPayload = useCallback((
+    nextPayload: LanSessionPayload | null | undefined,
+    sessionValue: string,
+    source: string,
+    options?: { force?: boolean },
+  ) => {
+    const currentCharacter = characterRef.current;
+    if (!currentCharacter?.id || !nextPayload?.state?.players?.length || !sessionValue) return;
+
+    const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
+    const officialSelf: any = findSelfLanPlayerInPayload(nextPayload, sessionValue, currentCharacter);
+    if (!officialSelf) return;
+
+    const revision = Math.max(
+      0,
+      Math.floor(Number(officialSelf.revisionSeq ?? officialSelf.revision_seq ?? officialSelf.revision ?? 0)) || 0,
+    );
+    const cacheKey = `${sessionValue}:${selfKey}`;
+    const lastSnapshot = lastAuthoritativeSnapshotPlayerRef.current[cacheKey];
+    const lastPatch = lastAuthoritativePlayerPatchRef.current;
+
+    if (!options?.force && revision > 0 && lastPatch.entityRevision > 0 && revision < lastPatch.entityRevision) {
+      debugLanFlow('PLAYER_SNAPSHOT_STATE_RECONCILE_SKIPPED_OLDER_REVISION', {
+        sessionId: sessionValue,
+        selfKey,
+        source,
+        revision,
+        lastPatchRevision: lastPatch.entityRevision,
+      });
+      return;
+    }
+
+    const localLevel = Math.max(1, Math.floor(Number((currentCharacter as any).level || 1) || 1));
+    const localHpMax = Math.max(0, Math.floor(Number((currentCharacter as any).hp_max || (currentCharacter as any).hpMax || 0) || 0));
+    const officialLevel = Math.max(1, Math.floor(Number(officialSelf.level || 1) || 1));
+    const officialHpMax = Math.max(0, Math.floor(Number(officialSelf.hpMax || officialSelf.hp_max || 0) || 0));
+    if ((localLevel > officialLevel || localHpMax > officialHpMax) && /payload|snapshot|resync/i.test(String(source || ''))) {
+      debugLanFlow('PLAYER_SNAPSHOT_STATE_RECONCILE_SKIPPED_OLDER_LEVELUP_V90', {
+        sessionId: sessionValue,
+        selfKey,
+        source,
+        force: Boolean(options?.force),
+        localLevel,
+        officialLevel,
+        localHpMax,
+        officialHpMax,
+        revision,
+      });
+      return;
+    }
+
+    const officialEffects = Array.isArray(officialSelf.effects) ? officialSelf.effects : [];
+    const nextValues = {
+      hp_current: Math.max(0, Math.floor(Number(officialSelf.hpCurrent ?? currentCharacter.hp_current ?? 0) || 0)),
+      hp_max: Math.max(0, Math.floor(Number(officialSelf.hpMax ?? currentCharacter.hp_max ?? 0) || 0)),
+      temp_hp: Math.max(0, Math.floor(Number(officialSelf.tempHp ?? currentCharacter.temp_hp ?? 0) || 0)),
+      xp: Math.max(0, Math.floor(Number(officialSelf.xp ?? currentCharacter.xp ?? 0) || 0)),
+      gp: Math.max(0, Math.floor(Number(officialSelf.gp ?? currentCharacter.gp ?? 0) || 0)),
+      sp: Math.max(0, Math.floor(Number(officialSelf.sp ?? currentCharacter.sp ?? 0) || 0)),
+      cp: Math.max(0, Math.floor(Number(officialSelf.cp ?? currentCharacter.cp ?? 0) || 0)),
+    };
+    const nextEffectsJson = JSON.stringify(officialEffects);
+    const fingerprint = JSON.stringify({ nextValues, effects: officialEffects });
+
+    if (lastSnapshot && lastSnapshot.revision === revision && lastSnapshot.fingerprint === fingerprint) {
+      return;
+    }
+
+    const pseudoEvent: LanSessionEvent = {
+      id: `payload_state_${sessionValue}_${revision || Date.now()}`,
+      sessionId: sessionValue,
+      type: 'player_patch',
+      fromKey: 'master',
+      toKey: selfKey,
+      entityType: 'player',
+      entityId: selfKey,
+      entityRevision: revision,
+      seq: revision || Date.now(),
+      serverSeq: revision || Date.now(),
+      numberPatch: {
+        hpCurrent: nextValues.hp_current,
+        hpMax: nextValues.hp_max,
+        tempHp: nextValues.temp_hp,
+        xp: nextValues.xp,
+        gp: nextValues.gp,
+        sp: nextValues.sp,
+        cp: nextValues.cp,
+      },
+      message: 'Reconciliacao autoritativa por payload.',
+      createdAt: new Date().toISOString(),
+    } as LanSessionEvent;
+
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = {
+        ...prev,
+        ...nextValues,
+        active_effects: officialEffects,
+        active_effects_json: nextEffectsJson,
+      };
+      characterRef.current = merged;
+      return merged;
+    });
+
+    updateSelfLanBarFromAuthoritativePatch(sessionValue, nextValues, pseudoEvent, { publicEffects: officialEffects });
+
+    lastAuthoritativeSnapshotPlayerRef.current[cacheKey] = {
+      revision,
+      fingerprint,
+      at: Date.now(),
+    };
+    if (revision > 0) {
+      lastAuthoritativePlayerPatchRef.current = {
+        seq: Math.max(lastAuthoritativePlayerPatchRef.current.seq, Number(pseudoEvent.seq || 0)),
+        entityRevision: Math.max(lastAuthoritativePlayerPatchRef.current.entityRevision, revision),
+        appliedAt: Date.now(),
+      };
+    }
+
+    void db.runAsync(
+      `UPDATE characters
+       SET hp_current = ?, hp_max = ?, temp_hp = ?, xp = ?, gp = ?, sp = ?, cp = ?, active_effects_json = ?
+       WHERE id = ?`,
+      [
+        nextValues.hp_current,
+        nextValues.hp_max,
+        nextValues.temp_hp,
+        nextValues.xp,
+        nextValues.gp,
+        nextValues.sp,
+        nextValues.cp,
+        nextEffectsJson,
+        Number(currentCharacter.id),
+      ],
+    ).catch((error) => {
+      debugLanFlow('PLAYER_SNAPSHOT_STATE_RECONCILE_PERSIST_FAILED', {
+        sessionId: sessionValue,
+        selfKey,
+        source,
+        revision,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    debugLanFlow('PLAYER_SNAPSHOT_STATE_RECONCILED_FROM_HOST', {
+      sessionId: sessionValue,
+      selfKey,
+      source,
+      force: Boolean(options?.force),
+      revision,
+      hpCurrent: nextValues.hp_current,
+      hpMax: nextValues.hp_max,
+      tempHp: nextValues.temp_hp,
+      xp: nextValues.xp,
+      effectCount: officialEffects.length,
+    });
+  }, [db, updateSelfLanBarFromAuthoritativePatch]);
 
   const terminateLanSessionFromMaster = useCallback(async (
     sessionValue: string,
@@ -1684,7 +3189,7 @@ export default function CharacterSheetScreen() {
 
       if (nextPayload.state?.status === 'paused') {
         setLanSessionStatus('paused');
-        setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+        mergeLanPlayersFromPayloadCache(nextPayload, selfKey, 'payload_cache');
         debugLanFlow('PLAYER_STOP_LIVE_SYNC_WHILE_PAUSED', {
           source: 'syncLanFromHost',
           sessionId: nextInfo.sessionId,
@@ -1698,11 +3203,7 @@ export default function CharacterSheetScreen() {
         return;
       }
 
-      const officialSelf = nextPayload.state?.players?.find((player) => (
-        player.remoteKey === selfKey ||
-        player.sourceCharacterId === Number(character.id) ||
-        player.characterName === character.name
-      ));
+      const officialSelf = findSelfLanPlayerInPayload(nextPayload, nextInfo.sessionId, character);
 
       // v34: subir de nivel é autonomia do jogador. O snapshot do mestre pode estar
       // atrasado por alguns segundos; isso não deve abrir solicitação/revisão para o mestre.
@@ -1715,7 +3216,23 @@ export default function CharacterSheetScreen() {
       }
 
       setLanSessionStatus(nextPayload.state?.status || null);
-      setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+      const lastLivePatchAgeMs = lastAuthoritativePlayerPatchRef.current.appliedAt
+        ? Date.now() - lastAuthoritativePlayerPatchRef.current.appliedAt
+        : Number.POSITIVE_INFINITY;
+      const allowPayloadNumberReconcile = lastLivePatchAgeMs > 12000;
+      mergeLanPlayersFromPayloadCache(nextPayload, selfKey, 'payload_cache_foreground_recovery', { forceNumbers: allowPayloadNumberReconcile });
+      if (allowPayloadNumberReconcile) {
+        applyAuthoritativeSelfStateFromPayload(nextPayload, nextInfo.sessionId, 'syncLanFromHost', { force: true });
+      } else {
+        debugLanFlow('PLAYER_PAYLOAD_NUMBER_RECONCILE_SKIPPED_RECENT_LIVE_PATCH_V92', {
+          sessionId: nextInfo.sessionId,
+          selfKey,
+          source: 'syncLanFromHost',
+          lastLivePatchAgeMs,
+        });
+      }
+      syncSelfLanRosterFromCharacter(nextInfo.sessionId, 'syncLanFromHost_after_payload');
+      applyAuthoritativeSelfInventoryFromPayload(nextPayload, nextInfo.sessionId, 'syncLanFromHost');
 
       await markLanConnectionStatus(db, {
         sessionId: nextInfo.sessionId,
@@ -1763,7 +3280,7 @@ export default function CharacterSheetScreen() {
         durationMs: Date.now() - startedAt,
       });
     }
-  }, [db, lanInfo, character?.id, character?.name, character?.level, character?.xp, fetchLanPayloadWithRecovery, notifyMasterReconnect, terminateLanSessionFromMaster]);
+  }, [db, lanInfo, character?.id, character?.name, character?.level, character?.xp, fetchLanPayloadWithRecovery, notifyMasterReconnect, terminateLanSessionFromMaster, applyAuthoritativeSelfInventoryFromPayload, applyAuthoritativeSelfStateFromPayload, syncSelfLanRosterFromCharacter]);
 
   useLanRealtimePlayerPatches({
     enabled: Boolean(
@@ -1780,6 +3297,29 @@ export default function CharacterSheetScreen() {
     characterName: character?.name,
     paused: lanSessionStatus === 'paused',
     reconnectEpoch: lanReconnectEpoch,
+    onPayloadUpdate: (payload, reason) => {
+      if (!payload || !lanInfo?.sessionId || !character) return;
+      const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+      setLanSessionStatus(payload.state?.status || null);
+      const forcePayloadReconcile = String(reason || '').includes('resync') || String(reason || '').includes('foreground') || String(reason || '').includes('recovery');
+      const lastLivePatchAgeMs = lastAuthoritativePlayerPatchRef.current.appliedAt
+        ? Date.now() - lastAuthoritativePlayerPatchRef.current.appliedAt
+        : Number.POSITIVE_INFINITY;
+      const allowPayloadNumberReconcile = forcePayloadReconcile && lastLivePatchAgeMs > 12000;
+      mergeLanPlayersFromPayloadCache(payload, selfKey, `live_payload_${reason || 'update'}`, { forceNumbers: allowPayloadNumberReconcile });
+      if (allowPayloadNumberReconcile) {
+        applyAuthoritativeSelfStateFromPayload(payload, lanInfo.sessionId, `live_payload_${reason || 'update'}`, { force: true });
+      } else if (forcePayloadReconcile) {
+        debugLanFlow('PLAYER_LIVE_PAYLOAD_NUMBER_RECONCILE_SKIPPED_RECENT_LIVE_PATCH_V92', {
+          sessionId: lanInfo.sessionId,
+          selfKey,
+          reason,
+          lastLivePatchAgeMs,
+        });
+      }
+      syncSelfLanRosterFromCharacter(lanInfo.sessionId, `live_payload_${reason || 'update'}_after_payload`);
+      applyAuthoritativeSelfInventoryFromPayload(payload, lanInfo.sessionId, `live_payload_${reason || 'update'}`);
+    },
     onNumberPatch: async (patch, event) => {
       traceFunctionCall('useLanRealtimePlayerPatches.onNumberPatch', { patch, event }, {
         screen: 'sheet',
@@ -1816,15 +3356,16 @@ export default function CharacterSheetScreen() {
           };
           updateSelfLanBarFromAuthoritativePatch(lanInfo.sessionId, nextValues, event);
         }
-        // Persistencia de evento/aplicacao roda depois da UI. Nao segure o socket.
-        await rememberLanSessionEvent(db, event).catch(() => false);
-        await markLanEventsApplied(db, {
+        // v82: persistência de evento/aplicação roda depois da UI e nunca segura
+        // a fila viva. Com 5-20 jogadores, ACK/SQLite não pode atrasar HP/troca.
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        void markLanEventsApplied(db, {
           sessionId: lanInfo.sessionId,
           deviceId: selfKey,
           role: 'player',
           playerKey: selfKey,
           events: [event],
-        });
+        }).catch(() => undefined);
       }
     },
     onEffectPatch: async (patch, event) => {
@@ -1855,7 +3396,7 @@ export default function CharacterSheetScreen() {
         patch: effectPatch,
       });
       await applyLanEffectPatchToCharacter(effectPatch, event);
-      await rememberLanSessionEvent(db, event).catch(() => false);
+      void rememberLanSessionEvent(db, event).catch(() => false);
       debugLanFlow('PLAYER_EFFECT_PATCH_APPLIED', {
         eventId: event.id,
         seq: event.seq,
@@ -1866,13 +3407,13 @@ export default function CharacterSheetScreen() {
       });
       if (lanInfo?.sessionId && character) {
         const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
-        await markLanEventsApplied(db, {
+        void markLanEventsApplied(db, {
           sessionId: lanInfo.sessionId,
           deviceId: selfKey,
           role: 'player',
           playerKey: selfKey,
           events: [event],
-        });
+        }).catch(() => undefined);
       }
     },
     onInventoryPatch: async (patch, event) => {
@@ -1885,9 +3426,8 @@ export default function CharacterSheetScreen() {
         targetKey: patch.targetKey,
         reason: patch.reason,
       });
-      await applyLanInventoryPatchToCharacter(patch);
+      await applyLanInventoryPatchToCharacter(patch, event);
       pendingOutgoingItemSendsRef.current.clear();
-      await rememberLanSessionEvent(db, event).catch(() => false);
       debugLanFlow(
         patch.action === 'grant' ? 'PLAYER_GRANTED_ITEM_APPLIED' : 'PLAYER_INVENTORY_PATCH_APPLIED',
         {
@@ -1898,16 +3438,49 @@ export default function CharacterSheetScreen() {
           reason: patch.reason,
         }
       );
+
+      // v82: persistência do log/aplicado não pode segurar a fila viva de inventory_patch.
+      // Em troca repetida, a UI já foi atualizada por applyLanInventoryPatchToCharacter.
+      // SQLite/histórico rodam em background; duplicidade é bloqueada por id/evento/transação.
+      void rememberLanSessionEvent(db, event).catch(() => false);
       if (lanInfo?.sessionId && character) {
         const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
-        await markLanEventsApplied(db, {
+        void markLanEventsApplied(db, {
           sessionId: lanInfo.sessionId,
           deviceId: selfKey,
           role: 'player',
           playerKey: selfKey,
           events: [event],
-        });
+        }).catch(() => undefined);
       }
+    },
+    onStatsPatch: async (statsPatch, event) => {
+      if (!character?.id || !lanInfo?.sessionId) return;
+      debugLanFlow('PLAYER_STATS_PATCH_APPLY_DIRECT', {
+        eventId: event.id,
+        seq: event.seq,
+        entityRevision: event.entityRevision,
+        patch: statsPatch,
+      });
+      setCharacter((prev: any) => {
+        if (!prev) return prev;
+        const merged = { ...prev, stats: statsPatch };
+        characterRef.current = merged;
+        return merged;
+      });
+      void updateDB(
+        { stats: statsPatch },
+        { allowLanAuthoritativeCache: true, reason: 'lan_authoritative_stats_patch_direct' }
+      );
+      await rememberLanSessionEvent(db, event).catch(() => false);
+      const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+      await markLanEventsApplied(db, {
+        sessionId: lanInfo.sessionId,
+        deviceId: selfKey,
+        role: 'player',
+        playerKey: selfKey,
+        events: [event],
+      }).catch(() => undefined);
     },
     onEvent: async (event) => {
       if (!lanInfo?.sessionId) return;
@@ -1917,8 +3490,21 @@ export default function CharacterSheetScreen() {
       if (!character || !lanInfo?.sessionId) return;
       const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
       const sessionEventKey = String(event.id || `${event.type}:${event.sessionId}:${event.entityRevision || event.seq || event.createdAt || ''}`);
-      if (handledSessionEventIdsRef.current.has(sessionEventKey)) {
+      const globalSessionKey = `${lanInfo.sessionId}:${sessionEventKey}`;
+      if (GLOBAL_SESSION_PATCH_EVENT_KEYS.has(globalSessionKey) || handledSessionEventIdsRef.current.has(sessionEventKey)) {
+        debugLanFlow('PLAYER_SESSION_PATCH_DUPLICATE_GLOBAL_SKIPPED', {
+          eventId: event.id,
+          sessionId: lanInfo.sessionId,
+          eventType: event.type,
+          status: event.sessionPatch?.status,
+        });
         return;
+      }
+      GLOBAL_SESSION_PATCH_EVENT_KEYS.add(globalSessionKey);
+      if (GLOBAL_SESSION_PATCH_EVENT_KEYS.size > 250) {
+        const keep = Array.from(GLOBAL_SESSION_PATCH_EVENT_KEYS).slice(-120);
+        GLOBAL_SESSION_PATCH_EVENT_KEYS.clear();
+        keep.forEach((key) => GLOBAL_SESSION_PATCH_EVENT_KEYS.add(key));
       }
       handledSessionEventIdsRef.current.add(sessionEventKey);
       if (handledSessionEventIdsRef.current.size > 100) {
@@ -2011,9 +3597,15 @@ export default function CharacterSheetScreen() {
               sessionId: lanInfo.sessionId,
               selfKey,
             });
-            const pausedAlertKey = `${lanInfo.sessionId}:paused`;
-            if (lastPausedAlertKeyRef.current !== pausedAlertKey) {
+            const pausedAlertKey = `${lanInfo.sessionId}:paused:${event.id || event.entityRevision || ''}`;
+            if (lastPausedAlertKeyRef.current !== pausedAlertKey && !GLOBAL_SESSION_PAUSE_ALERT_KEYS.has(pausedAlertKey)) {
               lastPausedAlertKeyRef.current = pausedAlertKey;
+              GLOBAL_SESSION_PAUSE_ALERT_KEYS.add(pausedAlertKey);
+              if (GLOBAL_SESSION_PAUSE_ALERT_KEYS.size > 80) {
+                const keep = Array.from(GLOBAL_SESSION_PAUSE_ALERT_KEYS).slice(-40);
+                GLOBAL_SESSION_PAUSE_ALERT_KEYS.clear();
+                keep.forEach((key) => GLOBAL_SESSION_PAUSE_ALERT_KEYS.add(key));
+              }
               debugLanFlow('PLAYER_SHOW_PAUSED_SESSION_ALERT', {
                 eventId: event.id,
                 sessionId: lanInfo.sessionId,
@@ -2142,72 +3734,79 @@ export default function CharacterSheetScreen() {
     },
     onHostUnreachable: async (reason: string) => {
       if (!character || !lanInfo?.sessionId) return;
-      const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
-      if (lanSessionStatus === 'paused') {
-        await markLanConnectionStatus(db, {
-          sessionId: lanInfo.sessionId,
-          deviceId: selfKey,
-          role: 'player',
-          playerKey: selfKey,
-          status: 'offline',
-        }).catch(() => {});
-        debugLanFlow('PLAYER_STOP_LIVE_SYNC_WHILE_PAUSED', {
-          screen: 'sheet',
-          source: 'useLanRealtimePlayerPatches.onHostUnreachable',
-          sessionId: lanInfo.sessionId,
-          characterId: character.id,
-          characterName: character.name,
-          playerKey: selfKey,
-          reason,
-        });
-        debugLanFlow('PLAYER_KEEP_BINDING_AFTER_PAUSE', {
-          screen: 'sheet',
-          source: 'useLanRealtimePlayerPatches.onHostUnreachable',
-          sessionId: lanInfo.sessionId,
-          characterId: character.id,
-          characterName: character.name,
-          playerKey: selfKey,
-          reason,
-        });
-        return;
-      }
-      traceApp('LAN_JOIN', 'PLAYER_SESSION_ENDED_CLEANUP_START', {
-        screen: 'sheet',
-        source: 'useLanRealtimePlayerPatches.onHostUnreachable',
-        sessionId: lanInfo.sessionId,
-        characterId: character.id,
-        characterName: character.name,
-        playerKey: selfKey,
-        reason,
-      });
-      sessionTerminatedRef.current = lanInfo.sessionId;
+      const currentSessionId = lanInfo.sessionId;
+      const selfKey = makeLanCharacterKey(currentSessionId, character);
+      const localLanInfo = await getLocalLanSessionForCharacter(db, Number(character.id)).catch(() => null);
+      const sessionIsPausedLocally = await isLanSessionLocallyPaused(
+        currentSessionId,
+        localLanInfo?.sessionId === currentSessionId ? localLanInfo?.payloadJson : null
+      );
+
+      // Regra v70:
+      // host inalcançável NÃO significa fim de sessão. O mestre pode só ter aberto
+      // outro app, a tela pode ter apagado por alguns segundos, ou o Android pode
+      // suspender temporariamente o socket TCP. Portanto, não desvincule a ficha
+      // automaticamente por ENETUNREACH/timeout. Desvincular só é permitido quando
+      // vier evento explícito de session_ended, player_kicked ou ação manual.
+      resetLanClientConnection();
       await markLanConnectionStatus(db, {
-        sessionId: lanInfo.sessionId,
+        sessionId: currentSessionId,
         deviceId: selfKey,
         role: 'player',
         playerKey: selfKey,
-        status: 'offline',
+        status: 'reconnecting',
       }).catch(() => {});
-      useLanRealtimeStore.getState().resetSession();
-      resetLanClientConnection();
-      setLanInfo(null);
-      setLanSessionStatus(null);
-      setLanPlayers([]);
-      setIncomingTrades([]);
-      traceApp('LAN_JOIN', 'PLAYER_SESSION_ENDED_CLEANUP_DONE', {
+
+      traceApp('LAN_JOIN', sessionIsPausedLocally ? 'PLAYER_KEEP_BINDING_AFTER_PAUSED_HOST_UNREACHABLE' : 'PLAYER_KEEP_BINDING_AFTER_TRANSIENT_HOST_UNREACHABLE', {
         screen: 'sheet',
         source: 'useLanRealtimePlayerPatches.onHostUnreachable',
-        sessionId: lanInfo.sessionId,
+        sessionId: currentSessionId,
         characterId: character.id,
         characterName: character.name,
         playerKey: selfKey,
         reason,
       });
-      showCustomAlert(
-        'Mestre desconectado',
-        'Nao consegui reconectar ao mestre. A sessao pode ter sido encerrada.',
-        [{ text: 'OK', color: appColors.primary, onPress: () => router.replace(`/sheet?id=${character.id}` as any) }]
-      );
+      debugLanFlow(sessionIsPausedLocally ? 'PLAYER_STOP_LIVE_SYNC_WHILE_PAUSED' : 'PLAYER_HOST_TEMPORARILY_UNREACHABLE_KEEP_BINDING', {
+        screen: 'sheet',
+        source: 'useLanRealtimePlayerPatches.onHostUnreachable',
+        sessionId: currentSessionId,
+        characterId: character.id,
+        characterName: character.name,
+        playerKey: selfKey,
+        reason,
+      });
+      debugLanFlow(sessionIsPausedLocally ? 'PLAYER_KEEP_BINDING_AFTER_PAUSE' : 'PLAYER_WAIT_MASTER_RECONNECT_KEEP_BINDING', {
+        screen: 'sheet',
+        source: 'useLanRealtimePlayerPatches.onHostUnreachable',
+        sessionId: currentSessionId,
+        characterId: character.id,
+        characterName: character.name,
+        playerKey: selfKey,
+        reason,
+      });
+
+      if (sessionIsPausedLocally) {
+        setLanSessionStatus('paused');
+        lanSessionStatusRef.current = 'paused';
+      } else {
+        // Mantenha status active para o hook continuar tentando reconectar.
+        // Não marque como ended e não apague lanInfo/binding.
+        setLanSessionStatus((current) => current || 'active');
+        if (!lanSessionStatusRef.current) lanSessionStatusRef.current = 'active';
+      }
+
+      const now = Date.now();
+      const lastAlert = lastHostUnavailableAlertKeyRef.current;
+      const shouldShowAlert = lastAlert.sessionId !== currentSessionId || now - lastAlert.at > 60_000;
+      if (shouldShowAlert) {
+        lastHostUnavailableAlertKeyRef.current = { sessionId: currentSessionId, at: now };
+        showCustomAlert(
+          sessionIsPausedLocally ? 'Sessao pausada' : 'Aguardando reconexao',
+          sessionIsPausedLocally
+            ? 'O mestre esta desconectado, mas a sessao estava pausada. Mantive o vinculo para retomar quando o mestre voltar.'
+            : 'Perdi contato temporario com o mestre. Mantive o vinculo da ficha e vou tentar reconectar automaticamente quando o app do mestre voltar para a rede.'
+        );
+      }
     },
   });
 
@@ -2219,16 +3818,24 @@ export default function CharacterSheetScreen() {
       sessionTerminatedRef.current !== lanInfo.sessionId
     ),
     onBackground: async () => {
-      // Não destrua o socket ao abrir Telegram/compartilhar logs/alternar apps.
-      // O Android pode manter a conexão viva; se ela cair, o foreground recovery
-      // força reconnect/resync. Resetar aqui era a causa de ficha voltar sem listener.
-      traceApp('LAN_JOIN', 'PLAYER_KEEP_SOCKET_DURING_BACKGROUND', {
+      // v86: depois de bloqueio de tela/Android suspendendo rede, o socket pode
+      // parecer vivo mas estar sem binding real no host. Fechamos o cliente aqui e
+      // reabrimos no foreground com resync autoritativo. O vínculo LAN/SQLite NÃO é apagado.
+      traceApp('LAN_JOIN', 'PLAYER_RESET_STALE_SOCKET_ON_BACKGROUND_KEEP_BINDING', {
         screen: 'sheet',
         source: 'useLanAppLifecycle.onBackground',
         sessionId: lanInfo?.sessionId,
         characterId: character?.id,
         characterName: character?.name,
       });
+      resetLanClientConnection();
+      if (lanInfo?.sessionId) {
+        useLanRealtimeStore.getState().setConnection({
+          sessionId: lanInfo.sessionId,
+          playerKey: getSelfLanKey(lanInfo.sessionId),
+          connected: false,
+        });
+      }
     },
     onForeground: async () => {
       if (lanInfo?.sessionId && sessionTerminatedRef.current === lanInfo.sessionId) {
@@ -2241,6 +3848,7 @@ export default function CharacterSheetScreen() {
         });
         return;
       }
+      await syncLanFromHost();
       const selfKey = getSelfLanKey(lanInfo?.sessionId);
       // Foreground apos compartilhar/alternar app deve reamarrar, nao destruir,
       // a conexao. requestLanSessionResync envia hello com playerKey e reconecta
@@ -2253,7 +3861,9 @@ export default function CharacterSheetScreen() {
           lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
           knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
           forceReconnect: true,
+          includeGlobal: true,
         }).catch(() => false);
+        void flushPendingLanOutboundEvents('app_foreground').catch(() => false);
       }
     },
   });
@@ -2287,6 +3897,7 @@ export default function CharacterSheetScreen() {
               knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
               forceReconnect: false,
             }).catch(() => false);
+            void flushPendingLanOutboundEvents(reason).catch(() => false);
           }
         }, delayMs);
       };
@@ -2342,6 +3953,7 @@ export default function CharacterSheetScreen() {
         characterId: character.id,
         characterName: character.name,
       });
+      void syncLanFromHost().catch(() => undefined);
       setLanReconnectEpoch((current) => current + 1);
       setTimeout(() => {
         if (disposed) return;
@@ -2351,9 +3963,28 @@ export default function CharacterSheetScreen() {
             playerKey: selfKey,
             lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
             knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+            includeGlobal: true,
+            forceReconnect: true,
           }).catch(() => false);
+          void flushPendingLanOutboundEvents(`${reason}:recovery_80ms`).catch(() => false);
         }
       }, 80);
+      setTimeout(() => {
+        if (disposed) return;
+        void syncLanFromHost().catch(() => undefined);
+        setLanReconnectEpoch((current) => current + 1);
+        if (selfKey) {
+          void requestLanSessionResync(lanInfo.joinUrl, {
+            sessionId: lanInfo.sessionId,
+            playerKey: selfKey,
+            lastAppliedSeq: 0,
+            knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+            includeGlobal: true,
+            forceReconnect: false,
+          }).catch(() => false);
+          void flushPendingLanOutboundEvents(`${reason}:recovery_650ms`).catch(() => false);
+        }
+      }, 650);
       setTimeout(() => {
         if (disposed) return;
         setLanReconnectEpoch((current) => current + 1);
@@ -2361,12 +3992,14 @@ export default function CharacterSheetScreen() {
           void requestLanSessionResync(lanInfo.joinUrl, {
             sessionId: lanInfo.sessionId,
             playerKey: selfKey,
-            lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+            lastAppliedSeq: 0,
             knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
-            forceReconnect: true,
+            includeGlobal: true,
+            forceReconnect: false,
           }).catch(() => false);
+          void flushPendingLanOutboundEvents(`${reason}:recovery_1800ms`).catch(() => false);
         }
-      }, 650);
+      }, 1800);
     };
 
     const unsubscribe = subscribeLanForegroundRecovery(recover);
@@ -2381,9 +4014,133 @@ export default function CharacterSheetScreen() {
     return makeLanCharacterKey(sessionValue, character);
   };
 
+  const schedulePendingLanOutboundFlush = (reason: string, delayMs = 900) => {
+    if (pendingLanOutboundFlushTimerRef.current) {
+      clearTimeout(pendingLanOutboundFlushTimerRef.current);
+    }
+    pendingLanOutboundFlushTimerRef.current = setTimeout(() => {
+      pendingLanOutboundFlushTimerRef.current = null;
+      void flushPendingLanOutboundEvents(reason).catch(() => false);
+    }, delayMs);
+  };
+
+  const queuePendingLanOutboundEvent = (event: LanSessionEvent, reason: string) => {
+    const key = String(event.clientMsgId || event.id || '');
+    if (!key) return;
+    pendingLanOutboundEventsRef.current = {
+      ...pendingLanOutboundEventsRef.current,
+      [key]: event,
+    };
+    debugLanFlow('PLAYER_OUTBOUND_EVENT_QUEUED', {
+      sessionId: event.sessionId,
+      eventId: event.id,
+      clientMsgId: event.clientMsgId,
+      type: event.type,
+      reason,
+      pendingCount: Object.keys(pendingLanOutboundEventsRef.current).length,
+    });
+    schedulePendingLanOutboundFlush(`queued:${reason}`, 800);
+  };
+
+  const sendLanEventWithRetry = async (event: LanSessionEvent, source: string) => {
+    await rememberLanSessionEvent(db, event).catch(() => false);
+    if (!lanInfo?.joinUrl) {
+      queuePendingLanOutboundEvent(event, `${source}:no_join_url`);
+      return false;
+    }
+    try {
+      await sendLanSessionEvent(lanInfo.joinUrl, event);
+      const key = String(event.clientMsgId || event.id || '');
+      if (key && pendingLanOutboundEventsRef.current[key]) {
+        const next = { ...pendingLanOutboundEventsRef.current };
+        delete next[key];
+        pendingLanOutboundEventsRef.current = next;
+      }
+      debugLanFlow('PLAYER_OUTBOUND_EVENT_SENT', {
+        sessionId: event.sessionId,
+        eventId: event.id,
+        clientMsgId: event.clientMsgId,
+        type: event.type,
+        source,
+      });
+      return true;
+    } catch (error) {
+      queuePendingLanOutboundEvent(event, `${source}:send_failed`);
+      debugLanFlow('PLAYER_OUTBOUND_EVENT_SEND_FAILED_QUEUED', {
+        sessionId: event.sessionId,
+        eventId: event.id,
+        clientMsgId: event.clientMsgId,
+        type: event.type,
+        source,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  };
+
+  const flushPendingLanOutboundEvents = async (reason: string) => {
+    if (!lanInfo?.joinUrl || !lanInfo?.sessionId) return false;
+    const entries = Object.values(pendingLanOutboundEventsRef.current)
+      .filter((event) => event.sessionId === lanInfo.sessionId)
+      .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    if (entries.length === 0) return true;
+
+    debugLanFlow('PLAYER_OUTBOUND_FLUSH_START', {
+      sessionId: lanInfo.sessionId,
+      reason,
+      count: entries.length,
+    });
+
+    let sent = 0;
+    for (const event of entries) {
+      try {
+        await sendLanEventWithRetry(event, 'sendItemRequest');
+        const key = String(event.clientMsgId || event.id || '');
+        if (key) {
+          const next = { ...pendingLanOutboundEventsRef.current };
+          delete next[key];
+          pendingLanOutboundEventsRef.current = next;
+        }
+        sent += 1;
+      } catch (error) {
+        debugLanFlow('PLAYER_OUTBOUND_FLUSH_STOPPED_OFFLINE', {
+          sessionId: lanInfo.sessionId,
+          eventId: event.id,
+          type: event.type,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        schedulePendingLanOutboundFlush(`flush_failed:${reason}`, 1800);
+        return false;
+      }
+    }
+
+    const selfKey = getSelfLanKey(lanInfo.sessionId);
+    if (selfKey) {
+      void requestLanSessionResync(lanInfo.joinUrl, {
+        sessionId: lanInfo.sessionId,
+        playerKey: selfKey,
+        lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+        knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+      }).catch(() => false);
+    }
+
+    debugLanFlow('PLAYER_OUTBOUND_FLUSH_DONE', {
+      sessionId: lanInfo.sessionId,
+      reason,
+      sent,
+      remaining: Object.keys(pendingLanOutboundEventsRef.current).length,
+    });
+    return true;
+  };
+
+
   const makeTradeItem = (item: any, qty: number): LanTradeItem => {
     const hydrated = hydrateInventoryItemForEffects(item);
     return {
+      id: hydrated.inventoryItemId ?? hydrated.inventory_item_id ?? hydrated.itemId ?? hydrated.item_id ?? hydrated.catalogItemId ?? hydrated.catalog_item_id ?? hydrated.sourceItemId ?? hydrated.source_item_id ?? hydrated.dbId ?? hydrated.id,
+      inventoryItemId: hydrated.inventoryItemId ?? hydrated.inventory_item_id ?? hydrated.itemId ?? hydrated.item_id ?? hydrated.catalogItemId ?? hydrated.catalog_item_id ?? hydrated.sourceItemId ?? hydrated.source_item_id ?? hydrated.dbId ?? hydrated.id,
+      stackKey: getSheetInventoryStackKey(hydrated),
       name: String(hydrated.name || 'Item'),
       qty: Math.max(1, Math.min(Number(hydrated.qty) || 1, qty)),
       weight: Number(hydrated.weight) || 0,
@@ -2404,6 +4161,7 @@ export default function CharacterSheetScreen() {
     if (!character) return false;
     try {
       await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [JSON.stringify(equipment), character.id]);
+      await syncCharacterInventoryForEquipment(db, Number(character.id), equipment).catch(() => undefined);
       setCharacter((prev: any) => ({ ...prev, equipment }));
       return true;
     } catch (error) {
@@ -2415,7 +4173,7 @@ export default function CharacterSheetScreen() {
   const addTradeItemToBag = async (tradeItem?: LanTradeItem) => {
     if (!character || !tradeItem) return false;
     const nextBag = [...character.equipment.bag];
-    const existingIndex = nextBag.findIndex((item: any) => item.name === tradeItem.name);
+    const existingIndex = nextBag.findIndex((item: any) => isSameSheetInventoryItem(item, tradeItem as any));
     if (existingIndex >= 0) {
       const hydratedTradeItem = hydrateInventoryItemForEffects(tradeItem);
       nextBag[existingIndex] = {
@@ -2457,7 +4215,7 @@ export default function CharacterSheetScreen() {
 
   const removeTradeItemFromBagByName = async (tradeItem?: LanTradeItem) => {
     if (!character || !tradeItem) return false;
-    const index = character.equipment.bag.findIndex((item: any) => item.name === tradeItem.name);
+    const index = character.equipment.bag.findIndex((item: any) => isSameSheetInventoryItem(item, tradeItem as any));
     if (index < 0) return false;
     return removeTradeItemFromBagByIndex(index, tradeItem.qty);
   };
@@ -2575,6 +4333,23 @@ export default function CharacterSheetScreen() {
     });
 
     for (const event of events) {
+      const eventKey = String(event.id || `${event.type}:${event.sessionId}:${event.entityRevision || event.seq || event.createdAt || ''}`);
+      if (eventKey && handledSessionEventIdsRef.current.has(eventKey)) {
+        debugLanFlow('PLAYER_EVENT_DUPLICATE_SKIPPED', {
+          eventId: event.id,
+          eventType: event.type,
+          seq: event.seq,
+          entityRevision: event.entityRevision,
+        });
+        continue;
+      }
+      if (eventKey) {
+        handledSessionEventIdsRef.current.add(eventKey);
+        if (handledSessionEventIdsRef.current.size > 300) {
+          handledSessionEventIdsRef.current = new Set(Array.from(handledSessionEventIdsRef.current).slice(-150));
+        }
+      }
+
       if (event.type === 'public_status' && event.publicState) {
         const statusTargetsSelf = event.fromKey === selfKey || event.fromName === character.name;
         if (statusTargetsSelf && isLanPlayerRuntime) {
@@ -2599,11 +4374,23 @@ export default function CharacterSheetScreen() {
           });
           continue;
         }
+        const incomingPublicSeq = Number(event.serverSeq ?? event.seq ?? event.entityRevision ?? 0) || Date.now();
+        const incomingPublicRevision = Number(event.entityRevision ?? event.serverSeq ?? event.seq ?? 0) || incomingPublicSeq;
         setLanPlayers((current) => {
           let matched = false;
           const next = current.map((player) => {
             if (!(player.key === event.fromKey || player.characterName === event.fromName)) return player;
             matched = true;
+            const existingSeq = Number((player as any).publicSeq || (player as any).publicRevision || 0) || 0;
+            if (existingSeq > 0 && incomingPublicSeq > 0 && incomingPublicSeq < existingSeq) {
+              debugLanFlow('PLAYER_PUBLIC_STATUS_STALE_SKIPPED_FOR_BAR', {
+                eventId: event.id,
+                fromKey: event.fromKey,
+                incomingPublicSeq,
+                existingSeq,
+              });
+              return player;
+            }
             const publicEffects = Array.isArray((event.publicState as any)?.effects)
               ? (event.publicState as any).effects
               : player.publicEffects;
@@ -2614,6 +4401,8 @@ export default function CharacterSheetScreen() {
               tempHp: event.publicState!.tempHp ?? player.tempHp,
               level: event.publicState!.level,
               publicEffects,
+              publicSeq: incomingPublicSeq,
+              publicRevision: incomingPublicRevision,
             };
           });
           if (matched) return next;
@@ -2630,6 +4419,8 @@ export default function CharacterSheetScreen() {
             tempHp: Number(event.publicState!.tempHp || 0) || 0,
             publicEffects,
             isSelf: Boolean(selfKey && key === selfKey),
+            publicSeq: incomingPublicSeq,
+            publicRevision: incomingPublicRevision,
           }];
         });
         traceApp('PUBLIC_STATUS_APPLIED', 'PLAYER_PUBLIC_STATUS_APPLIED_TO_BAR', {
@@ -2717,8 +4508,15 @@ export default function CharacterSheetScreen() {
           toName: event.toName,
           patch: event.statsPatch,
         });
-        await updateDB(
-          { stats: event.statsPatch },
+        const statsPatch = event.statsPatch as Record<string, unknown>;
+        setCharacter((prev: any) => {
+          if (!prev) return prev;
+          const merged = { ...prev, stats: statsPatch };
+          characterRef.current = merged;
+          return merged;
+        });
+        void updateDB(
+          { stats: statsPatch },
           { allowLanAuthoritativeCache: true, reason: 'lan_authoritative_stats_patch' }
         );
         continue;
@@ -2826,6 +4624,47 @@ export default function CharacterSheetScreen() {
       }
 
       if (event.type === 'trade_result') {
+        const resultTradeCommit = (event.tradeResult as any)?.tradeCommit;
+        const resultDeltas = Array.isArray(resultTradeCommit?.itemDeltas)
+          ? resultTradeCommit.itemDeltas.filter(Boolean)
+          : [];
+        if (event.tradeResult?.status === 'accepted' && resultDeltas.length > 0) {
+          const txId = [
+            sessionValue,
+            resultTradeCommit?.targetKey || event.toKey || selfKey,
+            resultTradeCommit?.commitId || event.sourceClientMsgId || event.id || resultTradeCommit?.tradeId || event.tradeId,
+          ].filter(Boolean).join(':');
+          if (!txId || !appliedInventoryTransactionIdsRef.current.has(txId)) {
+            debugLanFlow('PLAYER_TRADE_RESULT_APPLYING_AUTHORITATIVE_DELTAS', {
+              eventId: event.id,
+              tradeId: event.tradeId,
+              targetKey: resultTradeCommit?.targetKey || event.toKey,
+              deltaCount: resultDeltas.length,
+            });
+            await applyLanInventoryPatchToCharacter({
+              targetKey: resultTradeCommit?.targetKey || event.toKey || selfKey,
+              equipment: normalizeSheetEquipment(characterRef.current?.equipment),
+              itemDelta: resultDeltas[0],
+              itemDeltas: resultDeltas,
+              tradeCommit: {
+                tradeId: resultTradeCommit?.tradeId || event.tradeId || event.id,
+                commitId: resultTradeCommit?.commitId || event.sourceClientMsgId || event.id,
+                offeringKey: resultTradeCommit?.offeringKey,
+                acceptingKey: resultTradeCommit?.acceptingKey,
+                targetKey: resultTradeCommit?.targetKey || event.toKey || selfKey,
+                itemDeltas: resultDeltas,
+              } as any,
+              reason: event.tradeResult?.reason || event.message || 'Troca concluida.',
+              action: 'trade_commit',
+            } as any, event);
+          } else {
+            debugLanFlow('PLAYER_TRADE_RESULT_DELTAS_ALREADY_APPLIED', {
+              eventId: event.id,
+              tradeId: event.tradeId,
+              transactionId: txId,
+            });
+          }
+        }
         const fresh = await rememberLanSessionEvent(db, event);
         setIncomingTrades((current) => current.filter((entry) => (entry.tradeId || entry.id) !== (event.tradeId || event.id)));
         if ((selectedTradeOffer?.tradeId || selectedTradeOffer?.id) === (event.tradeId || event.id)) setSelectedTradeOffer(null);
@@ -2894,6 +4733,10 @@ export default function CharacterSheetScreen() {
 
       if (event.type === 'effect_patch' && event.effectPatch) {
         await rememberLanSessionEvent(db, event).catch(() => false);
+        if (event.numberPatch) {
+          const nextValues = await applyLanNumberPatchToCharacter(event.numberPatch, event);
+          if (nextValues) updateSelfLanBarFromAuthoritativePatch(sessionValue, nextValues, event);
+        }
         await applyLanEffectPatchToCharacter(event.effectPatch, event);
       }
 
@@ -2902,7 +4745,34 @@ export default function CharacterSheetScreen() {
       }
 
       if (event.type === 'pending_save_patch' && event.pendingSavePatch) {
-        await rememberLanSessionEvent(db, event);
+        await rememberLanSessionEvent(db, event).catch(() => false);
+        const action = String(event.pendingSavePatch.action || '');
+        if (action === 'create' && event.pendingSavePatch.save?.targetKey === selfKey) {
+          const save = event.pendingSavePatch.save;
+          setPendingEffectSave({
+            id: save.id,
+            sourceEffectId: String(save.sourceId || ''),
+            sourceEffectName: save.sourceName || 'Efeito',
+            targetKey: save.targetKey,
+            saveAbility: save.ability,
+            dc: save.dc ?? null,
+            rollMode: 'target_choice',
+            saveOnSuccess: String((save.effectPayload as any)?.saveOnSuccess || (save.effectPayload as any)?.save?.onSuccess || 'negates'),
+            pendingEffectPayload: save.effectPayload,
+          });
+          setSaveManualValue('');
+          debugLanFlow('PLAYER_PENDING_SAVE_PATCH_MODAL_OPENED', {
+            eventId: event.id,
+            saveId: save.id,
+            sourceName: save.sourceName,
+            ability: save.ability,
+            dc: save.dc,
+          });
+        } else if (action === 'resolve') {
+          const resolvedId = String(event.pendingSavePatch.id || '');
+          setPendingEffectSave((current) => current && current.id === resolvedId ? null : current);
+          setSaveManualValue('');
+        }
       }
     }
 
@@ -2932,15 +4802,36 @@ export default function CharacterSheetScreen() {
     const refreshLanMetadata = async () => {
       try {
         const localInfo = await getLocalLanSessionForCharacter(db, Number(character.id));
+
+        // Params antigos de rota nao podem ressuscitar uma sessao ja limpa.
+        // Depois de host unreachable, a binding local e desativada; se a tela
+        // ainda estiver com sessionId na rota, ignore em vez de reconectar.
+        if (routeSessionId && localInfo?.sessionId !== routeSessionId) {
+          traceApp('LAN_JOIN', 'PLAYER_IGNORE_STALE_ROUTE_SESSION', {
+            screen: 'sheet',
+            source: 'refreshLanMetadata',
+            routeSessionId,
+            localSessionId: localInfo?.sessionId,
+            characterId: character.id,
+            characterName: character.name,
+          });
+          return;
+        }
+
         const storedInfo = routeSessionId
           ? {
             sessionId: routeSessionId,
             joinUrl: routeJoinUrl || localInfo?.joinUrl || '',
             payloadJson: localInfo?.payloadJson,
+            status: (localInfo as any)?.status,
           }
           : localInfo;
 
         if (!storedInfo?.sessionId) return;
+        if ((storedInfo as any)?.status === 'paused') {
+          setLanSessionStatus('paused');
+          lanSessionStatusRef.current = 'paused';
+        }
         if (sessionTerminatedRef.current === storedInfo.sessionId) {
           traceApp('LAN_JOIN', 'PLAYER_STOP_PAYLOAD_RECOVERY_AFTER_END', {
             screen: 'sheet',
@@ -3009,14 +4900,10 @@ export default function CharacterSheetScreen() {
 
         const selfKey = makeLanCharacterKey(nextInfo.sessionId, character);
         setLanSessionStatus(nextPayload.state?.status || 'active');
-        setLanPlayers(getPublicLanPlayers(nextPayload, selfKey));
+        mergeLanPlayersFromPayloadCache(nextPayload, selfKey, 'payload_cache');
+        applyAuthoritativeSelfInventoryFromPayload(nextPayload, nextInfo.sessionId, 'refreshLanMetadata');
 
-        const isStillInSession = Boolean(nextPayload.state?.players?.some((player) => (
-          player.remoteKey === selfKey ||
-          player.sourceCharacterId === Number(character.id) ||
-          player.characterId === Number(character.id) ||
-          player.characterName === character.name
-        )));
+        const isStillInSession = Boolean(findSelfLanPlayerInPayload(nextPayload, nextInfo.sessionId, character));
 
         const wasKicked = nextPayload.events?.some((event) => (
           event.type === 'player_kicked' &&
@@ -3077,14 +4964,11 @@ export default function CharacterSheetScreen() {
       active = false;
       clearInterval(timer);
     };
-  }, [db, character?.id, character?.name, character?.level, character?.xp, routeSessionId, routeJoinUrl, fetchLanPayloadWithRecovery, terminateLanSessionFromMaster]);
+  }, [db, character?.id, character?.name, character?.level, character?.xp, routeSessionId, routeJoinUrl, fetchLanPayloadWithRecovery, terminateLanSessionFromMaster, applyAuthoritativeSelfInventoryFromPayload, applyAuthoritativeSelfStateFromPayload]);
 
   useEffect(() => {
-    const isLanBoundSheet = Boolean(routeSessionId || lanInfo?.sessionId);
-    if (!isLanBoundSheet) return;
-
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
-      traceApp('NAVIGATION', 'PLAYER_SHEET_HARDWARE_BACK_TO_HOME', {
+      traceApp('NAVIGATION', 'SHEET_HARDWARE_BACK_TO_HOME', {
         screen: 'sheet',
         source: 'BackHandler',
         sessionId: lanInfo?.sessionId || routeSessionId,
@@ -3109,17 +4993,17 @@ export default function CharacterSheetScreen() {
   const getMod = (val: string) => Math.floor(((parseInt(val) || 10) - 10) / 2);
   
   const forBase = parseInt(character.stats.FOR) || 10;
-  const forTemp = parseInt(character.stats.temp_mods?.FOR) || 0;
+  const forTemp = (parseInt(character.stats.temp_mods?.FOR) || 0) + getLanStatEffectBonus(character, 'FOR');
   const forEquip = parseInt(character.stats.equip_mods?.FOR) || 0;
   const forMod = Math.floor(((forBase + forTemp + forEquip) - 10) / 2);
 
   const desBase = parseInt(character.stats.DES) || 10;
-  const desTemp = parseInt(character.stats.temp_mods?.DES) || 0;
+  const desTemp = (parseInt(character.stats.temp_mods?.DES) || 0) + getLanStatEffectBonus(character, 'DES');
   const desEquip = parseInt(character.stats.equip_mods?.DES) || 0;
   const desMod = Math.floor(((desBase + desTemp + desEquip) - 10) / 2);
   
   const conBase = parseInt(character.stats.CON) || 10;
-  const conTemp = parseInt(character.stats.temp_mods?.CON) || 0;
+  const conTemp = (parseInt(character.stats.temp_mods?.CON) || 0) + getLanStatEffectBonus(character, 'CON');
   const conEquip = parseInt(character.stats.equip_mods?.CON) || 0;
   const conModBase = Math.floor((conBase - 10) / 2);
   const conModTotal = Math.floor(((conBase + conTemp + conEquip) - 10) / 2);
@@ -3160,7 +5044,7 @@ export default function CharacterSheetScreen() {
   const getAbilityModifierForAbility = (ability: string) => {
     const normalized = String(ability || '').toUpperCase();
     const base = parseInt(character.stats?.[normalized]) || 10;
-    const temp = parseInt(character.stats?.temp_mods?.[normalized]) || 0;
+    const temp = (parseInt(character.stats?.temp_mods?.[normalized]) || 0) + getLanStatEffectBonus(character, normalized);
     const equip = parseInt(character.stats?.equip_mods?.[normalized]) || 0;
     return Math.floor(((base + temp + equip) - 10) / 2);
   };
@@ -3179,11 +5063,14 @@ export default function CharacterSheetScreen() {
     : null;
 
   const handleSheetBack = () => {
-    if (lanInfo?.sessionId || routeSessionId) {
-      router.replace('/' as any);
-      return;
-    }
-    router.back();
+    traceApp('NAVIGATION', 'SHEET_BACK_TO_HOME', {
+      screen: 'sheet',
+      source: 'top_bar_back',
+      sessionId: lanInfo?.sessionId || routeSessionId,
+      characterId: characterRef.current?.id,
+      characterName: characterRef.current?.name,
+    });
+    router.replace('/' as any);
   };
 
 
@@ -3310,7 +5197,8 @@ export default function CharacterSheetScreen() {
 
   const isSheetActionSubmitting = (actionId: string) => submittingSheetActions.includes(actionId);
   const runSheetAction = async <T,>(actionId: string, task: () => Promise<T>): Promise<T | undefined> => {
-    if (submittingSheetActionsRef.current.has(actionId)) {
+    const isFastLocalAction = /^(coin:|inventory:|equip:)/.test(actionId);
+    if (!isFastLocalAction && submittingSheetActionsRef.current.has(actionId)) {
       debugLanFlow('ACTION_SUBMIT_IGNORED_ALREADY_PENDING', {
         screen: 'sheet',
         sessionId: lanInfo?.sessionId,
@@ -3320,8 +5208,10 @@ export default function CharacterSheetScreen() {
       return;
     }
 
-    submittingSheetActionsRef.current.add(actionId);
-    setSubmittingSheetActions((current) => current.includes(actionId) ? current : [...current, actionId]);
+    if (!isFastLocalAction) {
+      submittingSheetActionsRef.current.add(actionId);
+      setSubmittingSheetActions((current) => current.includes(actionId) ? current : [...current, actionId]);
+    }
     debugLanFlow('ACTION_SUBMIT_STARTED', {
       screen: 'sheet',
       sessionId: lanInfo?.sessionId,
@@ -3347,8 +5237,10 @@ export default function CharacterSheetScreen() {
       });
       throw error;
     } finally {
-      submittingSheetActionsRef.current.delete(actionId);
-      setSubmittingSheetActions((current) => current.filter((id) => id !== actionId));
+      if (!isFastLocalAction) {
+        submittingSheetActionsRef.current.delete(actionId);
+        setSubmittingSheetActions((current) => current.filter((id) => id !== actionId));
+      }
     }
   };
 
@@ -3363,15 +5255,15 @@ export default function CharacterSheetScreen() {
       characterName: character.name,
       playerKey: lanInfo?.sessionId ? getSelfLanKey(lanInfo.sessionId) : '',
     });
-    if (!lanInfo?.joinUrl) {
-      showCustomAlert('Sessao offline', 'Nao ha socket TCP ativo para enviar este pedido ao mestre.');
+    if (!lanInfo?.sessionId) {
+      showCustomAlert('Sessao offline', 'Nao ha sessao LAN ativa para enviar este pedido ao mestre.');
       return false;
     }
 
     const selfKey = getSelfLanKey(lanInfo.sessionId);
     const clientRequestId = request.clientRequestId || makeLanEventId();
     const event: LanSessionEvent = {
-      id: makeLanEventId(),
+      id: clientRequestId,
       clientMsgId: clientRequestId,
       sessionId: lanInfo.sessionId,
       type: 'resource_request',
@@ -3379,6 +5271,9 @@ export default function CharacterSheetScreen() {
       fromName: character.name,
       toKey: 'master',
       toName: 'Mestre',
+      entityType: 'request',
+      entityId: selfKey,
+      ackRequired: true,
       resourceRequest: { ...request, clientRequestId },
       message: request.message,
       createdAt: new Date().toISOString(),
@@ -3393,14 +5288,11 @@ export default function CharacterSheetScreen() {
         message: request.message,
       });
 
-      // v35: nao bloqueie o pedido aguardando re-join. O reanuncio pode levar
-      // segundos e era a causa de XP/recursos demorarem para aparecer no mestre.
-      // Se o roster estiver atrasado, o host cria/reativa o player pelo proprio evento.
-      void notifyMasterJoin(lanInfo.joinUrl, lanInfo.sessionId, character).catch(() => false);
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
-      await rememberLanSessionEvent(db, event).catch(() => false);
+      // v56: se o socket cair brevemente, o pedido entra na fila pendente
+      // e sera reenviado no foreground/reconnect sem duplicar pelo clientMsgId.
+      const sent = await sendLanEventWithRetry(event, 'sendResourceRequest');
       traceFunctionReturn('sendResourceRequest', {
-        sent: true,
+        sent,
         eventId: event.id,
         request,
       }, {
@@ -3414,7 +5306,7 @@ export default function CharacterSheetScreen() {
         fromKey: event.fromKey,
         toKey: event.toKey,
       });
-      showCustomAlert('Pedido enviado', 'O mestre recebeu sua solicitacao para revisar.');
+      showCustomAlert(sent ? 'Pedido enviado' : 'Pedido em fila', sent ? 'O mestre recebeu sua solicitacao para revisar.' : 'Sem resposta imediata do mestre; vou reenviar quando a conexao voltar.');
       return true;
     } catch (error) {
       console.warn('[LAN REQUEST FAILED]', error);
@@ -3435,11 +5327,32 @@ export default function CharacterSheetScreen() {
     equipment: any,
     reason: string,
     clientRequestId = makeLanEventId(),
-    statsPatch?: Record<string, unknown>
+    statsPatch?: Record<string, unknown>,
+    baseEquipment?: any
   ) => {
-    if (!lanInfo?.joinUrl || !character) return;
+    if (!lanInfo?.sessionId || !character) return;
     try {
+      const fingerprint = JSON.stringify({
+        equipment: normalizeSheetEquipment(equipment),
+        stats: statsPatch ? buildSheetStatsWithDerivedEquipMods(statsPatch as Record<string, any>, equipment) : null,
+        reason,
+      });
+      const now = Date.now();
+      if (lastInventoryPatchSentRef.current.fingerprint === fingerprint && now - lastInventoryPatchSentRef.current.at < 2500) {
+        debugLanFlow('PLAYER_INVENTORY_DUPLICATE_SEND_SKIPPED', {
+          sessionId: lanInfo.sessionId,
+          characterId: character.id,
+          characterName: character.name,
+          reason,
+          previousClientMsgId: lastInventoryPatchSentRef.current.clientMsgId,
+          nextClientMsgId: clientRequestId,
+        });
+        return true;
+      }
+      lastInventoryPatchSentRef.current = { fingerprint, at: now, clientMsgId: clientRequestId };
       const selfKey = getSelfLanKey(lanInfo.sessionId);
+      const base = baseEquipment || characterRef.current?.equipment || character.equipment;
+      const inferredDelta = inferSheetInventoryItemDelta(base, equipment);
       const event: LanSessionEvent = {
         id: clientRequestId,
         clientMsgId: clientRequestId,
@@ -3452,7 +5365,14 @@ export default function CharacterSheetScreen() {
         entityType: 'inventory',
         entityId: selfKey,
         ackRequired: true,
-        inventoryPatch: { targetKey: selfKey, equipment, reason, action: 'self_update' },
+        inventoryPatch: {
+          targetKey: selfKey,
+          equipment,
+          baseEquipment: base,
+          itemDelta: inferredDelta || undefined,
+          reason,
+          action: inferredDelta?.mode === 'remove' ? 'remove' : 'self_update',
+        },
         statsPatch,
         message: reason,
         createdAt: new Date().toISOString(),
@@ -3468,9 +5388,7 @@ export default function CharacterSheetScreen() {
         fromKey: event.fromKey,
         toKey: event.toKey,
       });
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
-      await rememberLanSessionEvent(db, event).catch(() => false);
-      return true;
+      return await sendLanEventWithRetry(event, 'notifyInventoryPatch');
     } catch {
       // A alteracao local continua valida; o mestre sincroniza quando receber o proximo snapshot aceito.
       return false;
@@ -3478,12 +5396,13 @@ export default function CharacterSheetScreen() {
   };
 
   const notifyNumberPatch = async (patch: LanSessionEvent['numberPatch'], reason: string) => {
-    if (!lanInfo?.joinUrl || !character) return;
+    if (!lanInfo?.sessionId || !character || !patch) return;
     try {
       const selfKey = getSelfLanKey(lanInfo.sessionId);
+      const eventId = makeLanEventId();
       const event: LanSessionEvent = {
-        id: makeLanEventId(),
-        clientMsgId: makeLanEventId(),
+        id: eventId,
+        clientMsgId: eventId,
         sessionId: lanInfo.sessionId,
         type: 'player_patch',
         fromKey: selfKey,
@@ -3494,6 +5413,7 @@ export default function CharacterSheetScreen() {
         entityId: selfKey,
         ackRequired: true,
         numberPatch: patch,
+        numberPatchIntent: 'mixed',
         message: reason,
         createdAt: new Date().toISOString(),
       };
@@ -3509,8 +5429,8 @@ export default function CharacterSheetScreen() {
         toKey: event.toKey,
         patch,
       });
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
-      traceFunctionReturn('notifyNumberPatch', { sent: true, eventId: event.id }, {
+      const sent = await sendLanEventWithRetry(event, 'notifyNumberPatch');
+      traceFunctionReturn('notifyNumberPatch', { sent, eventId: event.id }, {
         screen: 'sheet',
         source: 'player_request',
         sessionId: lanInfo.sessionId,
@@ -3524,23 +5444,60 @@ export default function CharacterSheetScreen() {
     }
   };
 
-  const getCurrentCoinPatch = () => ({
-    gp: Math.max(0, Math.floor(Number(character?.gp || 0))),
-    sp: Math.max(0, Math.floor(Number(character?.sp || 0))),
-    cp: Math.max(0, Math.floor(Number(character?.cp || 0))),
-  });
 
-  const getCoinTotalCopper = (coins: Partial<Record<'gp' | 'sp' | 'cp', number>>) => (
-    Math.max(0, Math.floor(Number(coins.gp || 0))) * COIN_RATES.gp +
-    Math.max(0, Math.floor(Number(coins.sp || 0))) * COIN_RATES.sp +
-    Math.max(0, Math.floor(Number(coins.cp || 0))) * COIN_RATES.cp
-  );
+  const getCurrentCoinPatch = () => {
+    const base = characterRef.current || character;
+    return sanitizeCoins({ gp: base?.gp, sp: base?.sp, cp: base?.cp });
+  };
+
+  const getCoinTotalCopper = (coins: Partial<Record<'gp' | 'sp' | 'cp', number>>) => getCoinTotalCopperValue(coins);
+
+  const persistFastLocalPatch = async (
+    updates: Partial<any>,
+    reason: string,
+    isStillCurrent?: () => boolean
+  ) => {
+    const currentCharacter = characterRef.current || character;
+    if (!currentCharacter?.id) return false;
+    if (isStillCurrent && !isStillCurrent()) {
+      debugLanFlow('FAST_LOCAL_PERSIST_SKIPPED_STALE', {
+        characterId: currentCharacter.id,
+        characterName: currentCharacter.name,
+        reason,
+        patch: updates,
+      });
+      return false;
+    }
+    const entries = Object.entries(updates);
+    if (entries.length === 0) return false;
+    const setString = entries.map(([key]) => `${key} = ?`).join(', ');
+    const values = entries.map(([_, value]) => (typeof value === 'object' ? JSON.stringify(value) : value));
+    try {
+      await db.runAsync(`UPDATE characters SET ${setString} WHERE id = ?`, [...values, Number(currentCharacter.id)]);
+      debugLanFlow('FAST_LOCAL_PERSIST_DONE', {
+        characterId: currentCharacter.id,
+        characterName: currentCharacter.name,
+        reason,
+        patch: updates,
+      });
+      return true;
+    } catch (error) {
+      debugLanFlow('FAST_LOCAL_PERSIST_FAILED', {
+        characterId: currentCharacter.id,
+        characterName: currentCharacter.name,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  };
 
   const sendCoinSelfPatchRequest = async (
     nextCoins: Partial<Record<'gp' | 'sp' | 'cp', number>>,
     reason: string
   ) => {
-    if (!lanInfo?.joinUrl || !character) return false;
+    const currentCharacter = characterRef.current || character;
+    if (!lanInfo?.sessionId || !currentCharacter) return false;
     const selfKey = getSelfLanKey(lanInfo.sessionId);
     const current = getCurrentCoinPatch();
     const next = {
@@ -3548,52 +5505,87 @@ export default function CharacterSheetScreen() {
       sp: nextCoins.sp == null ? current.sp : Math.max(0, Math.floor(Number(nextCoins.sp) || 0)),
       cp: nextCoins.cp == null ? current.cp : Math.max(0, Math.floor(Number(nextCoins.cp) || 0)),
     };
+    const opSeq = coinOptimisticSeqRef.current + 1;
     const eventId = makeLanEventId();
+    const nextTotalCopper = getCoinTotalCopper(next);
     const event: LanSessionEvent = {
       id: eventId,
       clientMsgId: eventId,
       sessionId: lanInfo.sessionId,
       type: 'coin_self_patch_request',
       fromKey: selfKey,
-      fromName: character.name,
+      fromName: currentCharacter.name,
       toKey: 'master',
       toName: 'Mestre',
       entityType: 'player',
       entityId: selfKey,
       ackRequired: true,
+      numberPatchIntent: 'self_coin',
+      numberPatch: next,
       coinPatchRequest: {
         targetKey: selfKey,
         current,
         next,
         currentTotalCopper: getCoinTotalCopper(current),
-        nextTotalCopper: getCoinTotalCopper(next),
+        nextTotalCopper,
+        opSeq,
         reason,
       },
       message: reason,
       createdAt: new Date().toISOString(),
     };
 
-    try {
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
-      await rememberLanSessionEvent(db, event).catch(() => false);
-      await updateDB(next, { allowLanAuthoritativeCache: true, reason: 'lan_player_self_coin_patch' });
-      // Redução/conversão de moeda própria é uma ação normal do jogador.
-      // Não mostre alerta modal; o mestre só verá no histórico da sessão.
-      return true;
-    } catch {
-      showCustomAlert('Sincronizacao falhou', 'Nao consegui enviar esta alteracao ao mestre.');
-      return false;
+    // Ação rápida: a UI muda no mesmo frame e o SQLite local é persistido sem
+    // setState posterior. Isso impede que timers antigos gravem 9 PO depois que
+    // o jogador já clicou para 8/7/6 PO.
+    coinOptimisticSeqRef.current = opSeq;
+    pendingSelfCoinStateRef.current = { ...next, totalCopper: nextTotalCopper, at: Date.now(), clientMsgId: eventId, opSeq };
+    setCharacter((prev: any) => {
+      const base = prev || currentCharacter;
+      const merged = { ...base, ...next };
+      characterRef.current = merged;
+      return merged;
+    });
+    void persistFastLocalPatch(next, 'lan_player_self_coin_optimistic', () => coinOptimisticSeqRef.current === opSeq);
+
+    if (coinPatchDebounceRef.current?.timer) {
+      clearTimeout(coinPatchDebounceRef.current.timer);
     }
+    coinPatchDebounceRef.current = {
+      event,
+      opSeq,
+      timer: setTimeout(() => {
+        const queued = coinPatchDebounceRef.current;
+        if (!queued || queued.opSeq !== opSeq) return;
+        const queuedEvent = queued.event || event;
+        coinPatchDebounceRef.current = null;
+        void (async () => {
+          try {
+            await sendLanEventWithRetry(queuedEvent, 'sendCoinSelfPatchRequest');
+            debugLanFlow('PLAYER_SELF_COIN_PATCH_SENT_FAST', {
+              eventId: queuedEvent.id,
+              opSeq,
+              next: queuedEvent.coinPatchRequest?.next,
+            });
+          } catch {
+            showCustomAlert('Sincronizacao falhou', 'Nao consegui enviar esta alteracao ao mestre.');
+          }
+        })();
+      }, 30),
+    };
+
+    return true;
   };
 
   const notifyEffectPatch = async (addEffects: any[], reason: string) => {
-    if (!lanInfo?.joinUrl || !character || addEffects.length === 0) return;
+    if (!lanInfo?.sessionId || !character || addEffects.length === 0) return;
     const selfKey = getSelfLanKey(lanInfo.sessionId);
 
     try {
+      const eventId = makeLanEventId();
       const event: LanSessionEvent = {
-        id: makeLanEventId(),
-        clientMsgId: makeLanEventId(),
+        id: eventId,
+        clientMsgId: eventId,
         sessionId: lanInfo.sessionId,
         type: 'effect_patch',
         fromKey: selfKey,
@@ -3614,7 +5606,6 @@ export default function CharacterSheetScreen() {
         createdAt: new Date().toISOString(),
       };
 
-      await rememberLanSessionEvent(db, event).catch(() => false);
       traceFunctionCall('notifyEffectPatch', { addEffects, reason }, {
         screen: 'sheet',
         source: 'player_request',
@@ -3627,7 +5618,7 @@ export default function CharacterSheetScreen() {
         toKey: event.toKey,
         patch: event.effectPatch,
       });
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
+      await sendLanEventWithRetry(event, 'notifyEffectPatch');
     } catch (error) {
       console.warn('[LAN ITEM EFFECT PATCH FAILED]', error);
     }
@@ -3639,7 +5630,7 @@ export default function CharacterSheetScreen() {
     rollMode: 'virtual' | 'manual',
   ) => {
     return runSheetAction(`save:${save.id}`, async () => {
-    if (!lanInfo?.joinUrl || !character) return false;
+    if (!lanInfo?.sessionId || !character) return false;
     const modifier = getSaveModifierForAbility(save.saveAbility);
     const resolvedSave = resolveSavingThrow({
       ability: save.saveAbility,
@@ -3689,8 +5680,7 @@ export default function CharacterSheetScreen() {
         passed: resolvedSave.passed,
         rollMode,
       });
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
-      await rememberLanSessionEvent(db, event).catch(() => false);
+      await sendLanEventWithRetry(event, 'sendEffectSaveResult');
       setPendingEffectSave(null);
       setSaveManualValue('');
       showCustomAlert(
@@ -3957,12 +5947,13 @@ export default function CharacterSheetScreen() {
       before: character ? { gp: character.gp, sp: character.sp, cp: character.cp } : undefined,
     });
     if (!ensureLanWritable()) return;
-    const nextValue = Math.max(0, character[type] + delta);
+    const currentChar = characterRef.current || character;
+    const nextValue = Math.max(0, Number(currentChar?.[type] || 0) + delta);
     if (lanInfo?.sessionId) {
       const currentCoins = getCurrentCoinPatch();
       const nextCoins = { ...currentCoins, [type]: nextValue };
       if (getCoinTotalCopper(nextCoins) > getCoinTotalCopper(currentCoins)) {
-        const amount = nextValue - Number(character[type] || 0);
+        const amount = nextValue - Number(currentChar?.[type] || 0);
         await sendResourceRequest({
           kind: 'coin',
           action: 'add',
@@ -3983,10 +5974,11 @@ export default function CharacterSheetScreen() {
   const executeCoinConversion = (sourceAmount: number, targetAmount: number) => {
     void runSheetAction('coin:convert', async () => {
     if (!ensureLanWritable()) return;
+    const currentChar = characterRef.current || character;
     const nextCoins = {
       ...getCurrentCoinPatch(),
-      [convertFrom]: character[convertFrom] - sourceAmount,
-      [convertTo]: character[convertTo] + targetAmount
+      [convertFrom]: Math.max(0, Number(currentChar?.[convertFrom] || 0) - sourceAmount),
+      [convertTo]: Math.max(0, Number(currentChar?.[convertTo] || 0) + targetAmount)
     };
     if (lanInfo?.sessionId) {
       await sendCoinSelfPatchRequest(
@@ -4081,14 +6073,23 @@ export default function CharacterSheetScreen() {
           delta,
           nextQty: newBag.find((entry: any) => entry.name === item.name)?.qty || 0,
         });
+        const clientRequestId = makeLanEventId();
+        pendingSelfInventoryStateRef.current = { equipment: nextEquipment, at: Date.now(), clientMsgId: clientRequestId };
+        setCharacter((current: any) => {
+          if (!current) return current;
+          const merged = { ...current, equipment: nextEquipment };
+          characterRef.current = merged;
+          return merged;
+        });
+        void persistFastLocalPatch({ equipment: nextEquipment }, 'lan_player_self_inventory_optimistic');
         void runSheetAction(actionId, async () => {
-          const sent = await notifyInventoryPatch(nextEquipment, `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`, makeLanEventId());
-          if (sent) {
-            await updateDB(
-              { equipment: nextEquipment },
-              { allowLanAuthoritativeCache: true, reason: 'lan_player_self_inventory_patch' }
-            );
-          }
+          await notifyInventoryPatch(
+            nextEquipment,
+            `${character.name} consumiu/removeu ${Math.abs(delta)}x ${item.name} da mochila.`,
+            clientRequestId,
+            undefined,
+            character.equipment
+          );
         });
       }
       return;
@@ -4167,6 +6168,19 @@ export default function CharacterSheetScreen() {
 
         const selfKey = getSelfLanKey(lanInfo.sessionId);
         const requestId = makeLanEventId();
+        const currentEquipment = characterRef.current?.equipment || character.equipment;
+        const nextBag = [...(currentEquipment?.bag || [])];
+        const itemIndex = nextBag.findIndex((entry: any, index: number) => (
+          index === selectedBagItem.index || String(entry?.name || '') === String(tradeItem.name || '')
+        ));
+        let sourceEquipmentAfter = currentEquipment;
+        if (itemIndex >= 0) {
+          const currentItem = nextBag[itemIndex];
+          const nextQty = Math.max(0, Number(currentItem?.qty || 0) - tradeItem.qty);
+          if (nextQty <= 0) nextBag.splice(itemIndex, 1);
+          else nextBag[itemIndex] = { ...currentItem, qty: nextQty };
+          sourceEquipmentAfter = { ...currentEquipment, bag: nextBag };
+        }
         const event: LanSessionEvent = {
           id: requestId,
           clientMsgId: requestId,
@@ -4185,41 +6199,37 @@ export default function CharacterSheetScreen() {
             toKey: target.key,
             item: tradeItem,
             qty: tradeItem.qty,
+            sourceEquipmentBefore: currentEquipment,
+            sourceEquipmentAfter,
           },
           item: tradeItem,
           message: `${character.name} enviou ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
           createdAt: new Date().toISOString(),
         };
 
-        await sendLanSessionEvent(lanInfo.joinUrl, event);
-        await rememberLanSessionEvent(db, event).catch(() => false);
+        const sent = await sendLanEventWithRetry(event, 'sendItemRequest');
 
         // Atualizacao otimista: remove imediatamente da mochila local para impedir
         // duplo envio acidental antes do inventory_patch oficial chegar do host.
-        const currentEquipment = characterRef.current?.equipment || character.equipment;
-        const nextBag = [...(currentEquipment?.bag || [])];
-        const itemIndex = nextBag.findIndex((entry: any, index: number) => (
-          index === selectedBagItem.index || String(entry?.name || '') === String(tradeItem.name || '')
-        ));
-        if (itemIndex >= 0) {
-          const currentItem = nextBag[itemIndex];
-          const nextQty = Math.max(0, Number(currentItem?.qty || 0) - tradeItem.qty);
-          if (nextQty <= 0) nextBag.splice(itemIndex, 1);
-          else nextBag[itemIndex] = { ...currentItem, qty: nextQty };
-          const nextEquipment = { ...currentEquipment, bag: nextBag };
+        // v71: tambem registra a acao pendente para o patch transfer_out oficial
+        // nao aplicar a mesma remocao uma segunda vez.
+        if (sourceEquipmentAfter !== currentEquipment) {
+          pendingSelfInventoryStateRef.current = { equipment: sourceEquipmentAfter, at: Date.now(), clientMsgId: requestId };
           setCharacter((current: any) => {
             if (!current) return current;
-            const merged = { ...current, equipment: nextEquipment };
+            const merged = { ...current, equipment: sourceEquipmentAfter };
             characterRef.current = merged;
             return merged;
           });
           await updateDB(
-            { equipment: nextEquipment },
+            { equipment: sourceEquipmentAfter },
             { allowLanAuthoritativeCache: true, reason: 'lan_player_send_item_optimistic_remove' }
           );
         }
 
-        showCustomAlert('Item enviado', `${target.characterName} recebera ${tradeItem.qty}x ${tradeItem.name}. O inventario sera sincronizado automaticamente.`);
+        showCustomAlert(sent ? 'Item enviado' : 'Item em fila', sent
+          ? `${target.characterName} recebera ${tradeItem.qty}x ${tradeItem.name}. O inventario sera sincronizado automaticamente.`
+          : `A conexao oscilou; vou reenviar ${tradeItem.qty}x ${tradeItem.name} quando reconectar.`);
       } catch {
         pendingOutgoingItemSendsRef.current.delete(pendingKey);
         showCustomAlert('Envio falhou', 'Nao consegui avisar a sessao LAN. O inventario local nao foi alterado.');
@@ -4238,7 +6248,7 @@ export default function CharacterSheetScreen() {
 
     try {
       const tradeId = makeLanEventId();
-      await sendLanSessionEvent(lanInfo.joinUrl, {
+      const offerEvent: LanSessionEvent = {
         id: tradeId,
         clientMsgId: tradeId,
         sessionId: lanInfo.sessionId,
@@ -4253,24 +6263,11 @@ export default function CharacterSheetScreen() {
         tradeId,
         offeredItem,
         createdAt: new Date().toISOString(),
-      });
-      await rememberLanSessionEvent(db, {
-        id: tradeId,
-        clientMsgId: tradeId,
-        sessionId: lanInfo.sessionId,
-        type: 'trade_offer',
-        fromKey: getSelfLanKey(lanInfo.sessionId),
-        fromName: character.name,
-        toKey: target.key,
-        toName: target.characterName,
-        entityType: 'inventory',
-        entityId: target.key,
-        ackRequired: true,
-        tradeId,
-        offeredItem,
-        createdAt: new Date().toISOString(),
-      }).catch(() => false);
-      showCustomAlert('Troca enviada', `${target.characterName} recebeu sua proposta de troca.`);
+      };
+      const sent = await sendLanEventWithRetry(offerEvent, 'tradeOffer');
+      showCustomAlert(sent ? 'Troca enviada' : 'Troca em fila', sent
+        ? `${target.characterName} recebeu sua proposta de troca.`
+        : 'A proposta sera reenviada automaticamente quando reconectar.');
     } catch {
       showCustomAlert('Troca falhou', 'Nao consegui enviar a proposta para a sessao LAN.');
     } finally {
@@ -4300,9 +6297,8 @@ export default function CharacterSheetScreen() {
       }
 
       if (isCounterResponse && currentOffer.offeredItem) {
-        const offeredName = String(currentOffer.offeredItem.name || '').trim().toLowerCase();
         const offeredQty = Math.max(1, Number(currentOffer.offeredItem.qty || 1));
-        const owned = (character.equipment?.bag || []).find((entry: any) => String(entry?.name || '').trim().toLowerCase() === offeredName);
+        const owned = (character.equipment?.bag || []).find((entry: any) => isSameSheetInventoryItem(entry, currentOffer.offeredItem as any));
         if (!owned || Math.max(0, Number(owned.qty || 0)) < offeredQty) {
           showCustomAlert('Troca cancelada', 'Voce nao tem mais o item/quantidade que ofereceu nessa proposta.');
           return;
@@ -4339,15 +6335,18 @@ export default function CharacterSheetScreen() {
             createdAt: new Date().toISOString(),
           };
 
-          await sendLanSessionEvent(lanInfo.joinUrl, counterEvent);
-          await rememberLanSessionEvent(db, counterEvent).catch(() => false);
+          const sent = await sendLanEventWithRetry(counterEvent, 'tradeCounter');
           setIncomingTrades((current) => current.filter((event) => (event.tradeId || event.id) !== tradeKey));
           setSelectedTradeOffer(null);
           setTradeCounterItem(null);
-          showCustomAlert('Resposta enviada', `${currentOffer.fromName} recebeu sua resposta. A troca so sera concluida se ele aceitar.`);
+          showCustomAlert(sent ? 'Resposta enviada' : 'Resposta em fila', sent
+            ? `${currentOffer.fromName} recebeu sua resposta. A troca so sera concluida se ele aceitar.`
+            : 'A resposta sera reenviada automaticamente quando reconectar.');
           return;
         }
 
+        const finalTradeFromKey = currentOffer.tradeAccept?.fromKey || selfKey;
+        const finalTradeToKey = currentOffer.tradeAccept?.toKey || currentOffer.fromKey;
         const finalAcceptEvent: LanSessionEvent = {
           id: eventId,
           clientMsgId: eventId,
@@ -4363,8 +6362,8 @@ export default function CharacterSheetScreen() {
           tradeId: tradeKey,
           tradeAccept: {
             tradeId: tradeKey,
-            fromKey: selfKey,
-            toKey: currentOffer.fromKey,
+            fromKey: finalTradeFromKey,
+            toKey: finalTradeToKey,
           },
           offeredItem: currentOffer.offeredItem,
           requestedItem: currentOffer.requestedItem,
@@ -4374,12 +6373,13 @@ export default function CharacterSheetScreen() {
           createdAt: new Date().toISOString(),
         };
 
-        await sendLanSessionEvent(lanInfo.joinUrl, finalAcceptEvent);
-        await rememberLanSessionEvent(db, finalAcceptEvent).catch(() => false);
+        const sent = await sendLanEventWithRetry(finalAcceptEvent, 'tradeAccept');
         setIncomingTrades((current) => current.filter((event) => (event.tradeId || event.id) !== tradeKey));
         setSelectedTradeOffer(null);
         setTradeCounterItem(null);
-        showCustomAlert('Troca aceita', 'A troca foi enviada para execucao automatica.');
+        showCustomAlert(sent ? 'Troca aceita' : 'Troca em fila', sent
+          ? 'A troca foi enviada para execucao automatica.'
+          : 'A confirmacao sera reenviada automaticamente quando reconectar.');
       } catch {
         showCustomAlert('Troca falhou', 'Nao consegui confirmar a troca na sessao LAN. O inventario local nao foi alterado.');
       }
@@ -4417,8 +6417,7 @@ export default function CharacterSheetScreen() {
           message: `${character.name} recusou a troca.`,
           createdAt: new Date().toISOString(),
         };
-        await sendLanSessionEvent(lanInfo.joinUrl, declineEvent);
-        await rememberLanSessionEvent(db, declineEvent).catch(() => false);
+        await sendLanEventWithRetry(declineEvent, 'tradeDecline');
         setIncomingTrades((current) => current.filter((entry) => (entry.tradeId || entry.id) !== tradeKey));
         if ((selectedTradeOffer?.tradeId || selectedTradeOffer?.id) === tradeKey) setSelectedTradeOffer(null);
       } catch {
@@ -4428,47 +6427,55 @@ export default function CharacterSheetScreen() {
   };
 
   const notifyOwnLanStatus = async (hpCurrent: number, hpMax: number) => {
-    if (!lanInfo?.joinUrl || !character) return;
+    if (!lanInfo?.sessionId || !character) return;
     try {
-      await sendLanSessionEvent(lanInfo.joinUrl, {
-        id: makeLanEventId(),
+      const eventId = makeLanEventId();
+      await sendLanEventWithRetry({
+        id: eventId,
+        clientMsgId: eventId,
         sessionId: lanInfo.sessionId,
         type: 'public_status',
         fromKey: getSelfLanKey(lanInfo.sessionId),
         fromName: character.name,
         toKey: 'session',
         toName: 'session',
+        ackRequired: false,
         publicState: {
           hpCurrent,
           hpMax,
+          tempHp: Math.max(0, Math.floor(Number((characterRef.current as any)?.temp_hp ?? character.temp_hp ?? 0) || 0)),
           level: character.level,
         },
         createdAt: new Date().toISOString(),
-      });
+      }, 'notifyOwnLanStatus');
     } catch {
       // A mudanca local de HP continua valida mesmo se a mesa estiver temporariamente offline.
     }
   };
 
   const notifySelfLanSpellEvent = async (spellEffect: NonNullable<LanSessionEvent['spellEffect']>) => {
-    if (!lanInfo?.joinUrl || !character) return;
+    if (!lanInfo?.sessionId || !character) return;
     const selfKey = getSelfLanKey(lanInfo.sessionId);
     if (!selfKey) return;
 
     try {
+      const eventId = makeLanEventId();
       const event: LanSessionEvent = {
-        id: makeLanEventId(),
+        id: eventId,
+        clientMsgId: eventId,
         sessionId: lanInfo.sessionId,
         type: spellEffect.mode === 'effect' ? 'spell_effect' : 'spell_hp',
         fromKey: selfKey,
         fromName: character.name,
-        toKey: selfKey,
-        toName: character.name,
+        toKey: 'master',
+        toName: 'Mestre',
+        entityType: spellEffect.mode === 'effect' ? 'effect' : 'player',
+        entityId: selfKey,
+        ackRequired: true,
         spellEffect,
         createdAt: new Date().toISOString(),
       };
-      await rememberLanSessionEvent(db, event);
-      await sendLanSessionEvent(lanInfo.joinUrl, event);
+      await sendLanEventWithRetry(event, 'notifySelfLanSpellEvent');
     } catch {
       // O item ja foi aplicado localmente; o proximo snapshot oficial corrige caso o host nao receba.
     }
@@ -4675,59 +6682,28 @@ export default function CharacterSheetScreen() {
       createdAt: new Date().toISOString(),
     };
 
-    await sendLanSessionEvent(lanInfo.joinUrl, event);
-    await rememberLanSessionEvent(db, event).catch(() => false);
+    await sendLanEventWithRetry(event, 'sendSpellTargetRequest');
   };
 
   const applyStructuredItemEffects = async (bagIndex: number, rawItem: any, qty: number, effects: any[], chosenAttr?: string) => {
     const item = hydrateInventoryItemForEffects(rawItem);
-    const lanMode = isLanCharacter();
 
-    if (lanMode) {
-      if (!lanInfo?.joinUrl || !character) return;
-      const selfKey = getSelfLanKey(lanInfo.sessionId);
-      const actionId = makeLanEventId();
-      const event: LanSessionEvent = {
-        id: actionId,
-        clientMsgId: actionId,
-        sessionId: lanInfo.sessionId,
-        type: 'item_use_request',
-        fromKey: selfKey,
-        fromName: character.name,
-        toKey: 'master',
-        toName: 'Mestre',
-        entityType: 'action',
-        entityId: actionId,
-        ackRequired: true,
-        actionRequest: {
-          actionId,
-          actionName: item.name,
-          actionKind: 'item',
-          sourceType: 'item',
-          targetKind: 'self',
-          targetKey: selfKey,
-          targetName: character.name,
-          rollMode: 'manual',
-          item: makeTradeItem(item, qty),
-          itemQty: qty,
-          effects,
-          chosenAttr,
-          createdAt: new Date().toISOString(),
-        },
-        message: `${character.name} pediu para usar ${qty}x ${item.name}.`,
-        createdAt: new Date().toISOString(),
+    // v54: consumir/usar item próprio é ação autônoma do jogador.
+    // Não vira item_use_request nem pede permissão do mestre; só envia patches vivos
+    // de inventário/atributo/efeito para o host validar que a quantidade não aumentou.
+    const equipmentBeforeConsume = normalizeSheetEquipment(character.equipment);
+    const consumedBag = [...equipmentBeforeConsume.bag];
+    const consumedIdx = Math.max(0, bagIndex);
+    if (consumedBag[consumedIdx]) {
+      consumedBag[consumedIdx] = {
+        ...hydrateInventoryItemForEffects(consumedBag[consumedIdx]),
+        qty: Math.max(0, Number(consumedBag[consumedIdx].qty || 0) - qty),
       };
-      try {
-        await sendLanSessionEvent(lanInfo.joinUrl, event);
-        await rememberLanSessionEvent(db, event).catch(() => false);
-        showCustomAlert('Pedido enviado ao mestre', `${item.name} sera consumido se o mestre confirmar a acao.`);
-      } catch {
-        showCustomAlert('Uso falhou', 'Nao consegui enviar o uso do item para o mestre.');
-      }
-      return;
     }
-
-    updateBagQty(bagIndex, -qty, item);
+    const equipmentAfterConsume = {
+      ...equipmentBeforeConsume,
+      bag: consumedBag.filter((entry: any) => Number(entry?.qty || 0) > 0),
+    };
 
     const nextStats = { ...character.stats, temp_mods: { ...(character.stats?.temp_mods || {}) } };
     const dbUpdates: any = {};
@@ -4775,25 +6751,29 @@ export default function CharacterSheetScreen() {
           nextStats.extra_points = (Number(nextStats.extra_points) || 0) + totalValue;
           messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue} permanente.`);
         } else {
-          nextStats.temp_mods[target] = (Number(nextStats.temp_mods[target]) || 0) + totalValue;
+          // v55: efeito temporario/CA de consumivel fica apenas em active_effects.
+          // Antes gravava tambem em temp_mods; a ficha soma temp_mods + active_effects
+          // e por isso o bonus aparecia/aplicava 2x no jogador e no mestre.
           messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue}${isPermanent ? ' permanente' : ''}.`);
         }
 
-        pushLocalEffect({
-          name: `${item.name}: ${target} ${totalValue > 0 ? '+' : ''}${totalValue}`,
-          status: isPermanent ? 'permanent_item_effect' : 'item_effect',
-          statusKey: isPermanent ? 'permanent_item_effect' : 'item_effect',
-          target: normalizeLanEffectTarget(target),
-          value: totalValue,
-          remaining: duration.remaining,
-          unit: duration.unit,
-          durationText: duration.text,
-          kind: target === 'CA' ? 'stat' : 'stat',
-          mode: effect.mode === 'set' ? 'set' : 'add',
-          color: isPermanent ? '#00fa9a' : '#00bfff',
-          secondaryColor: '#8be9fd',
-          visualPriority: isPermanent ? 70 : 50,
-        });
+        if (!isPermanent || target === 'CA') {
+          pushLocalEffect({
+            name: `${item.name}: ${target} ${totalValue > 0 ? '+' : ''}${totalValue}`,
+            status: 'item_effect',
+            statusKey: 'item_effect',
+            target: normalizeLanEffectTarget(target),
+            value: totalValue,
+            remaining: duration.remaining,
+            unit: duration.unit,
+            durationText: duration.text,
+            kind: target === 'CA' ? 'stat' : 'stat',
+            mode: effect.mode === 'set' ? 'set' : 'add',
+            color: '#00bfff',
+            secondaryColor: '#8be9fd',
+            visualPriority: 50,
+          });
+        }
       }
 
       if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
@@ -4857,18 +6837,65 @@ export default function CharacterSheetScreen() {
       }
     }
 
+    const previousBaseConForConsume = Math.floor(Number(character.stats?.CON || 10)) || 10;
+    const nextBaseConForConsume = Math.floor(Number(nextStats?.CON || previousBaseConForConsume)) || previousBaseConForConsume;
+    const consumeConHpDelta = (Math.floor((nextBaseConForConsume - 10) / 2) - Math.floor((previousBaseConForConsume - 10) / 2)) * Math.max(1, Number(character.level || 1));
+    if (consumeConHpDelta) {
+      dbUpdates.hp_max = Math.max(1, Number(character.hp_max || 0) + consumeConHpDelta);
+      dbUpdates.hp_current = Math.max(0, Number(character.hp_current || 0) + consumeConHpDelta);
+      numberPatch.hpMax = dbUpdates.hp_max;
+      numberPatch.hpCurrent = dbUpdates.hp_current;
+    }
+
+    dbUpdates.equipment = equipmentAfterConsume;
     dbUpdates.stats = nextStats;
     if (nextActiveEffects.length !== (Array.isArray(character.active_effects) ? character.active_effects.length : 0)) {
       dbUpdates.active_effects_json = nextActiveEffects;
     }
 
-    await updateDB(dbUpdates, { reason: 'offline_item_consume' });
-    setCharacter((prev: any) => prev ? ({
-      ...prev,
-      ...dbUpdates,
-      stats: nextStats,
-      active_effects: nextActiveEffects,
-    }) : prev);
+    // v86: consumo precisa ser visualmente imediato. O SQLite e o envio LAN ficam
+    // depois; se o host devolver correção, o inventory_patch/payload autoritativo reconcilia.
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const merged = {
+        ...prev,
+        ...dbUpdates,
+        equipment: equipmentAfterConsume,
+        stats: nextStats,
+        active_effects: nextActiveEffects,
+      };
+      characterRef.current = merged;
+      return merged;
+    });
+    void updateDB(dbUpdates, {
+      reason: isLanPlayerRuntime ? 'lan_item_consume_runtime_first_async' : 'offline_item_consume',
+      allowLanAuthoritativeCache: isLanPlayerRuntime,
+    }).catch((error) => {
+      debugLanFlow('PLAYER_ITEM_CONSUME_PERSIST_ASYNC_FAILED', {
+        itemName: item.name,
+        characterId: character.id,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    if (isLanPlayerRuntime && lanInfo?.sessionId) {
+      const clientRequestId = makeLanEventId();
+      pendingSelfInventoryStateRef.current = { equipment: equipmentAfterConsume, statsPatch: nextStats, at: Date.now(), clientMsgId: clientRequestId };
+      void notifyInventoryPatch(
+        equipmentAfterConsume,
+        `${character.name} consumiu ${qty}x ${item.name}.`,
+        clientRequestId,
+        nextStats,
+        equipmentBeforeConsume
+      );
+      if (Object.keys(numberPatch).length > 0) {
+        void notifyNumberPatch(numberPatch, `${character.name} atualizou PV por ${item.name}.`);
+      }
+      const liveEffects = lanEffectsToNotify.filter((effect: any) => !effect?.isPermanent && effect?.unit !== 'permanent');
+      if (liveEffects.length > 0) {
+        void notifyEffectPatch(liveEffects, `${character.name} aplicou efeito de ${item.name}.`);
+      }
+    }
 
     showCustomAlert('Efeito aplicado', messages.length ? messages.join('\n') : `${item.name} foi usado.`);
   };
@@ -5008,8 +7035,12 @@ export default function CharacterSheetScreen() {
           });
           msgParts.push(`✨ Escolha: ${totalVal > 0 ? '+'+totalVal : totalVal} em ${chosenAttr} (Permanente)`);
         } else {
-          if(!newStats.temp_mods) newStats.temp_mods = {};
-          newStats.temp_mods[chosenAttr] = (parseInt(newStats.temp_mods[chosenAttr]) || 0) + totalVal;
+          // v55: no LAN o host devolve effect_patch autoritativo; gravar temp_mods aqui
+          // faria o mesmo bonus somar 2x quando o effect_patch chegasse. Offline ainda usa temp_mods.
+          if (!isLanPlayerRuntime) {
+            if(!newStats.temp_mods) newStats.temp_mods = {};
+            newStats.temp_mods[chosenAttr] = (parseInt(newStats.temp_mods[chosenAttr]) || 0) + totalVal;
+          }
           lanEffects.push({
             spellName: item.name,
             mode: 'effect',
@@ -5051,8 +7082,12 @@ export default function CharacterSheetScreen() {
               });
               msgParts.push(`💪 Permanente: ${val > 0 ? '+'+val : val} em ${attr}`);
           } else {
-              if(!newStats.temp_mods) newStats.temp_mods = {};
-              newStats.temp_mods[attr] = (parseInt(newStats.temp_mods[attr]) || 0) + val;
+              // v55: no LAN o effect_patch autoritativo carrega esse bonus temporario.
+              // Offline continua gravando em temp_mods porque nao ha host para reenviar efeito.
+              if (!isLanPlayerRuntime) {
+                if(!newStats.temp_mods) newStats.temp_mods = {};
+                newStats.temp_mods[attr] = (parseInt(newStats.temp_mods[attr]) || 0) + val;
+              }
               lanEffects.push({
                 spellName: item.name,
                 mode: 'effect',
@@ -5111,8 +7146,20 @@ export default function CharacterSheetScreen() {
       if (msgParts.length === 0 && !chosenAttr) msgParts.push(`✨ Efeito da ingestão: ${effect}`);
 
       dbUpdates.stats = newStats;
-      if (Object.keys(dbUpdates).length > 0) updateDB(dbUpdates);
-      for (const lanEffect of lanEffects) {
+      if (Object.keys(dbUpdates).length > 0) updateDB(dbUpdates, { allowLanAuthoritativeCache: isLanPlayerRuntime, reason: isLanPlayerRuntime ? 'lan_text_item_consume_runtime_first' : 'offline_text_item_consume' });
+      if (isLanPlayerRuntime) {
+        const clientRequestId = makeLanEventId();
+        const latestEquipment = normalizeSheetEquipment(characterRef.current?.equipment || character.equipment);
+        pendingSelfInventoryStateRef.current = { equipment: latestEquipment, statsPatch: newStats, at: Date.now(), clientMsgId: clientRequestId };
+        void notifyInventoryPatch(
+          latestEquipment,
+          `${character.name} consumiu ${qty}x ${item.name}.`,
+          clientRequestId,
+          newStats,
+          character.equipment
+        );
+      }
+      for (const lanEffect of lanEffects.filter((effect: any) => effect?.durationUnit !== 'permanent')) {
         void notifySelfLanSpellEvent(lanEffect);
       }
 
@@ -5211,17 +7258,50 @@ export default function CharacterSheetScreen() {
 
   const getEquipBonus = (item: any) => {
     if (!item) return {};
-    const effect = item.damage || '';
-    const statRegex = /(CA|FOR|DES|CON|INT|SAB|CAR)\s*([+-]?\d+)(?!\s*\(?(Perm|Temp))/gi; 
-    const matches = [...effect.matchAll(statRegex)];
-    let bonuses: Record<string, number> = {};
-    matches.forEach(match => {
-      const attr = match[1].toUpperCase();
-      const val = parseInt(match[2].replace('+', ''));
-      if (!effect.toLowerCase().includes('perm') && !effect.toLowerCase().includes('temp')) {
-          bonuses[attr] = val;
-      }
+    const bonuses: Record<string, number> = {};
+
+    const addBonus = (attrRaw: unknown, rawValue: unknown) => {
+      const attr = String(attrRaw || '').toUpperCase();
+      if (!['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(attr)) return;
+      const value = Number(rawValue || 0);
+      if (!Number.isFinite(value) || value === 0) return;
+      bonuses[attr] = (bonuses[attr] || 0) + value;
+    };
+
+    // Itens criados no modo avançado salvam os bônus dentro de effect_json.
+    // Para item EQUIPADO, efeitos de atributo/CA viram equip_mods enquanto estiver usando.
+    const parsedEffectJson = safeJsonParse<any>(item.effect_json || item.effectJson, null);
+    const structuredEffects = Array.isArray(parsedEffectJson?.effects)
+      ? parsedEffectJson.effects
+      : Array.isArray(parsedEffectJson)
+        ? parsedEffectJson
+        : [];
+    const hasStructuredEquipEffects = structuredEffects.some((effect: any) => {
+      const target = String(effect?.target || '').toUpperCase();
+      if (!target || target === 'CHOOSE_STAT' || effect?.chooseStat) return false;
+      const kind = String(effect?.kind || effect?.type || '').toLowerCase();
+      return ['stat', 'attribute', 'atributo'].includes(kind) || ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(target);
     });
+
+    // v54: se houver effect_json estruturado, não some novamente o texto
+    // "CA 5 + CON 10", porque ele é apenas descrição do mesmo bônus.
+    if (!hasStructuredEquipEffects) {
+      const effectText = String(item.damage || '');
+      const statRegex = /(CA|FOR|DES|CON|INT|SAB|CAR)\s*([+-]?\d+)(?!\s*\(?(Perm|Temp))/gi;
+      for (const match of effectText.matchAll(statRegex)) {
+        if (effectText.toLowerCase().includes('perm') || effectText.toLowerCase().includes('temp')) continue;
+        addBonus(match[1], parseInt(match[2].replace('+', ''), 10));
+      }
+    }
+
+    for (const effect of structuredEffects) {
+      const target = String(effect?.target || '').toUpperCase();
+      const kind = String(effect?.kind || effect?.type || '').toLowerCase();
+      if (!['stat', 'attribute', 'atributo'].includes(kind) && !['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(target)) continue;
+      if (target === 'CHOOSE_STAT' || effect?.chooseStat) continue;
+      addBonus(target, effect?.value ?? effect?.amount);
+    }
+
     return bonuses;
   };
 
@@ -5292,15 +7372,27 @@ export default function CharacterSheetScreen() {
     }
 
     const nextEquipment = { bag: newBag, slots: newSlots };
+    // Idempotência: equip_mods é derivado dos slots finais, nunca somado incrementalmente.
+    // Assim, se o mesmo inventory_patch/rebind chegar duas vezes, CON/CA não entram em dobro.
+    newStats = buildSheetStatsWithDerivedEquipMods(character.stats, nextEquipment);
     if (lanInfo?.sessionId) {
+      const clientRequestId = makeLanEventId();
+      pendingSelfInventoryStateRef.current = { equipment: nextEquipment, statsPatch: newStats, at: Date.now(), clientMsgId: clientRequestId };
+      setCharacter((current: any) => {
+        if (!current) return current;
+        const merged = { ...current, equipment: nextEquipment, stats: newStats };
+        characterRef.current = merged;
+        return merged;
+      });
+      void persistFastLocalPatch({ equipment: nextEquipment, stats: newStats }, 'lan_player_self_equip_optimistic');
       void runSheetAction(`equip:${activeSlot}`, async () => {
-        const sent = await notifyInventoryPatch(nextEquipment, `${character.name} atualizou equipamentos equipados.`, makeLanEventId(), newStats);
-        if (sent) {
-          await updateDB(
-            { equipment: nextEquipment, stats: newStats },
-            { allowLanAuthoritativeCache: true, reason: 'lan_player_self_equip_patch' }
-          );
-        }
+        await notifyInventoryPatch(
+          nextEquipment,
+          `${character.name} atualizou equipamentos equipados.`,
+          clientRequestId,
+          newStats,
+          character.equipment
+        );
       });
     } else {
       void updateDB({ equipment: nextEquipment, stats: newStats });
@@ -5395,6 +7487,45 @@ export default function CharacterSheetScreen() {
   // 3. COMPONENTES DE RENDERIZAÇÃO
   // ==============================================================================
 
+
+  const renderPublicEffectsModal = (player: PublicLanPlayer | null, onClose: () => void) => {
+    const effects = summarizeEffectsForPublicRoster(player?.publicEffects || []);
+    return (
+      <Modal visible={Boolean(player)} transparent animationType="fade" onRequestClose={onClose} statusBarTranslucent>
+        <View style={styles.publicEffectModalOverlay}>
+          <TouchableOpacity style={styles.publicEffectBackdrop} activeOpacity={1} onPress={onClose} />
+          <View style={styles.publicEffectModalPanel}>
+            <View style={styles.publicEffectModalHeader}>
+              <View style={styles.publicEffectModalIcon}>
+                <Ionicons name="sparkles" size={18} color={appColors.primary} />
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.publicEffectModalTitle} numberOfLines={1}>Efeitos de {player?.characterName || 'jogador'}</Text>
+                <Text style={styles.publicEffectModalSubtitle}>{effects.length} efeito(s) visível(is) para a party</Text>
+              </View>
+              <TouchableOpacity style={styles.publicEffectModalClose} onPress={onClose}>
+                <Ionicons name="close" size={20} color={appColors.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.publicEffectModalList} contentContainerStyle={{ paddingBottom: 6 }} nestedScrollEnabled>
+              {effects.length === 0 ? (
+                <Text style={styles.publicEffectModalEmpty}>Nenhum efeito público ativo.</Text>
+              ) : effects.map((effect: any, index) => (
+                <View key={`${effect.id || effect.name || 'effect'}:${index}`} style={styles.publicEffectModalRow}>
+                  <View style={[styles.publicEffectDot, effect.color ? { backgroundColor: effect.color } : null]} />
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={styles.publicEffectModalName} numberOfLines={1}>{getPublicEffectName(effect)}</Text>
+                    <Text style={styles.publicEffectModalMeta}>{summarizePublicEffectDetail(effect)}</Text>
+                  </View>
+                </View>
+              ))}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
   const renderLanPartyCard = () => {
     if (!lanInfo && lanPlayers.length === 0) return null;
     const otherPlayers = lanPlayers.filter((player) => !player.isSelf);
@@ -5419,43 +7550,65 @@ export default function CharacterSheetScreen() {
           </Text>
         )}
 
-        {activeVisualEffects.length > 0 && (
-          <View style={[styles.sessionPlayerRow, { alignItems: 'flex-start' }]}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.sessionPlayerName}>Voce esta sob efeito de</Text>
-              <Text style={styles.sessionPlayerMeta}>
-                {activeVisualEffects.map((effect: any) => effect.name || effect.status || 'Efeito').join(', ')}
-              </Text>
-            </View>
-          </View>
-        )}
+        {activeVisualEffects.length > 0 && (() => {
+          const selfEffectSummary = formatPublicEffectSummary(activeVisualEffects, 2);
+          return (
+            <TouchableOpacity
+              style={[styles.sessionPlayerRow, { alignItems: 'flex-start' }]}
+              activeOpacity={0.75}
+              onPress={() => {
+                const self = lanPlayers.find((player) => player.isSelf) || null;
+                if (self) setPublicEffectsModalPlayer({ ...self, publicEffects: summarizeEffectsForPublicRoster(activeVisualEffects) });
+              }}
+            >
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.sessionPlayerName}>Voce esta sob efeito de</Text>
+                <Text style={styles.sessionPlayerMeta} numberOfLines={1} ellipsizeMode="tail">
+                  {selfEffectSummary.text}
+                </Text>
+              </View>
+            </TouchableOpacity>
+          );
+        })()}
 
         {lanPlayers.length === 0 ? (
           <Text style={styles.emptyText}>Aguardando sincronizacao da mesa.</Text>
         ) : lanPlayers.map((player) => {
           const hpPercent = player.hpMax > 0 ? Math.max(0, Math.min(100, (player.hpCurrent / player.hpMax) * 100)) : 0;
+          const effectSummary = formatPublicEffectSummary(player.publicEffects, 2);
           return (
-            <View key={player.key} style={styles.sessionPlayerRow}>
-              <View>
-                <Text style={styles.sessionPlayerName}>{player.characterName}{player.isSelf ? ' (voce)' : ''}</Text>
-                <Text style={styles.sessionPlayerMeta}>Nivel {player.level}{player.playerName ? ` - ${player.playerName}` : ''}</Text>
-              </View>
-              <View style={styles.sessionHpBox}>
-                <Text style={styles.sessionHpText}>{player.hpCurrent}/{player.hpMax}{player.tempHp > 0 ? ` +${player.tempHp}` : ''}</Text>
-                <View style={styles.sessionHpTrack}>
-                  <View style={[styles.sessionHpFill, { width: `${hpPercent}%` }]} />
-                </View>
-                {Array.isArray(player.publicEffects) && player.publicEffects.length > 0 && (
-                  <Text style={[styles.sessionPlayerMeta, { marginTop: 4, textAlign: 'right' }]}>
-                    {player.publicEffects.map((effect: any) => effect.name || effect.status || 'Efeito').join(', ')}
+            <TouchableOpacity
+              key={player.key}
+              style={styles.sessionPlayerRow}
+              activeOpacity={effectSummary.total > 0 ? 0.75 : 1}
+              onPress={() => {
+                if (effectSummary.total > 0) setPublicEffectsModalPlayer(player);
+              }}
+            >
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.sessionPlayerName} numberOfLines={1}>{player.characterName}{player.isSelf ? ' (voce)' : ''}</Text>
+                <Text style={styles.sessionPlayerMeta} numberOfLines={1}>Nivel {player.level}{player.playerName ? ` - ${player.playerName}` : ''}</Text>
+                {effectSummary.total > 0 && (
+                  <Text style={[styles.sessionPlayerMeta, { color: '#00fa9a' }]} numberOfLines={1} ellipsizeMode="tail">
+                    {effectSummary.text}
                   </Text>
                 )}
               </View>
-            </View>
+              <View style={[styles.sessionHpBox, { flexShrink: 0 }]}>
+                <Text style={styles.sessionHpText} numberOfLines={1}>
+                  {player.hpCurrent}/{player.hpMax}{player.tempHp > 0 ? ` +${player.tempHp}` : ''}
+                </Text>
+                <View style={styles.sessionHpTrack}>
+                  <View style={[styles.sessionHpFill, { width: `${hpPercent}%` }]} />
+                </View>
+              </View>
+            </TouchableOpacity>
           );
         })}
 
         {otherPlayers.length === 0 && <Text style={styles.sessionPartyHint}>Quando outro jogador entrar, ele aparece aqui para envio ou troca.</Text>}
+
+        {renderPublicEffectsModal(publicEffectsModalPlayer, () => setPublicEffectsModalPlayer(null))}
       </View>
     );
   };
@@ -6424,10 +8577,10 @@ export default function CharacterSheetScreen() {
                       <Text style={styles.tradeSlotMeta}>{selectedTradeOffer.type === 'trade_counter' ? (selectedTradeOffer.requestedItem ? `Qtd. ${selectedTradeOffer.requestedItem.qty || 1}` : 'Voce nao recebera item de volta') : (tradeCounterItem ? `Qtd. ${tradeCounterQty}` : 'Voce nao enviara item de volta')}</Text>
                     </View>
                     {selectedTradeOffer.type !== 'trade_counter' && tradeCounterItem && (
-                      <View style={styles.actionQtyRow}>
-                        <TouchableOpacity onPress={() => setTradeCounterQty(Math.max(1, tradeCounterQty - 1))} style={styles.actionQtyBtn}><Text style={styles.actionQtyBtnText}>-</Text></TouchableOpacity>
-                        <Text style={styles.actionQtyVal}>{tradeCounterQty}</Text>
-                        <TouchableOpacity onPress={() => setTradeCounterQty(Math.min(tradeCounterItem.item.qty, tradeCounterQty + 1))} style={styles.actionQtyBtn}><Text style={styles.actionQtyBtnText}>+</Text></TouchableOpacity>
+                      <View style={styles.tradeQtyRow}>
+                        <TouchableOpacity onPress={() => setTradeCounterQty(Math.max(1, tradeCounterQty - 1))} style={styles.tradeQtyBtn}><Text style={styles.tradeQtyBtnText}>-</Text></TouchableOpacity>
+                        <Text style={styles.tradeQtyVal}>{tradeCounterQty}</Text>
+                        <TouchableOpacity onPress={() => setTradeCounterQty(Math.min(tradeCounterItem.item.qty, tradeCounterQty + 1))} style={styles.tradeQtyBtn}><Text style={styles.tradeQtyBtnText}>+</Text></TouchableOpacity>
                       </View>
                     )}
                   </View>
@@ -6722,15 +8875,21 @@ type SheetActiveEffect = {
 const STAT_EFFECT_TARGETS = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'] as const;
 
 function getLanStatEffectBonus(character: any, stat: string): number {
+  const normalized = String(stat || '').toUpperCase();
   const effects: SheetActiveEffect[] = Array.isArray(character?.active_effects)
     ? (character.active_effects as SheetActiveEffect[])
     : safeJsonParse<SheetActiveEffect[]>(character?.active_effects_json, []);
 
   return effects.reduce<number>((sum: number, effect: SheetActiveEffect) => {
-    if (String(effect?.target || '').toUpperCase() !== stat) return sum;
-    if (String(effect?.mode || 'add') === 'set') return sum;
+    if ((effect as any)?.active === false) return sum;
+    if (String(effect?.target || '').toUpperCase() !== normalized) return sum;
+    const rawValue = Number(effect?.value) || 0;
+    if (String(effect?.mode || 'add') === 'set') {
+      const base = Number(character?.stats?.[normalized] ?? 10) || 10;
+      return sum + (rawValue - base);
+    }
 
-    return sum + (Number(effect?.value) || 0);
+    return sum + rawValue;
   }, 0);
 }
 
@@ -6741,8 +8900,6 @@ function summarizeStatEffectBonuses(effects: SheetActiveEffect[] = []): Record<s
     const target = String(effect?.target || '').toUpperCase();
 
     if (!STAT_EFFECT_TARGETS.includes(target as (typeof STAT_EFFECT_TARGETS)[number])) continue;
-    if (String(effect?.mode || 'add') === 'set') continue;
-
     result[target] = (result[target] || 0) + (Number(effect?.value) || 0);
   }
 
@@ -6967,3 +9124,59 @@ function getDiceParts(expression: string) {
     };
   }).filter((entry) => [4, 6, 8, 10, 12, 20, 100].includes(entry.sides));
 }
+
+function getPublicEffectName(effect: any): string {
+  const raw = String(effect?.name || effect?.status || effect?.statusKey || 'Efeito').trim();
+  return raw || 'Efeito';
+}
+
+function summarizeEffectsForPublicRoster(effects: unknown[]): any[] {
+  if (!Array.isArray(effects)) return [];
+  const byKey = new Map<string, any>();
+  for (const raw of effects) {
+    const effect = raw && typeof raw === 'object' ? raw as any : {};
+    if (effect.visibleToPlayer === false || effect.active === false) continue;
+    const id = String(effect.id || effect.lanEffectId || effect.statusKey || `${effect.name || effect.status || 'Efeito'}:${effect.target || ''}:${effect.value || ''}`);
+    if (!id) continue;
+    byKey.set(id, {
+      id,
+      name: getPublicEffectName(effect),
+      status: effect.status,
+      statusKey: effect.statusKey,
+      target: effect.target,
+      value: effect.value,
+      kind: effect.kind,
+      remaining: effect.remaining,
+      unit: effect.unit,
+      color: effect.color,
+      secondaryColor: effect.secondaryColor,
+      publicNote: effect.publicNote,
+    });
+  }
+  return Array.from(byKey.values());
+}
+
+function formatPublicEffectSummary(effects: unknown[] | undefined, limit = 2) {
+  const list = summarizeEffectsForPublicRoster(effects || []);
+  const names = list.map(getPublicEffectName).filter(Boolean);
+  const shown = names.slice(0, Math.max(1, limit));
+  const hidden = Math.max(0, names.length - shown.length);
+  return {
+    total: names.length,
+    hasMore: hidden > 0,
+    text: hidden > 0 ? `${shown.join(', ')}...mais` : shown.join(', '),
+  };
+}
+
+function summarizePublicEffectDetail(effect: any): string {
+  const parts: string[] = [];
+  const target = String(effect?.target || '').trim();
+  const value = Number(effect?.value || 0);
+  if (target && target !== 'custom') parts.push(`${target}${value ? ` ${value > 0 ? '+' : ''}${value}` : ''}`);
+  if (Number.isFinite(Number(effect?.remaining)) && Number(effect.remaining) > 0) {
+    parts.push(`${effect.remaining} ${effect.unit || 'turn'}`);
+  }
+  if (effect?.publicNote) parts.push(String(effect.publicNote));
+  return parts.join(' • ') || 'Efeito público ativo';
+}
+

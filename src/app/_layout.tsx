@@ -4,8 +4,8 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Stack } from 'expo-router';
 import { SQLiteProvider } from 'expo-sqlite';
 import React, { useEffect } from 'react';
-import { traceApp } from '../services/debug/appTrace';
 import { initializeDatabase } from '../database/init';
+import { traceApp } from '../services/debug/appTrace';
 
 export default function RootLayout() {
   useEffect(() => {
@@ -16,7 +16,7 @@ export default function RootLayout() {
   }, []);
 
   return (
-    <SQLiteProvider databaseName="dnd_dados121510.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_data_v40.db" onInit={initializeDatabase}>
       <ThemeProvider value={DarkTheme}>
         <LinearGradient
           colors={appGradients.main}

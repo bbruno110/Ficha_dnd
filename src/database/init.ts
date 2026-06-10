@@ -220,6 +220,68 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       payload_json TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS lan_inventory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      player_key TEXT NOT NULL,
+      player_id INTEGER,
+      catalog_item_id INTEGER,
+      inventory_item_id TEXT,
+      stack_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      equipped_slot TEXT,
+      item_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_inventory_movements (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      source_event_id TEXT,
+      trade_id TEXT,
+      from_key TEXT,
+      to_key TEXT,
+      item_stack_key TEXT,
+      item_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      before_json TEXT NOT NULL DEFAULT '{}',
+      after_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS character_inventory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_id INTEGER NOT NULL,
+      catalog_item_id INTEGER,
+      inventory_item_id TEXT,
+      stack_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      equipped_slot TEXT,
+      item_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS character_inventory_movements (
+      id TEXT PRIMARY KEY,
+      character_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      source_event_id TEXT,
+      trade_id TEXT,
+      from_key TEXT,
+      to_key TEXT,
+      item_stack_key TEXT,
+      item_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      before_json TEXT NOT NULL DEFAULT '{}',
+      after_json TEXT NOT NULL DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
   `);
   traceSqlite('SQLITE_WRITE_DONE', {
     source: 'initializeDatabase',

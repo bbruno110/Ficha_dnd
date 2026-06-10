@@ -28,14 +28,15 @@ type SpellItem = { id: number; name: string; level: string; category?: string; c
 
 const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Condicoes/Efeitos', 'Acervo'];
 const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capacete', 'Capa', 'Bota', 'Luva', 'Consumível', 'Ferramenta', 'Mochila/Saco', 'Outro'];
-const EFFECT_CATEGORIES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
+const DAMAGE_TYPE_OPTIONS = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante'];
+const DIRECT_EFFECT_OPTIONS = ['Cura', 'PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
 const ITEM_PROPS = ['Acuidade', 'Leve', 'Pesada', 'Duas mãos', 'Versátil', 'Arremesso', 'Munição', 'Alcance', 'Recarga', 'Especial', 'Foco Arcano', 'Foco Divino', 'Foco Druídico', 'Consumível', 'Mágico'];
 
 const SPELL_RANGES = ['Pessoal', 'Toque', '9m', '18m', '36m', 'Cubo', 'Cone'];
 const SPELL_COMPONENTS = ['V', 'S', 'M'];
 const SPELL_DURATION_TYPES = ['Instantânea', 'Rodada(s)', 'Minuto(s)', 'Hora(s)', 'Dia(s)', 'Concentração', 'Permanente'];
 const SPELL_SAVES = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'];
-const SPELL_DAMAGE_TYPES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'Outro'];
+const SPELL_DAMAGE_TYPES = [...DAMAGE_TYPE_OPTIONS, 'Força', 'Cura', 'Outro'];
 
 const VALID_TABLES = ['items', 'races', 'classes', 'subclasses', 'spells', 'starting_kits', 'spellcasting_progression'];
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
@@ -57,6 +58,25 @@ const CONDITION_OPTIONS = [
   { key: 'frightened', name: 'Amedrontado', color: '#ff8fa3' },
   { key: 'restrained', name: 'Contido', color: '#f4a261' },
   { key: 'prone', name: 'Caido', color: '#cdb4db' },
+];
+const EFFECT_KIND_OPTIONS = [
+  { label: 'Condicao', value: 'condition' },
+  { label: 'Buff', value: 'buff' },
+  { label: 'Debuff', value: 'debuff' },
+  { label: 'Doenca', value: 'disease' },
+  { label: 'Maldicao', value: 'curse' },
+  { label: 'Customizado', value: 'custom' },
+];
+const EFFECT_DURATION_UNIT_OPTIONS = [
+  { label: 'Turno', value: 'turn' },
+  { label: 'Minuto', value: 'minute' },
+  { label: 'Hora', value: 'hour' },
+  { label: 'Dia', value: 'day' },
+  { label: 'Descanso', value: 'rest' },
+  { label: 'Equipado', value: 'while_equipped' },
+  { label: 'Ate teste', value: 'until_save' },
+  { label: 'Permanente', value: 'permanent' },
+  { label: 'Manual', value: 'manual' },
 ];
 
 export default function AdvancedCreatorScreen() {
@@ -87,6 +107,8 @@ export default function AdvancedCreatorScreen() {
   const [itemSaveDc, setItemSaveDc] = useState('10');
   const [itemSaveOnSuccess, setItemSaveOnSuccess] = useState('none');
   const [itemConditionKey, setItemConditionKey] = useState('none');
+  const [itemCatalogEffectSearch, setItemCatalogEffectSearch] = useState('');
+  const [itemConditionSearch, setItemConditionSearch] = useState('');
 
   // Estados de Raça & Classe
   const [stats, setStats] = useState({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' });
@@ -141,6 +163,8 @@ export default function AdvancedCreatorScreen() {
   const [spellConditionKey, setSpellConditionKey] = useState('none');
   const [spellSaves, setSpellSaves] = useState<string[]>([]);
   const [spellDescription, setSpellDescription] = useState('');
+  const [spellCatalogEffectSearch, setSpellCatalogEffectSearch] = useState('');
+  const [spellConditionSearch, setSpellConditionSearch] = useState('');
 
   // Estados de Progressão de Magia
   const [casterType, setCasterType] = useState<'total' | 'meio' | 'terco' | 'pacto'>('total');
@@ -162,6 +186,7 @@ export default function AdvancedCreatorScreen() {
 
   // Estados de Condicoes / Efeitos
   const [effectCatalog, setEffectCatalog] = useState<LanEffectCatalogItem[]>([]);
+  const [effectCatalogSearch, setEffectCatalogSearch] = useState('');
   const [editingEffectId, setEditingEffectId] = useState<number | null>(null);
   const [effectStatusKey, setEffectStatusKey] = useState('');
   const [effectKind, setEffectKind] = useState('condition');
@@ -335,17 +360,17 @@ export default function AdvancedCreatorScreen() {
 
   const resetForms = () => {
     setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffVal(''); setTempEffType('Cortante'); setTempEffDuration(''); setTempEffTurns(''); setItemDescription(''); setItemEffectHidden(false);
-    setItemEffectAmountMode('dice'); setItemDiceCount('1'); setItemDiceSides('6'); setItemFlatBonus('0'); setItemSaveAbility('Nenhum'); setItemSaveDc('10'); setItemSaveOnSuccess('none'); setItemConditionKey('none');
+    setItemEffectAmountMode('dice'); setItemDiceCount('1'); setItemDiceSides('6'); setItemFlatBonus('0'); setItemSaveAbility('Nenhum'); setItemSaveDc('10'); setItemSaveOnSuccess('none'); setItemConditionKey('none'); setItemCatalogEffectSearch(''); setItemConditionSearch('');
     setStats({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' }); setSpeed('9m'); setHitDice('8'); setGold('10'); setSubclassLevel('3'); setIsCaster(false); setSaves([]);
     setSubclassParents([]); setSubclassSearch(''); setTempSubclassLevel('3'); setBonusSkills('0');
     if(dbClasses.length > 0) setTempSubclassParent(dbClasses[0].name);
     setSpellCategory('Magia'); setSpellLevel('Truque'); setSpellClassesReq([]); setSpellClassSearch(''); setTempSpellClassLvl('1');
     if(dbClasses.length > 0) setTempSpellClass(dbClasses[0].name);
     setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRange('18m'); setSpellRangeMode('Distancia'); setSpellRangeValue('18'); setSpellRangeUnit('m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
-    setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellEffectAmountMode('dice'); setSpellDiceCount('1'); setSpellDiceSides('8'); setSpellFlatBonus('0'); setSpellSaveAbility('Nenhum'); setSpellSaveDc(''); setSpellSaveOnSuccess('negates'); setSpellConditionKey('none'); setSpellSaves([]); setSpellDescription(''); 
+    setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellEffectAmountMode('dice'); setSpellDiceCount('1'); setSpellDiceSides('8'); setSpellFlatBonus('0'); setSpellSaveAbility('Nenhum'); setSpellSaveDc(''); setSpellSaveOnSuccess('negates'); setSpellConditionKey('none'); setSpellSaves([]); setSpellDescription(''); setSpellCatalogEffectSearch(''); setSpellConditionSearch('');
     setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
     setSelectedFeatures([]); setCasterType('total');
-    setEditingEffectId(null); setEffectStatusKey(''); setEffectKind('condition'); setEffectCategory('custom'); setEffectColor('#8E44AD'); setEffectSecondaryColor('#D2B4DE'); setEffectIcon('sparkles'); setEffectDescription(''); setEffectPriority('40'); setEffectStackable(false); setEffectRemovableBySave(false); setEffectRepeatSave('none'); setEffectSaveAbility('Nenhum'); setEffectSaveOnSuccess('remove'); setEffectDurationValue('1'); setEffectDurationUnit('turn'); setEffectRulesNote('');
+    setEditingEffectId(null); setEffectCatalogSearch(''); setEffectStatusKey(''); setEffectKind('condition'); setEffectCategory('custom'); setEffectColor('#8E44AD'); setEffectSecondaryColor('#D2B4DE'); setEffectIcon('sparkles'); setEffectDescription(''); setEffectPriority('40'); setEffectStackable(false); setEffectRemovableBySave(false); setEffectRepeatSave('none'); setEffectSaveAbility('Nenhum'); setEffectSaveOnSuccess('remove'); setEffectDurationValue('1'); setEffectDurationUnit('turn'); setEffectRulesNote('');
   };
 
   const loadEffectCatalog = async () => {
@@ -413,6 +438,32 @@ export default function AdvancedCreatorScreen() {
     setEffectDurationValue(String(effect.defaultDurationValue || 1));
     setEffectDurationUnit(String(effect.defaultDurationUnit || 'turn'));
     setEffectRulesNote(String((effect.rulesJson as any)?.mechanicalNote || ''));
+  };
+
+  const activeCatalogEffects = effectCatalog.filter((effect) => effect.active !== false);
+  const filteredEffectCatalog = filterEffectCatalog(effectCatalog, effectCatalogSearch).slice(0, 30);
+  const filteredEffectCatalogTotal = filterEffectCatalog(effectCatalog, effectCatalogSearch).length;
+  const filteredItemCatalogEffects = searchEffectCatalog(activeCatalogEffects, itemCatalogEffectSearch, 8);
+  const filteredSpellCatalogEffects = searchEffectCatalog(activeCatalogEffects, spellCatalogEffectSearch, 8);
+  const filteredItemConditionOptions = searchConditionOptions(conditionOptions, itemConditionSearch, 8);
+  const filteredSpellConditionOptions = searchConditionOptions(conditionOptions, spellConditionSearch, 8);
+
+  const addCatalogEffectToItem = (effect: LanEffectCatalogItem) => {
+    setItemEffects((current) => [...current, makeBuilderEffectFromCatalog(effect, {
+      saveAbility: itemSaveAbility,
+      saveDc: itemSaveDc,
+      saveOnSuccess: itemSaveOnSuccess,
+    })]);
+    setItemCatalogEffectSearch('');
+  };
+
+  const addCatalogEffectToSpell = (effect: LanEffectCatalogItem) => {
+    setSpellEffectsList((current) => [...current, makeBuilderEffectFromCatalog(effect, {
+      saveAbility: spellSaveAbility,
+      saveDc: spellSaveDc,
+      saveOnSuccess: spellSaveOnSuccess,
+    })]);
+    setSpellCatalogEffectSearch('');
   };
 
   const handleDuplicateEffect = async (effect: LanEffectCatalogItem) => {
@@ -549,7 +600,10 @@ export default function AdvancedCreatorScreen() {
         let typeParts: string[] = [];
         
         spellEffectsList.forEach(eff => {
-          if (eff.type === 'Cura') {
+          if (eff.catalogEffect) {
+            damageParts.push(`Aplica ${eff.conditionName || eff.type}`);
+          }
+          else if (eff.type === 'Cura') {
             if (eff.dice) damageParts.push(`Cura ${eff.dice}`);
           }
           else if (eff.type === 'Outro') {
@@ -591,8 +645,11 @@ export default function AdvancedCreatorScreen() {
         itemEffects.forEach(eff => {
           let suffix = eff.duration ? (eff.duration === 'Temp' && eff.turns ? ` (Temp: ${eff.turns} turnos)` : ` (${eff.duration})`) : '';
           
+          if (eff.catalogEffect) {
+            damageValueParts.push(`Aplica ${eff.conditionName || eff.type}`);
+          }
           // Se for atributo, Cura ou efeito especial de "Outro", o tipo vai no valor da string
-          if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Cura'].includes(eff.type)) {
+          else if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Cura'].includes(eff.type)) {
               if (eff.type === 'Escolher Atributo') damageValueParts.push(`Escolher ${eff.val}${suffix}`);
               else if (eff.type === 'Cura') damageValueParts.push(`Cura ${eff.val}`);
               else damageValueParts.push(`${eff.type} ${eff.val}${suffix}`);
@@ -776,7 +833,36 @@ export default function AdvancedCreatorScreen() {
 
         <Text style={styles.label}>CONSTRUTOR DE EFEITOS (Dano, Cura, Atributos)</Text>
         <View style={styles.effectBuilder}>
-          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>VALOR DO EFEITO</Text>
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>USAR EFEITO CADASTRADO</Text>
+          <TextInput
+            style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]}
+            value={itemCatalogEffectSearch}
+            onChangeText={setItemCatalogEffectSearch}
+            placeholder="Buscar efeito para aplicar com este item..."
+            placeholderTextColor="#888"
+          />
+          {itemCatalogEffectSearch.trim().length > 0 && filteredItemCatalogEffects.length > 0 && (
+            <View style={{marginBottom: 15}}>
+              {filteredItemCatalogEffects.map((effect) => (
+                <TouchableOpacity
+                  key={effect.statusKey}
+                  style={[styles.effectRow, {backgroundColor: 'rgba(0,250,154,0.08)', borderColor: effect.color || 'rgba(0,250,154,0.25)', paddingVertical: 10}]}
+                  onPress={() => addCatalogEffectToItem(effect)}
+                >
+                  <View style={{flex: 1}}>
+                    <Text style={styles.effectText}>{effect.name}</Text>
+                    <Text style={styles.catalogItemSub}>{formatEffectKindLabel(effect.kind)} - {formatCatalogEffectMechanic(effect)}</Text>
+                  </View>
+                  <Ionicons name="add-circle-outline" size={22} color="#00fa9a" />
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+          {itemCatalogEffectSearch.trim().length > 0 && filteredItemCatalogEffects.length === 0 && (
+            <Text style={[styles.emptyText, {marginTop: 0, marginBottom: 15}]}>Nenhum efeito encontrado.</Text>
+          )}
+
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>DANO, CURA OU AJUSTE DIRETO</Text>
           <View style={{flexDirection: 'row', gap: 8, marginBottom: 12}}>
             {(['dice', 'value', 'none'] as const).map(mode => (
               <TouchableOpacity key={mode} style={[styles.limitBtn, itemEffectAmountMode === mode && styles.limitBtnActive]} onPress={() => setItemEffectAmountMode(mode)}>
@@ -790,9 +876,20 @@ export default function AdvancedCreatorScreen() {
             <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} keyboardType="numeric" placeholder="Valor fixo (Ex: +2, -1, 21)" placeholderTextColor="#888" value={tempEffVal} onChangeText={(value) => setTempEffVal(value.replace(/[^0-9+-]/g, ''))} />
           )}
           
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>TIPO DE DANO</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 10}}>
+            <View style={{flexDirection: 'row', gap: 8}}>
+              {DAMAGE_TYPE_OPTIONS.map(cat => (
+                <TouchableOpacity key={cat} style={[styles.limitBtn, tempEffType === cat && styles.limitBtnActive]} onPress={() => { setTempEffType(cat); setTempEffDuration(''); }}>
+                  <Text style={[styles.limitBtnText, tempEffType === cat && styles.limitBtnTextActive]}>{cat}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>CURA OU ATRIBUTO</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
             <View style={{flexDirection: 'row', gap: 8}}>
-              {EFFECT_CATEGORIES.map(cat => (
+              {DIRECT_EFFECT_OPTIONS.map(cat => (
                 <TouchableOpacity key={cat} style={[styles.limitBtn, tempEffType === cat && styles.limitBtnActive]} onPress={() => { setTempEffType(cat); setTempEffDuration(''); }}>
                   <Text style={[styles.limitBtnText, tempEffType === cat && styles.limitBtnTextActive]}>{cat}</Text>
                 </TouchableOpacity>
@@ -844,16 +941,33 @@ export default function AdvancedCreatorScreen() {
                 </ScrollView>
               </View>
 
-              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA CONDICAO</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
-                <View style={{flexDirection: 'row', gap: 8}}>
-                  {conditionOptions.map(condition => (
-                    <TouchableOpacity key={condition.key} style={[styles.limitBtn, itemConditionKey === condition.key && styles.limitBtnActive]} onPress={() => setItemConditionKey(condition.key)}>
-                      <Text style={[styles.limitBtnText, itemConditionKey === condition.key && styles.limitBtnTextActive]}>{condition.name}</Text>
+              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA EFEITO CADASTRADO</Text>
+              {itemConditionKey !== 'none' && (
+                <TouchableOpacity style={[styles.effectRow, {paddingVertical: 10, marginBottom: 10}]} onPress={() => setItemConditionKey('none')}>
+                  <Text style={styles.effectText}>{getConditionOption(itemConditionKey, conditionOptions).name}</Text>
+                  <Ionicons name="close-circle" size={20} color="#ff6666" />
+                </TouchableOpacity>
+              )}
+              <TextInput
+                style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]}
+                value={itemConditionSearch}
+                onChangeText={setItemConditionSearch}
+                placeholder="Buscar efeito para aplicar na falha..."
+                placeholderTextColor="#888"
+              />
+              {itemConditionSearch.trim().length > 0 && filteredItemConditionOptions.length > 0 && (
+                <View style={{marginBottom: 15}}>
+                  {filteredItemConditionOptions.map(condition => (
+                    <TouchableOpacity key={condition.key} style={[styles.effectRow, itemConditionKey === condition.key && styles.limitBtnActive, {paddingVertical: 10}]} onPress={() => { setItemConditionKey(condition.key); setItemConditionSearch(''); }}>
+                      <View style={{flex: 1}}>
+                        <Text style={styles.effectText}>{condition.name}</Text>
+                        <Text style={styles.catalogItemSub}>{condition.key}</Text>
+                      </View>
+                      <Ionicons name="add-circle-outline" size={22} color="#00fa9a" />
                     </TouchableOpacity>
                   ))}
                 </View>
-              </ScrollView>
+              )}
             </>
           )}
           
@@ -887,14 +1001,15 @@ export default function AdvancedCreatorScreen() {
             {itemEffects.map((eff, i) => {
               let displayText = '';
               const suffix = eff.duration ? (eff.duration === 'Temp' && eff.turns ? ` (Temp: ${eff.turns} turnos)` : ` (${eff.duration})`) : '';
-              if (eff.type === 'Cura') displayText = `Cura ${eff.val}`;
+              if (eff.catalogEffect) displayText = `${eff.conditionName || eff.type} - ${formatBuilderEffectMechanic(eff)}`;
+              else if (eff.type === 'Cura') displayText = `Cura ${eff.val}`;
               else if (eff.type === 'Outro') displayText = eff.val;
               else if (eff.type === 'Escolher Atributo') displayText = `Escolher ${eff.val}${suffix}`;
               else if (['PV_TEMP', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) displayText = `${eff.type} ${eff.val}${suffix}`;
               else displayText = `${eff.val} ${eff.type}`;
               const condition = getConditionOption(eff.conditionKey, conditionOptions);
               if (eff.saveAbility && eff.saveAbility !== 'Nenhum') displayText += ` | Teste ${eff.saveAbility} CD ${eff.saveDc || '?'}`;
-              if (condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
+              if (!eff.catalogEffect && condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
 
               return (
                 <View key={i} style={styles.effectRow}>
@@ -1093,7 +1208,36 @@ export default function AdvancedCreatorScreen() {
 
         <Text style={styles.label}>CONSTRUTOR DE EFEITOS (Adicione múltiplos)</Text>
         <View style={styles.effectBuilder}>
-          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>VALOR / DADO</Text>
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>USAR EFEITO CADASTRADO</Text>
+          <TextInput
+            style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]}
+            value={spellCatalogEffectSearch}
+            onChangeText={setSpellCatalogEffectSearch}
+            placeholder="Buscar efeito para esta magia ou habilidade..."
+            placeholderTextColor="#888"
+          />
+          {spellCatalogEffectSearch.trim().length > 0 && filteredSpellCatalogEffects.length > 0 && (
+            <View style={{marginBottom: 15}}>
+              {filteredSpellCatalogEffects.map((effect) => (
+                <TouchableOpacity
+                  key={effect.statusKey}
+                  style={[styles.effectRow, {backgroundColor: 'rgba(0,250,154,0.08)', borderColor: effect.color || 'rgba(0,250,154,0.25)', paddingVertical: 10}]}
+                  onPress={() => addCatalogEffectToSpell(effect)}
+                >
+                  <View style={{flex: 1}}>
+                    <Text style={styles.effectText}>{effect.name}</Text>
+                    <Text style={styles.catalogItemSub}>{formatEffectKindLabel(effect.kind)} - {formatCatalogEffectMechanic(effect)}</Text>
+                  </View>
+                  <Ionicons name="add-circle-outline" size={22} color="#00fa9a" />
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+          {spellCatalogEffectSearch.trim().length > 0 && filteredSpellCatalogEffects.length === 0 && (
+            <Text style={[styles.emptyText, {marginTop: 0, marginBottom: 15}]}>Nenhum efeito encontrado.</Text>
+          )}
+
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>DANO, CURA OU AJUSTE DIRETO</Text>
           <View style={{flexDirection: 'row', gap: 8, marginBottom: 12}}>
             {(['dice', 'value', 'none'] as const).map(mode => (
               <TouchableOpacity key={mode} style={[styles.limitBtn, spellEffectAmountMode === mode && styles.limitBtnActive]} onPress={() => setSpellEffectAmountMode(mode)}>
@@ -1107,9 +1251,20 @@ export default function AdvancedCreatorScreen() {
             <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} keyboardType="numeric" placeholder="Valor fixo (Ex: +2, -1)" placeholderTextColor="#888" value={tempSpellDice} onChangeText={(value) => setTempSpellDice(value.replace(/[^0-9+-]/g, ''))} />
           )}
           
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>TIPO DE DANO</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 10}}>
+            <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
+              {[...DAMAGE_TYPE_OPTIONS, 'Força'].map(dt => (
+                <TouchableOpacity key={dt} style={[styles.limitBtn, tempSpellDmgType === dt && styles.limitBtnActive]} onPress={() => setTempSpellDmgType(dt)}>
+                  <Text style={[styles.limitBtnText, tempSpellDmgType === dt && styles.limitBtnTextActive]}>{dt}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+          <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>CURA OU OUTRO RESULTADO</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
             <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
-              {SPELL_DAMAGE_TYPES.map(dt => (
+              {['Cura', 'Outro'].map(dt => (
                 <TouchableOpacity key={dt} style={[styles.limitBtn, tempSpellDmgType === dt && styles.limitBtnActive]} onPress={() => setTempSpellDmgType(dt)}>
                   <Text style={[styles.limitBtnText, tempSpellDmgType === dt && styles.limitBtnTextActive]}>{dt}</Text>
                 </TouchableOpacity>
@@ -1147,16 +1302,33 @@ export default function AdvancedCreatorScreen() {
                 </ScrollView>
               </View>
 
-              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA CONDICAO</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
-                <View style={{flexDirection: 'row', gap: 8}}>
-                  {conditionOptions.map(condition => (
-                    <TouchableOpacity key={condition.key} style={[styles.limitBtn, spellConditionKey === condition.key && styles.limitBtnActive]} onPress={() => setSpellConditionKey(condition.key)}>
-                      <Text style={[styles.limitBtnText, spellConditionKey === condition.key && styles.limitBtnTextActive]}>{condition.name}</Text>
+              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>SE FALHAR, APLICA EFEITO CADASTRADO</Text>
+              {spellConditionKey !== 'none' && (
+                <TouchableOpacity style={[styles.effectRow, {paddingVertical: 10, marginBottom: 10}]} onPress={() => setSpellConditionKey('none')}>
+                  <Text style={styles.effectText}>{getConditionOption(spellConditionKey, conditionOptions).name}</Text>
+                  <Ionicons name="close-circle" size={20} color="#ff6666" />
+                </TouchableOpacity>
+              )}
+              <TextInput
+                style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]}
+                value={spellConditionSearch}
+                onChangeText={setSpellConditionSearch}
+                placeholder="Buscar efeito para aplicar na falha..."
+                placeholderTextColor="#888"
+              />
+              {spellConditionSearch.trim().length > 0 && filteredSpellConditionOptions.length > 0 && (
+                <View style={{marginBottom: 15}}>
+                  {filteredSpellConditionOptions.map(condition => (
+                    <TouchableOpacity key={condition.key} style={[styles.effectRow, spellConditionKey === condition.key && styles.limitBtnActive, {paddingVertical: 10}]} onPress={() => { setSpellConditionKey(condition.key); setSpellConditionSearch(''); }}>
+                      <View style={{flex: 1}}>
+                        <Text style={styles.effectText}>{condition.name}</Text>
+                        <Text style={styles.catalogItemSub}>{condition.key}</Text>
+                      </View>
+                      <Ionicons name="add-circle-outline" size={22} color="#00fa9a" />
                     </TouchableOpacity>
                   ))}
                 </View>
-              </ScrollView>
+              )}
             </>
           )}
           
@@ -1189,9 +1361,9 @@ export default function AdvancedCreatorScreen() {
           <View style={{marginBottom: 20}}>
             {spellEffectsList.map((eff, i) => {
               const condition = getConditionOption(eff.conditionKey, conditionOptions);
-              let displayText = eff.dice ? `${eff.dice} (${eff.type})` : `${eff.type}`;
+              let displayText = eff.catalogEffect ? `${eff.conditionName || eff.type} - ${formatBuilderEffectMechanic(eff)}` : eff.dice ? `${eff.dice} (${eff.type})` : `${eff.type}`;
               if (eff.saveAbility && eff.saveAbility !== 'Nenhum') displayText += ` | Teste ${eff.saveAbility}${eff.saveDc ? ` CD ${eff.saveDc}` : ''}`;
-              if (condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
+              if (!eff.catalogEffect && condition && condition.key !== 'none') displayText += ` | Falha: ${condition.name}`;
               return (
                 <View key={i} style={styles.effectRow}>
                   <Text style={styles.effectText}>{displayText}</Text>
@@ -1574,9 +1746,9 @@ export default function AdvancedCreatorScreen() {
         <Text style={styles.label}>TIPO MECANICO</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           <View style={{flexDirection: 'row', gap: 8}}>
-            {['condition', 'buff', 'debuff', 'disease', 'curse', 'custom'].map((kind) => (
-              <TouchableOpacity key={kind} style={[styles.limitBtn, effectKind === kind && styles.limitBtnActive]} onPress={() => setEffectKind(kind)}>
-                <Text style={[styles.limitBtnText, effectKind === kind && styles.limitBtnTextActive]}>{kind}</Text>
+            {EFFECT_KIND_OPTIONS.map((kind) => (
+              <TouchableOpacity key={kind.value} style={[styles.limitBtn, effectKind === kind.value && styles.limitBtnActive]} onPress={() => setEffectKind(kind.value)}>
+                <Text style={[styles.limitBtnText, effectKind === kind.value && styles.limitBtnTextActive]}>{kind.label}</Text>
               </TouchableOpacity>
             ))}
           </View>
@@ -1603,9 +1775,9 @@ export default function AdvancedCreatorScreen() {
           <TextInput style={[styles.input, {flex: 0.35}]} value={effectDurationValue} onChangeText={(value) => setEffectDurationValue(value.replace(/[^0-9]/g, ''))} keyboardType="numeric" placeholder="1" placeholderTextColor="#666" />
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: 1}}>
             <View style={{flexDirection: 'row', gap: 8}}>
-              {['turn', 'minute', 'hour', 'day', 'rest', 'while_equipped', 'until_save', 'permanent', 'manual'].map((unit) => (
-                <TouchableOpacity key={unit} style={[styles.limitBtn, effectDurationUnit === unit && styles.limitBtnActive]} onPress={() => setEffectDurationUnit(unit)}>
-                  <Text style={[styles.limitBtnText, effectDurationUnit === unit && styles.limitBtnTextActive]}>{unit}</Text>
+              {EFFECT_DURATION_UNIT_OPTIONS.map((unit) => (
+                <TouchableOpacity key={unit.value} style={[styles.limitBtn, effectDurationUnit === unit.value && styles.limitBtnActive]} onPress={() => setEffectDurationUnit(unit.value)}>
+                  <Text style={[styles.limitBtnText, effectDurationUnit === unit.value && styles.limitBtnTextActive]}>{unit.label}</Text>
                 </TouchableOpacity>
               ))}
             </View>
@@ -1673,19 +1845,38 @@ export default function AdvancedCreatorScreen() {
       </View>
 
       <View style={{marginTop: 14}}>
-        <Text style={styles.label}>CATALOGO</Text>
-        {effectCatalog.map((effect) => (
-          <View key={effect.id || effect.statusKey} style={styles.effectRow}>
+        <View style={{flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 8}}>
+          <Text style={styles.label}>CATALOGO</Text>
+          <Text style={styles.counterText}>{filteredEffectCatalog.length}/{filteredEffectCatalogTotal}</Text>
+        </View>
+        <TextInput
+          style={styles.searchInput}
+          value={effectCatalogSearch}
+          onChangeText={setEffectCatalogSearch}
+          placeholder="Buscar por nome, chave, tipo ou descricao..."
+          placeholderTextColor="#666"
+        />
+        {filteredEffectCatalogTotal > filteredEffectCatalog.length && (
+          <Text style={[styles.catalogItemSub, {marginBottom: 10}]}>Mostrando {filteredEffectCatalog.length} resultados. Refine a busca para ver outros efeitos.</Text>
+        )}
+        {filteredEffectCatalog.length > 0 ? filteredEffectCatalog.map((effect) => (
+          <TouchableOpacity key={effect.id || effect.statusKey} style={styles.effectRow} onPress={() => startEditEffect(effect)}>
             <View style={{flex: 1}}>
               <Text style={styles.effectText}>{effect.name} <Text style={{color: effect.color}}>{effect.statusKey}</Text></Text>
-              <Text style={styles.hpHint}>{effect.kind} - prioridade {effect.visualPriority} {effect.active ? '' : '- inativo'}</Text>
+              <Text style={[styles.catalogItemSub, {marginTop: 5}]}>
+                {formatEffectKindLabel(effect.kind)} - {formatCatalogEffectMechanic(effect)} - prioridade {effect.visualPriority}{effect.active ? '' : ' - inativo'}
+              </Text>
             </View>
-            <TouchableOpacity onPress={() => startEditEffect(effect)}><Ionicons name="create-outline" size={19} color="#00bfff" /></TouchableOpacity>
-            <TouchableOpacity onPress={() => handleDuplicateEffect(effect)}><Ionicons name="copy-outline" size={19} color="#00fa9a" /></TouchableOpacity>
-            <TouchableOpacity onPress={() => handleDisableEffect(effect)}><Ionicons name="pause-circle-outline" size={19} color="#ffd166" /></TouchableOpacity>
-            <TouchableOpacity onPress={() => handleDeleteEffect(effect)}><Ionicons name="trash" size={19} color="#ff6666" /></TouchableOpacity>
-          </View>
-        ))}
+            <View style={{flexDirection: 'row', gap: 12, alignItems: 'center'}}>
+              <Ionicons name="create-outline" size={19} color="#00bfff" />
+              <TouchableOpacity onPress={() => handleDuplicateEffect(effect)}><Ionicons name="copy-outline" size={19} color="#00fa9a" /></TouchableOpacity>
+              <TouchableOpacity onPress={() => handleDisableEffect(effect)}><Ionicons name="pause-circle-outline" size={19} color="#ffd166" /></TouchableOpacity>
+              <TouchableOpacity onPress={() => handleDeleteEffect(effect)}><Ionicons name="trash" size={19} color="#ff6666" /></TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        )) : (
+          <Text style={styles.emptyText}>Nenhum efeito encontrado.</Text>
+        )}
       </View>
     </>
   );
@@ -1772,6 +1963,108 @@ export default function AdvancedCreatorScreen() {
   );
 }
 
+function formatEffectKindLabel(kind: unknown) {
+  const raw = String(kind || '').toLowerCase();
+  return EFFECT_KIND_OPTIONS.find((option) => option.value === raw)?.label || 'Condicao';
+}
+
+function formatDurationUnitLabel(unit: unknown) {
+  const raw = String(unit || '').toLowerCase();
+  return EFFECT_DURATION_UNIT_OPTIONS.find((option) => option.value === raw)?.label || 'Manual';
+}
+
+function formatCatalogEffectMechanic(effect: LanEffectCatalogItem) {
+  const parts: string[] = [];
+  if (effect.target && effect.target !== 'custom') {
+    const value = Number(effect.value || 0);
+    parts.push(`${effect.target}${value ? ` ${value > 0 ? '+' : ''}${value}` : ''}`);
+  }
+  if (effect.defaultDurationUnit) {
+    const amount = Number(effect.defaultDurationValue || 0);
+    parts.push(`${amount > 0 ? `${amount} ` : ''}${formatDurationUnitLabel(effect.defaultDurationUnit)}`);
+  }
+  if (effect.removableBySave && effect.saveAbility) parts.push(`Teste ${effect.saveAbility}`);
+  return parts.length ? parts.join(' - ') : (effect.description || 'Efeito cadastrado');
+}
+
+function formatBuilderEffectMechanic(effect: any) {
+  const parts: string[] = [];
+  const target = String(effect.target || '').toUpperCase();
+  const value = Number(effect.value ?? effect.val ?? 0) || 0;
+  if (target && target !== 'CUSTOM' && target !== 'UNDEFINED') parts.push(`${target}${value ? ` ${value > 0 ? '+' : ''}${value}` : ''}`);
+  if (effect.durationText) parts.push(String(effect.durationText));
+  if (effect.saveAbility && effect.saveAbility !== 'Nenhum') parts.push(`Teste ${effect.saveAbility}${effect.saveDc ? ` CD ${effect.saveDc}` : ''}`);
+  return parts.join(' - ') || 'Efeito cadastrado';
+}
+
+function filterEffectCatalog(effects: LanEffectCatalogItem[], search: string) {
+  const term = normalizeSearchText(search);
+  if (!term) return effects;
+  return effects.filter((effect) => [
+    effect.name,
+    effect.statusKey,
+    effect.kind,
+    effect.category,
+    effect.description,
+    effect.target,
+    formatEffectKindLabel(effect.kind),
+  ].some((value) => normalizeSearchText(value).includes(term)));
+}
+
+function searchEffectCatalog(effects: LanEffectCatalogItem[], search: string, limit: number) {
+  const term = normalizeSearchText(search);
+  if (!term) return [];
+  return filterEffectCatalog(effects, search).slice(0, limit);
+}
+
+function searchConditionOptions(
+  options: { key: string; name: string; color?: string; secondaryColor?: string }[],
+  search: string,
+  limit: number,
+) {
+  const term = normalizeSearchText(search);
+  if (!term) return [];
+  return options
+    .filter((option) => option.key !== 'none')
+    .filter((option) => normalizeSearchText(`${option.name} ${option.key}`).includes(term))
+    .slice(0, limit);
+}
+
+function makeBuilderEffectFromCatalog(
+  effect: LanEffectCatalogItem,
+  overrides?: { saveAbility?: string; saveDc?: string; saveOnSuccess?: string },
+) {
+  const durationValue = effect.defaultDurationValue == null ? 1 : effect.defaultDurationValue;
+  const durationUnit = effect.defaultDurationUnit || 'turn';
+  const value = Number(effect.value || 0);
+  const selectedSave = overrides?.saveAbility && overrides.saveAbility !== 'Nenhum' ? overrides.saveAbility : '';
+  const saveAbility = effect.saveAbility || selectedSave || 'Nenhum';
+
+  return {
+    catalogEffect: true,
+    val: value ? String(value) : '',
+    dice: '',
+    type: effect.name,
+    target: effect.target || 'custom',
+    value,
+    mode: (effect.rulesJson as any)?.mode === 'set' ? 'set' : 'add',
+    conditionKey: effect.statusKey,
+    conditionName: effect.name,
+    conditionColor: effect.color,
+    conditionSecondaryColor: effect.secondaryColor,
+    catalogKind: effect.kind,
+    catalogDescription: effect.description,
+    catalogDurationValue: durationValue,
+    catalogDurationUnit: durationUnit,
+    durationText: `${durationValue > 0 ? `${durationValue} ` : ''}${formatDurationUnitLabel(durationUnit)}`.trim(),
+    saveAbility,
+    saveDc: saveAbility !== 'Nenhum' ? (overrides?.saveDc || '') : '',
+    saveOnSuccess: effect.saveOnSuccess || overrides?.saveOnSuccess || 'negates',
+    repeatSave: effect.repeatSave || 'none',
+    removableBySave: effect.removableBySave,
+  };
+}
+
 function parseDurationMetadata(duration: string) {
   const raw = String(duration || '').toLowerCase();
   if (!raw || raw.includes('instant') || raw.includes('permanente')) {
@@ -1802,6 +2095,13 @@ function formatStructuredRange(mode: string, value: string, unit: string) {
   const amount = Math.max(1, parseInt(value, 10) || 1);
   if (mode === 'Distancia') return `${amount}${unit || 'm'}`;
   return `${mode} ${amount}${unit || 'm'}`;
+}
+
+function normalizeSearchText(value: unknown) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
 }
 
 function getConditionOption(key?: string, options = CONDITION_OPTIONS) {
@@ -1840,6 +2140,8 @@ function buildConditionPayload(effect: any, hasSave: boolean, durationValue?: nu
 }
 
 function toStructuredSpellEffect(effect: any, durationText: string, durationMeta: { value: number | null; unit: string | null }) {
+  if (effect.catalogEffect) return toStructuredCatalogEffect(effect, durationText, durationMeta);
+
   const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
   const condition = buildConditionPayload(effect, Boolean(save), durationMeta.value, durationMeta.unit);
   const isHeal = effect.type === 'Cura';
@@ -1862,6 +2164,11 @@ function toStructuredSpellEffect(effect: any, durationText: string, durationMeta
 }
 
 function toStructuredItemEffect(effect: any) {
+  if (effect.catalogEffect) return toStructuredCatalogEffect(effect, effect.durationText || '', {
+    value: effect.catalogDurationValue ?? null,
+    unit: effect.catalogDurationUnit ?? null,
+  });
+
   const durationValue = effect.duration === 'Temp' && effect.turns ? Math.max(1, parseInt(effect.turns) || 1) : null;
   const durationUnit = effect.duration === 'Perm' ? 'permanent' : durationValue ? 'turn' : null;
   const isStat = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(effect.type);
@@ -1885,6 +2192,47 @@ function toStructuredItemEffect(effect: any) {
     durationText: effect.duration === 'Temp'
       ? durationValue ? `${durationValue} turno(s)` : 'Temporario'
       : effect.duration === 'Perm' ? 'Permanente' : '',
+    durationValue,
+    durationUnit,
+    save,
+    condition,
+  };
+}
+
+function toStructuredCatalogEffect(
+  effect: any,
+  fallbackDurationText: string,
+  fallbackDurationMeta: { value: number | null; unit: string | null },
+) {
+  const durationValue = effect.catalogDurationValue ?? fallbackDurationMeta.value ?? 1;
+  const durationUnit = effect.catalogDurationUnit ?? fallbackDurationMeta.unit ?? 'turn';
+  const save = buildSavePayload(effect.saveAbility, effect.saveDc, effect.saveOnSuccess);
+  const condition = {
+    key: effect.conditionKey,
+    statusKey: effect.conditionKey,
+    name: effect.conditionName || effect.type,
+    applyOn: save ? 'failed_save' : 'always',
+    color: effect.conditionColor,
+    secondaryColor: effect.conditionSecondaryColor,
+    duration: {
+      value: durationValue || 1,
+      unit: durationUnit || 'turn',
+      untilSave: Boolean(save),
+      repeatSave: effect.repeatSave || (save ? 'end_of_turn' : 'none'),
+    },
+  };
+
+  return {
+    type: 'condition',
+    kind: effect.catalogKind || 'condition',
+    target: effect.target || 'custom',
+    value: Number(effect.value ?? effect.val ?? 0) || 0,
+    mode: effect.mode === 'set' ? 'set' : 'add',
+    status: effect.conditionKey,
+    statusKey: effect.conditionKey,
+    sourceEffectId: effect.conditionKey,
+    sourceEffectName: effect.conditionName || effect.type,
+    durationText: effect.durationText || fallbackDurationText,
     durationValue,
     durationUnit,
     save,

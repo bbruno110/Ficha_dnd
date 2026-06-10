@@ -102,6 +102,44 @@ let clientSyntheticStatusEventIds = new Set<string>();
 let clientConnectPromise: Promise<LanSessionPayload> | null = null;
 export type ClientUpdate = { reason?: string; event?: LanSessionEvent; envelopeType?: string; payload?: LanSessionPayload };
 let clientUpdateListeners = new Set<(update?: ClientUpdate) => void>();
+const clientCriticalEventReplayKeys = new Map<string, number>();
+
+function shouldReplayCriticalClientEvent(event?: LanSessionEvent | null) {
+  if (!event?.id) return false;
+  return (
+    event.type === 'inventory_patch' ||
+    event.type === 'trade_result' ||
+    event.type === 'send_item_result' ||
+    event.type === 'public_status' ||
+    event.type === 'player_patch' ||
+    event.type === 'effect_patch' ||
+    event.type === 'pending_save_patch' ||
+    event.type === 'player_progression_patch' ||
+    event.type === 'session_patch' ||
+    event.type === 'session_ended' ||
+    event.type === 'player_kicked'
+  );
+}
+
+function scheduleCriticalClientEventReplay(event: LanSessionEvent, envelopeType?: string) {
+  if (!shouldReplayCriticalClientEvent(event)) return;
+  const key = `${event.sessionId}:${event.id}:${event.type}`;
+  const now = Date.now();
+  const last = clientCriticalEventReplayKeys.get(key) || 0;
+  if (now - last < 7000) return;
+  clientCriticalEventReplayKeys.set(key, now);
+  if (clientCriticalEventReplayKeys.size > 600) {
+    const keep = Array.from(clientCriticalEventReplayKeys.entries()).slice(-300);
+    clientCriticalEventReplayKeys.clear();
+    keep.forEach(([entryKey, at]) => clientCriticalEventReplayKeys.set(entryKey, at));
+  }
+  [60, 220, 700].forEach((delayMs) => {
+    setTimeout(() => {
+      notifyClientUpdates({ reason: 'critical_event_replay', event, envelopeType });
+    }, delayMs);
+  });
+}
+
 let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
 let clientJoinAckWaiters = new Set<ClientJoinAckWaiter>();
 let clientHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -358,23 +396,32 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           playerName,
         });
 
-        let joinCompleted = false;
-        const finishJoin = (payload?: LanSessionPayload | null) => {
-          if (joinCompleted) return;
-          joinCompleted = true;
-          clearTimeout(joinTimer);
-          if (payload?.session?.id === entrySessionId) {
-            hostPayload = payload;
-          }
-
-          const bootstrapPayload = makeHostPayload();
-          traceApp('LAN_JOIN', 'MASTER_JOIN_ACK_SENT_AFTER_UPSERT', {
+        let joinAckSent = false;
+        let joinFinalized = false;
+        const joinSlowTimer = setTimeout(() => {
+          if (joinFinalized) return;
+          traceApp('LAN_JOIN', 'MASTER_JOIN_UPSERT_SLOW_BACKGROUND', {
             source: 'lanTcpTransport.join',
             sessionId: entrySessionId,
             remoteKey,
             clientId,
             playerName,
-            playerCount: bootstrapPayload.state?.players?.length || 0,
+            decision: 'waiting_for_sqlite_upsert_before_join_ack',
+          });
+        }, 8000);
+
+        const sendJoinAck = (reason: string) => {
+          if (joinAckSent) return;
+          joinAckSent = true;
+          const currentPayload = makeHostPayload();
+          traceApp('LAN_JOIN', 'MASTER_JOIN_ACK_SENT_READY', {
+            source: 'lanTcpTransport.join',
+            sessionId: entrySessionId,
+            remoteKey,
+            clientId,
+            playerName,
+            playerCount: currentPayload.state?.players?.length || 0,
+            reason,
           });
           sendEnvelope(socket, {
             type: 'join_ack',
@@ -385,9 +432,21 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           });
           sendEnvelope(socket, {
             type: 'session_snapshot',
-            payload: bootstrapPayload,
+            payload: currentPayload,
             structural: true,
           });
+        };
+
+        const finishJoin = (payload?: LanSessionPayload | null) => {
+          if (payload?.session?.id === entrySessionId) {
+            hostPayload = payload;
+          }
+          sendJoinAck('upsert_done_ready_payload');
+          if (joinFinalized) return;
+          joinFinalized = true;
+          clearTimeout(joinSlowTimer);
+
+          const bootstrapPayload = makeHostPayload();
           broadcastEnvelope({
             type: 'payload_update',
             payload: bootstrapPayload,
@@ -422,9 +481,22 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         };
 
         const rejectJoin = (reason: string) => {
-          if (joinCompleted) return;
-          joinCompleted = true;
-          clearTimeout(joinTimer);
+          if (joinAckSent) {
+            joinFinalized = true;
+            clearTimeout(joinSlowTimer);
+            traceApp('LAN_JOIN', 'MASTER_JOIN_REJECT_IGNORED_AFTER_FAST_ACK', {
+              source: 'lanTcpTransport.join',
+              sessionId: entrySessionId,
+              remoteKey,
+              clientId,
+              playerName,
+              reason,
+            });
+            return;
+          }
+          joinAckSent = true;
+          joinFinalized = true;
+          clearTimeout(joinSlowTimer);
           sendEnvelope(socket, {
             type: 'join_rejected',
             sessionId: entrySessionId,
@@ -432,17 +504,8 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           });
         };
 
-        const joinTimer = setTimeout(() => {
-          traceApp('LAN_JOIN', 'MASTER_JOIN_UPSERT_TIMEOUT', {
-            source: 'lanTcpTransport.join',
-            sessionId: entrySessionId,
-            remoteKey,
-            clientId,
-            playerName,
-          });
-          rejectJoin('JOIN_UPSERT_TIMEOUT');
-        }, 8000);
-
+        // v80: não confirme o join antes do upsert SQLite/runtime do mestre.
+        // ACK com snapshot vazio fazia o jogador entrar piscando e sem enxergar o roster completo.
         notifyHostUpdates({
           reason: 'join',
           event: joinedEvent,
@@ -454,7 +517,19 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         return;
       }
 
-      if (message.type === 'event' || message.type === 'event_propose' || message.type === 'event_commit') {
+      if (message.type === 'event_propose') {
+        if (!isEnvelopeForCurrentSession(message.event?.sessionId)) return;
+        const event = normalizeWireEvent(message.event);
+        bindHostConnection(socket, { playerKey: event.fromKey, clientId: (message.event as any)?.clientId });
+        // Propostas/comandos do jogador são entrada para o host, não estado oficial.
+        // Não faça broadcast para os jogadores e não use isso como confirmação viva.
+        // A tela do mestre processa o comando e só então emite um event_commit autoritativo.
+        upsertByKey(hostEvents, event, 'id');
+        notifyHostUpdates({ reason: 'event_propose', event, envelopeType: message.type });
+        return;
+      }
+
+      if (message.type === 'event' || message.type === 'event_commit') {
         if (!isEnvelopeForCurrentSession(message.event?.sessionId)) return;
         const event = normalizeWireEvent(message.event);
         bindHostConnection(socket, { playerKey: event.fromKey, clientId: (message.event as any)?.clientId });
@@ -898,17 +973,25 @@ export async function getLanTcpClientEvents(
   const playerKey = typeof options === 'number' ? undefined : options?.playerKey;
   const includeGlobal = typeof options === 'number' ? true : options?.includeGlobal !== false;
   const filterOptions = { sessionId, playerKey, includeGlobal };
+  const capClientEventFetch = (events: LanSessionEvent[]) => events
+    .sort(compareEventsAscending)
+    .slice(-(LAN_NETWORK_LIMITS.maxEventsPerResync * 2));
+
   if (isCurrentHostUrl(url)) {
-    return getLanTcpHostEvents()
-      .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) <= 0 || getEventSeq(event) > minSeq))
-      .filter((event) => shouldReturnEventToClient(event, filterOptions))
-      .sort(compareEventsAscending);
+    return capClientEventFetch(getLanTcpHostEvents()
+      .filter((event) => (!sessionId || event.sessionId === sessionId) && shouldReturnEventAfterClientSeq(event, minSeq))
+      .filter((event) => shouldReturnEventToClient(event, filterOptions)));
   }
   await connectLanTcpClient(url, { playerKey, lastAppliedSeq: minSeq });
-  return clientEvents
-    .filter((event) => (!sessionId || event.sessionId === sessionId) && (minSeq <= 0 || getEventSeq(event) <= 0 || getEventSeq(event) > minSeq))
-    .filter((event) => shouldReturnEventToClient(event, filterOptions))
-    .sort(compareEventsAscending);
+  return capClientEventFetch(clientEvents
+    .filter((event) => (!sessionId || event.sessionId === sessionId) && shouldReturnEventAfterClientSeq(event, minSeq))
+    .filter((event) => shouldReturnEventToClient(event, filterOptions)));
+}
+
+function shouldReturnEventAfterClientSeq(event: LanSessionEvent, minSeq: number) {
+  if (minSeq <= 0) return true;
+  const seq = getEventSeq(event);
+  return seq <= 0 || seq > minSeq;
 }
 
 function isCurrentHostUrl(url?: string) {
@@ -949,9 +1032,29 @@ function sendClientHello(url: string, socket: TcpSocket, options?: { playerKey?:
 
 async function connectLanTcpClient(url: string, options?: { requestFresh?: boolean; forceReconnect?: boolean; playerKey?: string; lastAppliedSeq?: number; knownRevisions?: Record<string, number> }) {
   if (!isTcpLanUrl(url)) throw new Error('URL TCP invalida.');
+  const previousPlayerKey = clientBoundPlayerKey;
+  const nextPlayerKey = String(options?.playerKey || previousPlayerKey || '');
+  const playerBindingChanged = Boolean(
+    clientSocket &&
+    clientUrl === url &&
+    nextPlayerKey &&
+    previousPlayerKey &&
+    nextPlayerKey !== previousPlayerKey
+  );
   rememberClientBinding(options);
 
   if (clientSocket && clientUrl === url && clientPayload && !options?.forceReconnect) {
+    if (playerBindingChanged) {
+      clientEvents = [];
+      clientBoundLastAppliedSeq = Math.max(0, Math.floor(Number(options?.lastAppliedSeq || 0)));
+      clientBoundKnownRevisions = options?.knownRevisions;
+      traceApp('LAN_JOIN', 'TCP_CLIENT_PLAYER_BINDING_CHANGED_BUFFER_RESET', {
+        source: 'lanTcpTransport.connectLanTcpClient',
+        sessionId: parseTcpUrl(url).sessionId,
+        previousPlayerKey,
+        nextPlayerKey,
+      });
+    }
     if (options?.playerKey && getClientHelloBindingSignature(url) !== clientHelloBindingSignature) {
       sendClientHello(url, clientSocket, options);
     }
@@ -1159,10 +1262,10 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         if (!settled) {
           resolveOnce(message.payload);
         } else {
-          // payload_update/session_snapshot são cache estrutural.
-          // Não notifique a ficha como atualização viva, pois HP/XP/efeitos/inventário
-          // são aplicados por eventos versionados.
-          applyPayloadUpdate(message.payload, { notify: false });
+          // v84: payload/snapshot também notifica a ficha como reconciliação autoritativa.
+          // Eventos vivos continuam sendo o caminho rápido; o payload só corrige roster/inventário
+          // quando o socket recebeu o frame, mas o listener da tela perdeu a janela durante rebind/reconnect.
+          applyPayloadUpdate(message.payload, { notify: true });
         }
         return;
       }
@@ -1170,18 +1273,38 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       if (message.type === 'resync_events') {
         if (target.sessionId && message.sessionId !== target.sessionId) return;
         const orderedEvents = [...(message.events || [])].sort(compareEventsAscending);
+        let notifiedCount = 0;
+        let duplicateCount = 0;
+        let renotifiedCount = 0;
         for (const event of orderedEvents) {
           if (target.sessionId && event.sessionId !== target.sessionId) continue;
           const normalizedEvent = normalizeWireEvent(event);
+          const alreadyKnown = Boolean(normalizedEvent.id && clientEvents.some((entry) => entry.id === normalizedEvent.id));
           upsertByKey(clientEvents, normalizedEvent, 'id');
-          traceApp('RESYNC_RECEIVED', 'RESYNC_EVENT_BUFFERED', {
-            source: 'lanTcpTransport.resync_events',
-            ...getEnvelopeTraceFields({ type: 'event_commit', event: normalizedEvent }),
-          });
+          if (clientEvents.length > LAN_NETWORK_LIMITS.socketQueueMaxPending * 2) {
+            clientEvents = clientEvents.slice(-LAN_NETWORK_LIMITS.socketQueueMaxPending * 2);
+          }
+          if (alreadyKnown) {
+            duplicateCount += 1;
+            if (!shouldRenotifyKnownClientEvent(normalizedEvent)) continue;
+            renotifiedCount += 1;
+          }
+          notifiedCount += 1;
           notifyClientUpdates({ reason: 'resync_events', event: normalizedEvent, envelopeType: 'resync_events' });
+          scheduleCriticalClientEventReplay(normalizedEvent, 'resync_events');
+        }
+        if (notifiedCount > 0 || duplicateCount > 0) {
+          traceApp('RESYNC_RECEIVED', 'RESYNC_EVENTS_BUFFERED_BATCH', {
+            source: 'lanTcpTransport.resync_events',
+            sessionId: message.sessionId,
+            receivedCount: orderedEvents.length,
+            notifiedCount,
+            duplicateCount,
+            renotifiedCount,
+          });
         }
         if (message.payload) {
-          applyPayloadUpdate(message.payload, { notify: false });
+          applyPayloadUpdate(message.payload, { notify: true });
         }
         return;
       }
@@ -1189,8 +1312,28 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       if (message.type === 'event' || message.type === 'event_commit') {
         if (target.sessionId && message.event.sessionId !== target.sessionId) return;
         const normalizedEvent = normalizeWireEvent(message.event);
+        const alreadyKnown = Boolean(normalizedEvent.id && clientEvents.some((entry) => entry.id === normalizedEvent.id));
         upsertByKey(clientEvents, normalizedEvent, 'id');
-        notifyClientUpdates({ reason: 'event_commit', event: normalizedEvent, envelopeType: message.type });
+        if (clientEvents.length > LAN_NETWORK_LIMITS.socketQueueMaxPending * 2) {
+          clientEvents = clientEvents.slice(-LAN_NETWORK_LIMITS.socketQueueMaxPending * 2);
+        }
+        const shouldNotify = !alreadyKnown || shouldRenotifyKnownClientEvent(normalizedEvent);
+        if (shouldNotify) {
+          if (alreadyKnown) {
+            traceApp('SOCKET_RECEIVE', 'TCP_CLIENT_KNOWN_EVENT_RENOTIFY', {
+              source: 'lanTcpTransport.event_commit',
+              sessionId: normalizedEvent.sessionId,
+              eventType: normalizedEvent.type,
+              eventId: normalizedEvent.id,
+              envelopeType: message.type,
+              seq: normalizedEvent.seq,
+              entityId: getLanEventEntityId(normalizedEvent),
+              entityType: getLanEventEntityType(normalizedEvent),
+            });
+          }
+          notifyClientUpdates({ reason: 'event_commit', event: normalizedEvent, envelopeType: message.type });
+          scheduleCriticalClientEventReplay(normalizedEvent, message.type);
+        }
       }
     });
   }).finally(() => {
@@ -1500,15 +1643,33 @@ function getEnvelopePriority(message: TcpEnvelope) {
   if (message.type === 'event_commit' || message.type === 'event') {
     const eventType = message.event?.type;
     if (eventType === 'session_ended') return 100;
-    if (eventType === 'session_patch' || eventType === 'player_kicked') return 95;
-    if (eventType === 'player_progression_patch') return 94;
-    if (eventType === 'player_patch' || eventType === 'effect_patch' || eventType === 'inventory_patch' || eventType === 'pending_save_patch') return 90;
-    if (eventType === 'send_item_result' || eventType === 'trade_result' || eventType === 'send_item_request' || String(eventType || '').startsWith('trade_')) return 80;
+    if (eventType === 'session_patch' || eventType === 'player_kicked') return 98;
+    if (eventType === 'player_patch' || eventType === 'effect_patch' || eventType === 'inventory_patch' || eventType === 'pending_save_patch') return 97;
+    if (eventType === 'player_progression_patch') return 96;
+    if (eventType === 'send_item_result' || eventType === 'trade_result' || eventType === 'send_item_request' || String(eventType || '').startsWith('trade_')) return 95;
+    if (eventType === 'public_status') return 92;
     return 40;
   }
   if (message.type === 'resync_events') return 30;
   if (message.type === 'session_snapshot' || message.type === 'payload_update') return 10;
   return 0;
+}
+
+function shouldRenotifyKnownClientEvent(event: LanSessionEvent) {
+  const eventType = event.type;
+  return (
+    eventType === 'inventory_patch' ||
+    eventType === 'player_patch' ||
+    eventType === 'player_progression_patch' ||
+    eventType === 'effect_patch' ||
+    eventType === 'pending_save_patch' ||
+    eventType === 'session_patch' ||
+    eventType === 'session_ended' ||
+    eventType === 'player_kicked' ||
+    eventType === 'send_item_result' ||
+    eventType === 'trade_result' ||
+    eventType === 'public_status'
+  );
 }
 
 function enqueueHostEnvelope(socket: TcpSocket, message: TcpEnvelope) {
@@ -1901,6 +2062,10 @@ function configureSocket(socket: TcpSocket) {
 function mergeClientPayloadEvents(payload: LanSessionPayload, sessionId?: string) {
   for (const event of payload.events || []) {
     if (sessionId && event.sessionId !== sessionId) continue;
+    // Payload events are history. Stateful patches are represented by the
+    // payload snapshot/checkpoints and must not pre-mark the live socket event
+    // as alreadyKnown before the event_commit notification reaches the hook.
+    if (isStateReplayCoveredByCheckpoint(event)) continue;
     upsertByKey(clientEvents, event, 'id');
   }
 }
@@ -1978,8 +2143,12 @@ function makeHostJoinBlockKeys(sessionId: string, remoteKey?: string, clientId?:
 }
 
 function getEventsAfterSeq(seq: number, sessionId?: string) {
+  // Resync não deve despejar todo histórico de patches vivos no jogador.
+  // HP/moeda/inventário/efeitos são estados autoritativos e voltam por checkpoint.
+  // Reenviar todos os inventory_patch antigos foi a causa de 900/2000 logs e itens piscando.
   return mergeRecentEvents(hostPayload?.events || [], hostEvents)
     .filter((event) => (!sessionId || event.sessionId === sessionId) && (getEventSeq(event) <= 0 || getEventSeq(event) > seq))
+    .filter((event) => !isStateReplayCoveredByCheckpoint(event))
     .sort(compareEventsAscending);
 }
 
@@ -1996,7 +2165,9 @@ function getColdStartResyncEvents(sessionId?: string) {
 }
 
 function isStateReplayCoveredByCheckpoint(event: LanSessionEvent) {
+  if (event.type === 'session_patch') return true;
   if (event.type === 'player_patch') return true;
+  if (event.type === 'coin_self_patch_request') return true;
   if (event.type === 'effect_patch' || event.type === 'effect_expired') return true;
   if (event.type === 'inventory_patch') return true;
   if (event.type === 'pending_save_patch') return true;
@@ -2015,8 +2186,15 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
   // Reaplicá-los foi a causa de efeitos expirados voltarem, PV temporário persistir e histórico duplicar.
   const latestRevisionByEntity = new Map<string, number>();
   for (const event of events) {
+    // v55: propostas/eventos nativos do jogador usam Date.now() como entityRevision.
+    // Se isso entrar no checkpoint, um inventario antigo vira revision gigante e
+    // sobrescreve o patch autoritativo do mestre (troca/doacao parece acontecer, mas volta).
+    const isAuthoritativeRevision = event.fromKey === 'master'
+      || event.originClientId === 'master'
+      || event.fromKey === 'session';
+    if (!isAuthoritativeRevision) continue;
     const revision = Number(event.entityRevision || 0);
-    if (revision <= 0) continue;
+    if (revision <= 0 || revision > 1000000) continue;
     const entityKey = getRuntimeEntityKey(event);
     latestRevisionByEntity.set(entityKey, Math.max(latestRevisionByEntity.get(entityKey) || 0, revision));
   }
@@ -2033,10 +2211,11 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
     const effectEntityKey = `${player.sessionId || sessionId}:effect:${targetKey}`;
     // v32: efeito tem revisão própria. Não use player.revisionSeq como fallback,
     // senão qualquer dano/XP gera checkpoint de efeito novamente no resync.
-    const latestEffectRevision = Math.max(
+    const rawLatestEffectRevision = Math.max(
       latestRevisionByEntity.get(effectEntityKey) || 0,
       0,
     );
+    const latestEffectRevision = rawLatestEffectRevision > 1000000 ? 0 : rawLatestEffectRevision;
     const knownEffectRevision = Number(knownRevisions[effectEntityKey] || 0);
     if (latestEffectRevision > 0 && knownEffectRevision < latestEffectRevision) {
       const seq = syntheticSeq++;
@@ -2053,7 +2232,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
         entityRevision: latestEffectRevision,
         seq,
         serverSeq: seq,
-        ackRequired: true,
+        ackRequired: false,
         originClientId: 'master',
         effectPatch: {
           targetKey,
@@ -2103,7 +2282,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
         entityRevision: latestPlayerRevision,
         seq,
         serverSeq: seq,
-        ackRequired: true,
+        ackRequired: false,
         originClientId: 'master',
         numberPatch: {
           hpCurrent: Number(player.hpCurrent || 0),
@@ -2122,10 +2301,11 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
     const inventoryEntityKey = `${player.sessionId || sessionId}:inventory:${targetKey}`;
     // v32: inventário tem revisão própria. Não use player.revisionSeq como fallback,
     // senão todo patch de HP vira checkpoint de inventário e congestiona envio/troca.
-    const latestInventoryRevision = Math.max(
+    const rawLatestInventoryRevision = Math.max(
       latestRevisionByEntity.get(inventoryEntityKey) || 0,
       0,
     );
+    const latestInventoryRevision = rawLatestInventoryRevision > 1000000 ? 0 : rawLatestInventoryRevision;
     const knownInventoryRevision = Number(knownRevisions[inventoryEntityKey] || 0);
     if (latestInventoryRevision > 0 && knownInventoryRevision < latestInventoryRevision) {
       const seq = syntheticSeq++;
@@ -2142,7 +2322,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
         entityRevision: latestInventoryRevision,
         seq,
         serverSeq: seq,
-        ackRequired: true,
+        ackRequired: false,
         originClientId: 'master',
         inventoryPatch: {
           targetKey,
