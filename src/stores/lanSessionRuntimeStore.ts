@@ -33,6 +33,59 @@ type NumberPatch = Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | '
 
 const LIVE_FIELDS = ['hpCurrent', 'hpMax', 'tempHp', 'xp', 'gp', 'sp', 'cp', 'effects', 'equipment', 'stats'] as const;
 
+const PLAYER_REVISION_TIMESTAMP_THRESHOLD = 1000000;
+const REMOVED_RUNTIME_EFFECT_TOMBSTONE_TTL_MS = 120000;
+const removedRuntimeEffectIds = new Map<string, number>();
+
+function pruneRemovedRuntimeEffectIds() {
+  const now = Date.now();
+  for (const [key, expiresAt] of removedRuntimeEffectIds.entries()) {
+    if (expiresAt <= now) removedRuntimeEffectIds.delete(key);
+  }
+}
+
+function getRuntimeEffectIds(effect: any) {
+  return [
+    effect?.id,
+    effect?.lanEffectId,
+    effect?.lanEffectID,
+    effect?.sourceId,
+  ].map((value) => String(value || '')).filter(Boolean);
+}
+
+function getRuntimeRemovedEffectKey(sessionId: string, targetKey: string, id: string) {
+  return `${sessionId}:${targetKey}:${id}`;
+}
+
+function rememberRemovedRuntimeEffectIds(sessionId: string, targetKey: string, ids: string[]) {
+  pruneRemovedRuntimeEffectIds();
+  const expiresAt = Date.now() + REMOVED_RUNTIME_EFFECT_TOMBSTONE_TTL_MS;
+  for (const id of ids.map(String).filter(Boolean)) {
+    removedRuntimeEffectIds.set(getRuntimeRemovedEffectKey(sessionId, targetKey, id), expiresAt);
+  }
+}
+
+function isRuntimeEffectTombstoned(sessionId: string, targetKey: string, effect: any) {
+  pruneRemovedRuntimeEffectIds();
+  return getRuntimeEffectIds(effect).some((id) => removedRuntimeEffectIds.has(getRuntimeRemovedEffectKey(sessionId, targetKey, id)));
+}
+
+function isPlayerRuntimeEntityKey(entityKey: string) {
+  return entityKey.includes(':player:');
+}
+function cleanRuntimeRevisionForEntity(entityKey: string, value: unknown) {
+  const revision = Math.max(0, Math.floor(Number(value || 0) || 0));
+  if (isPlayerRuntimeEntityKey(entityKey) && revision > PLAYER_REVISION_TIMESTAMP_THRESHOLD) return 0;
+  return revision;
+}
+function maxCleanPlayerRevision(...values: unknown[]): number {
+  return values.reduce<number>((max, value) => {
+    const revision = Math.max(0, Math.floor(Number(value || 0) || 0));
+    if (revision > PLAYER_REVISION_TIMESTAMP_THRESHOLD) return max;
+    return Math.max(max, revision);
+  }, 0);
+}
+
 export const useLanSessionRuntimeStore = create<RuntimeStore>((set) => ({
   sessions: {},
 
@@ -299,30 +352,40 @@ export function applyHostEffectPatchRuntime(
   if (!player) return null;
 
   const removeSet = new Set((patch.remove || []).map(String));
+  if (removeSet.size > 0) rememberRemovedRuntimeEffectIds(sessionId, targetKey, Array.from(removeSet));
   const byId = new Map<string, any>();
   if (patch.replace === true) {
     for (const effect of patch.add || []) {
       const id = String((effect as any)?.id || '');
-      if (id && !removeSet.has(id)) byId.set(id, effect);
+      if (id && !removeSet.has(id) && !isRuntimeEffectTombstoned(sessionId, targetKey, effect)) byId.set(id, effect);
     }
   } else {
-    for (const effect of player.effects || []) {
+    for (const effect of filterLiveRuntimeEffects(player.effects || []) || []) {
       const id = String((effect as any)?.id || '');
       const lanEffectId = String((effect as any)?.lanEffectId || (effect as any)?.lanEffectID || '');
-      if (id && !removeSet.has(id) && !removeSet.has(lanEffectId)) byId.set(id, effect);
+      const sourceId = String((effect as any)?.sourceId || '');
+      if (id && !removeSet.has(id) && !removeSet.has(lanEffectId) && !removeSet.has(sourceId) && !isRuntimeEffectTombstoned(sessionId, targetKey, effect)) byId.set(id, effect);
     }
     for (const effect of patch.update || []) {
       const id = String((effect as any)?.id || '');
-      if (id && !removeSet.has(id) && byId.has(id)) byId.set(id, effect);
+      const lanEffectId = String((effect as any)?.lanEffectId || (effect as any)?.lanEffectID || '');
+      const sourceId = String((effect as any)?.sourceId || '');
+      if (id && !removeSet.has(id) && !removeSet.has(lanEffectId) && !removeSet.has(sourceId) && byId.has(id) && !isRuntimeEffectTombstoned(sessionId, targetKey, effect)) {
+        byId.set(id, mergeRuntimeEffectUpdate(byId.get(id), effect));
+      }
     }
     for (const effect of patch.add || []) {
       const id = String((effect as any)?.id || '');
-      if (id && !removeSet.has(id)) byId.set(id, effect);
+      const lanEffectId = String((effect as any)?.lanEffectId || (effect as any)?.lanEffectID || '');
+      const sourceId = String((effect as any)?.sourceId || '');
+      if (id && !removeSet.has(id) && !removeSet.has(lanEffectId) && !removeSet.has(sourceId) && !isRuntimeEffectTombstoned(sessionId, targetKey, effect)) {
+        byId.set(id, mergeRuntimeEffectUpdate(byId.get(id), effect));
+      }
     }
   }
 
   const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
-  const nextEffects = Array.from(byId.values());
+  const nextEffects = filterLiveRuntimeEffects(Array.from(byId.values()) as any);
   const updatedPlayer = {
     ...player,
     effects: nextEffects,
@@ -408,7 +471,7 @@ export function applyHostTurnRuntime(
     currentTurn: unit === 'turn' ? currentState.currentTurn + 1 : currentState.currentTurn,
     elapsedMinutes: currentState.elapsedMinutes + minuteDelta,
     players: currentState.players.map((player) => {
-      const effects = tickRuntimeEffects(player.effects || [], unit);
+      const effects = tickRuntimeEffects(filterLiveRuntimeEffects(player.effects || []), unit);
       if (effects === player.effects) return player;
       const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
       const updatedPlayer = { ...player, effects, tempHp: getTempHpAfterRuntimeEffectTick(player, effects), revisionSeq: revision };
@@ -488,6 +551,29 @@ function syncTempHpRuntimeEffectsWithNumber(effects: LanSessionPlayerState['effe
   });
 }
 
+function mergeRuntimeEffectUpdate(current: any, incoming: any) {
+  if (!current || !incoming) return incoming;
+  const currentRemaining = Number(current.remaining);
+  const incomingRemaining = Number(incoming.remaining);
+  const currentUnit = String(current.unit || '').toLowerCase();
+  const incomingUnit = String(incoming.unit || '').toLowerCase();
+  const durationCanTick = currentUnit &&
+    currentUnit === incomingUnit &&
+    currentUnit !== 'manual' &&
+    currentUnit !== 'permanent' &&
+    currentUnit !== 'while_equipped' &&
+    currentUnit !== 'concentration' &&
+    Number.isFinite(currentRemaining) &&
+    Number.isFinite(incomingRemaining);
+
+  if (!durationCanTick || incomingRemaining <= currentRemaining) return incoming;
+  return {
+    ...incoming,
+    remaining: currentRemaining,
+    durationText: current.durationText || incoming.durationText,
+  };
+}
+
 function preserveLivePlayerFields(currentPlayer: LanSessionPlayerState, incomingPlayer: LanSessionPlayerState) {
   const next: LanSessionPlayerState = { ...incomingPlayer };
   const currentLevel = Math.max(1, Number((currentPlayer as any).level || 1));
@@ -519,7 +605,7 @@ function preserveLivePlayerFields(currentPlayer: LanSessionPlayerState, incoming
     }
     (next as any)[field] = (currentPlayer as any)[field];
   }
-  next.revisionSeq = Math.max(Number(currentPlayer.revisionSeq || 0), Number(incomingPlayer.revisionSeq || 0));
+  next.revisionSeq = maxCleanPlayerRevision(currentPlayer.revisionSeq, incomingPlayer.revisionSeq);
   return next;
 }
 
@@ -552,9 +638,43 @@ function cleanNumberPatch(patch: NumberPatch, player: LanSessionPlayerState) {
   return cleanPatch;
 }
 
+function isManualRuntimeStatusCondition(effect: any) {
+  const source = String(effect?.source || '').trim().toLowerCase();
+  const kind = String(effect?.kind || '').trim().toLowerCase();
+  const statusKey = String(effect?.statusKey || effect?.status || '').trim();
+  return Boolean(statusKey) || kind === 'status' || source === 'condicao' || source === 'condição';
+}
+
+function shouldRuntimeStatusConditionTick(effect: any) {
+  if ((effect as any)?.autoExpire === true) return true;
+  const unit = String(effect?.unit || '').toLowerCase();
+  const remaining = Math.max(0, Math.floor(Number(effect?.remaining || 0) || 0));
+  const hasRepeatSave = Boolean(effect?.saveAbility || effect?.repeatSave || effect?.removableBySave);
+  return hasRepeatSave &&
+    remaining > 0 &&
+    unit !== 'manual' &&
+    unit !== 'permanent' &&
+    unit !== 'while_equipped' &&
+    unit !== 'concentration';
+}
+
+function isLiveRuntimeEffect(effect: any) {
+  if (!effect || effect.active === false) return false;
+  const unit = String(effect?.unit || '').toLowerCase();
+  if (effect?.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return true;
+  return Math.max(0, Math.floor(Number(effect?.remaining || 0) || 0)) > 0;
+}
+
+function filterLiveRuntimeEffects(effects: LanSessionPlayerState['effects']) {
+  return (Array.isArray(effects) ? effects : []).filter(isLiveRuntimeEffect);
+}
+
 function tickRuntimeEffects(effects: LanSessionPlayerState['effects'], unit: LanAdvanceUnit) {
   let changed = false;
-  const next = (effects || []).map((effect) => {
+  const next = filterLiveRuntimeEffects(effects || []).map((effect) => {
+    // v100: condicoes/status do catalogo sao controladas manualmente pelo mestre.
+    // Sem isso, um status com default 1 turn aparecia e sumia no primeiro passar turno.
+    if (isManualRuntimeStatusCondition(effect) && !shouldRuntimeStatusConditionTick(effect)) return effect;
     const delta = getDurationDelta(effect.unit, unit);
     if (delta <= 0) return effect;
     changed = true;
@@ -591,7 +711,10 @@ function getRuntimeSession(sessionId: string) {
 
 function nextRuntimeRevision(sessionId: string, entityKey: string, baseRevision?: number) {
   const meta = getRuntimeSession(sessionId).entities[entityKey];
-  return Math.max(Number(baseRevision || 0), Number(meta?.revision || 0)) + 1;
+  return Math.max(
+    cleanRuntimeRevisionForEntity(entityKey, baseRevision),
+    cleanRuntimeRevisionForEntity(entityKey, meta?.revision),
+  ) + 1;
 }
 
 function markRuntimeEntity(
@@ -604,6 +727,17 @@ function markRuntimeEntity(
 ) {
   const current = useLanSessionRuntimeStore.getState();
   const session = current.sessions[sessionId] || { state: null, entities: {} };
+  let safeRevision = cleanRuntimeRevisionForEntity(entityKey, revision);
+  if (isPlayerRuntimeEntityKey(entityKey) && safeRevision <= 0 && Math.max(0, Math.floor(Number(revision || 0) || 0)) > PLAYER_REVISION_TIMESTAMP_THRESHOLD) {
+    safeRevision = nextRuntimeRevision(sessionId, entityKey);
+    debugLanFlow('MASTER_RUNTIME_PLAYER_REVISION_TIMESTAMP_SANITIZED_V95', {
+      sessionId,
+      entityKey,
+      rawRevision: revision,
+      safeRevision,
+      source,
+    });
+  }
   useLanSessionRuntimeStore.setState({
     sessions: {
       ...current.sessions,
@@ -611,7 +745,7 @@ function markRuntimeEntity(
         ...session,
         entities: {
           ...session.entities,
-          [entityKey]: { revision, seq, updatedAt: Date.now(), source, removed },
+          [entityKey]: { revision: safeRevision, seq, updatedAt: Date.now(), source, removed },
         },
       },
     },

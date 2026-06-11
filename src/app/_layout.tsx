@@ -1,3 +1,4 @@
+import { LanActiveRuntimeSync } from '@/services/lan/lanActiveRuntimeSync';
 import { appColors, appGradients, layoutStyles as styles } from '@/styles/globalStyles';
 import { DarkTheme, ThemeProvider } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -16,7 +17,8 @@ export default function RootLayout() {
   }, []);
 
   return (
-    <SQLiteProvider databaseName="dnd_data_v40.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_data_v008.db" onInit={initializeDatabase}>
+      <LanActiveRuntimeSync />
       <ThemeProvider value={DarkTheme}>
         <LinearGradient
           colors={appGradients.main}

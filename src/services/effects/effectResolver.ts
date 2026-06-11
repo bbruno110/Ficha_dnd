@@ -55,6 +55,37 @@ export async function createPendingSave(
   await ensureEffectSchema(db);
   const save = parseSave(effectPayload);
   if (!save?.ability) return null;
+  if (context.sourceId) {
+    const existing = await db.getFirstAsync<Record<string, unknown>>(
+      `SELECT *
+         FROM lan_pending_saves
+        WHERE session_id = ?
+          AND target_key = ?
+          AND source_id = ?
+          AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [context.sessionId, context.targetKey, context.sourceId],
+    );
+    if (existing?.id) {
+      return {
+        id: String(existing.id),
+        sessionId: String(existing.session_id),
+        targetKey: String(existing.target_key),
+        sourceType: optionalString(existing.source_type),
+        sourceId: optionalString(existing.source_id),
+        sourceName: optionalString(existing.source_name),
+        effectPayload: parseJsonValue<Record<string, unknown>>(existing.effect_payload_json, effectPayload),
+        ability: String(existing.ability || save.ability),
+        dc: existing.dc == null ? null : toNumber(existing.dc),
+        dcMode: optionalString(existing.dc_mode),
+        status: 'pending',
+        result: parseJsonValue<Record<string, unknown>>(existing.result_json, {}),
+        createdAt: optionalString(existing.created_at),
+        resolvedAt: null,
+      } as LanPendingSave;
+    }
+  }
   const pending: LanPendingSave = {
     id: `save_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     sessionId: context.sessionId,
@@ -100,17 +131,18 @@ export async function resolveSave(
 ) {
   await ensureEffectSchema(db);
   const row = await db.getFirstAsync<Record<string, unknown>>(
-    `SELECT * FROM lan_pending_saves WHERE id = ? AND status = 'pending'`,
+    `SELECT * FROM lan_pending_saves WHERE id = ?`,
     [pendingSaveId],
   );
-  if (!row) return null;
+  if (!row || String(row.status || '') !== 'pending') return null;
   const result = { passed, roll: roll ?? null, resolvedAt: new Date().toISOString() };
-  await db.runAsync(
+  const updateResult = await db.runAsync(
     `UPDATE lan_pending_saves
      SET status = ?, result_json = ?, resolved_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
+     WHERE id = ? AND status = 'pending'`,
     [passed ? 'success' : 'failure', JSON.stringify(result), pendingSaveId],
   );
+  if (Number((updateResult as any)?.changes || 0) <= 0) return null;
   return {
     id: pendingSaveId,
     passed,

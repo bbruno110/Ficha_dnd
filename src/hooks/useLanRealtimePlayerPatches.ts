@@ -41,6 +41,7 @@ export type UseLanRealtimePlayerPatchesParams = {
   characterName?: string;
   paused?: boolean;
   reconnectEpoch?: number;
+  runtimeManagedExternally?: boolean;
 
   onNumberPatch?: (patch: LanNumberPatch, event: LanSessionEvent) => void | Promise<void>;
   onEffectPatch?: (patch: LanEffectPatch, event: LanSessionEvent) => void | Promise<void>;
@@ -62,6 +63,7 @@ export function useLanRealtimePlayerPatches({
   characterName,
   paused = false,
   reconnectEpoch = 0,
+  runtimeManagedExternally = false,
   onNumberPatch,
   onEffectPatch,
   onInventoryPatch,
@@ -125,6 +127,31 @@ export function useLanRealtimePlayerPatches({
 
   useEffect(() => {
     if (!enabled || !joinUrl || !sessionId) return;
+
+    // v99: quando o runtime global do _layout esta ativo, esta tela NAO pode
+    // abrir outro listener/socket, fazer polling, ACK/NACK ou aplicar patches.
+    // A ficha vira somente leitora do store vivo. Isso elimina competicao entre:
+    // LanActiveRuntimeSync + useLanRealtimePlayerPatches + loadData ao voltar do level-up.
+    if (runtimeManagedExternally) {
+      debugLanFlow('PLAYER_SHEET_HOOK_FULLY_DISABLED_EXTERNAL_RUNTIME_V99', {
+        sessionId,
+        selfKey,
+        characterName,
+        reconnectEpoch,
+      });
+      processingEventIdsRef.current.clear();
+      ignoredForeignEventIdsRef.current.clear();
+      applyQueueRef.current = [];
+      queueRunningRef.current = false;
+      applyRunningRef.current = false;
+      useLanRealtimeStore.getState().setConnection({
+        sessionId,
+        playerKey: selfKey,
+        connected: true,
+      });
+      return;
+    }
+
     let disposed = false;
     processingEventIdsRef.current.clear();
     const getEventSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
@@ -469,14 +496,19 @@ export function useLanRealtimePlayerPatches({
           // HP/XP/moedas/PV temp são absolutos. Eles não podem rodar em paralelo,
           // senão um patch antigo termina depois e faz a vida "voltar".
           await onNumberPatchRef.current?.(event.numberPatch!, event);
-          // Um player_patch pode carregar statsPatch junto com numberPatch (ex.: CON permanente
-          // altera atributo e HP no mesmo commit). Antes o retorno aqui ignorava statsPatch.
+          // Um player_patch pode carregar statsPatch/progressionPatch junto com numberPatch
+          // (ex.: level-up altera HP maximo, classe e atributos no mesmo commit).
+          // Antes o retorno aqui podia ignorar a progressao quando a ficha estava fechada
+          // e voltava apenas pelo checkpoint.
           if (event.statsPatch) {
             if (onStatsPatchRef.current) {
               await onStatsPatchRef.current(event.statsPatch, event);
             } else {
               await onEventRef.current?.(event);
             }
+          }
+          if ((event as any).progressionPatch) {
+            await onEventRef.current?.(event);
           }
           useLanRealtimeStore.getState().markEventApplied(event);
           releaseEventKey();
@@ -796,13 +828,26 @@ export function useLanRealtimePlayerPatches({
     };
 
     if (!paused) {
-      // Ao montar por QR ou pela Home/index, primeiro reenvie hello/resync com
-      // playerKey. Depois drene o buffer. Evita enxurrada de snapshots e mantém
-      // o socket associado ao jogador no host.
-      void requestResyncIfNeeded('mount_or_rebind');
-      setTimeout(() => { if (!disposed) void applyEvents({ reason: 'mount_or_reconnect' }); }, 120);
-      setTimeout(() => { if (!disposed) void applyEvents({ reason: 'post_mount_buffer_flush_650ms' }); }, 650);
-      if (reconnectEpoch > 0) {
+      if (runtimeManagedExternally) {
+        debugLanFlow('PLAYER_SHEET_HOOK_EXTERNAL_RUNTIME_LIGHT_MODE_V98', {
+          sessionId,
+          selfKey,
+          reconnectEpoch,
+        });
+        setTimeout(() => { if (!disposed) void applyEvents({ reason: 'external_runtime_light_mount_v98' }); }, 120);
+      } else {
+        // Ao montar por QR ou pela Home/index, primeiro reenvie hello/resync com
+        // playerKey. Depois drene o buffer. Evita enxurrada de snapshots e mantém
+        // o socket associado ao jogador no host.
+        void requestResyncIfNeeded('mount_or_rebind');
+        setTimeout(() => { if (!disposed) void applyEvents({ reason: 'mount_or_reconnect' }); }, 120);
+        setTimeout(() => { if (!disposed) void applyEvents({ reason: 'post_mount_buffer_flush_650ms' }); }, 650);
+        // v96: sync global mantém a ficha atualizada fora da tela. Ao montar/rebind,
+        // nao faça cold drain de toda a sessao, porque isso compete com eventos vivos
+        // logo depois do level-up e deixa a ficha parecer travada/lenta.
+        setTimeout(() => { if (!disposed) void applyEvents({ reason: 'mount_or_rebind_incremental_confirm_v96' }); }, 900);
+      }
+      if (reconnectEpoch > 0 && !runtimeManagedExternally) {
         // v86: voltar de outro app/tela bloqueada precisa de recuperacao pesada.
         // O socket pode parecer aberto, mas estar sem binding real no host. Fazemos:
         // 1) reconnect TCP forcado; 2) resync incremental; 3) cold resync/checkpoints;
@@ -842,7 +887,7 @@ export function useLanRealtimePlayerPatches({
       useLanRealtimeStore.getState().setConnection({ sessionId, playerKey: selfKey, connected: true });
     }
 
-    const timer = paused
+    const timer = paused || runtimeManagedExternally
       ? null
       : setInterval(() => {
           void applyEvents();
@@ -854,12 +899,14 @@ export function useLanRealtimePlayerPatches({
       // reemitidos pelo transporte como eventos individuais.
       if (update?.reason === 'socket_closed' && !paused) {
         useLanRealtimeStore.getState().setConnection({ sessionId, playerKey: selfKey, connected: false });
-        setTimeout(() => {
-          if (!disposed) void requestResyncIfNeeded('socket_closed', { force: true, forceReconnect: true, includeGlobal: true });
-        }, 150);
-        setTimeout(() => {
-          if (!disposed) void applyEvents({ forceFullDrain: false, reason: 'socket_closed_recovery_flush' });
-        }, 700);
+        if (!runtimeManagedExternally) {
+          setTimeout(() => {
+            if (!disposed) void requestResyncIfNeeded('socket_closed', { force: true, forceReconnect: true, includeGlobal: true });
+          }, 150);
+          setTimeout(() => {
+            if (!disposed) void applyEvents({ forceFullDrain: false, reason: 'socket_closed_recovery_flush' });
+          }, 700);
+        }
       }
       if (update?.payload) {
         // Snapshot/payload agora também serve como reconciliação autoritativa de roster/inventário.
@@ -901,5 +948,5 @@ export function useLanRealtimePlayerPatches({
       if (timer) clearInterval(timer);
       unsubscribe();
     };
-  }, [characterName, enabled, joinUrl, paused, reconnectEpoch, selfKey, sessionId]);
+  }, [characterName, enabled, joinUrl, paused, reconnectEpoch, runtimeManagedExternally, selfKey, sessionId]);
 }

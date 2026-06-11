@@ -1,4 +1,4 @@
-import DiceRoller3D from '@/components/DiceRoller3D';
+import DiceRoller3D, { type DiceRollRequest, type DiceRollResult } from '@/components/DiceRoller3D';
 import QrCodeView from '@/components/QrCodeView';
 import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
 import {
@@ -14,6 +14,13 @@ import {
 } from '@/services/debug/appTrace';
 import { applyDamageWithTempHp } from '@/services/combat/hpDamageService';
 import { resolveAttackAgainstArmorClass } from '@/services/combat/attackResolverService';
+import {
+  canUseVisualDiceRoll,
+  formatDiceRollBreakdown,
+  parseUsableDiceFormula,
+  rollParsedDiceFormula,
+  type ParsedDiceFormula,
+} from '@/services/combat/diceFormulaService';
 import { listEffects } from '@/services/effects/effectCatalogService';
 import { createEffectDurationPayload } from '@/services/effects/effectDurationService';
 import { createPendingSave, listPendingSaves, resolveSave } from '@/services/effects/effectResolver';
@@ -37,6 +44,7 @@ import {
   deleteLanSession,
   ensurePendingRemotePlayerFromEvent,
   formatElapsedTime,
+  getActiveLanSessionConflict,
   getBoundLanCharacter,
   getCustomCatalogOptions,
   getLanSessionEvents,
@@ -60,7 +68,6 @@ import {
   removeLanPlayerEffect,
   removeLanPlayerTempHpEffects,
   resetLanClientConnection,
-  resumeLanSession,
   reviewLanPlayerPendingSnapshot,
   saveLanSession,
   sendLanSessionEvent,
@@ -117,6 +124,7 @@ import { Alert, FlatList, Modal, ScrollView, Switch, Text, TextInput, TouchableO
 const CATALOG_FILTERS = ['Todos', 'Item', 'Raca', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit'];
 const EFFECT_TARGETS: LanEffectTarget[] = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA', 'HP', 'PV_TEMP', 'custom'];
 const EFFECT_UNITS: { label: string; value: LanEffectUnit }[] = [
+  { label: 'Manual', value: 'manual' },
   { label: 'Turnos', value: 'turn' },
   { label: 'Minutos', value: 'minute' },
   { label: 'Horas', value: 'hour' },
@@ -130,6 +138,24 @@ const SESSION_HISTORY_MAX_IN_MEMORY = 500;
 const MASTER_SQLITE_RELOAD_COOLDOWN_MS = 9000;
 const MASTER_REPEATABLE_ACTION_QUEUE_DELAY_MS = 80;
 const MASTER_REPEATABLE_ACTION_MAX_QUEUE_DEPTH = 50;
+
+// v109: guarda de ciclo de vida fora do componente. Em Expo/StrictMode ou com telas
+// duplicadas na pilha, refs locais podem nascer de novo; esse mapa impede pause/resume/end
+// duplicados para a mesma sessão em janelas curtas.
+const GLOBAL_MASTER_LIFECYCLE_ACTIONS = new Map<string, number>();
+function acquireMasterLifecycleAction(key: string, ttlMs = 2500) {
+  const now = Date.now();
+  for (const [entryKey, expiresAt] of GLOBAL_MASTER_LIFECYCLE_ACTIONS) {
+    if (expiresAt <= now) GLOBAL_MASTER_LIFECYCLE_ACTIONS.delete(entryKey);
+  }
+  const expiresAt = GLOBAL_MASTER_LIFECYCLE_ACTIONS.get(key) || 0;
+  if (expiresAt > now) return false;
+  GLOBAL_MASTER_LIFECYCLE_ACTIONS.set(key, now + ttlMs);
+  return true;
+}
+function releaseMasterLifecycleAction(key: string) {
+  GLOBAL_MASTER_LIFECYCLE_ACTIONS.delete(key);
+}
 
 function getLanPlayerEntityQueueKeys(sessionId: string, player: Pick<LanSessionPlayerState, 'id' | 'remoteKey' | 'characterName'> | null | undefined) {
   if (!sessionId || !player) return [];
@@ -374,6 +400,7 @@ type EffectDraft = {
   icon?: string;
   removableBySave?: boolean;
   visualPriority?: number;
+  autoExpire?: boolean;
   status?: string;
   statusKey?: string;
   color?: string;
@@ -382,6 +409,13 @@ type EffectDraft = {
   saveDc?: number;
   repeatSave?: string;
   saveOnSuccess?: string;
+};
+
+type DiceValueResolution = {
+  total: number;
+  mode: 'manual' | 'virtual';
+  formula: string;
+  breakdown?: string;
 };
 
 const PERMANENT_STAT_TARGETS = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'] as const;
@@ -544,6 +578,20 @@ export default function LanSessionScreen() {
   const [reviewedRequestEventIds, setReviewedRequestEventIds] = useState<string[]>([]);
   const [pendingSaves, setPendingSaves] = useState<LanPendingSave[]>([]);
   const [xpPool, setXpPool] = useState('1000');
+  const [masterDiceRollRequest, setMasterDiceRollRequest] = useState<DiceRollRequest | undefined>();
+  const [masterDiceValuePrompt, setMasterDiceValuePrompt] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+    formula: string;
+    qty: number;
+    manualValue: string;
+  }>({ visible: false, title: '', message: '', formula: '', qty: 1, manualValue: '' });
+  const pendingMasterDiceValueResolverRef = useRef<((result: DiceValueResolution | null) => void) | null>(null);
+  const pendingMasterVisualDiceValueRef = useRef<{
+    parsed: ParsedDiceFormula;
+    resolve: (result: DiceValueResolution | null) => void;
+  } | null>(null);
 
   const [inventoryModalPlayer, setInventoryModalPlayer] = useState<LanSessionPlayerState | null>(null);
   const [inventoryCatalog, setInventoryCatalog] = useState<InventoryItemOption[]>([]);
@@ -1187,6 +1235,21 @@ export default function LanSessionScreen() {
       sp: basePlayer.sp,
       cp: basePlayer.cp,
     };
+    const cleanPlayerRevision = (value: unknown) => {
+      const revision = Math.max(0, Math.floor(Number(value || 0) || 0));
+      return revision > 1000000 ? 0 : revision;
+    };
+    const currentCleanRevision = Math.max(
+      cleanPlayerRevision(currentPlayer.revisionSeq),
+      cleanPlayerRevision(basePlayer.revisionSeq),
+      cleanPlayerRevision(numberResult?.revision),
+      cleanPlayerRevision((patch as any).revisionSeq),
+      cleanPlayerRevision(event.entityRevision),
+    );
+    // v95: level-up/rejoin usa seq temporal, mas revisionSeq de player precisa
+    // continuar pequena e monotônica. Nunca carregue Date.now() para revisionSeq,
+    // senão a ficha privada passa a competir com snapshots/checkpoints temporais.
+    const nextProgressionRevision = Math.max(1, currentCleanRevision + 1);
     const nextPlayer: LanSessionPlayerState = {
       ...basePlayer,
       level: incomingLevel,
@@ -1196,11 +1259,7 @@ export default function LanSessionScreen() {
       hpMax: nextHpMax,
       stats: (patch.stats as LanSessionPlayerState['stats']) || basePlayer.stats,
       characterSnapshot: nextSnapshot as LanSessionPlayerState['characterSnapshot'],
-      revisionSeq: Math.max(
-        Math.floor(Number(basePlayer.revisionSeq || 0) || 0),
-        Math.floor(Number(numberResult?.revision || 0) || 0),
-        Math.floor(Number(event.seq || event.serverSeq || 0) || 0)
-      ),
+      revisionSeq: nextProgressionRevision,
     };
     const nextState: LanSessionState = {
       ...baseState,
@@ -1222,9 +1281,14 @@ export default function LanSessionScreen() {
       cp: nextPlayer.cp,
     });
 
-    // v92: eco autoritativo para a ficha do jogador. Evita que, apos level-up,
-    // payload/snapshot antigo deixe o jogador com sensacao de perda de sincronizacao.
-    if (joinUrl) {
+    // v95: eco autoritativo para a ficha do jogador.
+    // IMPORTANTE: seq/serverSeq continuam temporais, mas entityRevision NAO pode
+    // usar Date.now(), event.seq ou event.entityRevision do join/level-up.
+    // A revision correta do agregado e a revisionSeq pequena do player no mestre.
+    const authoritativePlayerRevision = Math.max(1, cleanPlayerRevision(nextPlayer.revisionSeq));
+
+    const echoToKey = String(nextPlayer.remoteKey || '');
+    if (joinUrl && echoToKey) {
       const echoSeq = Date.now();
       const echoEvent: LanSessionEvent = {
         id: makeLanEventId(),
@@ -1234,15 +1298,11 @@ export default function LanSessionScreen() {
         type: 'player_patch',
         fromKey: 'master',
         fromName: 'Mestre',
-        toKey: nextPlayer.remoteKey,
-        toName: nextPlayer.characterName,
+        toKey: echoToKey,
+        toName: nextPlayer.characterName || nextPlayer.playerName || 'Jogador',
         entityType: 'player',
-        entityId: nextPlayer.remoteKey,
-        entityRevision: Math.max(
-          Math.floor(Number(nextPlayer.revisionSeq || 0) || 0),
-          Math.floor(Number(event.seq || event.serverSeq || 0) || 0),
-          echoSeq
-        ),
+        entityId: echoToKey,
+        entityRevision: authoritativePlayerRevision,
         ackRequired: true,
         originClientId: 'master',
         numberPatch: {
@@ -1254,12 +1314,23 @@ export default function LanSessionScreen() {
           sp: nextPlayer.sp,
           cp: nextPlayer.cp,
         },
+        progressionPatch: {
+          revisionSeq: authoritativePlayerRevision,
+          level: nextPlayer.level,
+          className: nextPlayer.className,
+          race: nextPlayer.race,
+          hpCurrent: nextPlayer.hpCurrent,
+          hpMax: nextPlayer.hpMax,
+          stats: nextPlayer.stats as Record<string, unknown>,
+          characterSnapshot: nextSnapshot as Record<string, unknown>,
+        },
+        statsPatch: nextPlayer.stats as Record<string, unknown>,
         numberPatchIntent: 'level_up_authoritative_echo',
         message: `${nextPlayer.characterName} sincronizado apos subir de nivel.`,
         createdAt: new Date(echoSeq).toISOString(),
       };
       void sendLanSessionEvent(joinUrl, echoEvent)
-        .then(() => debugLanFlow('MASTER_LEVEL_UP_AUTHORITATIVE_ECHO_SENT_V92', {
+        .then(() => debugLanFlow('MASTER_LEVEL_UP_AUTHORITATIVE_ECHO_SENT_V95', {
           sessionId,
           playerId: nextPlayer.id,
           playerKey: nextPlayer.remoteKey,
@@ -1268,7 +1339,7 @@ export default function LanSessionScreen() {
           hpMax: nextPlayer.hpMax,
           level: nextPlayer.level,
         }))
-        .catch((error) => debugLanFlow('MASTER_LEVEL_UP_AUTHORITATIVE_ECHO_ERROR_V92', {
+        .catch((error) => debugLanFlow('MASTER_LEVEL_UP_AUTHORITATIVE_ECHO_ERROR_V95', {
           sessionId,
           playerId: nextPlayer.id,
           playerKey: nextPlayer.remoteKey,
@@ -1277,7 +1348,7 @@ export default function LanSessionScreen() {
       void rememberLanSessionEvent(db, echoEvent).catch(() => {});
     }
 
-    debugLanFlow('MASTER_LEVEL_UP_RUNTIME_FIRST_APPLIED_V92', {
+    debugLanFlow('MASTER_LEVEL_UP_RUNTIME_FIRST_APPLIED_V94', {
       sessionId,
       eventId: event.id,
       playerId: nextPlayer.id,
@@ -2315,7 +2386,26 @@ export default function LanSessionScreen() {
     targetKey: string,
     targetName: string,
     saveRequest: NonNullable<LanSessionEvent['saveRequest']>,
+    pendingSave?: LanPendingSave | null,
   ) => {
+    const saveForPatch: LanPendingSave = pendingSave || {
+      id: saveRequest.id,
+      sessionId,
+      targetKey,
+      sourceType: 'effect_save_request',
+      sourceId: saveRequest.sourceEffectId || null,
+      sourceName: saveRequest.sourceEffectName || null,
+      effectPayload: (saveRequest.pendingEffectPayload || {}) as Record<string, unknown>,
+      ability: saveRequest.saveAbility,
+      dc: saveRequest.dc ?? null,
+      dcMode: 'fixed',
+      status: 'pending',
+      result: {},
+    };
+    setPendingSaves((current) => {
+      if (current.some((entry) => entry.id === saveForPatch.id)) return current;
+      return [saveForPatch, ...current];
+    });
     const event = await rememberAndSendLanSessionEvent(db, joinUrl, {
       id: makeLanEventId(),
       sessionId,
@@ -2329,6 +2419,10 @@ export default function LanSessionScreen() {
       ackRequired: true,
       originClientId: 'master',
       saveRequest,
+      pendingSavePatch: {
+        action: 'create',
+        save: saveForPatch,
+      },
       message: `${targetName} precisa rolar ${saveRequest.saveAbility}${saveRequest.dc ? ` CD ${saveRequest.dc}` : ''}.`,
       createdAt: new Date().toISOString(),
     });
@@ -2545,13 +2639,16 @@ export default function LanSessionScreen() {
           color: row.color,
           secondaryColor: row.secondaryColor,
           conditionName: row.name,
-          saveAbility: row.saveAbility,
+          saveAbility: row.saveAbility || (row.rulesJson as any)?.save?.ability || (row.rulesJson as any)?.saveAbility,
+          saveDc: (row.rulesJson as any)?.save?.dc ?? (row.rulesJson as any)?.saveDc ?? (row.rulesJson as any)?.dc,
           repeatSave: row.repeatSave,
-          saveOnSuccess: row.saveOnSuccess,
+          saveOnSuccess: row.saveOnSuccess || (row.rulesJson as any)?.save?.onSuccess || (row.rulesJson as any)?.saveOnSuccess,
         }],
-        durationValue: Number(row.defaultDurationValue) || 1,
-        durationUnit: normalizeEffectUnit(row.defaultDurationUnit),
-        durationText: String(row.description || ''),
+        // v100: condicao/status e manual por padrao. Antes vinha 1 turn e era
+        // removida no primeiro ADVANCE_TIME_TURN, dando o efeito de aparecer e sumir.
+        durationValue: null,
+        durationUnit: 'manual' as LanEffectUnit,
+        durationText: 'Manual',
         statusKey: row.statusKey ? String(row.statusKey) : undefined,
         color: row.color ? String(row.color) : undefined,
         secondaryColor: row.secondaryColor ? String(row.secondaryColor) : undefined,
@@ -2597,6 +2694,17 @@ export default function LanSessionScreen() {
         sessionId,
         syncPayload,
         remainingMs: liveRuntimeLockUntilRef.current - now,
+      });
+      return;
+    }
+    const hasPendingMasterAction = pendingMasterActionIdsRef.current.size > 0 ||
+      Array.from(masterActionQueueDepthRef.current.values()).some((depth) => Number(depth || 0) > 0);
+    if (!syncPayload && hasPendingMasterAction) {
+      debugLanFlow('MASTER_RELOAD_SESSION_STATE_SKIPPED_DURING_MASTER_ACTION_V107', {
+        sessionId,
+        syncPayload,
+        pendingActionCount: pendingMasterActionIdsRef.current.size,
+        queuedActionDepth: Array.from(masterActionQueueDepthRef.current.values()).reduce((sum, value) => sum + Number(value || 0), 0),
       });
       return;
     }
@@ -2670,23 +2778,74 @@ export default function LanSessionScreen() {
   }, [applyExternalPayload, applyExternalSessionState, db, scheduleSilentPayloadRefresh]);
 
   const resumeMasterHost = useCallback(async () => {
-  if (!payload?.session?.id) return;
+  if (!payload?.session?.id || isEndingSession || endingSessionRef.current) return;
+
+  const sessionId = payload.session.id;
+  const currentStatus = sessionStateRef.current?.status || payload.state?.status || 'active';
+  if (currentStatus === 'ended') return;
+
+  const livePayload: LanSessionPayload = {
+    ...payload,
+    state: sessionStateRef.current || payload.state,
+  };
+
+  // v109: foreground/focus NÃO pode recriar o host nem salvar payload completo quando
+  // o servidor TCP já está vivo. Isso era a origem de snapshots/bootstrap atrasados,
+  // joins duplicados e efeitos reaparecendo após level-up/pausa.
+  const reusedLiveHost = updateLanTcpHostPayload(livePayload, { broadcast: false });
+  if (reusedLiveHost) {
+    debugLanFlow('MASTER_RESUME_HOST_REUSED_LIVE_SOCKET_V109', {
+      sessionId,
+      joinUrl,
+      status: currentStatus,
+      decision: 'skip_start_server_and_skip_sqlite_save',
+    });
+    return;
+  }
+
+  const guardKey = `${sessionId}:resume_host_start`;
+  if (!acquireMasterLifecycleAction(guardKey, 8000)) {
+    debugLanFlow('MASTER_RESUME_HOST_START_DEDUPED_V109', {
+      sessionId,
+      joinUrl,
+      status: currentStatus,
+    });
+    return;
+  }
 
   try {
-    const nextPayload = payload;
-    const nextJoinUrl = await startLanServer(nextPayload);
+    traceApp('LAN_JOIN', 'MASTER_RESUME_HOST_START_SOCKET_V109', {
+      screen: 'lan-session',
+      source: 'resumeMasterHost',
+      sessionId,
+      joinUrl,
+      status: currentStatus,
+    });
+    const nextJoinUrl = await startLanServer(livePayload);
 
-    await saveLanSession(db, nextPayload, nextJoinUrl, { isMaster: true });
+    await saveLanSession(db, livePayload, nextJoinUrl, { isMaster: true });
 
-    applyExternalPayload(nextPayload, 'sqlite');
+    applyExternalPayload(livePayload, 'sqlite');
     setJoinUrl(nextJoinUrl);
-    setJoinLink(buildJoinDeepLink(nextJoinUrl, nextPayload));
+    setJoinLink(buildJoinDeepLink(nextJoinUrl, livePayload));
 
     await loadSavedSessions();
+    debugLanFlow('MASTER_RESUME_HOST_SOCKET_STARTED_V109', {
+      sessionId,
+      nextJoinUrl,
+    });
   } catch (error) {
     console.warn('[LAN] Não foi possível retomar o host LAN automaticamente:', error);
+    traceError('LAN_JOIN', 'MASTER_RESUME_HOST_FAILED_V109', error, {
+      screen: 'lan-session',
+      source: 'resumeMasterHost',
+      sessionId,
+      joinUrl,
+    });
+  } finally {
+    releaseMasterLifecycleAction(guardKey);
   }
-}, [applyExternalPayload, buildJoinDeepLink, db, loadSavedSessions, payload, saveLanSession, startLanServer]);
+}, [applyExternalPayload, buildJoinDeepLink, db, isEndingSession, joinUrl, loadSavedSessions, payload, saveLanSession, startLanServer]);
 
 useLanAppLifecycle({
   enabled: Boolean(payload?.session?.id && joinUrl),
@@ -2836,10 +2995,24 @@ useEffect(() => {
             });
             if (!fresh) continue;
 
+            // v108: fecha o card pendente do mestre imediatamente; a persistência/resolução vem depois.
+            setPendingSaves((current) => current.filter((entry) => entry.id !== event.saveResult?.requestId));
+
             const resolved = await resolveSave(db, event.saveResult.requestId, Boolean(event.saveResult.passed), event.saveResult.total);
+            if (!resolved) {
+              debugLanFlow('MASTER_EFFECT_SAVE_RESULT_ALREADY_RESOLVED_V106', {
+                sessionId: activeSessionId,
+                requestId: event.saveResult.requestId,
+                eventId: event.id,
+                fromKey: event.fromKey,
+              });
+              setPendingSaves((current) => current.filter((entry) => entry.id !== event.saveResult?.requestId));
+              setPendingSaves(await listPendingSaves(db, activeSessionId));
+              continue;
+            }
             const targetState = await getLanSessionState(db, activeSessionId);
             const targetPlayer = targetState.players.find((entry) => entry.remoteKey === event.fromKey || entry.characterName === event.fromName);
-            if (!resolved || !targetPlayer) continue;
+            if (!targetPlayer) continue;
 
             const pendingPayload = resolved.effectPayload as Record<string, any>;
             const save = pendingPayload.save || {};
@@ -2949,25 +3122,36 @@ useEffect(() => {
               },
             );
 
-            const resolveEvent = await rememberAndSendLanSessionEvent(db, joinUrl, {
+            const resolveSeq = Date.now();
+            const resolveEvent: LanSessionEvent = {
               id: makeLanEventId(),
               sessionId: activeSessionId,
+              seq: resolveSeq,
+              serverSeq: resolveSeq,
               type: 'pending_save_patch',
               fromKey: 'master',
               fromName: 'Mestre',
               toKey: event.fromKey,
               toName: event.fromName,
+              entityType: 'save',
+              entityId: event.saveResult.requestId,
+              entityRevision: resolveSeq,
+              ackRequired: true,
+              originClientId: 'master',
               pendingSavePatch: {
                 action: 'resolve',
                 id: event.saveResult.requestId,
                 result: event.saveResult,
               },
               message: passed ? 'Salvaguarda passou.' : 'Salvaguarda falhou.',
-              createdAt: new Date().toISOString(),
-            });
+              createdAt: new Date(resolveSeq).toISOString(),
+            };
             rememberSentEventInTimeline(resolveEvent);
-            await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
-            shouldReloadSessionState = true;
+            setPendingSaves((current) => current.filter((entry) => entry.id !== event.saveResult?.requestId));
+            void sendLanSessionEvent(joinUrl, resolveEvent).catch(() => false);
+            void rememberLanSessionEvent(db, resolveEvent).catch(() => false);
+            void listPendingSaves(db, activeSessionId).then(setPendingSaves).catch(() => undefined);
+            scheduleSilentPayloadRefresh(activeSessionId);
             continue;
           }
 
@@ -3167,7 +3351,7 @@ useEffect(() => {
                       saveOnSuccess: saveConfig?.saveOnSuccess || 'negates',
                       saveOnFailure: 'apply_full',
                       pendingEffectPayload: pending.effectPayload,
-                    });
+                    }, pending);
                   }
                   continue;
                 }
@@ -3285,7 +3469,7 @@ useEffect(() => {
                   saveOnSuccess: saveConfig.saveOnSuccess || (spellEffect.mode === 'damage' ? 'half' : 'negates'),
                   saveOnFailure: 'apply_full',
                   pendingEffectPayload: pending.effectPayload,
-                });
+                }, pending);
                 await sendActionResult(
                   activeSessionId,
                   event.fromKey,
@@ -3775,8 +3959,9 @@ useEffect(() => {
               continue;
             }
             if (fresh) {
-              await syncLanSessionPayload(db, activeSessionId, { broadcast: false });
-              shouldReloadSessionState = true;
+              // v108: pedido do jogador ja aparece pelo runtime. Nao rode sync/reload pesado aqui,
+              // pois isso bloqueava respostas e fazia os pedidos chegarem atrasados.
+              scheduleSilentPayloadRefresh(activeSessionId);
             }
             continue;
           }
@@ -4118,7 +4303,9 @@ useEffect(() => {
     };
 
     pollJoinedPlayers();
-    const timer = setInterval(pollJoinedPlayers, 2500);
+    // v109: fallback de eventos genéricos precisa ser quase em tempo real;
+    // a deduplicação por eventId evita reaplicar eventos já tratados.
+    const timer = setInterval(pollJoinedPlayers, 1000);
     const unsubscribeRealtime = subscribeLanSessionHostUpdates(joinUrl, (update?: LanSessionHostUpdate) => {
       traceApp('SUBSCRIPTION_UPDATE', 'MASTER_HOST_SUBSCRIPTION_UPDATE', {
         screen: 'lan-session',
@@ -4539,6 +4726,16 @@ useEffect(() => {
       source: 'master_click',
       args: { sessionName, masterName, level: parsedLevel, allowExisting },
     });
+
+    const activeConflict = await getActiveLanSessionConflict(db, undefined, 'master');
+    if (activeConflict) {
+      Alert.alert(
+        'Sessão LAN ativa',
+        `Você já está ${activeConflict.role === 'master' ? 'mestrando' : 'jogando'} em uma sessão ativa: ${activeConflict.sessionName}. Pause, saia ou encerre essa sessão antes de iniciar outra.`
+      );
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -4616,6 +4813,15 @@ useEffect(() => {
       sessionId: session.id,
       args: { isMaster: session.isMaster, status: session.status, joinUrl: session.joinUrl },
     });
+    const activeConflict = await getActiveLanSessionConflict(db, session.id, session.isMaster ? 'master' : 'player');
+    if (activeConflict) {
+      Alert.alert(
+        'Sessão LAN ativa',
+        `Você já está ${activeConflict.role === 'master' ? 'mestrando' : 'jogando'} em uma sessão ativa: ${activeConflict.sessionName}. Pause, saia ou encerre essa sessão antes de trocar.`
+      );
+      return;
+    }
+
     if (!session.isMaster) {
       const bound = await getBoundLanCharacter(db, session.id);
       if (bound?.characterId) {
@@ -4658,6 +4864,15 @@ useEffect(() => {
         nextPayload = { ...nextPayload, state: await getLanSessionState(db, session.id) };
       }
       if (!nextPayload) throw new Error('Sessão não encontrada.');
+      const resumedHostInstanceId = makeLanHostInstanceId();
+      const activeState = nextPayload.state
+        ? { ...nextPayload.state, status: 'active' as const }
+        : { ...(await getLanSessionState(db, session.id)), status: 'active' as const };
+      nextPayload = {
+        ...nextPayload,
+        session: { ...nextPayload.session, hostInstanceId: resumedHostInstanceId },
+        state: activeState,
+      };
 
       const nextJoinUrl = await startLanServer(nextPayload);
 
@@ -4744,7 +4959,9 @@ useEffect(() => {
   };
 
   const finishStopSession = useCallback(async () => {
-    if (endingSessionRef.current) {
+    const sessionIdForGuard = payload?.session.id || '';
+    const endGuardKey = sessionIdForGuard ? `${sessionIdForGuard}:end_session` : '';
+    if (endingSessionRef.current || (endGuardKey && !acquireMasterLifecycleAction(endGuardKey, 10000))) {
       traceApp('LAN_JOIN', 'MASTER_SESSION_END_IGNORED_ALREADY_ENDING', {
         screen: 'lan-session',
         source: 'finishStopSession',
@@ -4755,10 +4972,10 @@ useEffect(() => {
     endingSessionRef.current = true;
     setIsEndingSession(true);
     const endingPlayers = sessionStateRef.current?.players || [];
+    const endingState = payload?.session.id && sessionStateRef.current
+      ? { ...sessionStateRef.current, status: 'ended' as const, players: [] }
+      : null;
     if (payload?.session.id) {
-      const endingState = sessionStateRef.current
-        ? { ...sessionStateRef.current, status: 'ended' as const, players: [] }
-        : null;
       if (endingState) {
         sessionStateRef.current = endingState;
         setSessionState(endingState);
@@ -4805,19 +5022,23 @@ useEffect(() => {
         message: 'O mestre encerrou a campanha. As fichas foram desvinculadas da sessao.',
         createdAt: endedAt,
       };
-      const committedEvent = await rememberAndSendLanSessionEvent(db, joinUrl, endedEvent).catch((error) => {
+      updateLanTcpHostPayload({
+        ...payload,
+        state: endingState || { ...((payload.state || {}) as any), status: 'ended', players: [] },
+      }, { broadcast: false });
+      const sentEvent = endedEvent;
+      rememberSentEventInTimeline(endedEvent);
+      setSessionEvents((current) => mergeMasterTimelineEvent(current, endedEvent));
+      await sendLanSessionEvent(joinUrl, endedEvent).catch((error) => {
         traceError('SOCKET_SEND_START', 'MASTER_SESSION_ENDED_EVENT_SEND_ERROR', error, {
           screen: 'lan-session',
           source: 'finishStopSession',
           sessionId: payload.session.id,
           eventId: endedEvent.id,
         });
-        return null;
+        return false;
       });
-      const sentEvent = committedEvent || endedEvent;
-      if (!committedEvent) {
-        await rememberLanSessionEvent(db, endedEvent).catch(() => false);
-      }
+      void rememberLanSessionEvent(db, endedEvent).catch(() => false);
       for (const player of endingPlayers) {
         if (!player.remoteKey) continue;
         traceApp('EVENT_CREATED', 'MASTER_SESSION_ENDED_SENT_TO_PLAYER', {
@@ -4837,7 +5058,7 @@ useEffect(() => {
           eventId: sentEvent.id,
           eventType: sentEvent.type,
         });
-        await waitForSessionEndAcks(sentEvent.id, payload.session.id, endingPlayers);
+        void waitForSessionEndAcks(sentEvent.id, payload.session.id, endingPlayers);
       }
       await db.runAsync(
         `UPDATE lan_sessions
@@ -4892,6 +5113,7 @@ useEffect(() => {
     router.replace('/' as any);
     } catch (error) {
       endingSessionRef.current = false;
+      if (endGuardKey) releaseMasterLifecycleAction(endGuardKey);
       setIsEndingSession(false);
       traceError('LAN_JOIN', 'MASTER_SESSION_END_FAILED', error, {
         screen: 'lan-session',
@@ -5062,160 +5284,210 @@ useEffect(() => {
   };
 
   const handleTogglePause = async () => {
-    if (!payload || !sessionState || pauseToggleRunningRef.current) return;
-    const wasPaused = sessionState.status === 'paused';
+    if (!payload || !sessionStateRef.current || pauseToggleRunningRef.current || endingSessionRef.current) return;
+    const sessionId = payload.session.id;
+    const latestState = sessionStateRef.current || sessionState;
+    const wasPaused = latestState.status === 'paused';
+    const targetStatus = wasPaused ? 'active' : 'paused';
+    const lifecycleKey = `${sessionId}:toggle:${targetStatus}`;
+    if (!acquireMasterLifecycleAction(lifecycleKey, 2500)) {
+      debugLanFlow('MASTER_SESSION_TOGGLE_DEDUPED_V109', {
+        sessionId,
+        targetStatus,
+        currentStatus: latestState.status,
+      });
+      return;
+    }
 
-    const applyPauseToggle = async () => {
-      if (pauseToggleRunningRef.current) return;
+    if (!wasPaused) {
       pauseToggleRunningRef.current = true;
-      sessionLifecycleLockUntilRef.current = Date.now() + 8000;
-      try {
-      const resumedHostInstanceId = wasPaused ? makeLanHostInstanceId() : payload.session.hostInstanceId;
-      if (wasPaused) {
-        traceApp('LAN_JOIN', 'MASTER_SESSION_RESUME_START', {
-          screen: 'lan-session',
-          source: 'handleTogglePause',
-          sessionId: payload.session.id,
-        });
-      }
-      const nextPayload = wasPaused
-        ? await resumeLanSession(db, payload.session.id)
-        : await pauseLanSession(db, payload.session.id);
-      const nextStatus = wasPaused ? 'active' : 'paused';
-      const optimisticState = sessionStateRef.current
-        ? { ...sessionStateRef.current, status: nextStatus as 'active' | 'paused' }
-        : nextPayload?.state
-          ? { ...nextPayload.state, status: nextStatus as 'active' | 'paused' }
-          : null;
-      if (optimisticState) {
-        sessionStateRef.current = optimisticState;
-        setSessionState(optimisticState);
-      }
-      setPayload((current) => current ? ({
-        ...current,
-        state: optimisticState || current.state,
-      }) : current);
-      let payloadForUi = nextPayload;
-      let eventJoinUrl = joinUrl;
-
-      if (wasPaused && nextPayload) {
-        payloadForUi = {
-          ...nextPayload,
-          session: {
-            ...nextPayload.session,
-            hostInstanceId: resumedHostInstanceId,
-          },
-          state: nextPayload.state ? { ...nextPayload.state, status: 'active' } : nextPayload.state,
-        };
-        const nextJoinUrl = await startLanServer(payloadForUi);
-        traceApp('LAN_JOIN', 'MASTER_SESSION_RESUME_HOST_STARTED', {
-          screen: 'lan-session',
-          source: 'handleTogglePause',
-          sessionId: payload.session.id,
-          joinUrl: nextJoinUrl,
-          hostInstanceId: resumedHostInstanceId,
-        });
-        await saveLanSession(db, payloadForUi, nextJoinUrl || joinUrl, { isMaster: true });
-        if (nextJoinUrl) {
-          eventJoinUrl = nextJoinUrl;
-          setJoinUrl(nextJoinUrl);
-          setJoinLink(buildJoinDeepLink(nextJoinUrl, payloadForUi));
-        }
-      }
+      sessionLifecycleLockUntilRef.current = Date.now() + 12000;
+      traceApp('LAN_JOIN', 'MASTER_SESSION_PAUSE_FAST_START_V106', {
+        screen: 'lan-session',
+        source: 'handleTogglePause',
+        sessionId,
+      });
 
       const now = new Date().toISOString();
-      const event = await rememberAndSendLanSessionEvent(db, eventJoinUrl, {
+      const optimisticState: LanSessionState = { ...latestState, status: 'paused' as const };
+      sessionStateRef.current = optimisticState;
+      setSessionState(optimisticState);
+      setPayload((current) => current ? ({ ...current, state: optimisticState }) : current);
+      // v107: pausar nao derruba mais o socket. Mantemos o host vivo e apenas
+      // atualizamos o snapshot em memoria para que o jogador receba pause/resume
+      // no mesmo joinUrl/porta.
+      updateLanTcpHostPayload({ ...payload, state: optimisticState }, { broadcast: false });
+
+      const seq = Date.now();
+      const event: LanSessionEvent = {
         id: makeLanEventId(),
-        sessionId: payload.session.id,
+        sessionId,
+        seq,
+        serverSeq: seq,
         type: 'session_patch',
         fromKey: 'master',
         fromName: 'Mestre',
         toKey: 'all',
         toName: 'Todos',
         entityType: 'session',
-        entityId: payload.session.id,
-        entityRevision: Date.now(),
+        entityId: sessionId,
+        entityRevision: seq,
         ackRequired: false,
         originClientId: 'master',
-        sessionPatch: wasPaused
-          ? {
-              status: 'active',
-              resumedAt: now,
-              hostInstanceId: resumedHostInstanceId,
-              sessionEpoch: Date.now(),
-              readOnlyForPlayers: false,
-            }
-          : {
-              status: 'paused',
-              pausedAt: now,
-              reason: 'master_paused',
-              keepPlayersLinked: true,
-              readOnlyForPlayers: true,
-              hostInstanceId: payload.session.hostInstanceId,
-            },
-        message: wasPaused ? 'O mestre retomou a sessao.' : 'O mestre pausou a sessao. A campanha continuara depois.',
+        sessionPatch: {
+          status: 'paused',
+          pausedAt: now,
+          reason: 'master_paused',
+          keepPlayersLinked: true,
+          readOnlyForPlayers: true,
+          hostInstanceId: payload.session.hostInstanceId,
+        },
+        message: 'O mestre pausou a sessao. A campanha continuara depois.',
         createdAt: now,
-      });
-      if (event) {
-        traceApp('EVENT_CREATED', 'MASTER_SESSION_PATCH_SENT', {
-          screen: 'lan-session',
-          source: 'handleTogglePause',
-          sessionId: payload.session.id,
-          eventId: event.id,
-          eventType: event.type,
-          status: nextStatus,
-        });
-        traceApp('EVENT_CREATED', wasPaused ? 'MASTER_SESSION_RESUMED_SENT' : 'MASTER_SESSION_PAUSED_SENT', {
-          screen: 'lan-session',
-          source: 'handleTogglePause',
-          sessionId: payload.session.id,
-          eventId: event.id,
-          eventType: event.type,
-          status: nextStatus,
-        });
-        setSessionEvents((current) => mergeMasterTimelineEvent(current, event));
-      }
-      await recordMasterTimelineEvent(wasPaused ? 'Mestre continuou a campanha.' : 'Mestre pausou a campanha para continuar depois.');
+      };
 
-      if (payloadForUi) {
-        const syncedPayload = await syncLanSessionPayload(db, payload.session.id, { broadcast: false });
-        applyExternalPayload(payloadForUi || syncedPayload, 'sqlite');
-      }
-      sessionLifecycleLockUntilRef.current = Date.now() + 8000;
-      traceApp('SQLITE_WRITE_DONE', wasPaused ? 'MASTER_SESSION_RESUMED_DB_DONE' : 'MASTER_SESSION_PAUSED_DB_DONE', {
-        screen: 'lan-session',
-        source: 'handleTogglePause',
-        sessionId: payload.session.id,
+      rememberSentEventInTimeline(event);
+      setSessionEvents((current) => mergeMasterTimelineEvent(current, event));
+      void sendLanSessionEvent(joinUrl, event).catch((error) => {
+        debugLanFlow('MASTER_SESSION_PAUSE_FAST_SEND_FAILED_V106', {
+          sessionId,
+          eventId: event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
       });
-      await loadSavedSessions();
-      } finally {
+      void rememberLanSessionEvent(db, event).catch(() => false);
+      void db.runAsync(
+        `UPDATE lan_sessions
+         SET status = 'paused', active = 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND COALESCE(status, 'active') != 'ended'`,
+        [sessionId],
+      ).then(async () => {
+        // v107: nao parar o servidor TCP aqui. Se a porta muda durante a pausa,
+        // os jogadores continuam presos no joinUrl antigo e nunca recebem o evento
+        // de retomada. A sessao fica read-only pelo status=paused.
+        updateLanTcpHostPayload({ ...payload, state: optimisticState }, { broadcast: false });
+        await recordMasterTimelineEvent('Mestre pausou a campanha para continuar depois.').catch(() => false);
+        await loadSavedSessions().catch(() => undefined);
+        debugLanFlow('MASTER_SESSION_PAUSED_DB_DONE_V107_KEEP_SOCKET', { sessionId });
+      }).catch((error) => {
+        debugLanFlow('MASTER_SESSION_PAUSED_DB_FAILED_V106', {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }).finally(() => {
         pauseToggleRunningRef.current = false;
-      }
-    };
-
-    if (!wasPaused) {
-      traceApp('LAN_JOIN', 'MASTER_SESSION_PAUSE_CONFIRM_OPENED', {
-        screen: 'lan-session',
-        source: 'handleTogglePause',
-        sessionId: payload.session.id,
+        releaseMasterLifecycleAction(lifecycleKey);
       });
+
+      debugLanFlow('MASTER_SESSION_PAUSED_SENT_FAST_V106', {
+        sessionId,
+        eventId: event.id,
+        decision: 'ui_and_socket_before_sqlite',
+      });
+      return;
+    }
+
+    const activeConflict = await getActiveLanSessionConflict(db, sessionId, 'master');
+    if (activeConflict) {
+      releaseMasterLifecycleAction(lifecycleKey);
       Alert.alert(
-        'Pausar sessao?',
-        'A campanha ficara salva para continuar depois.\nOs jogadores continuarao vinculados a mesa, mas as fichas ficarao em modo leitura ate o mestre retomar.',
-        [
-          { text: 'Cancelar', style: 'cancel' },
-          {
-            text: 'Pausar campanha',
-            onPress: () => {
-              void applyPauseToggle();
-            },
-          },
-        ]
+        'Sessão LAN ativa',
+        `Você já está ${activeConflict.role === 'master' ? 'mestrando' : 'jogando'} em uma sessão ativa: ${activeConflict.sessionName}. Pause, saia ou encerre essa sessão antes de retomar outra.`
       );
       return;
     }
 
-    await applyPauseToggle();
+    pauseToggleRunningRef.current = true;
+    sessionLifecycleLockUntilRef.current = Date.now() + 12000;
+    const resumedHostInstanceId = makeLanHostInstanceId();
+    traceApp('LAN_JOIN', 'MASTER_SESSION_RESUME_FAST_START_V108', {
+      screen: 'lan-session',
+      source: 'handleTogglePause',
+      sessionId,
+    });
+
+    const nowIso = new Date().toISOString();
+    const optimisticState: LanSessionState = { ...latestState, status: 'active' as const };
+    const payloadForUi = {
+      ...payload,
+      session: { ...payload.session, hostInstanceId: resumedHostInstanceId },
+      state: optimisticState,
+    };
+    sessionStateRef.current = optimisticState;
+    setSessionState(optimisticState);
+    setPayload(payloadForUi);
+    updateLanTcpHostPayload(payloadForUi, { broadcast: false });
+
+    const seq = Date.now();
+    const event: LanSessionEvent = {
+      id: makeLanEventId(),
+      sessionId,
+      seq,
+      serverSeq: seq,
+      type: 'session_patch',
+      fromKey: 'master',
+      fromName: 'Mestre',
+      toKey: 'all',
+      toName: 'Todos',
+      entityType: 'session',
+      entityId: sessionId,
+      entityRevision: seq,
+      ackRequired: false,
+      originClientId: 'master',
+      sessionPatch: {
+        status: 'active',
+        resumedAt: nowIso,
+        hostInstanceId: resumedHostInstanceId,
+        sessionEpoch: seq,
+        readOnlyForPlayers: false,
+      },
+      message: 'O mestre retomou a sessao.',
+      createdAt: nowIso,
+    };
+
+    rememberSentEventInTimeline(event);
+    setSessionEvents((current) => mergeMasterTimelineEvent(current, event));
+    void sendLanSessionEvent(joinUrl, event).catch((error) => {
+      debugLanFlow('MASTER_SESSION_RESUME_FAST_SEND_FAILED_V108', {
+        sessionId,
+        eventId: event.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    });
+    void rememberLanSessionEvent(db, event).catch(() => false);
+
+    void (async () => {
+      try {
+        await db.runAsync(
+          `UPDATE lan_sessions
+           SET status = 'active', active = 1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND COALESCE(status, 'active') != 'ended'`,
+          [sessionId],
+        );
+        await saveLanSession(db, payloadForUi, joinUrl, { isMaster: true });
+        await recordMasterTimelineEvent('Mestre continuou a campanha.').catch(() => false);
+        await loadSavedSessions().catch(() => undefined);
+        debugLanFlow('MASTER_SESSION_RESUMED_DB_DONE_V108_KEEP_SOCKET', { sessionId, eventId: event.id });
+      } catch (error) {
+        debugLanFlow('MASTER_SESSION_RESUMED_DB_FAILED_V108', {
+          sessionId,
+          eventId: event.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        pauseToggleRunningRef.current = false;
+        releaseMasterLifecycleAction(lifecycleKey);
+      }
+    })();
+
+    debugLanFlow('MASTER_SESSION_RESUMED_SENT_FAST_V108', {
+      sessionId,
+      eventId: event.id,
+      decision: 'ui_and_socket_before_sqlite',
+    });
+    return;
   };
 
   const handleAdvanceTime = async (unit: LanAdvanceUnit) => {
@@ -5241,12 +5513,14 @@ useEffect(() => {
       },
     });
 
+    holdLiveRuntimeLock('advance_time_runtime', 12000);
     const runtimeResult = applyHostTurnRuntime(sessionId, beforeState, unit);
     if (!runtimeResult) return;
 
     sessionStateRef.current = runtimeResult.state;
     setSessionState(runtimeResult.state);
     setPayload((current) => current ? ({ ...current, state: runtimeResult.state }) : current);
+    updateLanTcpHostPayload({ ...payload, state: runtimeResult.state }, { broadcast: false });
 
     const now = Date.now();
     const sessionPatchEvent: LanSessionEvent = {
@@ -5301,7 +5575,7 @@ useEffect(() => {
       const removed = beforeEffects.filter((effect) => !afterById.has(String(effect.id)) && String(effect.id || '').trim());
       const updated = afterEffects.filter((effect) => {
         const previous = beforeById.get(String(effect.id));
-        return previous && Number(previous.remaining || 0) !== Number(effect.remaining || 0);
+        return previous && Number((previous as any).remaining || 0) !== Number((effect as any).remaining || 0);
       });
 
       const beforeTempHp = Math.max(0, Math.floor(Number(beforePlayer.tempHp || 0)));
@@ -5379,6 +5653,89 @@ useEffect(() => {
       if (removed.length || updated.length) {
         void sendPublicPlayerStatus(sessionId, player, 'turn_effect_tick');
       }
+
+      if (unit === 'turn' && player.remoteKey) {
+        for (const effect of afterEffects) {
+          const repeatSave = String((effect as any)?.repeatSave || '').toLowerCase();
+          const saveAbility = String((effect as any)?.saveAbility || '').toUpperCase();
+          const saveDc = Number((effect as any)?.saveDc || 0) || 0;
+          const effectUnit = String((effect as any)?.unit || '').toLowerCase();
+          const isStillActive = (effect as any)?.isPermanent === true ||
+            effectUnit === 'manual' ||
+            effectUnit === 'permanent' ||
+            effectUnit === 'while_equipped' ||
+            effectUnit === 'concentration' ||
+            Number((effect as any)?.remaining || 0) > 0;
+          const shouldPromptSave = isStillActive && saveAbility && saveDc > 0 && (
+            repeatSave === 'end_of_turn' ||
+            repeatSave === 'start_of_turn' ||
+            repeatSave === 'turn' ||
+            repeatSave === 'each_turn'
+          );
+          if (!shouldPromptSave) continue;
+          const sourceId = String((effect as any)?.id || (effect as any)?.sourceId || (effect as any)?.statusKey || effect.name || 'effect');
+          const pending = await createPendingSave(db, {
+            sessionId,
+            playerId: player.id,
+            targetKey: player.remoteKey,
+            sourceType: 'turn_effect_save',
+            sourceId,
+            sourceName: String((effect as any)?.name || 'Efeito'),
+            appliedByKey: 'master',
+            appliedByName: 'Mestre',
+          }, {
+            ...effect,
+            save: {
+              ability: saveAbility,
+              dc: saveDc,
+              onSuccess: String((effect as any)?.saveOnSuccess || 'negates'),
+              repeatSave,
+            },
+          } as any).catch(() => null);
+          if (!pending) continue;
+          const saveEventSeq = Date.now();
+          const saveEvent: LanSessionEvent = {
+            id: makeLanEventId(),
+            sessionId,
+            seq: saveEventSeq,
+            serverSeq: saveEventSeq,
+            type: 'pending_save_patch',
+            fromKey: 'session',
+            fromName: 'Sessao',
+            toKey: player.remoteKey,
+            toName: player.characterName,
+            entityType: 'save',
+            entityId: pending.id,
+            entityRevision: runtimeResult.state.currentTurn,
+            ackRequired: true,
+            originClientId: 'master',
+            pendingSavePatch: {
+              action: 'create',
+              save: pending,
+            },
+            message: `Teste pendente criado para ${pending.sourceName || 'efeito'}.`,
+            createdAt: new Date(saveEventSeq).toISOString(),
+          };
+          rememberSentEventInTimeline(saveEvent);
+          setPendingSaves((current) => {
+            if (current.some((entry) => entry.id === pending.id)) return current;
+            return [pending, ...current];
+          });
+          void rememberLanSessionEvent(db, saveEvent).catch(() => false);
+          void sendLanSessionEvent(joinUrl, saveEvent).catch(() => false);
+          debugLanFlow('MASTER_TURN_PENDING_SAVE_PATCH_SENT_V106', {
+            sessionId,
+            playerKey: player.remoteKey,
+            playerName: player.characterName,
+            effectId: sourceId,
+            effectName: (effect as any)?.name,
+            saveId: pending.id,
+            ability: pending.ability,
+            dc: pending.dc,
+            turn: runtimeResult.state.currentTurn,
+          });
+        }
+      }
     }
 
     debugLanFlow('MASTER_TURN_RUNTIME_FIRST_SENT', {
@@ -5400,6 +5757,9 @@ useEffect(() => {
         nextCurrentTurn: runtimeResult.state.currentTurn,
         nextElapsedMinutes: runtimeResult.state.elapsedMinutes,
         skipEffectTick: false,
+        skipPendingSaveEvents: true,
+        // v106: pending save de turno ja foi emitido pelo runtime vivo acima.
+        // SQLite nao pode criar outro alerta atrasado/duplicado.
         // v56: runtime envia a remoção imediatamente, mas SQLite também precisa
         // decrementar/remover em background; senão o próximo reload/snapshot traz
         // o efeito vencido de volta para mestre e jogador.
@@ -5720,6 +6080,7 @@ useEffect(() => {
           repeatSave: draft.repeatSave ?? null,
           removableBySave: draft.removableBySave,
           visualPriority: draft.visualPriority,
+          autoExpire: (draft as any).autoExpire,
         } as LanSessionEffect;
       });
 
@@ -5908,6 +6269,7 @@ useEffect(() => {
       repeatSave: draft.repeatSave ?? null,
       removableBySave: draft.removableBySave,
       visualPriority: draft.visualPriority,
+      autoExpire: (draft as any).autoExpire,
     } as LanSessionEffect;
 
     const patch: NonNullable<LanSessionEvent['effectPatch']> = {
@@ -6705,12 +7067,24 @@ useEffect(() => {
     setEffectTarget(normalizeEffectTarget(firstEffect.target || firstEffect.stat || firstEffect.type));
     setEffectValue(String(firstEffect.value ?? firstEffect.val ?? firstEffect.amount ?? 0));
     setEffectMode(firstEffect.mode === 'set' ? 'set' : 'add');
-    const duration = createEffectDurationPayload({
-      value: option.durationValue ?? firstEffect.durationValue ?? firstEffect.duration ?? 1,
-      unit: option.durationUnit || firstEffect.durationUnit || firstEffect.unit || inferUnitFromText(option.durationText),
+    const isConditionOption = option.group === 'Condicao' || Boolean(option.statusKey || firstEffect.statusKey || firstEffect.status);
+    const duration = isConditionOption
+      ? { value: 0, remaining: 0, unit: 'manual', isPermanent: false }
+      : createEffectDurationPayload({
+          value: option.durationValue ?? firstEffect.durationValue ?? firstEffect.duration ?? 1,
+          unit: option.durationUnit || firstEffect.durationUnit || firstEffect.unit || inferUnitFromText(option.durationText),
+        });
+    // v102: não sobrescreva duração/unidade já ajustada pelo mestre ao marcar mais
+    // condições. O default manual só entra se a seleção de condição começou agora.
+    setEffectDuration((current) => {
+      const currentNumber = Math.max(0, Math.floor(Number(current) || 0));
+      if (isConditionOption && (selectedEffectKeys.length > 0 || currentNumber > 0)) return current;
+      return String(duration.value || 0);
     });
-    setEffectDuration(String(duration.value || 1));
-    setEffectUnit(duration.unit as LanEffectUnit);
+    setEffectUnit((current) => {
+      if (isConditionOption && selectedEffectKeys.length > 0) return current;
+      return duration.unit as LanEffectUnit;
+    });
   };
 
   const clearSelectedEffects = () => {
@@ -7106,9 +7480,19 @@ useEffect(() => {
   const handleResolvePendingSave = async (save: LanPendingSave, passed: boolean) => {
     if (!payload) return;
     const resolved = await resolveSave(db, save.id, passed);
+    if (!resolved) {
+      debugLanFlow('MASTER_PENDING_SAVE_ALREADY_RESOLVED_V106', {
+        sessionId: payload.session.id,
+        saveId: save.id,
+        passed,
+      });
+      setPendingSaves((current) => current.filter((entry) => entry.id !== save.id));
+      setPendingSaves(await listPendingSaves(db, payload.session.id));
+      return;
+    }
     const targetPlayer = sessionStateRef.current?.players.find((entry) => entry.remoteKey === save.targetKey)
       || sessionState?.players.find((entry) => entry.remoteKey === save.targetKey);
-    const pendingPayload = (resolved?.effectPayload || save.effectPayload || {}) as Record<string, any>;
+    const pendingPayload = (resolved.effectPayload || save.effectPayload || {}) as Record<string, any>;
     const activeEffectId = targetPlayer ? getActiveEffectIdFromPendingPayload(pendingPayload, targetPlayer) : '';
 
     if (targetPlayer && activeEffectId) {
@@ -7149,12 +7533,12 @@ useEffect(() => {
       pendingSavePatch: {
         action: 'resolve',
         id: save.id,
-        result: { passed },
+        // v107: jogador fecha modal por id ou result.requestId; envie ambos.
+        result: { passed, requestId: save.id },
       },
       message: `Mestre marcou ${save.sourceName || 'teste'} como ${passed ? 'sucesso' : 'falha'}.`,
       createdAt: new Date().toISOString(),
     });
-    await reloadSessionState(payload.session.id, false);
     setPendingSaves(await listPendingSaves(db, payload.session.id));
     scheduleSilentPayloadRefresh(payload.session.id);
   };
@@ -7289,6 +7673,81 @@ useEffect(() => {
   };
 
   // NOVO: Função para Aplicar Efeitos considerando o novo seletor (Toda a party ou Específico)
+  const completeMasterDiceValuePrompt = useCallback((result: DiceValueResolution | null) => {
+    const resolver = pendingMasterDiceValueResolverRef.current;
+    pendingMasterDiceValueResolverRef.current = null;
+    pendingMasterVisualDiceValueRef.current = null;
+    setMasterDiceValuePrompt({ visible: false, title: '', message: '', formula: '', qty: 1, manualValue: '' });
+    resolver?.(result);
+  }, []);
+
+  const requestMasterDiceValueForUse = useCallback((title: string, formula: string, qty = 1) => {
+    const parsed = parseUsableDiceFormula(formula, qty);
+    if (!parsed) return Promise.resolve<DiceValueResolution | null>(null);
+
+    return new Promise<DiceValueResolution | null>((resolve) => {
+      pendingMasterDiceValueResolverRef.current = resolve;
+      setMasterDiceValuePrompt({
+        visible: true,
+        title,
+        message: `Informe o valor final de ${parsed.formula} ou use o dado virtual.`,
+        formula,
+        qty,
+        manualValue: '',
+      });
+    });
+  }, []);
+
+  const rollMasterDiceValuePromptVirtually = useCallback(() => {
+    const resolver = pendingMasterDiceValueResolverRef.current;
+    if (!resolver) return;
+
+    const parsed = parseUsableDiceFormula(masterDiceValuePrompt.formula, masterDiceValuePrompt.qty);
+    if (!parsed) {
+      completeMasterDiceValuePrompt(null);
+      return;
+    }
+
+    setMasterDiceValuePrompt((current) => ({ ...current, visible: false }));
+    if (canUseVisualDiceRoll(parsed)) {
+      pendingMasterVisualDiceValueRef.current = { parsed, resolve: resolver };
+      setMasterDiceRollRequest({ sides: parsed.sides, count: parsed.count, nonce: Date.now() });
+      return;
+    }
+
+    const rolled = rollParsedDiceFormula(parsed);
+    completeMasterDiceValuePrompt({
+      total: rolled.total,
+      mode: 'virtual',
+      formula: parsed.formula,
+      breakdown: rolled.breakdown,
+    });
+  }, [completeMasterDiceValuePrompt, masterDiceValuePrompt.formula, masterDiceValuePrompt.qty]);
+
+  const submitManualMasterDiceValuePrompt = useCallback(() => {
+    const value = Math.max(0, Math.floor(Number(masterDiceValuePrompt.manualValue) || 0));
+    if (value <= 0) return;
+    const parsed = parseUsableDiceFormula(masterDiceValuePrompt.formula, masterDiceValuePrompt.qty);
+    completeMasterDiceValuePrompt({
+      total: value,
+      mode: 'manual',
+      formula: parsed?.formula || masterDiceValuePrompt.formula,
+      breakdown: String(value),
+    });
+  }, [completeMasterDiceValuePrompt, masterDiceValuePrompt.formula, masterDiceValuePrompt.manualValue, masterDiceValuePrompt.qty]);
+
+  const handleMasterDiceRollComplete = useCallback((result: DiceRollResult) => {
+    const pending = pendingMasterVisualDiceValueRef.current;
+    if (!pending) return;
+    const total = Math.max(0, Math.floor(Number(result.total || 0) + Number(pending.parsed.modifier || 0)));
+    completeMasterDiceValuePrompt({
+      total,
+      mode: 'virtual',
+      formula: pending.parsed.formula,
+      breakdown: formatDiceRollBreakdown((result.rolls || []).join('+'), pending.parsed.modifier),
+    });
+  }, [completeMasterDiceValuePrompt]);
+
   const handleApplyEffect = async () => runMasterAction('apply_effect', () => enqueueMasterMutation(async () => {
     if (!sessionState || !payload?.session?.id) return;
     traceButton('lan-session', 'MASTER_APPLY_EFFECT', {
@@ -7311,25 +7770,65 @@ useEffect(() => {
 
     if (targets.length === 0) return;
 
-    const manualDuration = createEffectDurationPayload({ value: effectDuration, unit: effectUnit });
-    debugLanFlow('EFFECT_DURATION_PAYLOAD_CREATED', {
+    const rawManualDuration = createEffectDurationPayload({ value: effectDuration, unit: effectUnit });
+    const selectedConditionCount = selectedEffectOptions.filter((option) => (
+      option.group === 'Condicao' || Boolean(option.statusKey || option.effects?.[0]?.statusKey || option.effects?.[0]?.status)
+    )).length;
+    const typedDurationValue = Math.max(0, Math.floor(Number(effectDuration) || 0));
+    // v102: em v101 o log mostrou effectDuration="1" e effectUnit="manual" ao aplicar
+    // condições. Isso acontecia porque selecionar outra condição podia restaurar o default
+    // manual, mesmo o mestre tendo digitado quantidade/esperando turnos. Para condição,
+    // quantidade > 0 + unidade manual vira turnos; quantidade vazia/0 continua manual.
+    const manualDuration = selectedConditionCount > 0 && rawManualDuration.unit === 'manual' && typedDurationValue > 0
+      ? createEffectDurationPayload({ value: String(typedDurationValue), unit: 'turn' })
+      : rawManualDuration;
+    debugLanFlow('EFFECT_DURATION_PAYLOAD_CREATED_V102', {
       sessionId: payload.session.id,
+      rawValue: rawManualDuration.value,
+      rawRemaining: rawManualDuration.remaining,
+      rawUnit: rawManualDuration.unit,
+      typedDurationValue,
+      selectedConditionCount,
       value: manualDuration.value,
       remaining: manualDuration.remaining,
       unit: manualDuration.unit,
       isPermanent: manualDuration.isPermanent,
     });
-    const manualEffectValue = parseInt(effectValue, 10) || 0;
-    const manualDurationText = manualDuration.isPermanent ? 'Permanente' : `${manualDuration.remaining} ${manualDuration.unit}`;
+    const parsedManualDiceValue = parseUsableDiceFormula(effectValue);
+    const resolvedManualDiceValue = parsedManualDiceValue
+      ? await requestMasterDiceValueForUse('Aplicar efeito', effectValue, 1)
+      : null;
+    if (parsedManualDiceValue && !resolvedManualDiceValue) return;
+    const manualEffectValue = resolvedManualDiceValue?.total ?? (parseInt(effectValue, 10) || 0);
+    const manualEffectValueDetail = resolvedManualDiceValue?.breakdown
+      ? `${resolvedManualDiceValue.formula}: ${resolvedManualDiceValue.breakdown}`
+      : '';
+    const manualDurationText = formatLanDurationText(manualDuration.remaining, manualDuration.unit, manualDuration.isPermanent);
+    const selectedDurationOverridesCondition = manualDuration.isPermanent || manualDuration.unit !== 'manual';
     const drafts: EffectDraft[] = selectedEffectOptions.length > 0
       ? selectedEffectOptions.map((option) => {
         const draft = makeEffectDraftFromOption(option);
+        const isConditionDraft = option.group === 'Condicao' || draft.kind === 'status' || Boolean(draft.statusKey || draft.status);
+        const shouldUseManualDuration = !isConditionDraft || selectedDurationOverridesCondition;
+        const nextRemaining = shouldUseManualDuration ? manualDuration.remaining : draft.remaining;
+        const nextUnit = (shouldUseManualDuration ? manualDuration.unit : draft.unit) as LanEffectUnit;
+        const nextDurationText = shouldUseManualDuration
+          ? manualDurationText
+          : (draft.durationText || 'Manual');
+        // v101: condicao continua manual por padrao, mas se o mestre escolher
+        // quantidade/unidade no modal (ex.: 1 turno), essa escolha deve vencer
+        // o default do catalogo. Na v100 o status sempre voltava como Manual.
+        const nextAutoExpire = isConditionDraft
+          ? (selectedDurationOverridesCondition && nextUnit !== 'manual' && nextUnit !== 'permanent')
+          : (draft as any).autoExpire;
         return {
           ...draft,
           value: manualEffectValue,
-          remaining: manualDuration.remaining,
-          unit: manualDuration.unit as LanEffectUnit,
-          durationText: manualDurationText,
+          remaining: nextRemaining,
+          unit: nextUnit,
+          durationText: nextDurationText,
+          source: [draft.source, manualEffectValueDetail].filter(Boolean).join(' - ') || draft.source,
+          autoExpire: nextAutoExpire,
           saveDc: draft.saveDc || (draft.saveAbility && manualEffectValue > 0 ? manualEffectValue : undefined),
         };
       })
@@ -7342,7 +7841,7 @@ useEffect(() => {
         durationText: manualDurationText,
         kind: effectTarget === 'PV_TEMP' ? 'temp_hp' : effectTarget === 'HP' ? 'hp' : effectTarget === 'custom' ? 'custom' : 'stat',
         mode: effectMode,
-        source: [effectSource.trim(), effectSaveInfo].filter(Boolean).join(' - ') || undefined,
+        source: [effectSource.trim(), effectSaveInfo, manualEffectValueDetail].filter(Boolean).join(' - ') || undefined,
         statusKey: effectTarget === 'custom' ? effectStatusKey || undefined : undefined,
         color: effectColor || undefined,
         secondaryColor: effectSecondaryColor || undefined,
@@ -7369,6 +7868,7 @@ useEffect(() => {
           saveDc: draft.saveDc,
           repeatSave: draft.repeatSave,
           saveOnSuccess: draft.saveOnSuccess,
+          autoExpire: (draft as any).autoExpire,
         };
       });
       const directEffects = [];
@@ -7409,7 +7909,7 @@ useEffect(() => {
               saveOnSuccess: effect.saveOnSuccess || 'negates',
               saveOnFailure: 'apply_full',
               pendingEffectPayload: pending.effectPayload,
-            });
+            }, pending);
           }
         } else {
           debugLanFlow('MASTER_EFFECT_APPLIES_DIRECT_NO_SAVE', {
@@ -7597,7 +8097,7 @@ useEffect(() => {
            value: val,
            remaining: qeIsTemp ? duration.remaining : 0,
            unit: qeIsTemp ? duration.unit as LanEffectUnit : 'permanent',
-           durationText: qeIsTemp ? `${duration.remaining} ${duration.unit}` : 'Permanente',
+           durationText: qeIsTemp ? formatLanDurationText(duration.remaining, duration.unit, duration.isPermanent) : 'Permanente',
            isPermanent: !qeIsTemp,
            kind: effKind,
            mode: 'add',
@@ -8672,7 +9172,9 @@ useEffect(() => {
               <Text style={{ color: appColors.danger, fontSize: 12, fontWeight: 'bold' }}>Limpar</Text>
             </TouchableOpacity>
           </View>
-          <Text style={styles.inventoryText}>{selectedEffectOptions.map((option) => option.name).join(', ')}</Text>
+          <Text style={styles.inventoryText} numberOfLines={1} ellipsizeMode="tail">
+            {formatSelectedEffectOptionsSummary(selectedEffectOptions, 2)}
+          </Text>
         </View>
       )}
 
@@ -8742,13 +9244,13 @@ useEffect(() => {
 
       <View style={{ flexDirection: 'row', gap: 12, marginVertical: 8 }}>
         <View style={{ flex: 1 }}>
-          <Text style={[styles.mutedText, { marginBottom: 4, fontSize: 12 }]}>Valor (Ex: 2, -1)</Text>
+          <Text style={[styles.mutedText, { marginBottom: 4, fontSize: 12 }]}>Valor (Ex: 2, -1, 1d8+2)</Text>
           <TextInput
             style={styles.effectInput}
             value={effectValue}
             onChangeText={setEffectValue}
-            keyboardType="numeric"
-            placeholder="+2"
+            keyboardType="default"
+            placeholder="+2 ou 1d8"
             placeholderTextColor={appColors.placeholderLight}
           />
         </View>
@@ -8831,8 +9333,50 @@ useEffect(() => {
       {renderInventoryModal()}
       {renderPlayerDetailsModal()}
       {renderQuickEditModal()}
+
+      <Modal visible={masterDiceValuePrompt.visible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalPanel}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>{masterDiceValuePrompt.title}</Text>
+                <Text style={styles.mutedText}>{masterDiceValuePrompt.message}</Text>
+              </View>
+              <TouchableOpacity style={styles.modalCloseButton} onPress={() => completeMasterDiceValuePrompt(null)}>
+                <Ionicons name="close" size={20} color={appColors.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <TextInput
+              style={styles.effectInput}
+              value={masterDiceValuePrompt.manualValue}
+              onChangeText={(manualValue) => setMasterDiceValuePrompt((current) => ({ ...current, manualValue }))}
+              keyboardType="numeric"
+              placeholder="Valor final"
+              placeholderTextColor={appColors.placeholderLight}
+            />
+            <View style={styles.toolbar}>
+              <TouchableOpacity style={[styles.smallButton, styles.smallButtonDanger]} onPress={() => completeMasterDiceValuePrompt(null)}>
+                <Ionicons name="close-circle" size={15} color={appColors.danger} />
+                <Text style={[styles.smallButtonText, styles.smallButtonTextDanger]}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.smallButton, parseInt(masterDiceValuePrompt.manualValue, 10) > 0 ? styles.smallButtonSuccess : { opacity: 0.5 }]}
+                disabled={!(parseInt(masterDiceValuePrompt.manualValue, 10) > 0)}
+                onPress={submitManualMasterDiceValuePrompt}
+              >
+                <Ionicons name="checkmark-circle" size={15} color={appColors.success} />
+                <Text style={[styles.smallButtonText, styles.smallButtonTextSuccess]}>Usar valor</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.smallButton, styles.smallButtonActive]} onPress={rollMasterDiceValuePromptVirtually}>
+                <Ionicons name="dice" size={15} color={appColors.primary} />
+                <Text style={[styles.smallButtonText, styles.smallButtonTextActive]}>Dado virtual</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
       
-      {payload && <DiceRoller3D />}
+      {payload && <DiceRoller3D rollRequest={masterDiceRollRequest} onRollComplete={handleMasterDiceRollComplete} />}
     </LinearGradient>
   );
 }
@@ -8865,12 +9409,26 @@ function formatMasterEffectSummary(effects: unknown[] | undefined, limit = 2) {
   return {
     total: names.length,
     hasMore: hidden > 0,
-    text: hidden > 0 ? `${shown.join(', ')}...mais` : shown.join(', '),
+    text: hidden > 0 ? `${shown.join(', ')}...` : shown.join(', '),
   };
 }
 
-function getVisibleMasterEffects<T extends { target?: unknown; unit?: unknown; isPermanent?: unknown; kind?: unknown }>(effects: T[] = []): T[] {
+function formatSelectedEffectOptionsSummary(options: EffectOption[] = [], limit = 2) {
+  const names = options.map((option) => String(option?.name || '').trim()).filter(Boolean);
+  const shown = names.slice(0, Math.max(1, limit));
+  return names.length > shown.length ? `${shown.join(', ')}...` : shown.join(', ');
+}
+
+function isMasterEffectStillActive(effect: any) {
+  if (!effect || effect.active === false) return false;
+  const unit = String(effect.unit || '').toLowerCase();
+  if (effect.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return true;
+  return Math.max(0, Math.floor(Number(effect.remaining || 0) || 0)) > 0;
+}
+
+function getVisibleMasterEffects<T extends { target?: unknown; unit?: unknown; isPermanent?: unknown; kind?: unknown; active?: unknown; remaining?: unknown }>(effects: T[] = []): T[] {
   return effects.filter((effect) => {
+    if (!isMasterEffectStillActive(effect)) return false;
     const target = String(effect.target || '').toUpperCase();
     const permanent = Boolean(effect.isPermanent || String(effect.unit || '').toLowerCase() === 'permanent');
     return !(permanent && PERMANENT_STAT_TARGETS.includes(target as any) && effect.kind !== 'hp' && effect.kind !== 'temp_hp');
@@ -8892,7 +9450,7 @@ function getMasterStatBreakdown(player: LanSessionPlayerState, stat: string) {
 
   const effectValue = effects
     .filter((effect: LanPlayerEffectForUi) => {
-      if ((effect as any).active === false) return false;
+      if (!isMasterEffectStillActive(effect)) return false;
       return String(effect.target || '').toUpperCase() === normalized;
     })
     .reduce<number>((total: number, effect: LanPlayerEffectForUi) => {
@@ -9043,13 +9601,43 @@ function formatInventoryItemEffect(effect: Record<string, any>) {
   return base.trim();
 }
 
+function formatLanDurationText(remaining: number, unit: string, isPermanent = false) {
+  if (isPermanent || unit === 'permanent') return 'Permanente';
+  if (unit === 'manual') return 'Manual';
+  if (unit === 'while_equipped') return 'Enquanto equipado';
+  if (unit === 'concentration') return 'Concentração';
+  const safeRemaining = Math.max(1, Math.floor(Number(remaining) || 1));
+  const labels: Record<string, [string, string]> = {
+    turn: ['turno', 'turnos'],
+    round: ['rodada', 'rodadas'],
+    minute: ['minuto', 'minutos'],
+    hour: ['hora', 'horas'],
+    day: ['dia', 'dias'],
+    rest: ['descanso', 'descansos'],
+    short_rest: ['descanso curto', 'descansos curtos'],
+    long_rest: ['descanso longo', 'descansos longos'],
+  };
+  const [singular, plural] = labels[unit] || [unit, unit];
+  return `${safeRemaining} ${safeRemaining === 1 ? singular : plural}`;
+}
+
 function makeEffectDraftFromOption(option: EffectOption): EffectDraft {
   const firstEffect = option.effects[0] || {};
+  const save: Record<string, any> = firstEffect.save && typeof firstEffect.save === 'object'
+    ? firstEffect.save
+    : firstEffect.savingThrow && typeof firstEffect.savingThrow === 'object'
+      ? firstEffect.savingThrow
+      : firstEffect.saving_throw && typeof firstEffect.saving_throw === 'object'
+        ? firstEffect.saving_throw
+        : {};
   const target = normalizeEffectTarget(firstEffect.target || firstEffect.stat || firstEffect.type);
-  const duration = createEffectDurationPayload({
-    value: option.durationValue ?? firstEffect.durationValue ?? firstEffect.duration ?? 1,
-    unit: option.durationUnit || firstEffect.durationUnit || firstEffect.unit || inferUnitFromText(option.durationText),
-  });
+  const isConditionOption = option.group === 'Condicao' || Boolean(option.statusKey || firstEffect.statusKey || firstEffect.status);
+  const duration = isConditionOption
+    ? { value: 0, remaining: 0, unit: 'manual', isPermanent: false }
+    : createEffectDurationPayload({
+        value: option.durationValue ?? firstEffect.durationValue ?? firstEffect.duration ?? 1,
+        unit: option.durationUnit || firstEffect.durationUnit || firstEffect.unit || inferUnitFromText(option.durationText),
+      });
   const remaining = duration.remaining;
   const unit = duration.unit as LanEffectUnit;
   const kind = target === 'PV_TEMP'
@@ -9059,6 +9647,10 @@ function makeEffectDraftFromOption(option: EffectOption): EffectDraft {
       : target === 'custom'
         ? 'status'
         : 'stat';
+  const rawSaveAbility = firstEffect.saveAbility ?? save.ability ?? save.saveAbility ?? firstEffect.ability ?? firstEffect.savingThrowAbility ?? firstEffect.saving_throw_ability;
+  const rawSaveDc = firstEffect.saveDc ?? save.dc ?? save.dcFixed ?? save.saveDc ?? firstEffect.dc ?? firstEffect.save_dc;
+  const saveDc = Number(rawSaveDc || 0) || undefined;
+  const saveAbility = String(rawSaveAbility || '').trim().toUpperCase() || undefined;
 
   return {
     name: String(firstEffect.conditionName || option.name || 'Efeito'),
@@ -9066,17 +9658,18 @@ function makeEffectDraftFromOption(option: EffectOption): EffectDraft {
     value: Number(firstEffect.value ?? firstEffect.val ?? firstEffect.amount ?? 0) || 0,
     remaining,
     unit,
-    durationText: option.durationText || `${remaining} ${unit}`,
+    durationText: isConditionOption ? 'Manual' : (option.durationText || `${remaining} ${unit}`),
     kind,
     mode: firstEffect.mode === 'set' ? 'set' : 'add',
     source: option.group,
     statusKey: option.statusKey || String(firstEffect.statusKey || firstEffect.status || ''),
     color: option.color || String(firstEffect.color || ''),
     secondaryColor: option.secondaryColor || String(firstEffect.secondaryColor || ''),
-    saveAbility: firstEffect.saveAbility,
-    saveDc: firstEffect.saveDc,
-    repeatSave: firstEffect.repeatSave,
-    saveOnSuccess: firstEffect.saveOnSuccess,
+    saveAbility,
+    saveDc,
+    repeatSave: firstEffect.repeatSave ?? save.repeatSave,
+    saveOnSuccess: firstEffect.saveOnSuccess ?? save.onSuccess ?? save.saveOnSuccess,
+    autoExpire: isConditionOption ? false : undefined,
   };
 }
 
@@ -9279,10 +9872,12 @@ function parseOptionEffects(value: unknown) {
 
 function normalizeCatalogEffect(effect: any) {
   const condition = effect?.condition || {};
-  const save = effect?.save || {};
+  const save = effect?.save || effect?.savingThrow || effect?.saving_throw || {};
   const conditionDuration = condition?.duration || {};
   const kind = String(effect?.kind || effect?.type || '').toLowerCase();
   const target = effect?.target || (kind === 'temp_hp' ? 'PV_TEMP' : kind === 'stat' ? effect?.stat : 'custom');
+  const rawSaveAbility = save?.ability ?? save?.saveAbility ?? effect?.saveAbility ?? effect?.ability ?? effect?.savingThrowAbility ?? effect?.saving_throw_ability;
+  const rawSaveDc = save?.dc ?? save?.dcFixed ?? save?.saveDc ?? effect?.saveDc ?? effect?.dc ?? effect?.save_dc;
 
   return {
     ...effect,
@@ -9292,10 +9887,10 @@ function normalizeCatalogEffect(effect: any) {
     conditionName: condition?.name,
     color: condition?.color || effect?.color,
     secondaryColor: condition?.secondaryColor || effect?.secondaryColor,
-    saveAbility: save?.ability,
-    saveDc: save?.dc,
+    saveAbility: String(rawSaveAbility || '').trim().toUpperCase() || undefined,
+    saveDc: Number(rawSaveDc || 0) || undefined,
     repeatSave: save?.repeatSave ?? conditionDuration?.repeatSave ?? effect?.repeatSave,
-    saveOnSuccess: save?.onSuccess,
+    saveOnSuccess: save?.onSuccess ?? save?.saveOnSuccess ?? effect?.saveOnSuccess,
     durationValue: effect?.durationValue ?? conditionDuration?.value,
     durationUnit: effect?.durationUnit ?? conditionDuration?.unit,
     mode: effect?.mode === 'set' || effect?.operation === 'set' || kind === 'stat_set' ? 'set' : 'add',
@@ -9363,6 +9958,17 @@ function buildEffectDraftFromPendingSavePayload(
   const saveAbility = String(rawSaveAbility || '').trim().toUpperCase();
   const repeatSave = String(pendingPayload.repeatSave ?? save.repeatSave ?? '').trim();
   const saveOnSuccess = String(save.onSuccess || save.saveOnSuccess || pendingPayload.saveOnSuccess || '').trim();
+  const explicitAutoExpire = typeof pendingPayload.autoExpire === 'boolean'
+    ? pendingPayload.autoExpire
+    : typeof pendingPayload.auto_expire === 'boolean'
+      ? pendingPayload.auto_expire
+      : undefined;
+  const shouldInferAutoExpire = kind === 'status' &&
+    !isPermanent &&
+    remaining > 0 &&
+    unit !== 'manual' &&
+    unit !== 'concentration' &&
+    unit !== 'while_equipped';
 
   return {
     name: String(pendingPayload.name || pendingPayload.sourceName || fallback?.sourceName || 'Efeito'),
@@ -9382,6 +9988,7 @@ function buildEffectDraftFromPendingSavePayload(
     saveAbility: saveAbility || undefined,
     repeatSave: repeatSave || undefined,
     saveOnSuccess: saveOnSuccess || undefined,
+    autoExpire: explicitAutoExpire ?? shouldInferAutoExpire,
   };
 }
 
@@ -9612,6 +10219,17 @@ function buildHostEffectDraftFromSpell(spellEffect: NonNullable<LanSessionEvent[
   const unit = duration.unit as LanEffectUnit;
   const isPermanent = duration.isPermanent;
   const remaining = duration.remaining;
+  const spellAutoExpire = typeof (spellEffect as any).autoExpire === 'boolean'
+    ? (spellEffect as any).autoExpire
+    : Boolean(
+      (spellEffect.status || spellEffect.target === 'custom') &&
+      !isPermanent &&
+      remaining > 0 &&
+      unit !== 'manual' &&
+      unit !== 'permanent' &&
+      unit !== 'concentration' &&
+      unit !== 'while_equipped'
+    );
   return {
     name: spellEffect.spellName || 'Efeito',
     target: spellEffect.target || 'custom',
@@ -9626,6 +10244,7 @@ function buildHostEffectDraftFromSpell(spellEffect: NonNullable<LanSessionEvent[
     color: spellEffect.color,
     secondaryColor: spellEffect.secondaryColor,
     repeatSave: (spellEffect as any).repeatSave,
+    autoExpire: spellAutoExpire,
     source: sourceName,
   };
 }
@@ -9644,6 +10263,19 @@ function buildHostEffectDraftFromRaw(rawEffect: Record<string, any>, request: No
   const isPermanent = duration.isPermanent || String(rawEffect.durationText || '').toLowerCase().includes('permanente');
   const remaining = isPermanent ? 0 : duration.remaining;
   const value = Number(rawEffect.value || rawEffect.amount || 0);
+  const explicitAutoExpire = typeof rawEffect.autoExpire === 'boolean'
+    ? rawEffect.autoExpire
+    : typeof conditionDuration.autoExpire === 'boolean'
+      ? conditionDuration.autoExpire
+      : undefined;
+  const timedAutoExpire = Boolean(
+    !isPermanent &&
+    remaining > 0 &&
+    unit !== 'manual' &&
+    unit !== 'permanent' &&
+    unit !== 'concentration' &&
+    unit !== 'while_equipped'
+  );
 
   if (kind === 'heal') {
     return {
@@ -9671,6 +10303,7 @@ function buildHostEffectDraftFromRaw(rawEffect: Record<string, any>, request: No
       color: condition.color,
       secondaryColor: condition.secondaryColor,
       repeatSave: rawEffect.repeatSave || rawEffect.save?.repeatSave || conditionDuration.repeatSave,
+      autoExpire: explicitAutoExpire ?? timedAutoExpire,
       source: sourceName,
     };
   }
@@ -9689,6 +10322,7 @@ function buildHostEffectDraftFromRaw(rawEffect: Record<string, any>, request: No
     color: isPermanent ? '#00fa9a' : '#00bfff',
     secondaryColor: '#8be9fd',
     repeatSave: rawEffect.repeatSave || rawEffect.save?.repeatSave,
+    autoExpire: explicitAutoExpire,
     source: sourceName,
   };
 }

@@ -81,6 +81,8 @@ export type LanActiveEffectSnapshot = {
   repeatSave?: string | null;
   removableBySave?: boolean;
   visualPriority?: number;
+  /** Quando true, status/condicoes com duração definida expiram ao passar tempo. */
+  autoExpire?: boolean;
 };
 
 export type ApplyActiveEffectInput = {
@@ -110,6 +112,8 @@ export type ApplyActiveEffectInput = {
   color?: string;
   secondaryColor?: string;
   icon?: string;
+  /** Quando true, status/condicoes com duração definida expiram ao passar tempo. */
+  autoExpire?: boolean;
 };
 
 export type LanEffectPatch = {

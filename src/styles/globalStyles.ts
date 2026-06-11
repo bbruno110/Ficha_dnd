@@ -136,6 +136,21 @@ export const qrCodeStyles = StyleSheet.create({
 
 export const sheetStyles = StyleSheet.create({
   container: { flex: 1 },
+  conditionGlowFrame: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    bottom: 8,
+    left: 8,
+    borderWidth: 1.5,
+    borderRadius: 24,
+    opacity: 0.72,
+    zIndex: 2,
+    elevation: 2,
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 0 },
+  },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#02112b' },
   errorText: { color: '#ff6666', fontWeight: 'bold' },
   topBar: { paddingTop: 60, paddingBottom: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.2)', position: 'relative' },

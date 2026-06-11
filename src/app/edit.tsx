@@ -572,10 +572,13 @@ export default function EditCharacterScreen() {
           );
 
           if (shouldSendProgressionPatch && updatedCharacter) {
+            const progressionSeq = Date.now();
             const progressionEvent: LanSessionEvent = {
               id: makeLanEventId(),
               clientMsgId: makeLanEventId(),
               sessionId: sessionValue,
+              seq: progressionSeq,
+              serverSeq: progressionSeq,
               type: 'player_progression_patch',
               fromKey: playerKey,
               fromName: String((updatedCharacter as any).name || ''),
@@ -603,23 +606,49 @@ export default function EditCharacterScreen() {
             await sendLanSessionEvent(joinUrlValue, progressionEvent).catch((progressionError) => {
               console.warn('Falha ao enviar progressao LAN:', progressionError);
             });
+
+            useLanRealtimeStore.getState().mergeLivePlayerState(`${sessionValue}:${playerKey}`, {
+              sessionId: sessionValue,
+              playerKey,
+              characterId: Number(character.id),
+              characterName: String((updatedCharacter as any).name || ''),
+              level: updatedLevel,
+              class: updatedClass,
+              race: String((updatedCharacter as any).race || ''),
+              hp_current: updatedHpCurrent,
+              hp_max: updatedHpMax,
+              stats: statsToSave,
+              numbersSeq: progressionSeq,
+              statsSeq: progressionSeq,
+              seq: progressionSeq,
+              revision: 0,
+            });
           }
 
-          await notifyMasterJoin(
-            joinUrlValue,
-            sessionValue,
-            updatedCharacter || character,
-            '',
-            { reviewSnapshot: !shouldSendProgressionPatch }
-          );
+          // v107: depois de subir nivel, nao reenviar JOIN/snapshot completo.
+          // O JOIN logo apos progressao reabre fluxo de bootstrap e pode duplicar
+          // modal/ressuscitar estado antigo. A progressao ja foi enviada como patch.
+          if (!shouldSendProgressionPatch) {
+            await notifyMasterJoin(
+              joinUrlValue,
+              sessionValue,
+              updatedCharacter || character,
+              '',
+              { reviewSnapshot: true }
+            );
+          }
 
           const runtime = useLanRealtimeStore.getState();
           runtime.setConnection({ sessionId: sessionValue, playerKey, connected: true });
           await requestLanSessionResync(joinUrlValue, {
             sessionId: sessionValue,
             playerKey,
-            lastAppliedSeq: runtime.sessionId === sessionValue ? runtime.lastAppliedSeq : 0,
-            knownRevisions: getKnownLanEntityRevisions(sessionValue),
+            // v93: depois de subir nivel, peça checkpoint autoritativo completo.
+            // Usar lastAppliedSeq antigo deixava a ficha privada dependente da tela estar aberta.
+            lastAppliedSeq: shouldSendProgressionPatch ? 0 : (runtime.sessionId === sessionValue ? runtime.lastAppliedSeq : 0),
+            knownRevisions: shouldSendProgressionPatch ? {} : getKnownLanEntityRevisions(sessionValue),
+            includeGlobal: false,
+            forceReconnect: Boolean(shouldSendProgressionPatch),
           }).catch(() => false);
         } catch (lanError) {
           console.warn("Ficha salva, mas falhou ao avisar a sessao LAN:", lanError);

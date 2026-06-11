@@ -504,8 +504,10 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
           });
         };
 
-        // v80: não confirme o join antes do upsert SQLite/runtime do mestre.
-        // ACK com snapshot vazio fazia o jogador entrar piscando e sem enxergar o roster completo.
+        // v105: ACK rápido no socket para o jogador não esperar retry/timeouts.
+        // O payload completo com o player oficial continua sendo enviado em finishJoin,
+        // depois do upsert SQLite/runtime do mestre.
+        sendJoinAck('fast_socket_accept_before_sqlite');
         notifyHostUpdates({
           reason: 'join',
           event: joinedEvent,
@@ -727,7 +729,20 @@ export async function sendLanTcpJoin(url: string | undefined, entry: Record<stri
       cancelJoinAckWaiter(ackPromise);
       return false;
     }
-    await ackPromise;
+    // v109: o jogador não pode ficar 3,5s preso aguardando ACK se o socket enviou
+    // o join com sucesso. O mestre já responde por snapshot/payload_update; a tela pode
+    // abrir e o runtime corrige o roster assim que o host finalizar o upsert.
+    const ackedFast = await Promise.race([
+      ackPromise.then(() => true).catch(() => false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 450)),
+    ]);
+    if (!ackedFast) {
+      debugLanFlow('PLAYER_JOIN_ACK_WAIT_BYPASSED_AFTER_SOCKET_SEND_V109', {
+        sessionId,
+        remoteKey,
+        clientId,
+      });
+    }
     return true;
   };
 
@@ -2194,7 +2209,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
       || event.fromKey === 'session';
     if (!isAuthoritativeRevision) continue;
     const revision = Number(event.entityRevision || 0);
-    if (revision <= 0 || revision > 1000000) continue;
+    if (revision <= 0) continue;
     const entityKey = getRuntimeEntityKey(event);
     latestRevisionByEntity.set(entityKey, Math.max(latestRevisionByEntity.get(entityKey) || 0, revision));
   }
@@ -2215,7 +2230,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
       latestRevisionByEntity.get(effectEntityKey) || 0,
       0,
     );
-    const latestEffectRevision = rawLatestEffectRevision > 1000000 ? 0 : rawLatestEffectRevision;
+    const latestEffectRevision = rawLatestEffectRevision;
     const knownEffectRevision = Number(knownRevisions[effectEntityKey] || 0);
     if (latestEffectRevision > 0 && knownEffectRevision < latestEffectRevision) {
       const seq = syntheticSeq++;
@@ -2234,6 +2249,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
         serverSeq: seq,
         ackRequired: false,
         originClientId: 'master',
+        ...( { authoritativeCheckpoint: true, checkpointVersion: 'v93' } as any ),
         effectPatch: {
           targetKey,
           replace: true,
@@ -2265,7 +2281,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
     // v34: if an old build stored a Date.now() value as player revision, never create
     // a player checkpoint from it. It would poison the client again and make XP/HP/level
     // events with normal revisions look stale.
-    const latestPlayerRevision = rawLatestPlayerRevision > 1000000 ? 0 : rawLatestPlayerRevision;
+    const latestPlayerRevision = rawLatestPlayerRevision;
     const knownPlayerRevision = Number(knownRevisions[playerEntityKey] || 0);
     if (latestPlayerRevision > 0 && knownPlayerRevision < latestPlayerRevision) {
       const seq = syntheticSeq++;
@@ -2284,6 +2300,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
         serverSeq: seq,
         ackRequired: false,
         originClientId: 'master',
+        ...( { authoritativeCheckpoint: true, checkpointVersion: 'v93' } as any ),
         numberPatch: {
           hpCurrent: Number(player.hpCurrent || 0),
           hpMax: Number(player.hpMax || 0),
@@ -2305,7 +2322,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
       latestRevisionByEntity.get(inventoryEntityKey) || 0,
       0,
     );
-    const latestInventoryRevision = rawLatestInventoryRevision > 1000000 ? 0 : rawLatestInventoryRevision;
+    const latestInventoryRevision = rawLatestInventoryRevision;
     const knownInventoryRevision = Number(knownRevisions[inventoryEntityKey] || 0);
     if (latestInventoryRevision > 0 && knownInventoryRevision < latestInventoryRevision) {
       const seq = syntheticSeq++;
@@ -2324,6 +2341,7 @@ function getEventsForRevisionGaps(sessionId: string | undefined, knownRevisions:
         serverSeq: seq,
         ackRequired: false,
         originClientId: 'master',
+        ...( { authoritativeCheckpoint: true, checkpointVersion: 'v93' } as any ),
         inventoryPatch: {
           targetKey,
           equipment: (player as any).equipment || { bag: [], slots: {} },

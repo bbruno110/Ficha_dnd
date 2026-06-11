@@ -17,6 +17,7 @@ import {
 
 import {
   fetchLanSessionPayload,
+  getActiveLanSessionConflict,
   getBoundLanCharacter,
   importLanCatalog,
   joinLanSessionWithCharacter,
@@ -222,6 +223,14 @@ export default function SessionJoinScreen() {
 
       if (!nextPayload?.session?.id) {
         throw new Error('Convite LAN inválido ou sessão sem identificador.');
+      }
+
+      const activeConflict = await getActiveLanSessionConflict(db, nextPayload.session.id, 'player');
+      if (activeConflict) {
+        throw new Error(
+          `Você já está ${activeConflict.role === 'master' ? 'mestrando' : 'jogando'} em uma sessão ativa: ${activeConflict.sessionName}. ` +
+          'Pause, saia ou encerre essa sessão antes de entrar em outra.'
+        );
       }
 
       traceSqlite('SQLITE_WRITE_START', {

@@ -78,6 +78,19 @@ export type SelectableCustomTable = (typeof SELECTABLE_CUSTOM_TABLES)[number];
 export type CatalogSelection = Partial<Record<SelectableCustomTable, number[]>>;
 
 export type LanSessionStatus = 'active' | 'paused' | 'ended';
+
+export type ActiveLanRole = 'master' | 'player';
+export type ActiveLanSessionInfo = {
+  sessionId: string;
+  sessionName: string;
+  role: ActiveLanRole;
+  status: LanSessionStatus;
+  joinUrl?: string;
+  characterId?: number;
+  characterName?: string;
+  updatedAt?: string;
+};
+
 export type LanEffectUnit =
   | 'instant'
   | 'turn'
@@ -139,6 +152,11 @@ export type LanSessionEffect = {
   repeatSave?: string | null;
   removableBySave?: boolean;
   visualPriority?: number;
+  /**
+   * v100: condicoes do catalogo sao manuais por padrao; so expiram com passagem de
+   * turno/minuto se vierem marcadas explicitamente como autoExpire.
+   */
+  autoExpire?: boolean;
 };
 
 export type LanSessionPlayerState = {
@@ -583,6 +601,9 @@ export type LanSessionEvent = {
   };
   numberPatch?: Partial<Pick<LanSessionPlayerState, 'hpCurrent' | 'hpMax' | 'tempHp' | 'xp' | 'gp' | 'sp' | 'cp'>>;
   progressionPatch?: {
+    /** Revisao autoritativa do jogador no mestre.
+     *  Usada para level-up sem envenenar a fila com Date.now(). */
+    revisionSeq?: number;
     level?: number;
     className?: string;
     race?: string;
@@ -834,6 +855,10 @@ export async function saveLanSession(
   // Por segurança, o padrão agora é jogador.
   // Só vira mestre quando a tela do mestre passar explicitamente { isMaster: true }.
   const isMaster = options?.isMaster === true;
+  const normalizedNextStatus = normalizeSessionStatus(state.status);
+  if (normalizedNextStatus === 'active') {
+    await assertCanActivateLanSession(db, payload.session.id, isMaster ? 'master' : 'player');
+  }
 
   const existingSession = await db.getFirstAsync<{ id: string }>(
     `SELECT id FROM lan_sessions WHERE id = ?`,
@@ -892,6 +917,10 @@ export async function saveLanSession(
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'ended' THEN 0 ELSE 1 END, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
       [payload.session.id, ...values, state.status]
     );
+  }
+
+  if (normalizedNextStatus === 'active') {
+    await markLanSessionAsOnlyActive(db, payload.session.id);
   }
 
   await saveLanSessionSnapshot(db, payload).catch(() => {});
@@ -1160,6 +1189,100 @@ export async function closeAllLanSessionsBeforeCreate(db: SQLiteDatabase) {
          last_seen_at = CURRENT_TIMESTAMP
      WHERE session_id IN (SELECT id FROM lan_sessions WHERE active = 0)`
   );
+}
+
+
+export async function getActiveLanSessionConflict(
+  db: SQLiteDatabase,
+  nextSessionId?: string,
+  nextRole?: ActiveLanRole
+): Promise<ActiveLanSessionInfo | null> {
+  await ensureLanSchema(db);
+  const rows = await db.getAllAsync<Record<string, unknown>>(
+    `SELECT * FROM (
+        SELECT 'master' as role,
+               s.id as sessionId,
+               s.name as sessionName,
+               COALESCE(s.status, 'active') as status,
+               s.join_url as joinUrl,
+               NULL as characterId,
+               NULL as characterName,
+               COALESCE(s.updated_at, s.created_at) as updatedAt
+          FROM lan_sessions s
+         WHERE COALESCE(s.is_master, 0) = 1
+           AND COALESCE(s.active, 1) = 1
+           AND COALESCE(s.status, 'active') = 'active'
+        UNION ALL
+        SELECT 'player' as role,
+               s.id as sessionId,
+               s.name as sessionName,
+               COALESCE(s.status, 'active') as status,
+               COALESCE(b.join_url, s.join_url) as joinUrl,
+               b.character_id as characterId,
+               c.name as characterName,
+               COALESCE(b.updated_at, b.joined_at, s.updated_at, s.created_at) as updatedAt
+          FROM lan_local_character_bindings b
+          JOIN lan_sessions s ON s.id = b.session_id
+          LEFT JOIN characters c ON c.id = b.character_id
+         WHERE COALESCE(b.is_active, 1) = 1
+           AND COALESCE(s.active, 1) = 1
+           AND COALESCE(s.status, 'active') = 'active'
+      ) active_lan
+      ORDER BY updatedAt DESC`
+  ).catch(() => []);
+
+  const different = rows.find((row) => {
+    const sessionId = String(row.sessionId || '');
+    const role = String(row.role || 'player');
+    if (!sessionId) return false;
+    if (nextSessionId && sessionId === String(nextSessionId)) return false;
+    // Mesmo sessionId e papel diferente tambem nao deve virar outro sync; mas se
+    // for a mesma sessao, tratamos como retomada/reabertura local.
+    if (nextSessionId && sessionId === String(nextSessionId) && role === String(nextRole || role)) return false;
+    return true;
+  });
+
+  if (!different) return null;
+  return {
+    sessionId: String(different.sessionId),
+    sessionName: String(different.sessionName || 'Sessão LAN'),
+    role: String(different.role || 'player') === 'master' ? 'master' : 'player',
+    status: normalizeSessionStatus(different.status),
+    joinUrl: different.joinUrl ? String(different.joinUrl) : undefined,
+    characterId: different.characterId == null ? undefined : toNumber(different.characterId),
+    characterName: different.characterName ? String(different.characterName) : undefined,
+    updatedAt: different.updatedAt ? String(different.updatedAt) : undefined,
+  };
+}
+
+export async function assertCanActivateLanSession(
+  db: SQLiteDatabase,
+  nextSessionId: string,
+  nextRole: ActiveLanRole
+) {
+  const conflict = await getActiveLanSessionConflict(db, nextSessionId, nextRole);
+  if (!conflict) return null;
+
+  const currentRole = conflict.role === 'master' ? 'mestrando' : 'jogando';
+  const nextRoleText = nextRole === 'master' ? 'iniciar ou retomar outra mesa como mestre' : 'entrar em outra sessão como jogador';
+  throw new Error(
+    `Você já está ${currentRole} em uma sessão ativa: ${conflict.sessionName}. ` +
+    `Para ${nextRoleText}, primeiro pause, saia ou encerre a sessão atual.`
+  );
+}
+
+async function markLanSessionAsOnlyActive(db: SQLiteDatabase, sessionId: string) {
+  // Mantém sessões pausadas/encerradas no histórico, mas garante que só uma
+  // sessão local fique com status active por vez. Isso evita dois sockets/runtimes
+  // concorrentes misturando sessionId, remoteKey, ACK e snapshots.
+  await db.runAsync(
+    `UPDATE lan_sessions
+        SET status = 'paused', updated_at = CURRENT_TIMESTAMP
+      WHERE id != ?
+        AND COALESCE(active, 1) = 1
+        AND COALESCE(status, 'active') = 'active'`,
+    [sessionId]
+  ).catch(() => undefined);
 }
 
 export async function importLanCatalog(db: SQLiteDatabase, payload: LanSessionPayload) {
@@ -1758,7 +1881,7 @@ export async function pauseLanSession(db: SQLiteDatabase, sessionId: string) {
     [sessionId]
   );
   await stopLanForegroundSession().catch(() => false);
-  return syncLanSessionPayload(db, sessionId, { broadcast: true });
+  return syncLanSessionPayload(db, sessionId, { broadcast: false });
 }
 
 export async function endLanSession(db: SQLiteDatabase, sessionId: string) {
@@ -1791,11 +1914,16 @@ export async function endLanSession(db: SQLiteDatabase, sessionId: string) {
     ).catch(() => undefined);
   });
   await stopLanForegroundSession().catch(() => false);
-  return syncLanSessionPayload(db, sessionId, { broadcast: true });
+  return syncLanSessionPayload(db, sessionId, { broadcast: false });
 }
 
 export async function resumeLanSession(db: SQLiteDatabase, sessionId: string) {
   await ensureLanSchema(db);
+  const session = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT COALESCE(is_master, 0) as isMaster FROM lan_sessions WHERE id = ? LIMIT 1`,
+    [sessionId]
+  ).catch(() => null);
+  await assertCanActivateLanSession(db, sessionId, toNumber(session?.isMaster) === 1 ? 'master' : 'player');
 
   // RETOMAR = volta da pausa. Mantém os mesmos jogadores vinculados.
   await db.runAsync(
@@ -1804,7 +1932,8 @@ export async function resumeLanSession(db: SQLiteDatabase, sessionId: string) {
      WHERE id = ? AND COALESCE(status, 'active') != 'ended'`,
     [sessionId]
   );
-  return syncLanSessionPayload(db, sessionId, { broadcast: true });
+  await markLanSessionAsOnlyActive(db, sessionId);
+  return syncLanSessionPayload(db, sessionId, { broadcast: false });
 }
 
 export async function joinLanSessionWithCharacter(
@@ -1815,6 +1944,7 @@ export async function joinLanSessionWithCharacter(
   options?: { joinUrl?: string; inviteCode?: string }
 ) {
   await ensureLanSchema(db);
+  await assertCanActivateLanSession(db, sessionId, 'player');
   const character = await db.getFirstAsync<Record<string, unknown>>(`SELECT * FROM characters WHERE id = ?`, [characterId]);
   const normalized = normalizeCharacterState(character || {});
   const remoteKey = makeLanCharacterKey(sessionId, { ...(character || {}), id: characterId });
@@ -1844,6 +1974,8 @@ export async function joinLanSessionWithCharacter(
       remoteKey,
     ]
   );
+
+  await markLanSessionAsOnlyActive(db, sessionId);
 
   return character || {
     id: characterId,
@@ -2924,6 +3056,7 @@ export async function addLanPlayerEffect(
     saveDc: effect.saveDc,
     saveAbility: effect.saveAbility,
     repeatSave: effect.repeatSave,
+    autoExpire: effect.autoExpire,
     useCatalogDefaults: Boolean(effect.statusKey || effect.status),
   });
   if (!result) return;
@@ -2972,6 +3105,7 @@ export async function addLanPlayerEffectsBatch(
       saveDc: effect.saveDc,
       saveAbility: effect.saveAbility,
       repeatSave: effect.repeatSave,
+      autoExpire: effect.autoExpire,
       useCatalogDefaults: Boolean(effect.statusKey || effect.status),
     });
     if (result) results.push(result);
@@ -3067,6 +3201,8 @@ export async function advanceLanSessionTime(
     nextElapsedMinutes?: number;
     /** v55: evita ticar efeitos 2x quando o runtime ja enviou os effect_patch vivos. */
     skipEffectTick?: boolean;
+    /** v106: runtime do mestre cria/enfileira o teste imediatamente; o tick SQLite nao deve reenviar duplicado. */
+    skipPendingSaveEvents?: boolean;
   } = {},
 ) {
   await ensureLanSchema(db);
@@ -3149,7 +3285,7 @@ export async function advanceLanSessionTime(
     });
   }
 
-  for (const save of tickResult.pendingSaves) {
+  for (const save of (options.skipPendingSaveEvents ? [] : tickResult.pendingSaves)) {
     await rememberLanSessionEvent(db, {
       id: makeLanEventId(),
       sessionId,
@@ -4872,11 +5008,18 @@ function describeResourceRequest(request: LanResourceRequest) {
   return 'pedido';
 }
 
+function isLanEffectStillActiveForStats(effect: any) {
+  if (!effect || effect.active === false) return false;
+  const unit = String(effect.unit || '').toLowerCase();
+  if (effect.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return true;
+  return Number(effect.remaining || 0) > 0;
+}
+
 function applyEffectsToStats(stats: Record<string, unknown>, effects: LanSessionEffect[]) {
   const nextStats: Record<string, any> = { ...stats };
   const tempMods: Record<string, number> = {};
 
-  for (const effect of effects) {
+  for (const effect of (effects || []).filter(isLanEffectStillActiveForStats)) {
     if (!['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(effect.target)) continue;
     if (effect.mode === 'set') {
       const baseValue = toNumber(nextStats[effect.target], effect.target === 'CA' ? 10 : 10);
@@ -4913,9 +5056,32 @@ async function updateLocalCharacterNumbers(
   await db.runAsync(`UPDATE characters SET ${setSql} WHERE id = ?`, [...values, characterId]);
 }
 
+function isManualStatusConditionEffect(effect: Partial<LanSessionEffect> | any) {
+  const source = String(effect?.source || '').trim().toLowerCase();
+  const kind = String(effect?.kind || '').trim().toLowerCase();
+  const statusKey = String(effect?.statusKey || effect?.status || '').trim();
+  return Boolean(statusKey) || kind === 'status' || source === 'condicao' || source === 'condição';
+}
+
+function shouldStatusConditionEffectTick(effect: Partial<LanSessionEffect> | any) {
+  if ((effect as any)?.autoExpire === true) return true;
+  const unit = String(effect?.unit || '').toLowerCase();
+  const remaining = Math.max(0, Math.floor(Number(effect?.remaining || 0) || 0));
+  const hasRepeatSave = Boolean(effect?.saveAbility || effect?.repeatSave || effect?.removableBySave);
+  return hasRepeatSave &&
+    remaining > 0 &&
+    unit !== 'manual' &&
+    unit !== 'permanent' &&
+    unit !== 'while_equipped' &&
+    unit !== 'concentration';
+}
+
 function tickEffects(effects: LanSessionEffect[], unit: LanAdvanceUnit) {
   const next = effects.map((effect) => {
       let delta = 0;
+      // v100: condicoes do catalogo nao devem sumir so porque o mestre passou turno.
+      // Elas ficam ate remocao manual ou ate uma futura mecanica de save/remocao.
+      if (isManualStatusConditionEffect(effect) && !shouldStatusConditionEffectTick(effect)) return effect;
       if (effect.unit === 'turn' && unit === 'turn') delta = 1;
       if (effect.unit === 'minute') {
         if (unit === 'minute') delta = 1;

@@ -2,6 +2,13 @@
 import DiceRoller3D, { type DiceRollRequest, type DiceRollResult } from '@/components/DiceRoller3D';
 import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
 import { useLanRealtimePlayerPatches } from '@/hooks/useLanRealtimePlayerPatches';
+import {
+  canUseVisualDiceRoll,
+  formatDiceRollBreakdown,
+  parseUsableDiceFormula,
+  rollParsedDiceFormula,
+  type ParsedDiceFormula,
+} from '@/services/combat/diceFormulaService';
 import { applyDamageWithTempHp } from '@/services/combat/hpDamageService';
 import { resolveSavingThrow } from '@/services/combat/saveResolverService';
 import {
@@ -14,7 +21,7 @@ import {
   traceSqlite,
   traceStateChange,
 } from '@/services/debug/appTrace';
-import { getCurrentBreathColor, getVisibleEffects } from '@/services/effects/effectVisualService';
+import { getCurrentBreathFrameStyle, getVisibleEffects } from '@/services/effects/effectVisualService';
 import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import {
   debugLanFlow,
@@ -83,11 +90,43 @@ const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 const GLOBAL_SESSION_PAUSE_ALERT_KEYS = new Set<string>();
 // Dedupe global do proprio session_patch; evita que hooks duplicados apliquem pause/resume 2-3x antes do estado local atualizar.
 const GLOBAL_SESSION_PATCH_EVENT_KEYS = new Set<string>();
+const REMOVED_SHEET_EFFECT_TOMBSTONE_TTL_MS = 120000;
+const REMOVED_SHEET_EFFECT_IDS = new Map<string, number>();
 
 // Regra da mesa/app: 1 PO = 10 PP = 100 PC.
 const COIN_RATES = { gp: 100, sp: 10, cp: 1 };
 const COIN_NAMES = { gp: 'Ouro', sp: 'Prata', cp: 'Cobre' };
 const COIN_COLORS = { gp: appColors.warning, sp: appColors.silver, cp: appColors.copper };
+
+type DiceValueResolution = {
+  total: number;
+  mode: 'manual' | 'virtual';
+  formula: string;
+  breakdown?: string;
+};
+
+const ROLLABLE_EFFECT_TARGETS = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA', 'HP', 'PV_TEMP'];
+
+function getStructuredEffectDiceFormulaForUse(effect: any) {
+  const kind = String(effect?.kind || effect?.type || '').toLowerCase();
+  const target = String(effect?.target || '').toUpperCase();
+  const valueFormula = [effect?.value, effect?.amount].find((candidate) => parseUsableDiceFormula(candidate));
+  if (valueFormula && kind !== 'damage') return String(valueFormula);
+
+  const healFormula = [effect?.healDice, effect?.dice].find((candidate) => parseUsableDiceFormula(candidate));
+  if (healFormula && (kind === 'heal' || target === 'HP')) return String(healFormula);
+
+  const tempHpFormula = [effect?.healDice, effect?.damageDice, effect?.dice].find((candidate) => parseUsableDiceFormula(candidate));
+  if (tempHpFormula && (kind === 'temp_hp' || target === 'PV_TEMP')) return String(tempHpFormula);
+
+  const genericFormula = [effect?.dice, effect?.damageDice].find((candidate) => parseUsableDiceFormula(candidate));
+  if (genericFormula && ROLLABLE_EFFECT_TARGETS.includes(target)) return String(genericFormula);
+  return '';
+}
+
+function getStructuredEffectDiceKey(index: number, effect: any) {
+  return `${index}:${getStructuredEffectDiceFormulaForUse(effect)}`;
+}
 const getCoinTotalCopperValue = (coins: Partial<Record<'gp' | 'sp' | 'cp', unknown>>) => (
   Math.max(0, Math.floor(Number(coins.gp || 0))) * COIN_RATES.gp +
   Math.max(0, Math.floor(Number(coins.sp || 0))) * COIN_RATES.sp +
@@ -176,6 +215,76 @@ const syncTempHpEffectsLocallyWithNumber = (effects: any[], tempHp: number) => {
   });
   const changed = nextEffects.length !== safeEffects.length || getTempHpEffectValue(selected.effect) !== cleanTempHp;
   return { effects: nextEffects, changed };
+};
+
+
+const isRenderableLanEffectActive = (effect: any) => {
+  if (!effect || effect.active === false) return false;
+  const unit = String(effect.unit || '').toLowerCase();
+  if (effect.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return true;
+  return Math.max(0, Math.floor(Number(effect.remaining || 0) || 0)) > 0;
+};
+
+const filterRenderableLanEffects = (effects: any[]) => (Array.isArray(effects) ? effects : []).filter(isRenderableLanEffectActive);
+
+function pruneRemovedSheetEffectIds() {
+  const now = Date.now();
+  for (const [key, expiresAt] of REMOVED_SHEET_EFFECT_IDS.entries()) {
+    if (expiresAt <= now) REMOVED_SHEET_EFFECT_IDS.delete(key);
+  }
+}
+
+function getSheetEffectIds(effect: any) {
+  return [
+    effect?.id,
+    effect?.lanEffectId,
+    effect?.lanEffectID,
+    effect?.sourceId,
+  ].map((value) => String(value || '')).filter(Boolean);
+}
+
+function getRemovedSheetEffectKey(sessionId: string | undefined | null, effectId: string) {
+  return `${sessionId || 'global'}:${effectId}`;
+}
+
+function rememberRemovedSheetEffectIds(sessionId: string | undefined | null, ids: string[]) {
+  pruneRemovedSheetEffectIds();
+  const expiresAt = Date.now() + REMOVED_SHEET_EFFECT_TOMBSTONE_TTL_MS;
+  for (const id of ids.map(String).filter(Boolean)) {
+    REMOVED_SHEET_EFFECT_IDS.set(getRemovedSheetEffectKey(sessionId, id), expiresAt);
+    REMOVED_SHEET_EFFECT_IDS.set(getRemovedSheetEffectKey('global', id), expiresAt);
+  }
+}
+
+function isSheetEffectTombstoned(sessionId: string | undefined | null, effect: any) {
+  pruneRemovedSheetEffectIds();
+  return getSheetEffectIds(effect).some((id) => (
+    REMOVED_SHEET_EFFECT_IDS.has(getRemovedSheetEffectKey(sessionId, id)) ||
+    REMOVED_SHEET_EFFECT_IDS.has(getRemovedSheetEffectKey('global', id))
+  ));
+}
+
+const mergeSheetEffectUpdatePreservingElapsedDuration = (current: any, incoming: any) => {
+  if (!current || !incoming) return incoming;
+  const currentRemaining = Number(current.remaining);
+  const incomingRemaining = Number(incoming.remaining);
+  const currentUnit = String(current.unit || '').toLowerCase();
+  const incomingUnit = String(incoming.unit || '').toLowerCase();
+  const durationCanTick = currentUnit &&
+    currentUnit === incomingUnit &&
+    currentUnit !== 'manual' &&
+    currentUnit !== 'permanent' &&
+    currentUnit !== 'while_equipped' &&
+    currentUnit !== 'concentration' &&
+    Number.isFinite(currentRemaining) &&
+    Number.isFinite(incomingRemaining);
+
+  if (!durationCanTick || incomingRemaining <= currentRemaining) return incoming;
+  return {
+    ...incoming,
+    remaining: currentRemaining,
+    durationText: current.durationText || incoming.durationText,
+  };
 };
 
 const getTempHpUnitWeight = (unit: unknown) => {
@@ -556,6 +665,8 @@ const normalizeSheetEquipment = (value: unknown) => {
   };
 };
 
+const getSheetEquipmentFingerprint = (value: unknown) => JSON.stringify(normalizeSheetEquipment(value));
+
 
 
 const addSheetEquipBonus = (target: Record<string, number>, attrRaw: unknown, rawValue: unknown) => {
@@ -687,13 +798,22 @@ export default function CharacterSheetScreen() {
     routeJoinUrl,
   });
   const isLanPlayerRuntime = isLanPlayerMode(sheetRuntimeMode);
+  const livePlayerStates = useLanRealtimeStore((state) => state.livePlayerStates);
+  const liveLanEvents = useLanRealtimeStore((state) => state.liveEvents);
   const characterRef = useRef<any>(null);
+  const lanPlayersRef = useRef<PublicLanPlayer[]>([]);
   const lastLanJoinNotifyRef = useRef<{ key: string; at: number }>({ key: '', at: 0 });
   const sessionTerminatedRef = useRef<string | null>(null);
   const handledSessionEventIdsRef = useRef<Set<string>>(new Set());
+  const handledRuntimeLiveEventIdsRef = useRef<Set<string>>(new Set());
+  const resolvedSaveRequestIdsRef = useRef<Set<string>>(new Set());
+  const openedSaveRequestIdsRef = useRef<Set<string>>(new Set());
   const lastPausedAlertKeyRef = useRef<string>('');
+  const lastSessionStatusAlertKeyRef = useRef<string>('');
   const lastHostUnavailableAlertKeyRef = useRef<{ sessionId: string; at: number }>({ sessionId: '', at: 0 });
   const lastLevelUpPromptKeyRef = useRef<string>('');
+  const pendingLevelUpPromptKeyRef = useRef<string>('');
+  const levelUpNavigationLockedRef = useRef(false);
   const pendingOutgoingItemSendsRef = useRef<Set<string>>(new Set());
   const pendingSelfCoinStateRef = useRef<{ gp: number; sp: number; cp: number; totalCopper: number; at: number; clientMsgId?: string; opSeq?: number } | null>(null);
   const coinPatchDebounceRef = useRef<{ timer: ReturnType<typeof setTimeout> | null; event: LanSessionEvent | null; opSeq: number } | null>(null);
@@ -707,6 +827,10 @@ export default function CharacterSheetScreen() {
   const pendingLanOutboundFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastInventoryPatchSentRef = useRef<{ fingerprint: string; at: number; clientMsgId?: string }>({ fingerprint: '', at: 0 });
   const lanRecoveryGateRef = useRef<{ at: number; reason: string }>({ at: 0, reason: '' });
+
+  useEffect(() => {
+    lanPlayersRef.current = lanPlayers;
+  }, [lanPlayers]);
 
   useEffect(() => {
     if (!publicEffectsModalPlayer) return;
@@ -728,13 +852,148 @@ export default function CharacterSheetScreen() {
   const normalizeLanPlayerPatchRevision = useCallback((event?: LanSessionEvent) => {
     const raw = Number(event?.entityRevision || 0) || 0;
     const id = String(event?.id || '');
+    // v94: eco de level-up usa seq temporal, mas revision autoritativa deve vir
+    // de progressionPatch.revisionSeq para nao bloquear danos/curas seguintes.
+    if (event?.type === 'player_patch' && String((event as any)?.numberPatchIntent || '') === 'level_up_authoritative_echo') {
+      const progressionRevision = Number((event as any)?.progressionPatch?.revisionSeq || 0) || 0;
+      if (progressionRevision > 0) return progressionRevision;
+    }
     // v33: checkpoints legados podem vir com revision baseada em Date.now().
     // Se essa revision for gravada como última autoritativa, todos os danos revision=1..N são tratados como antigos.
-    if (event?.type === 'player_patch' && id.startsWith('checkpoint_player_') && raw > 1000000) {
+    if (event?.type === 'player_patch' && id.startsWith('checkpoint_player_') && raw > 1000000 && (event as any).authoritativeCheckpoint !== true) {
       return 0;
     }
     return raw;
   }, []);
+
+
+  useEffect(() => {
+    if (!isLanPlayerRuntime || !character?.id || !lanInfo?.sessionId) return;
+    const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+    const liveState = livePlayerStates[`${lanInfo.sessionId}:${selfKey}`];
+    if (!liveState) return;
+    if (liveState.characterId && Number(liveState.characterId) !== Number(character.id)) return;
+
+    const nextPatch: Record<string, unknown> = {};
+    if (liveState.hp_current != null) nextPatch.hp_current = liveState.hp_current;
+    if (liveState.hp_max != null) nextPatch.hp_max = liveState.hp_max;
+    if (liveState.temp_hp != null) nextPatch.temp_hp = liveState.temp_hp;
+    if (liveState.xp != null) nextPatch.xp = liveState.xp;
+    if (liveState.gp != null) nextPatch.gp = liveState.gp;
+    if (liveState.sp != null) nextPatch.sp = liveState.sp;
+    if (liveState.cp != null) nextPatch.cp = liveState.cp;
+    if (liveState.level != null) nextPatch.level = liveState.level;
+    if (liveState.class != null) nextPatch.class = liveState.class;
+    if (liveState.race != null) nextPatch.race = liveState.race;
+    if (liveState.stats != null) nextPatch.stats = typeof liveState.stats === 'string' ? safeJsonParse<Record<string, any>>(liveState.stats, character.stats || {}) : liveState.stats;
+    if ((liveState as any).equipment != null) {
+      const pendingInventory = pendingSelfInventoryStateRef.current;
+      const pendingIsRecent = Boolean(pendingInventory && Date.now() - pendingInventory.at < 15000);
+      const liveEquipment = normalizeSheetEquipment((liveState as any).equipment);
+      const pendingFingerprint = pendingInventory ? getSheetEquipmentFingerprint(pendingInventory.equipment) : '';
+      const liveFingerprint = getSheetEquipmentFingerprint(liveEquipment);
+      if (pendingIsRecent && pendingFingerprint && pendingFingerprint !== liveFingerprint) {
+        debugLanFlow('PLAYER_LIVE_EQUIPMENT_SKIPPED_DURING_PENDING_SELF_PATCH', {
+          sessionId: lanInfo.sessionId,
+          selfKey,
+          characterId: character.id,
+        });
+      } else {
+        if (pendingIsRecent && pendingFingerprint === liveFingerprint) pendingSelfInventoryStateRef.current = null;
+        nextPatch.equipment = liveEquipment;
+      }
+    }
+    // v100: o runtime global tambem e o dono dos efeitos/condicoes. Na v99 a ficha
+    // assinava HP/XP/nivel do store vivo, mas ignorava active_effects; como o hook
+    // antigo foi desligado (single writer), condicoes podiam aparecer no card/snapshot
+    // e sumir/nao refletir corretamente dentro da ficha.
+    let liveEffectsFromRuntime: any[] | null = null;
+    if (Array.isArray((liveState as any).active_effects)) {
+      liveEffectsFromRuntime = (liveState as any).active_effects;
+    } else if ((liveState as any).active_effects_json != null) {
+      liveEffectsFromRuntime = safeJsonParse<any[]>((liveState as any).active_effects_json, []);
+    }
+    if (liveEffectsFromRuntime) {
+      const activeRuntimeEffects = filterRenderableLanEffects(liveEffectsFromRuntime);
+      const syncedEffects = liveState.temp_hp != null
+        ? syncTempHpEffectsLocallyWithNumber(activeRuntimeEffects, Number(liveState.temp_hp || 0)).effects
+        : activeRuntimeEffects;
+      nextPatch.active_effects = syncedEffects;
+      nextPatch.active_effects_json = JSON.stringify(syncedEffects);
+    }
+    if (Object.keys(nextPatch).length === 0) return;
+
+    const currentRevision = Number(lastAuthoritativePlayerPatchRef.current.entityRevision || 0) || 0;
+    const liveRevision = Number(liveState.revision || 0) || 0;
+    const liveSeq = Number(liveState.seq || 0) || 0;
+    const currentSeq = Number(lastAuthoritativePlayerPatchRef.current.seq || 0) || 0;
+    const hasRuntimeEffectsPatch = Object.prototype.hasOwnProperty.call(nextPatch, 'active_effects');
+    const hasRuntimeStatsPatch = Object.prototype.hasOwnProperty.call(nextPatch, 'stats');
+    // v104: revisoes de player/effect/stats podem caminhar em entidades diferentes,
+    // mas a ficha usava um unico lastAuthoritativePlayerPatchRef. Isso podia ignorar
+    // remocao de efeito ou statsPatch se um player_patch numerico mais novo ja tivesse
+    // elevado a revision local. Seq mais novo vindo do runtime global deve vencer.
+    if (liveRevision > 0 && currentRevision > liveRevision && liveSeq <= currentSeq && !hasRuntimeEffectsPatch && !hasRuntimeStatsPatch) return;
+
+    setCharacter((prev: any) => {
+      if (!prev) return prev;
+      const same = Object.entries(nextPatch).every(([key, value]) => JSON.stringify(prev?.[key]) === JSON.stringify(value));
+      if (same) return prev;
+      const merged = { ...prev, ...nextPatch };
+      characterRef.current = merged;
+      return merged;
+    });
+
+    if (nextPatch.xp != null && Number(nextPatch.xp || 0) !== Number(character?.xp || 0)) {
+      const xpForPrompt = Math.max(0, Math.floor(Number(nextPatch.xp || 0)));
+      void (async () => {
+        const currentCharacter = characterRef.current || character;
+        const currentLevel = Math.max(
+          1,
+          Number(currentCharacter?.level || 0) || 0,
+          inferTotalLevelFromClassName(currentCharacter?.class)
+        );
+        const expectedLevelAfterXp = await getExpectedLevelForXpFromDb(db, xpForPrompt).catch(() => currentLevel);
+        const promptKey = `${Number(currentCharacter?.id || character.id)}:level:${expectedLevelAfterXp}`;
+        if (
+          expectedLevelAfterXp > currentLevel &&
+          !levelUpModalVisible &&
+          !levelUpNavigationLockedRef.current &&
+          lastLevelUpPromptKeyRef.current !== promptKey &&
+          pendingLevelUpPromptKeyRef.current !== promptKey
+        ) {
+          pendingLevelUpPromptKeyRef.current = promptKey;
+          lastLevelUpPromptKeyRef.current = promptKey;
+          setNewLevelData(expectedLevelAfterXp);
+          setLevelUpModalVisible(true);
+          debugLanFlow('PLAYER_LEVEL_UP_PROMPT_OPENED_FROM_GLOBAL_RUNTIME_V105', {
+            sessionId: lanInfo.sessionId,
+            characterId: character.id,
+            xp: xpForPrompt,
+            currentLevel,
+            expectedLevelAfterXp,
+          });
+        }
+      })();
+    }
+
+    lastAuthoritativePlayerPatchRef.current = {
+      seq: Math.max(Number(lastAuthoritativePlayerPatchRef.current.seq || 0) || 0, liveSeq),
+      entityRevision: Math.max(currentRevision, liveRevision),
+      appliedAt: Date.now(),
+    };
+    debugLanFlow('PLAYER_SHEET_LIVE_GLOBAL_STATE_APPLIED_V98', {
+      sessionId: lanInfo.sessionId,
+      selfKey,
+      characterId: character.id,
+      revision: liveRevision,
+      seq: liveSeq,
+      hpCurrent: nextPatch.hp_current,
+      hpMax: nextPatch.hp_max,
+      xp: nextPatch.xp,
+      activeEffectCount: Array.isArray((nextPatch as any).active_effects) ? (nextPatch as any).active_effects.length : undefined,
+    });
+  }, [character?.id, character?.name, character?.xp, db, isLanPlayerRuntime, lanInfo?.sessionId, levelUpModalVisible, livePlayerStates]);
 
   const getAuthoritativeTempHpPatchForEffectEvent = useCallback((event?: LanSessionEvent) => {
     const lastPatch = lastAuthoritativeTempHpPatchRef.current;
@@ -814,6 +1073,19 @@ export default function CharacterSheetScreen() {
   const [spellEffectFilter, setSpellEffectFilter] = useState('Todos');
   const [spellSortOrder, setSpellSortOrder] = useState<'A-Z' | 'Z-A'>('A-Z');
   const [diceRollRequest, setDiceRollRequest] = useState<DiceRollRequest | undefined>();
+  const [diceValuePrompt, setDiceValuePrompt] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+    formula: string;
+    qty: number;
+    manualValue: string;
+  }>({ visible: false, title: '', message: '', formula: '', qty: 1, manualValue: '' });
+  const pendingDiceValueResolverRef = useRef<((result: DiceValueResolution | null) => void) | null>(null);
+  const pendingVisualDiceValueRef = useRef<{
+    parsed: ParsedDiceFormula;
+    resolve: (result: DiceValueResolution | null) => void;
+  } | null>(null);
   const [effectFrame, setEffectFrame] = useState(0);
   
   // Estado para o Detalhe da Magia e Animação
@@ -822,7 +1094,9 @@ export default function CharacterSheetScreen() {
   const spellFadeAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
-    const timer = setInterval(() => setEffectFrame((frame) => (frame + 1) % 24), 1400);
+    // v108: tick de 50ms para fade real. O service mantém 2s por efeito,
+    // mas faz fade in / hold / fade out entre as cores.
+    const timer = setInterval(() => setEffectFrame((frame) => frame + 1), 50);
     return () => clearInterval(timer);
   }, []);
 
@@ -902,9 +1176,260 @@ export default function CharacterSheetScreen() {
     }
   }, [selectedSpell]);
 
-  const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string}[]) => {
+  const showCustomAlert = useCallback((title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string}[]) => {
     setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: appColors.primary }] });
-  };
+  }, []);
+
+  const terminateLanSessionFastFromLiveEvent = useCallback((sessionValue: string, source: string, event?: LanSessionEvent) => {
+    const currentCharacter = characterRef.current || character;
+    if (!currentCharacter?.id || !sessionValue) return;
+    const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
+
+    sessionTerminatedRef.current = sessionValue;
+    setLanSessionStatus(null);
+    setLanInfo(null);
+    setLanPlayers([]);
+    setIncomingTrades([]);
+    setPendingEffectSave(null);
+    setSaveManualValue('');
+    useLanRealtimeStore.getState().resetSession(sessionValue);
+    resetLanClientConnection();
+    traceApp('LAN_JOIN', 'PLAYER_SESSION_TERMINATED_FROM_LIVE_EVENT_FAST_V109', {
+      screen: 'sheet',
+      source,
+      sessionId: sessionValue,
+      characterId: currentCharacter.id,
+      characterName: currentCharacter.name,
+      playerKey: selfKey,
+      eventId: event?.id,
+      eventType: event?.type,
+    });
+    router.replace('/' as any);
+
+    void (async () => {
+      try {
+        if (event) await rememberLanSessionEvent(db, event).catch(() => false);
+        const current = await db.getFirstAsync<Record<string, unknown>>(
+          `SELECT active_effects_json FROM characters WHERE id = ?`,
+          [Number(currentCharacter.id)]
+        ).catch(() => null);
+        const effects = safeJsonParse<any[]>((current as any)?.active_effects_json, []);
+        const nextEffects = effects.filter((effect) => {
+          const effectSessionId = String(effect?.sessionId || '');
+          const isLanSessionEffect =
+            (String(effect?.origin || '') === 'lan' && effectSessionId === sessionValue) ||
+            (String(effect?.sourceType || '') === 'lan_session' && effectSessionId === sessionValue) ||
+            (Boolean(effect?.lanEventId) && effectSessionId === sessionValue);
+          return !isLanSessionEffect;
+        });
+        const nextTempHp = calculateStandardTempHpFromEffects(nextEffects);
+        await db.runAsync(
+          `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
+          [JSON.stringify(nextEffects), nextTempHp, Number(currentCharacter.id)]
+        ).catch(() => undefined);
+        await unlinkCharacterFromLanSession(db, Number(currentCharacter.id), sessionValue).catch(() => undefined);
+        await db.runAsync(
+          `UPDATE lan_local_character_bindings
+             SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE session_id = ?`,
+          [sessionValue]
+        ).catch(() => undefined);
+        await db.runAsync(
+          `UPDATE lan_sessions
+             SET status = 'ended', active = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [sessionValue]
+        ).catch(() => undefined);
+        traceApp('LAN_JOIN', 'PLAYER_SESSION_TERMINATION_PERSISTED_FROM_LIVE_EVENT_V109', {
+          screen: 'sheet',
+          source,
+          sessionId: sessionValue,
+          characterId: currentCharacter.id,
+          characterName: currentCharacter.name,
+          playerKey: selfKey,
+        });
+      } catch (error) {
+        traceError('LAN_JOIN', 'PLAYER_SESSION_TERMINATION_FROM_LIVE_EVENT_FAILED_V109', error, {
+          screen: 'sheet',
+          source,
+          sessionId: sessionValue,
+          characterId: currentCharacter.id,
+          characterName: currentCharacter.name,
+          playerKey: selfKey,
+        });
+      }
+    })();
+  }, [character, db, router]);
+
+  useEffect(() => {
+    if (!isLanPlayerRuntime || !character?.id || !lanInfo?.sessionId) return;
+    const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+    const notices = Object.values(liveLanEvents || {})
+      .map((notice: any) => notice?.event as LanSessionEvent | undefined)
+      .filter((event): event is LanSessionEvent => Boolean(event?.id && event.sessionId === lanInfo.sessionId))
+      .filter((event) => {
+        const toKey = String(event.toKey || '');
+        const targetKey = String(event.saveRequest?.targetKey || event.pendingSavePatch?.save?.targetKey || event.inventoryPatch?.targetKey || '');
+        return toKey === 'all' || toKey === selfKey || targetKey === selfKey || event.type === 'session_patch' || event.type === 'session_ended';
+      })
+      .sort((a, b) => Number(a.seq || a.serverSeq || 0) - Number(b.seq || b.serverSeq || 0));
+
+    for (const event of notices) {
+      const id = String(event.id || event.clientMsgId || '');
+      const scopedId = `${lanInfo.sessionId}:${id}`;
+      if (!id || handledRuntimeLiveEventIdsRef.current.has(scopedId)) continue;
+      handledRuntimeLiveEventIdsRef.current.add(scopedId);
+
+      if (event.type === 'session_ended') {
+        debugLanFlow('PLAYER_SESSION_ENDED_RECEIVED_FROM_LIVE_STORE_V109', {
+          eventId: event.id,
+          sessionId: lanInfo.sessionId,
+          selfKey,
+          source: 'liveLanEvents_single_writer',
+        });
+        terminateLanSessionFastFromLiveEvent(lanInfo.sessionId, 'liveLanEvents.session_ended', event);
+        continue;
+      }
+
+      if (event.type === 'player_kicked' && (event.toKey === selfKey || event.toKey === 'all')) {
+        debugLanFlow('PLAYER_KICKED_RECEIVED_FROM_LIVE_STORE_V109', {
+          eventId: event.id,
+          sessionId: lanInfo.sessionId,
+          selfKey,
+          source: 'liveLanEvents_single_writer',
+        });
+        terminateLanSessionFastFromLiveEvent(lanInfo.sessionId, 'liveLanEvents.player_kicked', event);
+        continue;
+      }
+
+      if (event.type === 'effect_save_request' && event.saveRequest) {
+        const saveId = String(event.saveRequest.id || '');
+        if (!saveId || resolvedSaveRequestIdsRef.current.has(saveId) || openedSaveRequestIdsRef.current.has(saveId)) {
+          debugLanFlow('PLAYER_EFFECT_SAVE_REQUEST_IGNORED_DUP_OR_RESOLVED_V106', { eventId: event.id, saveId });
+          continue;
+        }
+        openedSaveRequestIdsRef.current.add(saveId);
+        setPendingEffectSave(event.saveRequest);
+        setSaveManualValue('');
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        debugLanFlow('PLAYER_EFFECT_SAVE_REQUEST_RECEIVED_FROM_RUNTIME_V105', {
+          eventId: event.id,
+          requestId: event.saveRequest.id,
+          sourceEffectName: event.saveRequest.sourceEffectName,
+          saveAbility: event.saveRequest.saveAbility,
+          dc: event.saveRequest.dc,
+        });
+        continue;
+      }
+
+      if (event.type === 'pending_save_patch' && event.pendingSavePatch) {
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        const action = String(event.pendingSavePatch.action || '');
+        if (action === 'create' && event.pendingSavePatch.save?.targetKey === selfKey) {
+          const save = event.pendingSavePatch.save;
+          const saveId = String(save.id || '');
+          if (!saveId || resolvedSaveRequestIdsRef.current.has(saveId) || openedSaveRequestIdsRef.current.has(saveId)) {
+            debugLanFlow('PLAYER_PENDING_SAVE_PATCH_CREATE_IGNORED_DUP_OR_RESOLVED_V106', { eventId: event.id, saveId });
+            continue;
+          }
+          openedSaveRequestIdsRef.current.add(saveId);
+          setPendingEffectSave({
+            id: save.id,
+            sourceEffectId: String(save.sourceId || ''),
+            sourceEffectName: save.sourceName || 'Efeito',
+            targetKey: save.targetKey,
+            saveAbility: save.ability,
+            dc: save.dc ?? null,
+            rollMode: 'target_choice',
+            saveOnSuccess: String((save.effectPayload as any)?.saveOnSuccess || (save.effectPayload as any)?.save?.onSuccess || 'negates'),
+            pendingEffectPayload: save.effectPayload,
+          });
+          setSaveManualValue('');
+          debugLanFlow('PLAYER_PENDING_SAVE_PATCH_MODAL_OPENED_FROM_RUNTIME_V105', {
+            eventId: event.id,
+            saveId: save.id,
+            sourceName: save.sourceName,
+            ability: save.ability,
+            dc: save.dc,
+          });
+        } else if (action === 'resolve') {
+          const resolvedId = String(
+            event.pendingSavePatch.id ||
+            event.pendingSavePatch.result?.requestId ||
+            event.pendingSavePatch.save?.id ||
+            ''
+          );
+          if (resolvedId) resolvedSaveRequestIdsRef.current.add(resolvedId);
+          if (resolvedId) openedSaveRequestIdsRef.current.delete(resolvedId);
+          setPendingEffectSave((current) => {
+            if (!current) return current;
+            return !resolvedId || current.id === resolvedId || current.sourceEffectId === resolvedId ? null : current;
+          });
+          setSaveManualValue('');
+          debugLanFlow('PLAYER_PENDING_SAVE_PATCH_RESOLVED_AND_CLOSED_FROM_RUNTIME_V107', {
+            eventId: event.id,
+            saveId: resolvedId,
+          });
+        }
+        continue;
+      }
+
+      if (event.type === 'session_patch') {
+        const status = event.sessionPatch?.status;
+        if (status === 'paused' || status === 'active') {
+          const previousStatus = lanSessionStatusRef.current;
+          const alertKey = `${lanInfo.sessionId}:${event.id || event.entityRevision || event.seq}:${status}`;
+          setLanSessionStatus(status);
+          lanSessionStatusRef.current = status;
+          if (lastSessionStatusAlertKeyRef.current !== alertKey) {
+            lastSessionStatusAlertKeyRef.current = alertKey;
+            if (status === 'paused' && previousStatus !== 'paused') {
+              lastPausedAlertKeyRef.current = alertKey;
+              showCustomAlert('Sessao pausada', event.message || 'O mestre pausou a sessao.');
+            }
+            if (status === 'active' && previousStatus === 'paused') {
+              lastPausedAlertKeyRef.current = '';
+              showCustomAlert('Sessao retomada', event.message || 'O mestre retomou a sessao.');
+            }
+          }
+        }
+        continue;
+      }
+
+      if ((event.type === 'trade_offer' || event.type === 'trade_counter') && event.toKey === selfKey) {
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        setIncomingTrades((current) => {
+          const byKey = new Map<string, LanSessionEvent>();
+          for (const entry of current) byKey.set(entry.tradeId || entry.id, entry);
+          byKey.set(event.tradeId || event.id, event);
+          return Array.from(byKey.values());
+        });
+        showCustomAlert(event.type === 'trade_counter' ? 'Resposta de troca' : 'Proposta de troca', event.message || `${event.fromName || 'Jogador'} enviou uma proposta.`);
+        continue;
+      }
+
+      if (event.type === 'trade_decline') {
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        setIncomingTrades((current) => current.filter((entry) => (entry.tradeId || entry.id) !== (event.tradeId || event.id)));
+        showCustomAlert('Troca recusada', event.message || `${event.fromName || 'Jogador'} recusou a troca.`);
+        continue;
+      }
+
+      if (event.type === 'trade_result') {
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        setIncomingTrades((current) => current.filter((entry) => (entry.tradeId || entry.id) !== (event.tradeId || event.id)));
+        const accepted = event.tradeResult?.status === 'accepted';
+        showCustomAlert(accepted ? 'Troca concluida' : 'Troca nao concluida', event.tradeResult?.reason || event.message || (accepted ? 'Inventarios sincronizados.' : 'A troca nao foi concluida.'));
+        continue;
+      }
+
+      if (event.type === 'send_item' && event.item) {
+        void rememberLanSessionEvent(db, event).catch(() => false);
+        showCustomAlert('Item recebido', `${event.fromName || 'Jogador'} enviou ${event.item?.qty || 1}x ${event.item?.name || 'item'}.`);
+        continue;
+      }
+    }
+  }, [character?.id, character?.name, db, isLanPlayerRuntime, lanInfo?.sessionId, liveLanEvents, showCustomAlert, terminateLanSessionFastFromLiveEvent]);
 
   const isLanSessionLocallyPaused = useCallback(async (sessionId: string, fallbackPayloadJson?: string | null) => {
     if (lanSessionStatusRef.current === 'paused') return true;
@@ -1017,6 +1542,111 @@ export default function CharacterSheetScreen() {
     throw new Error('Sessao LAN sem URL ativa.');
   }, []);
 
+
+  const mergeLoadedCharacterWithLiveLanState = useCallback((loadedCharacter: any) => {
+    if (!loadedCharacter?.id || !routeSessionId) return loadedCharacter;
+    const selfKey = makeLanCharacterKey(routeSessionId, loadedCharacter);
+    const liveCharacter = characterRef.current;
+    const liveSameCharacter = liveCharacter && Number(liveCharacter.id) === Number(loadedCharacter.id)
+      ? liveCharacter
+      : null;
+    const publicSelf = lanPlayersRef.current.find((player) => (
+      player.isSelf ||
+      player.key === selfKey ||
+      player.characterName === loadedCharacter.name
+    ));
+
+    const loadedLevel = Math.max(1, Math.floor(Number(loadedCharacter.level || 1) || 1), inferTotalLevelFromClassName(loadedCharacter.class));
+    const liveLevel = liveSameCharacter
+      ? Math.max(1, Math.floor(Number(liveSameCharacter.level || 1) || 1), inferTotalLevelFromClassName(liveSameCharacter.class))
+      : 0;
+    const publicLevel = publicSelf ? Math.max(1, Math.floor(Number(publicSelf.level || 1) || 1)) : 0;
+    const loadedHpMax = Math.max(0, Math.floor(Number(loadedCharacter.hp_max || loadedCharacter.hpMax || 0) || 0));
+    const liveHpMax = liveSameCharacter ? Math.max(0, Math.floor(Number(liveSameCharacter.hp_max || liveSameCharacter.hpMax || 0) || 0)) : 0;
+    const publicHpMax = publicSelf ? Math.max(0, Math.floor(Number(publicSelf.hpMax || 0) || 0)) : 0;
+    const publicRevision = Math.max(0, Math.floor(Number((publicSelf as any)?.publicRevision || (publicSelf as any)?.publicSeq || 0) || 0));
+    const lastLivePatchAgeMs = Date.now() - Math.max(0, Number(lastAuthoritativePlayerPatchRef.current.appliedAt || 0));
+    const liveLooksAuthoritative = Boolean(
+      liveSameCharacter &&
+      lastLivePatchAgeMs < 120000 &&
+      (liveLevel >= loadedLevel || liveHpMax >= loadedHpMax)
+    );
+    const publicLooksAuthoritative = Boolean(
+      publicSelf &&
+      (publicRevision > 0 || publicLevel >= loadedLevel || publicHpMax >= loadedHpMax)
+    );
+
+    if (!liveLooksAuthoritative && !publicLooksAuthoritative) return loadedCharacter;
+
+    const merged: any = { ...loadedCharacter };
+    if (liveLooksAuthoritative && liveSameCharacter) {
+      const liveStats = liveSameCharacter.stats && typeof liveSameCharacter.stats === 'object'
+        ? liveSameCharacter.stats
+        : null;
+      merged.level = Math.max(loadedLevel, liveLevel || loadedLevel);
+      merged.class = liveLevel >= loadedLevel && liveSameCharacter.class ? liveSameCharacter.class : merged.class;
+      merged.race = liveSameCharacter.race || merged.race;
+      merged.stats = liveStats || merged.stats;
+      const pendingInventory = pendingSelfInventoryStateRef.current;
+      const pendingIsRecent = Boolean(pendingInventory && Date.now() - pendingInventory.at < 15000);
+      const liveEquipmentFingerprint = liveSameCharacter.equipment ? getSheetEquipmentFingerprint(liveSameCharacter.equipment) : '';
+      const pendingEquipmentFingerprint = pendingInventory ? getSheetEquipmentFingerprint(pendingInventory.equipment) : '';
+      if (pendingInventory && pendingIsRecent && pendingEquipmentFingerprint && pendingEquipmentFingerprint !== liveEquipmentFingerprint) {
+        const pendingEquipment = normalizeSheetEquipment(pendingInventory.equipment);
+        merged.equipment = pendingEquipment;
+        merged.stats = pendingInventory.statsPatch && typeof pendingInventory.statsPatch === 'object'
+          ? pendingInventory.statsPatch
+          : buildSheetStatsWithDerivedEquipMods(merged.stats, pendingEquipment);
+      } else {
+        if (pendingIsRecent && pendingEquipmentFingerprint === liveEquipmentFingerprint) pendingSelfInventoryStateRef.current = null;
+        merged.equipment = liveSameCharacter.equipment || merged.equipment;
+      }
+      merged.active_effects = Array.isArray(liveSameCharacter.active_effects) ? liveSameCharacter.active_effects : merged.active_effects;
+      merged.active_effects_json = liveSameCharacter.active_effects_json || merged.active_effects_json;
+      merged.hp_max = Math.max(loadedHpMax, liveHpMax || loadedHpMax);
+      merged.hp_current = Math.max(0, Math.min(Math.max(merged.hp_max, 1), Math.floor(Number(liveSameCharacter.hp_current ?? liveSameCharacter.hpCurrent ?? merged.hp_current ?? 0) || 0)));
+      merged.temp_hp = Math.max(0, Math.floor(Number(liveSameCharacter.temp_hp ?? liveSameCharacter.tempHp ?? merged.temp_hp ?? 0) || 0));
+      if (Array.isArray(merged.active_effects) || merged.active_effects_json) {
+        const mergedEffects = Array.isArray(merged.active_effects)
+          ? merged.active_effects
+          : safeJsonParse<any[]>(merged.active_effects_json, []);
+        const syncedEffects = syncTempHpEffectsLocallyWithNumber(mergedEffects, merged.temp_hp).effects;
+        merged.active_effects = syncedEffects;
+        merged.active_effects_json = JSON.stringify(syncedEffects);
+      }
+      merged.xp = Math.max(Math.floor(Number(merged.xp || 0) || 0), Math.floor(Number(liveSameCharacter.xp || 0) || 0));
+      merged.gp = liveSameCharacter.gp ?? merged.gp;
+      merged.sp = liveSameCharacter.sp ?? merged.sp;
+      merged.cp = liveSameCharacter.cp ?? merged.cp;
+    }
+
+    if (publicLooksAuthoritative && publicSelf) {
+      const nextHpMax = Math.max(Math.max(0, Number(merged.hp_max || 0)), publicHpMax);
+      merged.level = Math.max(Math.max(1, Number(merged.level || 1)), publicLevel || 1);
+      merged.hp_max = nextHpMax;
+      merged.hp_current = Math.max(0, Math.min(Math.max(nextHpMax, 1), Math.floor(Number(publicSelf.hpCurrent ?? merged.hp_current ?? 0) || 0)));
+      merged.temp_hp = Math.max(0, Math.floor(Number(publicSelf.tempHp ?? merged.temp_hp ?? 0) || 0));
+      if ((publicSelf as any).xp != null) merged.xp = Math.max(0, Math.floor(Number((publicSelf as any).xp || merged.xp || 0) || 0));
+      if ((publicSelf as any).gp != null) merged.gp = Math.max(0, Math.floor(Number((publicSelf as any).gp || 0) || 0));
+      if ((publicSelf as any).sp != null) merged.sp = Math.max(0, Math.floor(Number((publicSelf as any).sp || 0) || 0));
+      if ((publicSelf as any).cp != null) merged.cp = Math.max(0, Math.floor(Number((publicSelf as any).cp || 0) || 0));
+    }
+
+    debugLanFlow('PLAYER_SHEET_LOAD_MERGED_LIVE_LAN_STATE_V95', {
+      sessionId: routeSessionId,
+      characterId: loadedCharacter.id,
+      characterName: loadedCharacter.name,
+      loadedHp: `${loadedCharacter.hp_current}/${loadedCharacter.hp_max}`,
+      mergedHp: `${merged.hp_current}/${merged.hp_max}`,
+      loadedLevel,
+      mergedLevel: merged.level,
+      liveLooksAuthoritative,
+      publicLooksAuthoritative,
+      publicRevision,
+    });
+    return merged;
+  }, [routeSessionId]);
+
   useFocusEffect(
     useCallback(() => {
     traceScreen('sheet', 'SHEET_SCREEN_FOCUS', {
@@ -1044,6 +1674,51 @@ export default function CharacterSheetScreen() {
           sessionId: routeSessionId,
         });
         const result = await db.getFirstAsync(`SELECT * FROM characters WHERE id = ?`, [Number(id)]);
+        if (result) {
+          try {
+            const quickParsedEquip = normalizeSheetEquipment((result as any).equipment);
+            let quickSaves = safeJsonParse<any[]>((result as any).save_values, []);
+            let quickSkills = safeJsonParse<any[]>((result as any).skill_values, []);
+            const quickBackupProfs = safeJsonParse<string[]>((result as any).proficiencies, []);
+            if (!Array.isArray(quickSaves) || (quickSaves.length > 0 && typeof quickSaves[0] !== 'string')) {
+              quickSaves = quickBackupProfs.filter((p: string) => p.startsWith('save_'));
+            }
+            if (!Array.isArray(quickSkills) || (quickSkills.length > 0 && typeof quickSkills[0] !== 'string')) {
+              quickSkills = quickBackupProfs.filter((p: string) => p.startsWith('skill_'));
+            }
+            const quickStats = safeJsonParse<Record<string, any>>((result as any).stats, {});
+            if (!quickStats.temp_mods) quickStats.temp_mods = {};
+            if (!quickStats.equip_mods) quickStats.equip_mods = {};
+            const quickCharData: any = {
+              ...(result as any),
+              stats: quickStats,
+              save_values: quickSaves,
+              skill_values: quickSkills,
+              equipment: quickParsedEquip,
+              spells: safeJsonParse<any[]>((result as any).spells, []),
+              active_effects: safeJsonParse<any[]>((result as any).active_effects_json, []),
+            };
+            const quickMerged = mergeLoadedCharacterWithLiveLanState(quickCharData);
+            characterRef.current = quickMerged;
+            setCharacter(quickMerged);
+            setLoading(false);
+            debugLanFlow('PLAYER_SHEET_FAST_CHARACTER_BOOTSTRAP_V98', {
+              sessionId: routeSessionId,
+              characterId: quickMerged.id,
+              characterName: quickMerged.name,
+              hpCurrent: quickMerged.hp_current,
+              hpMax: quickMerged.hp_max,
+              xp: quickMerged.xp,
+              durationMs: Date.now() - startedAt,
+            });
+          } catch (quickError) {
+            debugLanFlow('PLAYER_SHEET_FAST_CHARACTER_BOOTSTRAP_FAILED_V98', {
+              sessionId: routeSessionId,
+              characterId: id,
+              reason: quickError instanceof Error ? quickError.message : String(quickError),
+            });
+          }
+        }
         await ensureItemEffectHiddenColumn(db);
         const catalog = await db.getAllAsync(`SELECT * FROM items ORDER BY name ASC`);
         const skillsList = await db.getAllAsync(`SELECT * FROM skills ORDER BY name ASC`);
@@ -1080,39 +1755,41 @@ export default function CharacterSheetScreen() {
             spells: safeJsonParse<any[]>((result as any).spells, []),
             active_effects: safeJsonParse<any[]>((result as any).active_effects_json, []),
           };
-          setCharacter(charData);
+          const mergedCharData = mergeLoadedCharacterWithLiveLanState(charData);
+          characterRef.current = mergedCharData;
+          setCharacter(mergedCharData);
           traceSqlite('SQLITE_READ_DONE', {
             screen: 'sheet',
             source: 'loadData',
             functionName: 'loadData',
             table: 'characters',
             operation: 'SHEET_CHARACTER_LOAD',
-            characterId: charData.id,
-            characterName: charData.name,
+            characterId: mergedCharData.id,
+            characterName: mergedCharData.name,
             sessionId: routeSessionId,
             result: {
-              hp_current: charData.hp_current,
-              hp_max: charData.hp_max,
-              temp_hp: charData.temp_hp,
-              xp: charData.xp,
-              gp: charData.gp,
-              sp: charData.sp,
-              cp: charData.cp,
-              activeEffectCount: charData.active_effects?.length || 0,
+              hp_current: mergedCharData.hp_current,
+              hp_max: mergedCharData.hp_max,
+              temp_hp: mergedCharData.temp_hp,
+              xp: mergedCharData.xp,
+              gp: mergedCharData.gp,
+              sp: mergedCharData.sp,
+              cp: mergedCharData.cp,
+              activeEffectCount: mergedCharData.active_effects?.length || 0,
             },
             durationMs: Date.now() - startedAt,
           });
 
-          const raceData = await db.getFirstAsync<{speed: string}>(`SELECT speed FROM races WHERE name = ?`, [charData.race]);
+          const raceData = await db.getFirstAsync<{speed: string}>(`SELECT speed FROM races WHERE name = ?`, [mergedCharData.race]);
           if (raceData) setCharRaceSpeed(raceData.speed);
 
           const casterClasses = await db.getAllAsync<{name: string}>(`SELECT name FROM classes WHERE is_caster = 1`);
-          const hasSpells = casterClasses.some(c => charData.class.includes(c.name));
+          const hasSpells = casterClasses.some(c => String(mergedCharData.class || '').includes(c.name));
           setCharHasSpells(true);
 
-          if (charData.spells.length > 0) {
-            const placeholders = charData.spells.map(() => '?').join(',');
-            const spellsFull = await db.getAllAsync(`SELECT * FROM spells WHERE id IN (${placeholders})`, charData.spells.map((s: string) => Number(s)));
+          if (mergedCharData.spells.length > 0) {
+            const placeholders = mergedCharData.spells.map(() => '?').join(',');
+            const spellsFull = await db.getAllAsync(`SELECT * FROM spells WHERE id IN (${placeholders})`, mergedCharData.spells.map((s: string) => Number(s)));
             setSpellDetails(spellsFull);
           }
         }
@@ -1690,16 +2367,21 @@ export default function CharacterSheetScreen() {
     const incomingHpMaxForPatch = patch.hpMax == null ? currentHpMaxForPatch : Number(patch.hpMax || 0);
     const incomingXpForPatch = patch.xp == null ? Number(optimisticBase.xp || 0) : Number(patch.xp || 0);
     let expectedLevelForIncomingXp = currentLevelForPatch;
-    try {
-      expectedLevelForIncomingXp = await getExpectedLevelForXpFromDb(db, incomingXpForPatch);
-    } catch {
-      expectedLevelForIncomingXp = currentLevelForPatch;
+    const needsProgressionHpMaxProtection = Boolean(
+      currentLevelForPatch > 1 &&
+      incomingHpMaxForPatch > 0 &&
+      incomingHpMaxForPatch < currentHpMaxForPatch
+    );
+    if (needsProgressionHpMaxProtection) {
+      try {
+        expectedLevelForIncomingXp = await getExpectedLevelForXpFromDb(db, incomingXpForPatch);
+      } catch {
+        expectedLevelForIncomingXp = currentLevelForPatch;
+      }
     }
     const preserveLocalProgressionHpMax =
-      currentLevelForPatch > 1 &&
-      expectedLevelForIncomingXp >= currentLevelForPatch &&
-      incomingHpMaxForPatch > 0 &&
-      incomingHpMaxForPatch < currentHpMaxForPatch;
+      needsProgressionHpMaxProtection &&
+      expectedLevelForIncomingXp >= currentLevelForPatch;
     const safeIncomingHpMax = preserveLocalProgressionHpMax ? currentHpMaxForPatch : incomingHpMaxForPatch;
 
     if (preserveLocalProgressionHpMax) {
@@ -1788,13 +2470,21 @@ export default function CharacterSheetScreen() {
       xp: nextValues.xp,
     });
 
-    if (patch.xp != null) {
+    const xpActuallyChanged = patch.xp != null && Number(patch.xp || 0) !== Number(base.xp || currentCharacter.xp || 0);
+    if (xpActuallyChanged) {
       try {
         const expectedLevelAfterXp = await getExpectedLevelForXpFromDb(db, Number(nextValues.xp || 0));
         const currentForPrompt = characterRef.current || currentCharacter;
         const currentLevel = Math.max(Number(currentForPrompt.level || 1), inferTotalLevelFromClassName(currentForPrompt.class), 1);
-        const promptKey = `${currentCharacter.id}:${Number(nextValues.xp || 0)}:${expectedLevelAfterXp}`;
-        if (expectedLevelAfterXp > currentLevel && !levelUpModalVisible && lastLevelUpPromptKeyRef.current !== promptKey) {
+        const promptKey = `${currentCharacter.id}:level:${expectedLevelAfterXp}`;
+        if (
+          expectedLevelAfterXp > currentLevel &&
+          !levelUpModalVisible &&
+          !levelUpNavigationLockedRef.current &&
+          lastLevelUpPromptKeyRef.current !== promptKey &&
+          pendingLevelUpPromptKeyRef.current !== promptKey
+        ) {
+          pendingLevelUpPromptKeyRef.current = promptKey;
           lastLevelUpPromptKeyRef.current = promptKey;
           debugLanFlow('PLAYER_XP_PATCH_LEVEL_UP_AVAILABLE', {
             eventId: event?.id,
@@ -2111,37 +2801,47 @@ export default function CharacterSheetScreen() {
     const optimisticRemoveSet = new Set((patch.remove || [])
       .map(String)
       .filter((id) => !(shouldProtectExistingTempHpEffect && optimisticCurrentTempHpIds.has(id))));
+    const patchSessionId = event?.sessionId || (currentCharacter as any)?.activeLanSessionId || '';
+    if (optimisticRemoveSet.size > 0) {
+      rememberRemovedSheetEffectIds(patchSessionId, Array.from(optimisticRemoveSet));
+    }
     const optimisticById = new Map<string, any>();
     if (patch.replace === true) {
       for (const effect of patch.add || []) {
         if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
-        if (!id || optimisticRemoveSet.has(id)) continue;
+        if (!id || optimisticRemoveSet.has(id) || isSheetEffectTombstoned(patchSessionId, effect)) continue;
         optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
       }
     } else {
       for (const effect of optimisticCurrentEffects) {
         const id = String(effect?.id || '');
         const lanEffectId = String(effect?.lanEffectId || effect?.lanEffectID || '');
-        if (id && !optimisticRemoveSet.has(id) && !optimisticRemoveSet.has(lanEffectId)) {
+        if (id && !optimisticRemoveSet.has(id) && !optimisticRemoveSet.has(lanEffectId) && !isSheetEffectTombstoned(patchSessionId, effect)) {
           optimisticById.set(id, effect);
         }
       }
       for (const effect of patch.update || []) {
         if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
-        if (id && !optimisticRemoveSet.has(id) && optimisticById.has(id)) {
-          optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+        if (id && !optimisticRemoveSet.has(id) && optimisticById.has(id) && !isSheetEffectTombstoned(patchSessionId, effect)) {
+          optimisticById.set(id, mergeSheetEffectUpdatePreservingElapsedDuration(
+            optimisticById.get(id),
+            markLanEffectForLocalCharacter(effect, event),
+          ));
         }
       }
       for (const effect of patch.add || []) {
         if (shouldSkipStaleTempHpEffect(effect)) continue;
         const id = String((effect as any)?.id || '');
-        if (!id || optimisticRemoveSet.has(id)) continue;
-        optimisticById.set(id, markLanEffectForLocalCharacter(effect, event));
+        if (!id || optimisticRemoveSet.has(id) || isSheetEffectTombstoned(patchSessionId, effect)) continue;
+        optimisticById.set(id, mergeSheetEffectUpdatePreservingElapsedDuration(
+          optimisticById.get(id),
+          markLanEffectForLocalCharacter(effect, event),
+        ));
       }
     }
-    const optimisticNextEffects = Array.from(optimisticById.values());
+    const optimisticNextEffects = filterRenderableLanEffects(Array.from(optimisticById.values()));
     const optimisticTempHp = bundledTempHpPatch != null
       ? bundledTempHpPatch
       : Math.max(
@@ -2204,248 +2904,9 @@ export default function CharacterSheetScreen() {
     });
     return;
 
-    traceSqlite('SQLITE_READ_START', {
-      screen: 'sheet',
-      source: 'applyLanEffectPatchToCharacter',
-      functionName: 'applyLanEffectPatchToCharacter',
-      table: 'characters',
-      operation: 'READ_ACTIVE_EFFECTS',
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-    });
-    const current = await db.getFirstAsync<Record<string, unknown>>(
-      `SELECT active_effects_json FROM characters WHERE id = ?`,
-      [Number(currentCharacter.id)]
-    );
-    traceSqlite('SQLITE_READ_DONE', {
-      screen: 'sheet',
-      source: 'applyLanEffectPatchToCharacter',
-      functionName: 'applyLanEffectPatchToCharacter',
-      table: 'characters',
-      operation: 'READ_ACTIVE_EFFECTS',
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-      result: current,
-    });
-
-    const currentEffects = safeJsonParse<any[]>((current as any)?.active_effects_json, []);
-    const currentTempHpIds = new Set(currentEffects
-      .filter((effect) => isTempHpEffectSnapshot(effect))
-      .flatMap((effect) => [String(effect?.id || ''), String(effect?.lanEffectId || effect?.lanEffectID || '')])
-      .filter(Boolean));
-    const removeSet = new Set((patch.remove || [])
-      .map(String)
-      .filter((id) => !(shouldProtectExistingTempHpEffect && currentTempHpIds.has(id))));
-    const byId = new Map<string, any>();
-
-    if (patch.replace === true) {
-      for (const effect of patch.add || []) {
-        if (shouldSkipStaleTempHpEffect(effect)) continue;
-        const id = String((effect as any)?.id || '');
-        if (!id || removeSet.has(id)) continue;
-        byId.set(id, markLanEffectForLocalCharacter(effect, event));
-      }
-      debugLanFlow('PLAYER_EFFECT_CHECKPOINT_REPLACE_APPLIED', {
-        eventId: event?.id,
-        characterId: currentCharacter.id,
-        addCount: patch.add?.length || 0,
-        removeCount: patch.remove?.length || 0,
-      });
-    } else {
-      for (const effect of currentEffects) {
-        const id = String(effect?.id || '');
-        const lanEffectId = String(effect?.lanEffectId || effect?.lanEffectID || '');
-        if (id && !removeSet.has(id) && !removeSet.has(lanEffectId)) byId.set(id, effect);
-      }
-
-      for (const effect of patch.update || []) {
-        if (shouldSkipStaleTempHpEffect(effect)) continue;
-        const id = String((effect as any)?.id || '');
-        if (id && !removeSet.has(id) && byId.has(id)) {
-          byId.set(id, markLanEffectForLocalCharacter(effect, event));
-        }
-      }
-
-      for (const effect of patch.add || []) {
-        if (shouldSkipStaleTempHpEffect(effect)) continue;
-        const id = String((effect as any)?.id || '');
-        if (!id || removeSet.has(id)) continue;
-
-        // Se havia um efeito otimista local do mesmo item/alvo, substitui pelo efeito autoritativo do Host.
-        for (const [existingId, existing] of Array.from(byId.entries())) {
-          const isOptimisticLocal = String(existingId).startsWith('local_') || String(existingId).startsWith('pending_item_');
-          const sameEffect =
-            String(existing?.source || '') === String((effect as any)?.source || '') &&
-            String(existing?.name || '') === String((effect as any)?.name || '') &&
-            String(existing?.target || '') === String((effect as any)?.target || '') &&
-            Number(existing?.value || 0) === Number((effect as any)?.value || 0);
-
-          if (isOptimisticLocal && sameEffect) byId.delete(existingId);
-        }
-
-        byId.set(id, markLanEffectForLocalCharacter(effect, event));
-      }
-    }
-
-    const nextEffects = Array.from(byId.values());
-    if (shouldGuardStaleTempHpEffects) {
-      const droppedIncomingCount = [...(patch.add || []), ...(patch.update || [])].filter(shouldSkipStaleTempHpEffect).length;
-      if (droppedIncomingCount > 0) {
-        debugLanFlow('PLAYER_EFFECT_PATCH_TEMP_HP_DROPPED_AFTER_AUTHORITATIVE_PATCH', {
-          eventId: event?.id,
-          characterId: currentCharacter.id,
-          droppedCount: droppedIncomingCount,
-          authoritativeTempHp: authoritativeTempHpPatch?.value,
-          seq: event?.seq,
-          entityRevision: event?.entityRevision,
-        });
-      }
-    }
-    const preservedTempHp = bundledTempHpPatch != null
-      ? bundledTempHpPatch
-      : Math.max(
-        0,
-        Math.floor(Number((characterRef.current as any)?.temp_hp ?? currentCharacter.temp_hp ?? 0) || 0)
-      );
-    traceStateChange('STATE_CHANGE', 'PLAYER_CHARACTER_EFFECT_PATCH_COMPUTED', {
-      effectCount: currentEffects.length,
-      effects: currentEffects,
-    }, {
-      effectCount: nextEffects.length,
-      effects: nextEffects,
-    }, {
-      screen: 'sheet',
-      source: 'applyLanEffectPatchToCharacter',
-      sessionId: event?.sessionId,
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-      eventType: event?.type,
-      seq: event?.seq,
-      entityRevision: event?.entityRevision,
-      patch,
-    });
-
-    setCharacter((prev: any) => {
-      if (!prev) return prev;
-      const merged = {
-        ...prev,
-        active_effects: nextEffects,
-        active_effects_json: JSON.stringify(nextEffects),
-        temp_hp: preservedTempHp,
-      };
-      characterRef.current = merged;
-      return merged;
-    });
-    if (event?.sessionId) {
-      updateSelfPublicEffectsFromLocalEffects(event.sessionId, nextEffects, preservedTempHp, event);
-    }
-    debugLanFlow('PLAYER_RUNTIME_PATCH_APPLIED', {
-      eventId: event?.id,
-      type: event?.type,
-      characterId: currentCharacter.id,
-      effectCount: nextEffects.length,
-    });
-    debugLanFlow('PLAYER_EFFECT_TICK_APPLIED_ONCE', {
-      eventId: event?.id,
-      characterId: currentCharacter.id,
-      effectCount: nextEffects.length,
-      removeCount: patch.remove?.length || 0,
-    });
-    debugLanFlow('PLAYER_SQLITE_PERSIST_START', {
-      eventId: event?.id,
-      characterId: currentCharacter.id,
-      field: 'active_effects_json',
-    });
-
-    traceSqlite('SQLITE_WRITE_START', {
-      screen: 'sheet',
-      source: 'applyLanEffectPatchToCharacter',
-      functionName: 'applyLanEffectPatchToCharacter',
-      table: 'characters',
-      operation: 'UPDATE_ACTIVE_EFFECTS',
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-      before: currentEffects,
-      after: nextEffects,
-      patch,
-    });
-    await db.runAsync(
-      `UPDATE characters SET active_effects_json = ?, temp_hp = ? WHERE id = ?`,
-      [JSON.stringify(nextEffects), preservedTempHp, Number(currentCharacter.id)]
-    );
-    traceSqlite('SQLITE_WRITE_DONE', {
-      screen: 'sheet',
-      source: 'applyLanEffectPatchToCharacter',
-      functionName: 'applyLanEffectPatchToCharacter',
-      table: 'characters',
-      operation: 'UPDATE_ACTIVE_EFFECTS',
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-      result: { effectCount: nextEffects.length },
-    });
-    debugLanFlow('PLAYER_SQLITE_PERSIST_DONE', {
-      eventId: event?.id,
-      characterId: currentCharacter.id,
-      field: 'active_effects_json',
-    });
-
-    setCharacter((prev: any) => {
-      if (!prev) return prev;
-      const merged = {
-        ...prev,
-        active_effects: nextEffects,
-        active_effects_json: JSON.stringify(nextEffects),
-        temp_hp: preservedTempHp,
-      };
-      characterRef.current = merged;
-      return merged;
-    });
-    debugLanFlow('PLAYER_EFFECT_PATCH_APPLY_DONE', {
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      effectCount: nextEffects.length,
-    });
-    debugLanFlow('PLAYER_EFFECT_BATCH_APPLIED', {
-      eventId: event?.id,
-      characterId: currentCharacter.id,
-      effectCount: nextEffects.length,
-      addCount: patch.add?.length || 0,
-      updateCount: patch.update?.length || 0,
-      removeCount: patch.remove?.length || 0,
-    });
-    debugLanFlow('PLAYER_STAT_EFFECT_UI_RECALCULATED', {
-      eventId: event?.id,
-      characterId: currentCharacter.id,
-      bonuses: summarizeStatEffectBonuses(nextEffects),
-    });
-    traceApp('UI_UPDATE', 'CHARACTER_SHEET_EFFECTS_UPDATED', {
-      screen: 'sheet',
-      source: 'applyLanEffectPatchToCharacter',
-      sessionId: event?.sessionId,
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-      eventType: event?.type,
-      before: { effectCount: currentEffects.length },
-      after: { effectCount: nextEffects.length },
-      patch,
-    });
-    traceFunctionReturn('applyLanEffectPatchToCharacter', {
-      effectCount: nextEffects.length,
-    }, {
-      screen: 'sheet',
-      source: 'event_commit',
-      sessionId: event?.sessionId,
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      eventId: event?.id,
-      durationMs: Date.now() - startedAt,
-    });
+    // v103: bloco legado removido. O caminho otimista acima agora e o unico caminho
+    // da ficha quando ela recebe effect_patch; o writer global continua sendo o dono
+    // principal, e este trecho nao deve reprocessar SQLite novamente.
   }, [db, getAuthoritativeTempHpPatchForEffectEvent, updateSelfPublicEffectsFromLocalEffects]);
 
   const clearLanSessionEffectsFromCharacter = useCallback(async (sessionValue: string) => {
@@ -2658,6 +3119,24 @@ export default function CharacterSheetScreen() {
     if (
       pendingIsRecent &&
       !matchesPendingCommand &&
+      pendingJson &&
+      pendingJson !== incomingJson &&
+      itemDeltas.length === 0 &&
+      (action === 'replace' || action === 'self_update')
+    ) {
+      debugLanFlow('PLAYER_IGNORED_STALE_SELF_INVENTORY_REPLACE_DURING_PENDING_PATCH', {
+        eventId: event?.id,
+        action,
+        sourceClientMsgId,
+        pendingClientMsgId: pendingInventory?.clientMsgId,
+        authoritative: shouldTrustAuthoritativeSnapshot,
+      });
+      return;
+    }
+
+    if (
+      pendingIsRecent &&
+      !matchesPendingCommand &&
       !shouldTrustAuthoritativeSnapshot &&
       pendingJson &&
       pendingJson !== incomingJson &&
@@ -2709,6 +3188,18 @@ export default function CharacterSheetScreen() {
       });
     }
 
+    if (event?.sessionId) {
+      const selfKey = makeLanCharacterKey(event.sessionId, currentCharacter);
+      const cacheKey = `${event.sessionId}:${selfKey}`;
+      const eventRevision = Math.max(0, Math.floor(Number(event.entityRevision || 0) || 0));
+      const lastInventorySnapshot = lastAuthoritativeSnapshotInventoryRef.current[cacheKey];
+      lastAuthoritativeSnapshotInventoryRef.current[cacheKey] = {
+        revision: Math.max(eventRevision, lastInventorySnapshot?.revision || 0),
+        fingerprint: getSheetEquipmentFingerprint(nextEquipment),
+        at: Date.now(),
+      };
+    }
+
     const persistCharacterId = Number(currentCharacter.id);
     const persistEquipment = normalizeSheetEquipment(nextEquipment);
     const persistStats = nextStatsPatch;
@@ -2757,12 +3248,39 @@ export default function CharacterSheetScreen() {
     const currentFingerprint = JSON.stringify(currentEquipment);
     if (!officialFingerprint || officialFingerprint === currentFingerprint) return;
 
+    const pendingInventory = pendingSelfInventoryStateRef.current;
+    const pendingIsRecent = Boolean(pendingInventory && Date.now() - pendingInventory.at < 15000);
+    const pendingFingerprint = pendingInventory ? getSheetEquipmentFingerprint(pendingInventory.equipment) : '';
+    if (pendingIsRecent && pendingFingerprint) {
+      if (pendingFingerprint === officialFingerprint) {
+        pendingSelfInventoryStateRef.current = null;
+      } else {
+        debugLanFlow('PLAYER_SNAPSHOT_INVENTORY_RECONCILE_SKIPPED_PENDING_SELF_PATCH', {
+          sessionId: sessionValue,
+          selfKey,
+          source,
+        });
+        return;
+      }
+    }
+
     const revision = Math.max(
       0,
       Math.floor(Number(officialSelf.revisionSeq ?? officialSelf.revision_seq ?? officialSelf.revision ?? 0)) || 0
     );
     const cacheKey = `${sessionValue}:${selfKey}`;
     const last = lastAuthoritativeSnapshotInventoryRef.current[cacheKey];
+    const payloadLooksGeneral = /payload|snapshot|resync|syncLanFromHost|live_payload|refresh/i.test(String(source || ''));
+    if (last && payloadLooksGeneral && Date.now() - last.at < 60000 && last.fingerprint !== officialFingerprint) {
+      debugLanFlow('PLAYER_SNAPSHOT_INVENTORY_RECONCILE_SKIPPED_RECENT_DIRECT_PATCH', {
+        sessionId: sessionValue,
+        selfKey,
+        source,
+        revision,
+        lastRevision: last.revision,
+      });
+      return;
+    }
     if (last && revision > 0 && revision < last.revision) {
       debugLanFlow('PLAYER_SNAPSHOT_INVENTORY_RECONCILE_SKIPPED_OLDER_REVISION', {
         sessionId: sessionValue,
@@ -2870,7 +3388,16 @@ export default function CharacterSheetScreen() {
       return;
     }
 
-    const officialEffects = Array.isArray(officialSelf.effects) ? officialSelf.effects : [];
+    const officialEffects = filterRenderableLanEffects(Array.isArray(officialSelf.effects) ? officialSelf.effects : [])
+      .filter((effect) => !isSheetEffectTombstoned(sessionValue, effect));
+    const officialSnapshot = officialSelf.characterSnapshot && typeof officialSelf.characterSnapshot === 'object'
+      ? officialSelf.characterSnapshot as Record<string, unknown>
+      : {};
+    const nextProgressionValues = {
+      level: Math.max(1, Math.floor(Number(officialSelf.level ?? officialSnapshot.level ?? currentCharacter.level ?? 1) || 1)),
+      class: String(officialSelf.className ?? officialSnapshot.class ?? currentCharacter.class ?? '').trim() || currentCharacter.class,
+      stats: officialSelf.stats || officialSnapshot.stats || currentCharacter.stats,
+    };
     const nextValues = {
       hp_current: Math.max(0, Math.floor(Number(officialSelf.hpCurrent ?? currentCharacter.hp_current ?? 0) || 0)),
       hp_max: Math.max(0, Math.floor(Number(officialSelf.hpMax ?? currentCharacter.hp_max ?? 0) || 0)),
@@ -2881,7 +3408,7 @@ export default function CharacterSheetScreen() {
       cp: Math.max(0, Math.floor(Number(officialSelf.cp ?? currentCharacter.cp ?? 0) || 0)),
     };
     const nextEffectsJson = JSON.stringify(officialEffects);
-    const fingerprint = JSON.stringify({ nextValues, effects: officialEffects });
+    const fingerprint = JSON.stringify({ nextValues, nextProgressionValues, effects: officialEffects });
 
     if (lastSnapshot && lastSnapshot.revision === revision && lastSnapshot.fingerprint === fingerprint) {
       return;
@@ -2911,10 +3438,18 @@ export default function CharacterSheetScreen() {
       createdAt: new Date().toISOString(),
     } as LanSessionEvent;
 
+    characterRef.current = {
+      ...(characterRef.current || currentCharacter),
+      ...nextProgressionValues,
+      ...nextValues,
+      active_effects: officialEffects,
+      active_effects_json: nextEffectsJson,
+    };
     setCharacter((prev: any) => {
       if (!prev) return prev;
       const merged = {
         ...prev,
+        ...nextProgressionValues,
         ...nextValues,
         active_effects: officialEffects,
         active_effects_json: nextEffectsJson,
@@ -2940,9 +3475,12 @@ export default function CharacterSheetScreen() {
 
     void db.runAsync(
       `UPDATE characters
-       SET hp_current = ?, hp_max = ?, temp_hp = ?, xp = ?, gp = ?, sp = ?, cp = ?, active_effects_json = ?
+       SET level = ?, class = ?, stats = ?, hp_current = ?, hp_max = ?, temp_hp = ?, xp = ?, gp = ?, sp = ?, cp = ?, active_effects_json = ?
        WHERE id = ?`,
       [
+        nextProgressionValues.level,
+        nextProgressionValues.class,
+        typeof nextProgressionValues.stats === 'string' ? nextProgressionValues.stats : JSON.stringify(nextProgressionValues.stats || {}),
         nextValues.hp_current,
         nextValues.hp_max,
         nextValues.temp_hp,
@@ -2987,11 +3525,13 @@ export default function CharacterSheetScreen() {
     const selfKey = makeLanCharacterKey(sessionValue, currentCharacter);
 
     sessionTerminatedRef.current = sessionValue;
-    // Evento terminal: a UI deve sair do modo LAN imediatamente. A limpeza SQLite roda em seguida.
+    // Evento terminal: a UI deve sair do modo LAN imediatamente. A limpeza SQLite roda em background.
     setLanSessionStatus(null);
     setLanInfo(null);
     setLanPlayers([]);
     setIncomingTrades([]);
+    setPendingEffectSave(null);
+    setSaveManualValue('');
     useLanRealtimeStore.getState().resetSession(sessionValue);
     resetLanClientConnection();
     traceApp('LAN_JOIN', 'PLAYER_TERMINATION_FLAG_SET', {
@@ -3004,9 +3544,18 @@ export default function CharacterSheetScreen() {
       eventId: event?.id,
       eventType: event?.type,
     });
+    traceApp('NAVIGATION', 'PLAYER_NAVIGATE_HOME_AFTER_END_FAST_V108', {
+      screen: 'sheet',
+      source,
+      sessionId: sessionValue,
+      characterId: currentCharacter.id,
+      characterName: currentCharacter.name,
+      playerKey: selfKey,
+    });
+    router.replace('/' as any);
 
     if (event) {
-      await rememberLanSessionEvent(db, event).catch(() => false);
+      void rememberLanSessionEvent(db, event).catch(() => false);
     }
     await clearLanSessionEffectsFromCharacter(sessionValue);
     debugLanFlow('PLAYER_CLEAR_TEMP_SESSION_EFFECTS', {
@@ -3101,15 +3650,6 @@ export default function CharacterSheetScreen() {
       characterName: currentCharacter.name,
       playerKey: selfKey,
     });
-    traceApp('NAVIGATION', 'PLAYER_NAVIGATE_HOME_AFTER_END', {
-      screen: 'sheet',
-      source,
-      sessionId: sessionValue,
-      characterId: currentCharacter.id,
-      characterName: currentCharacter.name,
-      playerKey: selfKey,
-    });
-    router.replace('/' as any);
   }, [clearLanSessionEffectsFromCharacter, db, router]);
 
   const syncLanFromHost = useCallback(async () => {
@@ -3297,6 +3837,7 @@ export default function CharacterSheetScreen() {
     characterName: character?.name,
     paused: lanSessionStatus === 'paused',
     reconnectEpoch: lanReconnectEpoch,
+    runtimeManagedExternally: Boolean(isLanPlayerRuntime && lanInfo?.sessionId),
     onPayloadUpdate: (payload, reason) => {
       if (!payload || !lanInfo?.sessionId || !character) return;
       const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
@@ -3888,15 +4429,15 @@ export default function CharacterSheetScreen() {
             characterName: character.name,
             playerKey: selfKey,
           });
-          setLanReconnectEpoch((current) => current + 1);
+          // v98: com sync global ativo, foco de tela nao deve pedir checkpoint/resync.
+          // Esse era o principal causador da sensacao de ficha travada ao voltar
+          // do level-up: o checkpoint competia com player_patch vivo e snapshots.
           if (selfKey) {
-            void requestLanSessionResync(lanInfo.joinUrl, {
+            debugLanFlow('PLAYER_SHEET_FOCUS_REBIND_SKIPPED_GLOBAL_RUNTIME_V98', {
               sessionId: lanInfo.sessionId,
               playerKey: selfKey,
-              lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
-              knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
-              forceReconnect: false,
-            }).catch(() => false);
+              reason,
+            });
             void flushPendingLanOutboundEvents(reason).catch(() => false);
           }
         }, delayMs);
@@ -4043,7 +4584,8 @@ export default function CharacterSheetScreen() {
   };
 
   const sendLanEventWithRetry = async (event: LanSessionEvent, source: string) => {
-    await rememberLanSessionEvent(db, event).catch(() => false);
+    // v108: socket primeiro, SQLite em background. Pedidos/testes não podem esperar persistência local.
+    void rememberLanSessionEvent(db, event).catch(() => false);
     if (!lanInfo?.joinUrl) {
       queuePendingLanOutboundEvent(event, `${source}:no_join_url`);
       return false;
@@ -4348,6 +4890,85 @@ export default function CharacterSheetScreen() {
         if (handledSessionEventIdsRef.current.size > 300) {
           handledSessionEventIdsRef.current = new Set(Array.from(handledSessionEventIdsRef.current).slice(-150));
         }
+      }
+
+      if ((event.type === 'player_progression_patch' || (event.type === 'player_patch' && (event as any).progressionPatch)) && (event as any).progressionPatch && isForMe(event)) {
+        const progression = (event as any).progressionPatch || {};
+        const current = characterRef.current || character;
+        if (current?.id) {
+          const nextLevel = Math.max(1, Math.floor(Number(progression.level || current.level || 1) || 1));
+          const nextClass = String(progression.className || current.class || '').trim() || current.class;
+          const nextHpMax = Math.max(1, Math.floor(Number(progression.hpMax ?? current.hp_max ?? 1) || 1));
+          const nextHpCurrent = Math.max(0, Math.min(nextHpMax, Math.floor(Number(progression.hpCurrent ?? current.hp_current ?? 0) || 0)));
+          const nextStats = progression.stats && typeof progression.stats === 'object' ? progression.stats : current.stats;
+          const nextSaveValues = progression.saveValues ?? current.save_values;
+          const nextSkillValues = progression.skillValues ?? current.skill_values;
+          const nextProficiencies = progression.proficiencies ?? current.proficiencies;
+          const nextSpells = progression.spells ?? current.spells;
+          const merged = {
+            ...current,
+            level: nextLevel,
+            class: nextClass,
+            hp_max: nextHpMax,
+            hp_current: nextHpCurrent,
+            stats: nextStats,
+            save_values: nextSaveValues,
+            skill_values: nextSkillValues,
+            proficiencies: nextProficiencies,
+            spells: nextSpells,
+          };
+          characterRef.current = { ...(characterRef.current || current), ...merged };
+          setCharacter((prev: any) => {
+            const base = prev || current;
+            const next = { ...base, ...merged };
+            characterRef.current = next;
+            return next;
+          });
+          lastAuthoritativePlayerPatchRef.current = {
+            seq: Number(event.seq ?? event.serverSeq ?? 0) || lastAuthoritativePlayerPatchRef.current.seq,
+            entityRevision: normalizeLanPlayerPatchRevision(event) || lastAuthoritativePlayerPatchRef.current.entityRevision,
+            appliedAt: Date.now(),
+          };
+          updateSelfLanBarFromAuthoritativePatch(sessionValue, {
+            hp_current: nextHpCurrent,
+            hp_max: nextHpMax,
+            temp_hp: Number((current as any).temp_hp || 0) || 0,
+            xp: Number((current as any).xp || 0) || 0,
+            gp: Number((current as any).gp || 0) || 0,
+            sp: Number((current as any).sp || 0) || 0,
+            cp: Number((current as any).cp || 0) || 0,
+          }, event);
+          void db.runAsync(
+            `UPDATE characters SET level = ?, class = ?, hp_max = ?, hp_current = ?, stats = ?, save_values = ?, skill_values = ?, proficiencies = ?, spells = ? WHERE id = ?`,
+            [
+              nextLevel,
+              nextClass,
+              nextHpMax,
+              nextHpCurrent,
+              typeof nextStats === 'string' ? nextStats : JSON.stringify(nextStats || {}),
+              typeof nextSaveValues === 'string' ? nextSaveValues : JSON.stringify(nextSaveValues || []),
+              typeof nextSkillValues === 'string' ? nextSkillValues : JSON.stringify(nextSkillValues || []),
+              typeof nextProficiencies === 'string' ? nextProficiencies : JSON.stringify(nextProficiencies || []),
+              typeof nextSpells === 'string' ? nextSpells : JSON.stringify(nextSpells || []),
+              Number(current.id),
+            ]
+          ).catch((error) => {
+            debugLanFlow('PLAYER_PROGRESSION_PATCH_PERSIST_FAILED_V93', {
+              eventId: event.id,
+              characterId: current.id,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          });
+          debugLanFlow('PLAYER_PROGRESSION_PATCH_APPLIED_TO_CHARACTER_V93', {
+            eventId: event.id,
+            characterId: current.id,
+            level: nextLevel,
+            className: nextClass,
+            hpCurrent: nextHpCurrent,
+            hpMax: nextHpMax,
+          });
+        }
+        continue;
       }
 
       if (event.type === 'public_status' && event.publicState) {
@@ -4749,6 +5370,12 @@ export default function CharacterSheetScreen() {
         const action = String(event.pendingSavePatch.action || '');
         if (action === 'create' && event.pendingSavePatch.save?.targetKey === selfKey) {
           const save = event.pendingSavePatch.save;
+          const saveId = String(save.id || '');
+          if (!saveId || resolvedSaveRequestIdsRef.current.has(saveId) || openedSaveRequestIdsRef.current.has(saveId)) {
+            debugLanFlow('PLAYER_PENDING_SAVE_PATCH_CREATE_IGNORED_DUP_OR_RESOLVED_V106', { eventId: event.id, saveId, source: 'handleLanEvents' });
+            continue;
+          }
+          openedSaveRequestIdsRef.current.add(saveId);
           setPendingEffectSave({
             id: save.id,
             sourceEffectId: String(save.sourceId || ''),
@@ -4768,10 +5395,21 @@ export default function CharacterSheetScreen() {
             ability: save.ability,
             dc: save.dc,
           });
-        } else if (action === 'resolve') {
-          const resolvedId = String(event.pendingSavePatch.id || '');
-          setPendingEffectSave((current) => current && current.id === resolvedId ? null : current);
+        }
+        if (action === 'resolve') {
+          const resolvedId = String(event.pendingSavePatch.id || event.pendingSavePatch.result?.requestId || event.pendingSavePatch.save?.id || '');
+          if (resolvedId) resolvedSaveRequestIdsRef.current.add(resolvedId);
+          if (resolvedId) openedSaveRequestIdsRef.current.delete(resolvedId);
+          setPendingEffectSave((current) => {
+            if (!current) return current;
+            return !resolvedId || current.id === resolvedId || current.sourceEffectId === resolvedId ? null : current;
+          });
           setSaveManualValue('');
+          debugLanFlow('PLAYER_PENDING_SAVE_PATCH_RESOLVED_AND_CLOSED_V106', {
+            eventId: event.id,
+            saveId: resolvedId,
+            source: 'handleLanEvents',
+          });
         }
       }
     }
@@ -5056,11 +5694,13 @@ export default function CharacterSheetScreen() {
     return abilityMod + (proficient ? profBonusChar : 0);
   };
   const isLanReadOnly = Boolean(lanInfo?.sessionId && lanSessionStatus && lanSessionStatus !== 'active');
-  const activeVisualEffects = getVisibleEffects(character.active_effects);
-  const activeConditionColor = getCurrentBreathColor(activeVisualEffects as any, effectFrame);
-  const conditionFrameStyle = activeConditionColor
-    ? { borderWidth: 3, borderColor: String(activeConditionColor) }
-    : null;
+  const activeVisualEffects = getVisibleEffects(
+    Array.isArray(character.active_effects)
+      ? character.active_effects
+      : safeJsonParse<any[]>(character.active_effects_json, [])
+  );
+  const conditionFrameStyle = getCurrentBreathFrameStyle(activeVisualEffects as any, effectFrame) || null;
+  const activeConditionColor = conditionFrameStyle?.borderColor;
 
   const handleSheetBack = () => {
     traceApp('NAVIGATION', 'SHEET_BACK_TO_HOME', {
@@ -5632,13 +6272,26 @@ export default function CharacterSheetScreen() {
     return runSheetAction(`save:${save.id}`, async () => {
     if (!lanInfo?.sessionId || !character) return false;
     const modifier = getSaveModifierForAbility(save.saveAbility);
-    const resolvedSave = resolveSavingThrow({
+    const baseResolvedSave = resolveSavingThrow({
       ability: save.saveAbility,
       dc: Number(save.dc || 1),
       modifier,
       rollMode,
       manualRoll: rawRoll,
     });
+    // v108: o campo manual representa o resultado final informado pelo jogador.
+    // Antes ele era travado em 1..20 como dado bruto, então valores totais acima de 20
+    // podiam ser marcados como falha mesmo quando passavam da CD.
+    const manualTotal = Math.floor(Number(rawRoll) || 0);
+    const resolvedSave = rollMode === 'manual'
+      ? {
+          ...baseResolvedSave,
+          rawRoll: Math.max(1, Math.min(20, manualTotal - modifier || manualTotal)),
+          manualValue: manualTotal,
+          total: manualTotal,
+          passed: manualTotal >= baseResolvedSave.dc,
+        }
+      : baseResolvedSave;
     const selfKey = getSelfLanKey(lanInfo.sessionId);
     const eventId = makeLanEventId();
     const event: LanSessionEvent = {
@@ -5658,7 +6311,7 @@ export default function CharacterSheetScreen() {
         rollMode,
         dice: '1d20',
         rawRoll: resolvedSave.rawRoll,
-        manualValue: rollMode === 'manual' ? resolvedSave.rawRoll : undefined,
+        manualValue: rollMode === 'manual' ? resolvedSave.total : undefined,
         modifier: resolvedSave.modifier,
         total: resolvedSave.total,
         dc: save.dc ?? null,
@@ -5680,12 +6333,16 @@ export default function CharacterSheetScreen() {
         passed: resolvedSave.passed,
         rollMode,
       });
-      await sendLanEventWithRetry(event, 'sendEffectSaveResult');
+      resolvedSaveRequestIdsRef.current.add(save.id);
+      openedSaveRequestIdsRef.current.delete(save.id);
       setPendingEffectSave(null);
       setSaveManualValue('');
+      await sendLanEventWithRetry(event, 'sendEffectSaveResult');
       showCustomAlert(
         resolvedSave.passed ? 'Salvaguarda passou' : 'Salvaguarda falhou',
-        `${resolvedSave.ability}: d20 ${resolvedSave.rawRoll} ${resolvedSave.modifier >= 0 ? '+' : ''}${resolvedSave.modifier} = ${resolvedSave.total}. CD ${resolvedSave.dc}.`
+        rollMode === 'manual'
+          ? `${resolvedSave.ability}: total informado ${resolvedSave.total}. CD ${resolvedSave.dc}.`
+          : `${resolvedSave.ability}: d20 ${resolvedSave.rawRoll} ${resolvedSave.modifier >= 0 ? '+' : ''}${resolvedSave.modifier} = ${resolvedSave.total}. CD ${resolvedSave.dc}.`
       );
       return true;
     } catch {
@@ -5892,8 +6549,10 @@ export default function CharacterSheetScreen() {
 
   const goToEditScreen = () => {
     if (!ensureLanWritable()) return;
+    if (levelUpNavigationLockedRef.current) return;
+    levelUpNavigationLockedRef.current = true;
     setLevelUpModalVisible(false);
-    router.push(`/edit?id=${character.id}&levelUpTo=${newLevelData}${lanInfo?.sessionId ? `&sessionId=${lanInfo.sessionId}&joinUrl=${encodeURIComponent(lanInfo.joinUrl || '')}` : ''}` as any);
+    router.replace(`/edit?id=${character.id}&levelUpTo=${newLevelData}${lanInfo?.sessionId ? `&sessionId=${lanInfo.sessionId}&joinUrl=${encodeURIComponent(lanInfo.joinUrl || '')}` : ''}` as any);
   };
 
   const handleCoinSubmit = () => {
@@ -6528,6 +7187,69 @@ export default function CharacterSheetScreen() {
     });
   };
 
+  const completeDiceValuePrompt = (result: DiceValueResolution | null) => {
+    const resolver = pendingDiceValueResolverRef.current;
+    pendingDiceValueResolverRef.current = null;
+    pendingVisualDiceValueRef.current = null;
+    setDiceValuePrompt((current) => ({ ...current, visible: false, manualValue: '' }));
+    resolver?.(result);
+  };
+
+  const requestDiceValueForUse = (title: string, formula: string, qty = 1) => {
+    const parsed = parseUsableDiceFormula(formula, qty);
+    if (!parsed) return Promise.resolve<DiceValueResolution | null>(null);
+
+    return new Promise<DiceValueResolution | null>((resolve) => {
+      pendingDiceValueResolverRef.current = resolve;
+      setDiceValuePrompt({
+        visible: true,
+        title,
+        message: `Informe o valor final de ${parsed.formula} ou use o dado virtual.`,
+        formula,
+        qty,
+        manualValue: '',
+      });
+    });
+  };
+
+  const rollDiceValuePromptVirtually = () => {
+    const resolver = pendingDiceValueResolverRef.current;
+    if (!resolver) return;
+
+    const parsed = parseUsableDiceFormula(diceValuePrompt.formula, diceValuePrompt.qty);
+    if (!parsed) {
+      completeDiceValuePrompt(null);
+      return;
+    }
+
+    setDiceValuePrompt((current) => ({ ...current, visible: false }));
+    if (canUseVisualDiceRoll(parsed)) {
+      pendingVisualDiceValueRef.current = { parsed, resolve: resolver };
+      setDiceRollRequest({ sides: parsed.sides, count: parsed.count, nonce: Date.now() });
+      return;
+    }
+
+    const rolled = rollParsedDiceFormula(parsed);
+    completeDiceValuePrompt({
+      total: rolled.total,
+      mode: 'virtual',
+      formula: parsed.formula,
+      breakdown: rolled.breakdown,
+    });
+  };
+
+  const submitManualDiceValuePrompt = () => {
+    const value = Math.max(0, Math.floor(Number(diceValuePrompt.manualValue) || 0));
+    if (value <= 0) return;
+    const parsed = parseUsableDiceFormula(diceValuePrompt.formula, diceValuePrompt.qty);
+    completeDiceValuePrompt({
+      total: value,
+      mode: 'manual',
+      formula: parsed?.formula || diceValuePrompt.formula,
+      breakdown: String(value),
+    });
+  };
+
   const rollSpellForTargets = () => {
     if (!ensureLanWritable()) return;
     if (!selectedSpell) return;
@@ -6542,6 +7264,18 @@ export default function CharacterSheetScreen() {
   };
 
   const handleSpellDiceComplete = (result: DiceRollResult) => {
+    const pendingDiceValue = pendingVisualDiceValueRef.current;
+    if (pendingDiceValue) {
+      const total = Math.max(0, result.total + pendingDiceValue.parsed.modifier);
+      completeDiceValuePrompt({
+        total,
+        mode: 'virtual',
+        formula: pendingDiceValue.parsed.formula,
+        breakdown: formatDiceRollBreakdown((result.rolls || []).join('+'), pendingDiceValue.parsed.modifier),
+      });
+      return;
+    }
+
     if (!selectedSpell || !spellCastVisible) return;
     if (spellDicePurpose === 'attack') {
       const attackModifier = getSpellAttackModifier(selectedSpell);
@@ -6685,7 +7419,41 @@ export default function CharacterSheetScreen() {
     await sendLanEventWithRetry(event, 'sendSpellTargetRequest');
   };
 
-  const applyStructuredItemEffects = async (bagIndex: number, rawItem: any, qty: number, effects: any[], chosenAttr?: string) => {
+  const resolveStructuredItemDiceValues = async (item: any, qty: number, effects: any[]) => {
+    const resolutions: Record<string, DiceValueResolution> = {};
+
+    for (const [index, effect] of effects.entries()) {
+      const formula = getStructuredEffectDiceFormulaForUse(effect);
+      if (!formula) continue;
+      const promptQty = effect?.mode === 'set' ? 1 : qty;
+      const result = await requestDiceValueForUse(`Usar ${item.name}`, formula, promptQty);
+      if (!result) return null;
+      resolutions[getStructuredEffectDiceKey(index, effect)] = result;
+    }
+
+    return resolutions;
+  };
+
+  const confirmAndApplyStructuredItemEffects = async (
+    bagIndex: number,
+    item: any,
+    qty: number,
+    effects: any[],
+    chosenAttr?: string,
+  ) => {
+    const diceResolutions = await resolveStructuredItemDiceValues(item, qty, effects);
+    if (diceResolutions === null) return;
+    await applyStructuredItemEffects(bagIndex, item, qty, effects, chosenAttr, diceResolutions);
+  };
+
+  const applyStructuredItemEffects = async (
+    bagIndex: number,
+    rawItem: any,
+    qty: number,
+    effects: any[],
+    chosenAttr?: string,
+    diceResolutions: Record<string, DiceValueResolution> = {},
+  ) => {
     const item = hydrateInventoryItemForEffects(rawItem);
 
     // v54: consumir/usar item próprio é ação autônoma do jogador.
@@ -6726,11 +7494,17 @@ export default function CharacterSheetScreen() {
       lanEffectsToNotify.push(effect);
     };
 
-    for (const effect of effects) {
+    for (const [effectIndex, effect] of effects.entries()) {
       const kind = String(effect.kind || effect.type || '').toLowerCase();
       const needsChosenStat = Boolean(effect.chooseStat) || String(effect.target || '').toUpperCase() === 'CHOOSE_STAT' || String(effect.effectType || '') === 'Escolher Atributo';
       const target = String(needsChosenStat ? chosenAttr : effect.target || '').toUpperCase();
-      const value = Number(effect.value || 0);
+      const diceResolution = diceResolutions[getStructuredEffectDiceKey(effectIndex, effect)];
+      const rawValue = Number(effect.value ?? effect.amount ?? 0);
+      const value = diceResolution ? diceResolution.total : (Number.isFinite(rawValue) ? rawValue : 0);
+      const valueIncludesQty = Boolean(diceResolution);
+      const valueDetail = diceResolution
+        ? ` (${diceResolution.mode === 'virtual' ? 'dado virtual' : 'manual'}${diceResolution.breakdown ? `: ${diceResolution.breakdown}` : ''})`
+        : '';
       const dice = effect.healDice || effect.damageDice || effect.dice || '';
       const duration = getItemEffectDuration(item, effect);
       const isPermanent = duration.unit === 'permanent' || String(effect.durationText || '').toLowerCase().includes('permanente');
@@ -6738,23 +7512,23 @@ export default function CharacterSheetScreen() {
       if (needsChosenStat && !target) continue;
 
       if (['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'].includes(target) && value) {
-        const totalValue = effect.mode === 'set' ? value : value * qty;
+        const totalValue = effect.mode === 'set' || valueIncludesQty ? value : value * qty;
 
         if (effect.mode === 'set') {
           const base = Number(nextStats[target] || 10);
           nextStats.temp_mods[target] = value - base;
-          messages.push(`${target} definido como ${value}.`);
+          messages.push(`${target} definido como ${value}${valueDetail}.`);
         } else if (isPermanent && target !== 'CA') {
           // Offline mantém o bônus permanente na própria ficha. Em LAN também aplica otimista localmente,
           // mas envia effect_patch para o Host registrar a versão autoritativa sem payload/snapshot.
           nextStats[target] = String((Number(nextStats[target]) || 10) + totalValue);
           nextStats.extra_points = (Number(nextStats.extra_points) || 0) + totalValue;
-          messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue} permanente.`);
+          messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue} permanente${valueDetail}.`);
         } else {
           // v55: efeito temporario/CA de consumivel fica apenas em active_effects.
           // Antes gravava tambem em temp_mods; a ficha soma temp_mods + active_effects
           // e por isso o bonus aparecia/aplicava 2x no jogador e no mestre.
-          messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue}${isPermanent ? ' permanente' : ''}.`);
+          messages.push(`${target} ${totalValue > 0 ? '+' : ''}${totalValue}${isPermanent ? ' permanente' : ''}${valueDetail}.`);
         }
 
         if (!isPermanent || target === 'CA') {
@@ -6777,16 +7551,17 @@ export default function CharacterSheetScreen() {
       }
 
       if ((kind === 'temp_hp' || target === 'PV_TEMP') && value) {
-        const nextTempHp = Math.max(Number(character.temp_hp || 0), value * qty);
+        const totalValue = valueIncludesQty ? value : value * qty;
+        const nextTempHp = Math.max(Number(character.temp_hp || 0), totalValue);
         dbUpdates.temp_hp = nextTempHp;
         numberPatch.tempHp = nextTempHp;
-        messages.push(`PV temporario +${value * qty}.`);
+        messages.push(`PV temporario +${totalValue}${valueDetail}.`);
         pushLocalEffect({
-          name: `${item.name}: PV temporario +${value * qty}`,
+          name: `${item.name}: PV temporario +${totalValue}`,
           status: 'item_effect',
           statusKey: 'item_effect',
           target: 'PV_TEMP',
-          value: value * qty,
+          value: totalValue,
           remaining: duration.remaining,
           unit: duration.unit,
           durationText: duration.text,
@@ -6798,12 +7573,14 @@ export default function CharacterSheetScreen() {
       }
 
       if (kind === 'heal') {
-        const fixedHeal = Number(value || String(dice).match(/^\d+$/)?.[0] || 0) * qty;
+        const fixedHeal = diceResolution
+          ? diceResolution.total
+          : Number(value || String(dice).match(/^\d+$/)?.[0] || 0) * qty;
         if (fixedHeal > 0) {
           const nextHp = Math.min(Number(character.hp_max || 0), Number(character.hp_current || 0) + fixedHeal);
           dbUpdates.hp_current = nextHp;
           numberPatch.hpCurrent = nextHp;
-          messages.push(`Recuperou ${fixedHeal} PV.`);
+          messages.push(`Recuperou ${fixedHeal} PV${valueDetail}.`);
         } else if (dice) {
           messages.push(`Role a cura: ${qty}x ${dice}.`);
         }
@@ -6955,7 +7732,7 @@ export default function CharacterSheetScreen() {
         const attrButtons: any[] = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].map(attr => ({
           text: attr,
           color: value >= 0 ? '#00fa9a' : '#ff6666',
-          onPress: () => void applyStructuredItemEffects(bagIndex, item, qty, structuredEffects, attr),
+          onPress: () => void confirmAndApplyStructuredItemEffects(bagIndex, item, qty, structuredEffects, attr),
         }));
 
         showCustomAlert(
@@ -6977,7 +7754,7 @@ export default function CharacterSheetScreen() {
           {
             text: 'Usar',
             color: '#00fa9a',
-            onPress: () => void applyStructuredItemEffects(bagIndex, item, qty, structuredEffects),
+            onPress: () => void confirmAndApplyStructuredItemEffects(bagIndex, item, qty, structuredEffects),
           },
         ]
       );
@@ -7007,7 +7784,17 @@ export default function CharacterSheetScreen() {
     }
 
     // Função interna que processa TUDO: O status escolhido (se tiver), as penalidades e curas.
-    const executeConsumption = (chosenAttr?: string) => {
+    const executeConsumption = async (chosenAttr?: string) => {
+      const lowerEffectText = effect.toLowerCase();
+      const textHasHealingDice = Boolean(
+        parseUsableDiceFormula(effect, qty) &&
+        (lowerEffectText.includes('cura') || lowerEffectText.includes('hp') || (item.damage_type || '').toLowerCase().includes('cura'))
+      );
+      const textDiceResolution = textHasHealingDice
+        ? await requestDiceValueForUse(`Consumir ${qty}x ${item.name}`, effect, qty)
+        : null;
+      if (textHasHealingDice && !textDiceResolution) return;
+
       updateBagQty(bagIndex, -qty);
 
       let newStats = { ...character.stats };
@@ -7104,7 +7891,7 @@ export default function CharacterSheetScreen() {
       }
 
       // 3. Aplica curas diretas
-      const effectStr = effect.toLowerCase();
+      const effectStr = lowerEffectText;
       if (effectStr.includes('cura') || effectStr.includes('hp') || (item.damage_type || '').toLowerCase().includes('cura')) {
         const temDado = /d\d+/i.test(effect);
         if (!temDado) {
@@ -7138,9 +7925,22 @@ export default function CharacterSheetScreen() {
             }
           }
         } else {
-          showHpModal = true;
+          const curaValor = Math.max(0, Number(textDiceResolution?.total || 0));
+          if (curaValor > 0) {
+            const novoHp = Math.min(character.hp_max, character.hp_current + curaValor);
+            dbUpdates.hp_current = novoHp;
+            lanEffects.push({
+              spellName: item.name,
+              mode: 'heal',
+              amount: curaValor,
+              description: item.descricao || item.properties || '',
+            });
+            msgParts.push(`Recuperou ${curaValor} Pontos de Vida${textDiceResolution?.breakdown ? ` (${textDiceResolution.breakdown})` : ''}.`);
+          } else {
+            showHpModal = true;
           msgParts.push(`🎲 Requer Rolagem de Cura:\n${qty}x (${effect})`);
         }
+      }
       }
 
       if (msgParts.length === 0 && !chosenAttr) msgParts.push(`✨ Efeito da ingestão: ${effect}`);
@@ -7179,7 +7979,7 @@ export default function CharacterSheetScreen() {
       const attrButtons: any[] = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].map(attr => ({
         text: attr,
         color: escolherVal > 0 ? '#00fa9a' : '#ff6666',
-        onPress: () => executeConsumption(attr)
+        onPress: () => void executeConsumption(attr)
       }));
 
       showCustomAlert(
@@ -7200,7 +8000,7 @@ export default function CharacterSheetScreen() {
           { 
             text: "Beber / Comer", 
             color: "#00fa9a",
-            onPress: () => executeConsumption()
+            onPress: () => void executeConsumption()
           }
         ]
       );
@@ -7699,8 +8499,11 @@ export default function CharacterSheetScreen() {
   // ==============================================================================
 
   return (
-    <LinearGradient colors={appGradients.main} style={[styles.container, conditionFrameStyle]}>
+    <LinearGradient colors={appGradients.main} style={styles.container}>
       <Stack.Screen options={{ headerShown: false, gestureEnabled: false }} />
+      {activeConditionColor ? (
+        <View pointerEvents="none" style={[styles.conditionGlowFrame, conditionFrameStyle]} />
+      ) : null}
 
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarBack} onPress={() => {
@@ -8745,7 +9548,7 @@ export default function CharacterSheetScreen() {
               value={saveManualValue}
               onChangeText={setSaveManualValue}
               keyboardType="numeric"
-              placeholder="Valor do d20 fisico"
+              placeholder="Total final do teste"
               placeholderTextColor="#666"
             />
             <View style={styles.customAlertBtnRow}>
@@ -8761,10 +9564,48 @@ export default function CharacterSheetScreen() {
                 disabled={!(parseInt(saveManualValue, 10) > 0) || Boolean(pendingEffectSave && isSheetActionSubmitting(`save:${pendingEffectSave.id}`))}
                 onPress={() => {
                   if (!pendingEffectSave) return;
-                  void sendEffectSaveResult(pendingEffectSave, Math.max(1, Math.min(20, parseInt(saveManualValue, 10) || 1)), 'manual');
+                  void sendEffectSaveResult(pendingEffectSave, Math.max(1, parseInt(saveManualValue, 10) || 1), 'manual');
                 }}
               >
                 <Text style={[styles.customAlertBtnText, { color: '#00fa9a' }]}>Enviar manual</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={diceValuePrompt.visible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.customAlertBox}>
+            <Text style={styles.customAlertTitle}>{diceValuePrompt.title}</Text>
+            <Text style={styles.customAlertMessage}>{diceValuePrompt.message}</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={diceValuePrompt.manualValue}
+              onChangeText={(manualValue) => setDiceValuePrompt((current) => ({ ...current, manualValue }))}
+              keyboardType="numeric"
+              placeholder="Valor final"
+              placeholderTextColor="#666"
+            />
+            <View style={styles.customAlertBtnRow}>
+              <TouchableOpacity
+                style={[styles.customAlertBtn, { borderColor: '#ff6666', borderWidth: 1 }]}
+                onPress={() => completeDiceValuePrompt(null)}
+              >
+                <Text style={[styles.customAlertBtnText, { color: '#ff6666' }]}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.customAlertBtn, { borderColor: '#00fa9a', borderWidth: 1, opacity: parseInt(diceValuePrompt.manualValue, 10) > 0 ? 1 : 0.5 }]}
+                disabled={!(parseInt(diceValuePrompt.manualValue, 10) > 0)}
+                onPress={submitManualDiceValuePrompt}
+              >
+                <Text style={[styles.customAlertBtnText, { color: '#00fa9a' }]}>Usar valor</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.customAlertBtn, { borderColor: '#00bfff', borderWidth: 1 }]}
+                onPress={rollDiceValuePromptVirtually}
+              >
+                <Text style={[styles.customAlertBtnText, { color: '#00bfff' }]}>Dado virtual</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -8874,6 +9715,13 @@ type SheetActiveEffect = {
 
 const STAT_EFFECT_TARGETS = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'CA'] as const;
 
+function isSheetEffectStillActive(effect: SheetActiveEffect | any) {
+  if (!effect || effect.active === false) return false;
+  const unit = String(effect.unit || '').toLowerCase();
+  if (effect.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return true;
+  return Number(effect.remaining || 0) > 0;
+}
+
 function getLanStatEffectBonus(character: any, stat: string): number {
   const normalized = String(stat || '').toUpperCase();
   const effects: SheetActiveEffect[] = Array.isArray(character?.active_effects)
@@ -8881,7 +9729,7 @@ function getLanStatEffectBonus(character: any, stat: string): number {
     : safeJsonParse<SheetActiveEffect[]>(character?.active_effects_json, []);
 
   return effects.reduce<number>((sum: number, effect: SheetActiveEffect) => {
-    if ((effect as any)?.active === false) return sum;
+    if (!isSheetEffectStillActive(effect)) return sum;
     if (String(effect?.target || '').toUpperCase() !== normalized) return sum;
     const rawValue = Number(effect?.value) || 0;
     if (String(effect?.mode || 'add') === 'set') {
@@ -8899,6 +9747,7 @@ function summarizeStatEffectBonuses(effects: SheetActiveEffect[] = []): Record<s
   for (const effect of effects) {
     const target = String(effect?.target || '').toUpperCase();
 
+    if (!isSheetEffectStillActive(effect)) continue;
     if (!STAT_EFFECT_TARGETS.includes(target as (typeof STAT_EFFECT_TARGETS)[number])) continue;
     result[target] = (result[target] || 0) + (Number(effect?.value) || 0);
   }
@@ -9164,7 +10013,7 @@ function formatPublicEffectSummary(effects: unknown[] | undefined, limit = 2) {
   return {
     total: names.length,
     hasMore: hidden > 0,
-    text: hidden > 0 ? `${shown.join(', ')}...mais` : shown.join(', '),
+    text: hidden > 0 ? `${shown.join(', ')}...` : shown.join(', '),
   };
 }
 
@@ -9179,4 +10028,3 @@ function summarizePublicEffectDetail(effect: any): string {
   if (effect?.publicNote) parts.push(String(effect.publicNote));
   return parts.join(' • ') || 'Efeito público ativo';
 }
-

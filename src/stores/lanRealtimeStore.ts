@@ -4,7 +4,7 @@ import { traceApp } from '@/services/debug/appTrace';
 import { getLanEventEntityId, getLanEventEntityType } from '@/services/lan/lanEntityQueue';
 import type { LanSessionEvent, LanSessionPlayerState } from '@/services/lanSession';
 
-export const LAN_REALTIME_STORE_VERSION = 'gap-checkpoint-v3';
+export const LAN_REALTIME_STORE_VERSION = 'gap-checkpoint-v4-runtime-events';
 
 traceApp('EVENT_DECISION', 'LAN_REALTIME_STORE_VERSION', {
   source: 'src/stores/lanRealtimeStore.ts',
@@ -24,6 +24,41 @@ export type PendingEvent = {
   createdAt: number;
   status: 'pending' | 'acked' | 'nacked';
   reason?: string;
+};
+
+export type LivePlayerRuntimeState = {
+  sessionId: string;
+  playerKey?: string;
+  characterId?: number;
+  characterName?: string;
+  hp_current?: number;
+  hp_max?: number;
+  temp_hp?: number;
+  xp?: number;
+  gp?: number;
+  sp?: number;
+  cp?: number;
+  level?: number;
+  class?: string;
+  race?: string;
+  stats?: unknown;
+  equipment?: unknown;
+  active_effects?: unknown[];
+  active_effects_json?: string;
+  numbersSeq?: number;
+  effectsSeq?: number;
+  statsSeq?: number;
+  equipmentSeq?: number;
+  revision?: number;
+  seq?: number;
+  updatedAt: number;
+};
+
+export type LiveLanEventNotice = {
+  id: string;
+  event: LanSessionEvent;
+  seq: number;
+  receivedAt: number;
 };
 
 export type LanEventApplyDecisionReason =
@@ -68,8 +103,12 @@ export type LanRealtimeState = {
   appliedEventIds: Record<string, true>;
   entityVersions: Record<string, RuntimeEntityState>;
   pendingEvents: Record<string, PendingEvent>;
+  livePlayerStates: Record<string, LivePlayerRuntimeState>;
+  liveEvents: Record<string, LiveLanEventNotice>;
 
   setConnection: (state: { sessionId?: string; clientId?: string; playerKey?: string; connected: boolean }) => void;
+  mergeLivePlayerState: (key: string, patch: Partial<LivePlayerRuntimeState>) => void;
+  publishLiveEvent: (event: LanSessionEvent) => void;
   getEventApplyDecision: (event: LanSessionEvent) => LanEventApplyDecision;
   shouldApplyEvent: (event: LanSessionEvent) => boolean;
   markEventApplied: (event: LanSessionEvent) => void;
@@ -93,7 +132,8 @@ export const getLanRuntimeEntityKey = (event: LanSessionEvent) => {
 
 const isLegacyTimestampCheckpoint = (event: LanSessionEvent) => (
   String(event.id || '').startsWith('checkpoint_') &&
-  Number(event.entityRevision || 0) > 1000000
+  Number(event.entityRevision || 0) > 1000000 &&
+  (event as any).authoritativeCheckpoint !== true
 );
 
 // v55: snapshots/checkpoints antigos de player/inventory/effect podiam vir com
@@ -102,7 +142,27 @@ const isLegacyTimestampCheckpoint = (event: LanSessionEvent) => (
 // Checkpoint legado não pode avançar a revision de nenhum agregado.
 const getRevision = (event: LanSessionEvent) => {
   if (isLegacyTimestampCheckpoint(event)) return 0;
-  return Number(event.entityRevision ?? event.seq ?? 0) || 0;
+  // v94: o eco de level-up pode ter seq temporal, mas a revision da entidade
+  // deve ser a revisionSeq autoritativa do player. Se Date.now() entrar aqui,
+  // os danos/curas seguintes com revisionSeq real parecem antigos e a ficha trava.
+  if (
+    event?.type === 'player_patch' &&
+    String((event as any)?.numberPatchIntent || '') === 'level_up_authoritative_echo'
+  ) {
+    const progressionRevision = Number((event as any)?.progressionPatch?.revisionSeq || 0) || 0;
+    if (progressionRevision > 0) return progressionRevision;
+  }
+  const raw = Number(event.entityRevision ?? event.seq ?? 0) || 0;
+  const derivedType = getLanEventEntityType(event);
+  // v100: public_status/checkpoints/eco antigos podem carregar Date.now() em
+  // entityRevision. Isso nao pode contaminar player/effect/inventory; a ordem real
+  // continua vindo pelo seq e pelo id aplicado. Se uma revision temporal entrar aqui,
+  // eventos reais seguintes de condicao/HP parecem antigos e a UI pisca/some.
+  if (
+    raw > 1000000 &&
+    (derivedType === 'player' || derivedType === 'effect' || derivedType === 'inventory' || String(event.type || '') === 'public_status')
+  ) return 0;
+  return raw;
 };
 const getSeq = (event: LanSessionEvent) => Number(event.seq ?? event.serverSeq ?? 0) || 0;
 
@@ -114,8 +174,85 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
   appliedEventIds: {},
   entityVersions: {},
   pendingEvents: {},
+  livePlayerStates: {},
+  liveEvents: {},
 
   setConnection: (next) => set((state) => ({ ...state, ...next })),
+
+  mergeLivePlayerState: (key, patch) => {
+    if (!key) return;
+    set((state) => {
+      const previous = state.livePlayerStates[key];
+      const patchSeq = Math.max(0, Number(patch.seq || 0) || 0);
+      const previousSeq = Math.max(0, Number(previous?.seq || 0) || 0);
+      const nextRevision = Math.max(Number(previous?.revision || 0) || 0, Number(patch.revision || 0) || 0);
+      const nextSeq = Math.max(previousSeq, patchSeq);
+      const acceptDomain = (domain: 'numbersSeq' | 'effectsSeq' | 'statsSeq' | 'equipmentSeq') => {
+        const patchDomainSeq = Math.max(0, Number((patch as any)?.[domain] || 0) || 0);
+        const previousDomainSeq = Math.max(0, Number((previous as any)?.[domain] || 0) || 0);
+        if (!previous || patchDomainSeq <= 0 || previousDomainSeq <= 0) return true;
+        return patchDomainSeq >= previousDomainSeq;
+      };
+      const nextState: LivePlayerRuntimeState = {
+        ...(previous || { sessionId: String(patch.sessionId || ''), updatedAt: Date.now() }),
+        ...patch,
+        revision: nextRevision || patch.revision || previous?.revision,
+        seq: nextSeq || patch.seq || previous?.seq,
+        numbersSeq: Math.max(Number(previous?.numbersSeq || 0) || 0, Number(patch.numbersSeq || 0) || 0) || undefined,
+        effectsSeq: Math.max(Number(previous?.effectsSeq || 0) || 0, Number(patch.effectsSeq || 0) || 0) || undefined,
+        statsSeq: Math.max(Number(previous?.statsSeq || 0) || 0, Number(patch.statsSeq || 0) || 0) || undefined,
+        equipmentSeq: Math.max(Number(previous?.equipmentSeq || 0) || 0, Number(patch.equipmentSeq || 0) || 0) || undefined,
+        updatedAt: Date.now(),
+      } as LivePlayerRuntimeState;
+
+      // v106: eventos de domínios diferentes chegam fora de ordem em LAN real.
+      // Um player_patch novo de HP não pode bloquear uma remoção de efeito, mas um
+      // effect_patch antigo/resync também não pode ressuscitar buff/condição já removido.
+      if (previous && !acceptDomain('numbersSeq')) {
+        nextState.hp_current = previous.hp_current;
+        nextState.hp_max = previous.hp_max;
+        nextState.temp_hp = previous.temp_hp;
+        nextState.xp = previous.xp;
+        nextState.gp = previous.gp;
+        nextState.sp = previous.sp;
+        nextState.cp = previous.cp;
+      }
+      if (previous && !acceptDomain('effectsSeq')) {
+        nextState.active_effects = previous.active_effects;
+        nextState.active_effects_json = previous.active_effects_json;
+      }
+      if (previous && !acceptDomain('statsSeq')) {
+        nextState.stats = previous.stats;
+      }
+      if (previous && !acceptDomain('equipmentSeq')) {
+        nextState.equipment = previous.equipment;
+      }
+
+      return {
+        livePlayerStates: {
+          ...state.livePlayerStates,
+          [key]: nextState,
+        },
+      };
+    });
+  },
+
+  publishLiveEvent: (event) => {
+    if (!event?.id || !event.sessionId) return;
+    const key = `${event.sessionId}:${event.id || event.clientMsgId}`;
+    const notice: LiveLanEventNotice = {
+      id: key,
+      event,
+      seq: getSeq(event),
+      receivedAt: Date.now(),
+    };
+    set((state) => {
+      const entries = Object.entries({ ...(state.liveEvents || {}), [key]: notice })
+        .sort(([, a], [, b]) => Number(a.receivedAt || 0) - Number(b.receivedAt || 0))
+        .slice(-160);
+      return { liveEvents: Object.fromEntries(entries) as Record<string, LiveLanEventNotice> };
+    });
+  },
 
   getEventApplyDecision: (event) => {
     const state = get();
@@ -302,15 +439,28 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
     };
   }),
 
-  resetSession: (sessionId) => set({
-    sessionId,
-    connected: false,
-    lastSeenSeq: 0,
-    lastAppliedSeq: 0,
-    seenEventIds: {},
-    appliedEventIds: {},
-    entityVersions: {},
-    pendingEvents: {},
+  resetSession: (sessionId) => set((state) => {
+    const nextLivePlayerStates = sessionId
+      ? Object.fromEntries(Object.entries(state.livePlayerStates || {}).filter(([key, value]) => (
+          !key.startsWith(`${sessionId}:`) && value.sessionId !== sessionId
+        )))
+      : {};
+    return {
+      sessionId,
+      connected: false,
+      lastSeenSeq: 0,
+      lastAppliedSeq: 0,
+      seenEventIds: {},
+      appliedEventIds: {},
+      entityVersions: {},
+      pendingEvents: {},
+      livePlayerStates: nextLivePlayerStates,
+      liveEvents: sessionId
+        ? Object.fromEntries(Object.entries(state.liveEvents || {}).filter(([key, value]) => (
+            !key.startsWith(`${sessionId}:`) && value.event?.sessionId !== sessionId
+          )))
+        : {},
+    };
   }),
 }));
 

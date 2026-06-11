@@ -625,6 +625,10 @@ export async function tickTurnEffects(
       const save = await maybeCreateRepeatSave(db, sessionId, player.target_key, snapshot, unit);
       if (save) result.pendingSaves.push(save);
       if (snapshot.isPermanent || snapshot.unit === 'permanent') continue;
+      // v101: condicoes/status sao manuais por padrao. Se o mestre definiu
+      // duração no modal, autoExpire vem true; só nesse caso a passagem de
+      // turno/minuto deve reduzir/remover a condição.
+      if (isStatusConditionSnapshot(snapshot) && !shouldStatusConditionSnapshotTick(snapshot)) continue;
 
       const delta = getDurationDelta(snapshot.unit, unit);
       if (delta <= 0) continue;
@@ -1026,6 +1030,7 @@ function buildInputSnapshot(
     repeatSave: input.repeatSave || catalog?.repeatSave || null,
     removableBySave: Boolean(catalog?.removableBySave || input.repeatSave || input.saveAbility),
     visualPriority: catalog?.visualPriority || 0,
+    autoExpire: input.autoExpire,
   };
 }
 
@@ -1065,6 +1070,7 @@ function mapActiveEffectRow(row: Record<string, unknown>): LanActiveEffectSnapsh
     repeatSave: optionalString(row.repeat_save) || stored.repeatSave || optionalString(row.catalog_repeat_save),
     removableBySave: Boolean(toNumber(row.catalog_removable_by_save) || stored.removableBySave),
     visualPriority: toNumber(row.catalog_visual_priority ?? stored.visualPriority),
+    autoExpire: stored.autoExpire,
   };
 }
 
@@ -1077,6 +1083,26 @@ async function getSessionTiming(db: SQLiteDatabase, sessionId: string) {
     currentTurn: toNumber(row?.current_turn, 1),
     elapsedMinutes: toNumber(row?.elapsed_minutes),
   };
+}
+
+function isStatusConditionSnapshot(snapshot: Partial<LanActiveEffectSnapshot>) {
+  const source = String(snapshot.source || '').trim().toLowerCase();
+  const kind = String(snapshot.kind || '').trim().toLowerCase();
+  const statusKey = String(snapshot.statusKey || snapshot.status || '').trim();
+  return Boolean(statusKey) || kind === 'status' || source === 'condicao' || source === 'condição';
+}
+
+function shouldStatusConditionSnapshotTick(snapshot: Partial<LanActiveEffectSnapshot>) {
+  if (snapshot.autoExpire === true) return true;
+  const unit = String(snapshot.unit || '').toLowerCase();
+  const remaining = Math.max(0, Math.floor(Number(snapshot.remaining || 0) || 0));
+  const hasRepeatSave = Boolean(snapshot.saveAbility || snapshot.repeatSave || snapshot.removableBySave);
+  return hasRepeatSave &&
+    remaining > 0 &&
+    unit !== 'manual' &&
+    unit !== 'permanent' &&
+    unit !== 'while_equipped' &&
+    unit !== 'concentration';
 }
 
 function getDurationDelta(unit: DurationUnit | 'rest', advanceUnit: 'turn' | 'minute' | 'hour' | 'shortRest' | 'longRest') {
