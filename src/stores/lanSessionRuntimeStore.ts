@@ -210,7 +210,11 @@ export function mergeSessionStatePreservingLiveFields(
   for (const incomingPlayer of incomingState.players || []) {
     const key = getPlayerKey(sessionId, incomingPlayer);
     incomingKeys.add(key);
-    const meta = runtime.entities[key];
+    const meta = getNewestRuntimeMeta(
+      runtime.entities[key],
+      runtime.entities[getEffectKey(sessionId, key)],
+      runtime.entities[getInventoryKey(sessionId, key)],
+    );
     const currentPlayer = currentByKey.get(key);
 
     if (meta?.removed) {
@@ -384,20 +388,22 @@ export function applyHostEffectPatchRuntime(
     }
   }
 
-  const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
+  const playerKey = getPlayerKey(sessionId, player);
+  const effectKey = getEffectKey(sessionId, playerKey);
+  const revision = nextRuntimeRevision(sessionId, effectKey, (player as any).effectRevisionSeq);
   const nextEffects = filterLiveRuntimeEffects(Array.from(byId.values()) as any);
-  const updatedPlayer = {
+  const updatedPlayer: LanSessionPlayerState = {
     ...player,
     effects: nextEffects,
     tempHp: Math.max(0, Math.floor(Number(player.tempHp) || 0)),
-    revisionSeq: revision,
+    effectRevisionSeq: revision,
   };
   const nextState = {
     ...currentState,
     players: currentState.players.map((entry) => entry.id === player.id ? updatedPlayer : entry),
   };
 
-  markRuntimeEntity(sessionId, getPlayerKey(sessionId, updatedPlayer), revision, revision, source);
+  markRuntimeEntity(sessionId, effectKey, revision, revision, source);
   useLanSessionRuntimeStore.getState().setSessionState(sessionId, nextState);
   return { state: nextState, player: updatedPlayer, revision };
 }
@@ -419,7 +425,9 @@ export function applyHostInventoryPatchRuntime(
   ));
   if (!player) return null;
 
-  const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
+  const playerKey = getPlayerKey(sessionId, player);
+  const inventoryKey = getInventoryKey(sessionId, playerKey);
+  const revision = nextRuntimeRevision(sessionId, inventoryKey, (player as any).inventoryRevisionSeq);
   const rawPreviousStats = player.stats && typeof player.stats === 'object' ? player.stats : {};
   const previousEquipment = player.equipment && typeof player.equipment === 'object' ? player.equipment as Record<string, any> : { bag: [], slots: {} };
   const previousStats = buildRuntimeStatsWithDerivedEquipMods(rawPreviousStats, previousEquipment);
@@ -445,14 +453,14 @@ export function applyHostInventoryPatchRuntime(
     stats: nextStats,
     hpMax: hpDelta ? Math.max(1, Number(player.hpMax || 0) + hpDelta) : player.hpMax,
     hpCurrent: hpDelta ? Math.max(0, Number(player.hpCurrent || 0) + hpDelta) : player.hpCurrent,
-    revisionSeq: revision,
+    inventoryRevisionSeq: revision,
   };
   const nextState: LanSessionState = {
     ...currentState,
     players: currentState.players.map((entry) => entry.id === player.id ? updatedPlayer : entry),
   };
 
-  markRuntimeEntity(sessionId, getPlayerKey(sessionId, updatedPlayer), revision, revision, source);
+  markRuntimeEntity(sessionId, inventoryKey, revision, revision, source);
   useLanSessionRuntimeStore.getState().setSessionState(sessionId, nextState);
   return { state: nextState, player: updatedPlayer, revision };
 }
@@ -473,9 +481,11 @@ export function applyHostTurnRuntime(
     players: currentState.players.map((player) => {
       const effects = tickRuntimeEffects(filterLiveRuntimeEffects(player.effects || []), unit);
       if (effects === player.effects) return player;
-      const revision = nextRuntimeRevision(sessionId, getPlayerKey(sessionId, player), player.revisionSeq);
-      const updatedPlayer = { ...player, effects, tempHp: getTempHpAfterRuntimeEffectTick(player, effects), revisionSeq: revision };
-      markRuntimeEntity(sessionId, getPlayerKey(sessionId, updatedPlayer), revision, revision, 'runtime');
+      const playerKey = getPlayerKey(sessionId, player);
+      const effectKey = getEffectKey(sessionId, playerKey);
+      const revision = nextRuntimeRevision(sessionId, effectKey, (player as any).effectRevisionSeq);
+      const updatedPlayer: LanSessionPlayerState = { ...player, effects, tempHp: getTempHpAfterRuntimeEffectTick(player, effects), effectRevisionSeq: revision };
+      markRuntimeEntity(sessionId, effectKey, revision, revision, 'runtime');
       return updatedPlayer;
     }),
   };
@@ -494,6 +504,8 @@ export function removeHostPlayerRuntime(
   const key = getPlayerKey(sessionId, player);
   const revision = nextRuntimeRevision(sessionId, key, player.revisionSeq);
   markRuntimeEntity(sessionId, key, revision, revision, 'runtime', true);
+  markRuntimeEntity(sessionId, getEffectKey(sessionId, key), revision, revision, 'runtime', true);
+  markRuntimeEntity(sessionId, getInventoryKey(sessionId, key), revision, revision, 'runtime', true);
   const nextState = {
     ...currentState,
     players: currentState.players.filter((entry) => getPlayerKey(sessionId, entry) !== key),
@@ -756,8 +768,25 @@ function getPlayerKey(sessionId: string, player: LanSessionPlayerState) {
   return `${sessionId}:player:${player.remoteKey || player.clientId || player.sourceCharacterId || player.characterId || player.id || player.characterName}`;
 }
 
+function getEffectKey(sessionId: string, playerKey: string) {
+  return `${sessionId}:effect:${playerKey}`;
+}
+
+function getInventoryKey(sessionId: string, playerKey: string) {
+  return `${sessionId}:inventory:${playerKey}`;
+}
+
 function getSessionKey(sessionId: string) {
   return `${sessionId}:session`;
+}
+
+function getNewestRuntimeMeta(...metas: (RuntimeMeta | undefined)[]) {
+  return metas
+    .filter(Boolean)
+    .sort((left, right) => (
+      Math.max(Number(right?.updatedAt || 0), Number(right?.revision || 0)) -
+      Math.max(Number(left?.updatedAt || 0), Number(left?.revision || 0))
+    ))[0];
 }
 
 function getSessionRevision(state: LanSessionState) {

@@ -24,6 +24,10 @@ import {
 import { getCurrentBreathFrameStyle, getVisibleEffects } from '@/services/effects/effectVisualService';
 import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
 import {
+  consumeItemAtomically as consumeLanInventoryItemAtomically,
+  equipItemAtomically as equipLanInventoryItemAtomically,
+} from '@/services/lan/lanInventoryDomain';
+import {
   debugLanFlow,
   getSheetRuntimeMode,
   hasLanBlockedUpdates,
@@ -7459,19 +7463,19 @@ export default function CharacterSheetScreen() {
     // v54: consumir/usar item próprio é ação autônoma do jogador.
     // Não vira item_use_request nem pede permissão do mestre; só envia patches vivos
     // de inventário/atributo/efeito para o host validar que a quantidade não aumentou.
-    const equipmentBeforeConsume = normalizeSheetEquipment(character.equipment);
-    const consumedBag = [...equipmentBeforeConsume.bag];
-    const consumedIdx = Math.max(0, bagIndex);
-    if (consumedBag[consumedIdx]) {
-      consumedBag[consumedIdx] = {
-        ...hydrateInventoryItemForEffects(consumedBag[consumedIdx]),
-        qty: Math.max(0, Number(consumedBag[consumedIdx].qty || 0) - qty),
-      };
+    let consumeTx: ReturnType<typeof consumeLanInventoryItemAtomically>;
+    try {
+      consumeTx = consumeLanInventoryItemAtomically({
+        equipment: character.equipment,
+        bagIndex,
+        qty,
+      });
+    } catch (error) {
+      showCustomAlert('Consumo bloqueado', error instanceof Error ? error.message : 'Nao foi possivel consumir este item.');
+      return;
     }
-    const equipmentAfterConsume = {
-      ...equipmentBeforeConsume,
-      bag: consumedBag.filter((entry: any) => Number(entry?.qty || 0) > 0),
-    };
+    const equipmentBeforeConsume = consumeTx.equipmentBefore;
+    const equipmentAfterConsume = consumeTx.equipmentAfter;
 
     const nextStats = { ...character.stats, temp_mods: { ...(character.stats?.temp_mods || {}) } };
     const dbUpdates: any = {};
@@ -7795,7 +7799,19 @@ export default function CharacterSheetScreen() {
         : null;
       if (textHasHealingDice && !textDiceResolution) return;
 
-      updateBagQty(bagIndex, -qty);
+      let consumeTx: ReturnType<typeof consumeLanInventoryItemAtomically>;
+      try {
+        consumeTx = consumeLanInventoryItemAtomically({
+          equipment: character.equipment,
+          bagIndex,
+          qty,
+        });
+      } catch (error) {
+        showCustomAlert('Consumo bloqueado', error instanceof Error ? error.message : 'Nao foi possivel consumir este item.');
+        return;
+      }
+      const equipmentBeforeConsume = consumeTx.equipmentBefore;
+      const equipmentAfterConsume = consumeTx.equipmentAfter;
 
       let newStats = { ...character.stats };
       let msgParts = [];
@@ -7946,17 +7962,23 @@ export default function CharacterSheetScreen() {
       if (msgParts.length === 0 && !chosenAttr) msgParts.push(`✨ Efeito da ingestão: ${effect}`);
 
       dbUpdates.stats = newStats;
+      dbUpdates.equipment = equipmentAfterConsume;
+      setCharacter((current: any) => {
+        if (!current) return current;
+        const merged = { ...current, ...dbUpdates, equipment: equipmentAfterConsume, stats: newStats };
+        characterRef.current = merged;
+        return merged;
+      });
       if (Object.keys(dbUpdates).length > 0) updateDB(dbUpdates, { allowLanAuthoritativeCache: isLanPlayerRuntime, reason: isLanPlayerRuntime ? 'lan_text_item_consume_runtime_first' : 'offline_text_item_consume' });
       if (isLanPlayerRuntime) {
         const clientRequestId = makeLanEventId();
-        const latestEquipment = normalizeSheetEquipment(characterRef.current?.equipment || character.equipment);
-        pendingSelfInventoryStateRef.current = { equipment: latestEquipment, statsPatch: newStats, at: Date.now(), clientMsgId: clientRequestId };
+        pendingSelfInventoryStateRef.current = { equipment: equipmentAfterConsume, statsPatch: newStats, at: Date.now(), clientMsgId: clientRequestId };
         void notifyInventoryPatch(
-          latestEquipment,
+          equipmentAfterConsume,
           `${character.name} consumiu ${qty}x ${item.name}.`,
           clientRequestId,
           newStats,
-          character.equipment
+          equipmentBeforeConsume
         );
       }
       for (const lanEffect of lanEffects.filter((effect: any) => effect?.durationUnit !== 'permanent')) {
@@ -8108,12 +8130,53 @@ export default function CharacterSheetScreen() {
   const handleEquipItem = (itemToEquip: any) => {
     if (!ensureLanWritable()) return;
     if (!activeSlot) return;
+    let equipTx: ReturnType<typeof equipLanInventoryItemAtomically>;
+    try {
+      equipTx = equipLanInventoryItemAtomically({
+        equipment: character.equipment,
+        stats: character.stats,
+        slot: activeSlot,
+        itemToEquip,
+      });
+    } catch (error) {
+      showCustomAlert('Acao Bloqueada', error instanceof Error ? error.message : 'Nao foi possivel atualizar este equipamento.');
+      return;
+    }
+    const nextEquipmentAtomic = equipTx.equipmentAfter;
+    const nextStatsAtomic = equipTx.statsAfter;
+    if (equipTx.unequippedOffHand) {
+      showCustomAlert('Aviso de Sistema', 'Sua mao secundaria foi desequipada. Esta arma requer as duas maos livres.');
+    }
+    if (lanInfo?.sessionId) {
+      const clientRequestId = makeLanEventId();
+      pendingSelfInventoryStateRef.current = { equipment: nextEquipmentAtomic, statsPatch: nextStatsAtomic, at: Date.now(), clientMsgId: clientRequestId };
+      setCharacter((current: any) => {
+        if (!current) return current;
+        const merged = { ...current, equipment: nextEquipmentAtomic, stats: nextStatsAtomic };
+        characterRef.current = merged;
+        return merged;
+      });
+      void persistFastLocalPatch({ equipment: nextEquipmentAtomic, stats: nextStatsAtomic }, 'lan_player_self_equip_optimistic');
+      void runSheetAction(`equip:${activeSlot}`, async () => {
+        await notifyInventoryPatch(
+          nextEquipmentAtomic,
+          `${character.name} atualizou equipamentos equipados.`,
+          clientRequestId,
+          nextStatsAtomic,
+          equipTx.equipmentBefore
+        );
+      });
+    } else {
+      void updateDB({ equipment: nextEquipmentAtomic, stats: nextStatsAtomic });
+    }
+    setSlotModalVisible(false);
+    if (false) {
     let newBag = [...character.equipment.bag];
     let newSlots = { ...character.equipment.slots };
     let newStats = { ...character.stats };
     if(!newStats.equip_mods) newStats.equip_mods = {};
 
-    const oldItem = newSlots[activeSlot];
+    const oldItem = newSlots[activeSlot!];
     if (oldItem) {
       const oldBonuses = getEquipBonus(oldItem);
       for (const [stat, val] of Object.entries(oldBonuses)) {
@@ -8161,14 +8224,14 @@ export default function CharacterSheetScreen() {
         newBag[bagIdx].qty -= 1;
         if (newBag[bagIdx].qty <= 0) newBag.splice(bagIdx, 1);
       }
-      newSlots[activeSlot] = { ...itemToEquip, qty: 1 };
+      newSlots[activeSlot!] = { ...itemToEquip, qty: 1 };
 
       const newBonuses = getEquipBonus(itemToEquip);
       for (const [stat, val] of Object.entries(newBonuses)) {
         newStats.equip_mods[stat] = (newStats.equip_mods[stat] || 0) + (val as number);
       }
     } else {
-      newSlots[activeSlot] = null;
+      newSlots[activeSlot!] = null;
     }
 
     const nextEquipment = { bag: newBag, slots: newSlots };
@@ -8198,6 +8261,7 @@ export default function CharacterSheetScreen() {
       void updateDB({ equipment: nextEquipment, stats: newStats });
     }
     setSlotModalVisible(false);
+    }
   };
 
   const getFilteredAndSortedSpells = () => {

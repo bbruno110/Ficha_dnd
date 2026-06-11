@@ -5,6 +5,7 @@
   "scripts": {
     "start": "expo start",
     "dev-client": "expo start --dev-client",
+    "test:lan": "npx tsc --outDir .lan-test-build --module commonjs --target es2020 --moduleResolution node --esModuleInterop --skipLibCheck scripts/lan-domain-tests.ts && node .lan-test-build/scripts/lan-domain-tests.js",
     "reset-project": "node ./scripts/reset-project.js",
     "android": "expo run:android",
     "ios": "expo run:ios",

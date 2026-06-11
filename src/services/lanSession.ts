@@ -185,6 +185,12 @@ export type LanSessionPlayerState = {
   pendingCharacter?: Record<string, unknown> | null;
   pendingDiff?: string[];
   revisionSeq?: number;
+  playerRevisionSeq?: number;
+  effectRevisionSeq?: number;
+  inventoryRevisionSeq?: number;
+  sessionRevisionSeq?: number;
+  pendingSaveRevisionSeq?: number;
+  tradeRevisionSeq?: number;
 };
 
 export type LanSessionState = {
