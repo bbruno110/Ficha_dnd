@@ -267,6 +267,7 @@ export type LanResourceRequest = {
   amount?: number;
   field?: string;
   value?: number;
+  coins?: Partial<Pick<LanSessionPlayerState, 'gp' | 'sp' | 'cp'>>;
   item?: LanTradeItem;
   duration?: number;
   unit?: LanEffectUnit;
@@ -316,7 +317,11 @@ export type LanSessionEventType =
   | 'pending_save_patch'
   | 'session_patch'
   | 'session_ended'
-  | 'timeline_event';
+  | 'timeline_event'
+  | 'character_transaction'
+  | 'party_transaction'
+  | 'spell_transaction'
+  | 'reward_transaction';
 
 export type LanSessionEvent = {
   protocol?: 'ficha-dnd-lan-v2';

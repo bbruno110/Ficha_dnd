@@ -1,6 +1,7 @@
 // ================= sheet.tsx =================
 import DiceRoller3D, { type DiceRollRequest, type DiceRollResult } from '@/components/DiceRoller3D';
 import { useLanAppLifecycle } from '@/hooks/useLanAppLifecycle';
+import { useLanProjection } from '@/hooks/useLanProjection';
 import { useLanRealtimePlayerPatches } from '@/hooks/useLanRealtimePlayerPatches';
 import {
   canUseVisualDiceRoll,
@@ -23,9 +24,21 @@ import {
 } from '@/services/debug/appTrace';
 import { getCurrentBreathFrameStyle, getVisibleEffects } from '@/services/effects/effectVisualService';
 import { subscribeLanForegroundRecovery } from '@/services/lan/lanForegroundRecoveryBus';
+import { LAN_ENGINE_PROJECTION_MODE } from '@/services/lan/lanClientEngine';
+import {
+  applyIncomingSnapshot,
+  dispatchPlayerCommand,
+  getLanProjection,
+} from '@/services/lan/engine/LanEngineBridge';
+import type {
+  CharacterProjection,
+  LanAuthoritativeEvent,
+  LanCommand,
+} from '@/services/lan/engine/LanTypes';
 import {
   consumeItemAtomically as consumeLanInventoryItemAtomically,
   equipItemAtomically as equipLanInventoryItemAtomically,
+  getInventoryStackKey,
 } from '@/services/lan/lanInventoryDomain';
 import {
   debugLanFlow,
@@ -744,6 +757,96 @@ const buildSheetStatsWithDerivedEquipMods = (stats: Record<string, any> | null |
   return nextStats;
 };
 
+function lanDomainEffectToSheetEffect(effect: any) {
+  const id = String(effect?.effectId || effect?.id || effect?.sourceId || `lan_fx_${Date.now()}`);
+  return {
+    id,
+    lanEffectId: id,
+    name: String(effect?.name || 'Efeito'),
+    status: effect?.kind === 'status' ? String(effect?.name || effect?.status || '') : effect?.status,
+    statusKey: effect?.statusKey || effect?.status || (effect?.kind === 'status' ? id : undefined),
+    target: normalizeLanEffectTarget(effect?.target || 'custom'),
+    value: Math.floor(Number(effect?.value || 0)),
+    remaining: Math.max(0, Math.floor(Number(effect?.remaining || 0))),
+    unit: normalizeLanEffectUnit(effect?.unit || 'manual'),
+    durationText: effect?.durationText || '',
+    kind: effect?.kind,
+    mode: effect?.mode === 'set' ? 'set' : 'add',
+    source: effect?.source || effect?.sourceType || 'LAN',
+    sourceType: effect?.sourceType || 'lan_session',
+    sourceId: String(effect?.sourceId || id),
+    color: effect?.color,
+    secondaryColor: effect?.secondaryColor,
+    visualPriority: effect?.visualPriority,
+    origin: 'lan',
+    visibleToPlayer: effect?.visibleToPlayer !== false,
+  };
+}
+
+function lanCharacterToSheetPatch(character: CharacterProjection) {
+  const activeEffects = character.activeEffects.map(lanDomainEffectToSheetEffect);
+  return {
+    name: character.name,
+    level: character.level || 1,
+    class: character.className || '',
+    race: character.race || '',
+    hp_current: character.hpCurrent,
+    hp_max: character.hpMax,
+    temp_hp: character.tempHp,
+    xp: character.xp,
+    gp: character.coins.gp,
+    sp: character.coins.sp,
+    cp: character.coins.cp,
+    stats: {
+      ...character.baseStats,
+      temp_mods: {},
+    },
+    equipment: normalizeSheetEquipment(character.inventory || character.equipment),
+    active_effects: activeEffects,
+    active_effects_json: JSON.stringify(activeEffects),
+  };
+}
+
+function authoritativeEventToSheetLanEvent(
+  event: LanAuthoritativeEvent | null | undefined,
+  input: { selfKey: string; characterName: string },
+): LanSessionEvent | null {
+  if (!event) return null;
+  const payload = (event.payload || {}) as any;
+  const seq = Math.max(1, Math.floor(Number(event.serverSeq || 0) || Date.now()));
+  const base = {
+    id: event.eventId,
+    clientMsgId: event.commandId || event.eventId,
+    sessionId: event.sessionId,
+    seq,
+    serverSeq: seq,
+    fromKey: input.selfKey,
+    fromName: input.characterName,
+    toKey: 'master',
+    toName: 'Mestre',
+    entityType: event.aggregateType,
+    entityId: event.aggregateId,
+    entityRevision: event.aggregateRevision,
+    ackRequired: true,
+    originClientId: input.selfKey,
+    createdAt: event.createdAt,
+  } satisfies Partial<LanSessionEvent>;
+
+  if (['character_transaction', 'party_transaction', 'spell_transaction', 'reward_transaction'].includes(event.type)) {
+    return ({
+      ...base,
+      type: event.type as any,
+      targetKey: payload.targetKey || input.selfKey,
+      changes: payload.changes,
+      rolls: payload.rolls,
+      characterTransaction: payload,
+      message: payload.message || `${input.characterName} atualizou a ficha.`,
+    } as unknown) as LanSessionEvent;
+  }
+
+  return null;
+}
+
 export default function CharacterSheetScreen() {
   const { id, sessionId, joinUrl } = useLocalSearchParams<{ id?: string; sessionId?: string; joinUrl?: string }>();
   const router = useRouter();
@@ -802,6 +905,21 @@ export default function CharacterSheetScreen() {
     routeJoinUrl,
   });
   const isLanPlayerRuntime = isLanPlayerMode(sheetRuntimeMode);
+  const activeLanSessionId = isLanPlayerRuntime ? (lanInfo?.sessionId || routeSessionId || '') : '';
+  const activeLanPlayerKey = activeLanSessionId && character ? makeLanCharacterKey(activeLanSessionId, character) : '';
+  const lanProjectionState = useLanProjection(activeLanSessionId, activeLanPlayerKey);
+  const lanProjection = lanProjectionState.projection;
+  const lanCharacter = lanProjectionState.character;
+  const isLanMode = Boolean(activeLanSessionId && activeLanPlayerKey);
+  const visibleCharacterPatch = lanCharacter ? lanCharacterToSheetPatch(lanCharacter) : null;
+  const visibleCharacter = visibleCharacterPatch && character ? { ...character, ...visibleCharacterPatch } : character;
+  const visibleInventory = visibleCharacterPatch?.equipment || normalizeSheetEquipment(character?.equipment);
+  const visibleEquipment = visibleInventory;
+  const visibleEffects = visibleCharacterPatch?.active_effects || (
+    Array.isArray(character?.active_effects)
+      ? character.active_effects
+      : safeJsonParse<any[]>(character?.active_effects_json, [])
+  );
   const livePlayerStates = useLanRealtimeStore((state) => state.livePlayerStates);
   const liveLanEvents = useLanRealtimeStore((state) => state.liveEvents);
   const characterRef = useRef<any>(null);
@@ -835,6 +953,52 @@ export default function CharacterSheetScreen() {
   useEffect(() => {
     lanPlayersRef.current = lanPlayers;
   }, [lanPlayers]);
+
+  useEffect(() => {
+    if (!lanCharacter) return;
+    const patch = lanCharacterToSheetPatch(lanCharacter);
+    setCharacter((current: any) => {
+      if (!current) return current;
+      const merged = { ...current, ...patch };
+      characterRef.current = merged;
+      return merged;
+    });
+  }, [lanCharacter]);
+
+  useEffect(() => {
+    if (!LAN_ENGINE_PROJECTION_MODE || !lanProjection || !activeLanPlayerKey) return;
+    const nextPlayers: PublicLanPlayer[] = Object.values(lanProjection.players || {}).map((entry) => ({
+      key: entry.playerKey,
+      playerName: entry.name || 'Jogador',
+      characterName: entry.name || 'Jogador',
+      level: Math.max(1, Math.floor(Number(entry.level || 1) || 1)),
+      hpCurrent: Math.max(0, Math.floor(Number(entry.hpCurrent || 0) || 0)),
+      hpMax: Math.max(0, Math.floor(Number(entry.hpMax || 0) || 0)),
+      tempHp: Math.max(0, Math.floor(Number(entry.tempHp || 0) || 0)),
+      publicEffects: summarizeEffectsForPublicRoster(entry.activeEffects || []),
+      isSelf: entry.playerKey === activeLanPlayerKey,
+      publicSeq: lanProjection.serverSeq,
+      publicRevision: Math.max(
+        lanProjection.versions.players[entry.playerKey] || 0,
+        lanProjection.versions.effects[entry.playerKey] || 0,
+        lanProjection.versions.inventories[entry.playerKey] || 0,
+      ),
+    }));
+    setLanPlayers((current) => {
+      const pick = (player: PublicLanPlayer) => ({
+        key: player.key,
+        hpCurrent: player.hpCurrent,
+        hpMax: player.hpMax,
+        tempHp: player.tempHp,
+        level: player.level,
+        effects: player.publicEffects,
+        isSelf: player.isSelf,
+      });
+      const currentFingerprint = JSON.stringify(current.map(pick));
+      const nextFingerprint = JSON.stringify(nextPlayers.map(pick));
+      return currentFingerprint === nextFingerprint ? current : nextPlayers;
+    });
+  }, [activeLanPlayerKey, lanProjection]);
 
   useEffect(() => {
     if (!publicEffectsModalPlayer) return;
@@ -872,6 +1036,7 @@ export default function CharacterSheetScreen() {
 
 
   useEffect(() => {
+    if (LAN_ENGINE_PROJECTION_MODE) return;
     if (!isLanPlayerRuntime || !character?.id || !lanInfo?.sessionId) return;
     const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
     const liveState = livePlayerStates[`${lanInfo.sessionId}:${selfKey}`];
@@ -3239,6 +3404,14 @@ export default function CharacterSheetScreen() {
     sessionValue: string,
     source: string,
   ) => {
+    if (LAN_ENGINE_PROJECTION_MODE && getLanProjection(sessionValue)) {
+      debugLanFlow('PLAYER_PAYLOAD_INVENTORY_SKIPPED_PROJECTION_SOURCE_CUT6', {
+        sessionId: sessionValue,
+        source,
+        decision: 'projection_is_authoritative',
+      });
+      return;
+    }
     const currentCharacter = characterRef.current;
     if (!currentCharacter?.id || !nextPayload?.state?.players?.length || !sessionValue) return;
 
@@ -3347,6 +3520,15 @@ export default function CharacterSheetScreen() {
     source: string,
     options?: { force?: boolean },
   ) => {
+    if (LAN_ENGINE_PROJECTION_MODE && getLanProjection(sessionValue)) {
+      debugLanFlow('PLAYER_PAYLOAD_STATE_SKIPPED_PROJECTION_SOURCE_CUT6', {
+        sessionId: sessionValue,
+        source,
+        force: Boolean(options?.force),
+        decision: 'projection_is_authoritative',
+      });
+      return;
+    }
     const currentCharacter = characterRef.current;
     if (!currentCharacter?.id || !nextPayload?.state?.players?.length || !sessionValue) return;
 
@@ -3658,6 +3840,23 @@ export default function CharacterSheetScreen() {
 
   const syncLanFromHost = useCallback(async () => {
     if (!lanInfo?.sessionId || !character?.id) return;
+    if (LAN_ENGINE_PROJECTION_MODE && lanInfo.joinUrl && getLanProjection(lanInfo.sessionId)) {
+      debugLanFlow('PLAYER_SYNC_LAN_FROM_HOST_SKIPPED_PROJECTION_SOURCE_CUT6', {
+        sessionId: lanInfo.sessionId,
+        characterId: character.id,
+        decision: 'request_resync_only_projection_authoritative',
+      });
+      const selfKey = makeLanCharacterKey(lanInfo.sessionId, character);
+      await requestLanSessionResync(lanInfo.joinUrl, {
+        sessionId: lanInfo.sessionId,
+        playerKey: selfKey,
+        lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+        knownRevisions: getKnownLanEntityRevisions(lanInfo.sessionId),
+        includeGlobal: true,
+        forceReconnect: true,
+      }).catch(() => false);
+      return;
+    }
     if (sessionTerminatedRef.current === lanInfo.sessionId) {
       traceApp('LAN_JOIN', 'PLAYER_STOP_FOREGROUND_RECOVERY_AFTER_END', {
         screen: 'sheet',
@@ -4393,7 +4592,6 @@ export default function CharacterSheetScreen() {
         });
         return;
       }
-      await syncLanFromHost();
       const selfKey = getSelfLanKey(lanInfo?.sessionId);
       // Foreground apos compartilhar/alternar app deve reamarrar, nao destruir,
       // a conexao. requestLanSessionResync envia hello com playerKey e reconecta
@@ -4498,7 +4696,6 @@ export default function CharacterSheetScreen() {
         characterId: character.id,
         characterName: character.name,
       });
-      void syncLanFromHost().catch(() => undefined);
       setLanReconnectEpoch((current) => current + 1);
       setTimeout(() => {
         if (disposed) return;
@@ -4516,7 +4713,6 @@ export default function CharacterSheetScreen() {
       }, 80);
       setTimeout(() => {
         if (disposed) return;
-        void syncLanFromHost().catch(() => undefined);
         setLanReconnectEpoch((current) => current + 1);
         if (selfKey) {
           void requestLanSessionResync(lanInfo.joinUrl, {
@@ -4976,79 +5172,14 @@ export default function CharacterSheetScreen() {
       }
 
       if (event.type === 'public_status' && event.publicState) {
-        const statusTargetsSelf = event.fromKey === selfKey || event.fromName === character.name;
-        if (statusTargetsSelf && isLanPlayerRuntime) {
-          const lastPatch = lastAuthoritativePlayerPatchRef.current;
-          debugLanFlow('PLAYER_PUBLIC_STATUS_SKIPPED_SELF', {
-            eventId: event.id,
-            fromKey: event.fromKey,
-            fromName: event.fromName,
-            selfKey,
-          });
-          debugLanFlow('PLAYER_PUBLIC_STATUS_IGNORED_STALE', {
-            eventId: event.id,
-            fromKey: event.fromKey,
-            fromName: event.fromName,
-            selfKey,
-            seq: event.seq,
-            serverSeq: event.serverSeq,
-            entityRevision: event.entityRevision,
-            lastPatchSeq: lastPatch.seq,
-            lastPatchRevision: lastPatch.entityRevision,
-            lastPatchAgeMs: lastPatch.appliedAt ? Date.now() - lastPatch.appliedAt : null,
-          });
-          continue;
-        }
-        const incomingPublicSeq = Number(event.serverSeq ?? event.seq ?? event.entityRevision ?? 0) || Date.now();
-        const incomingPublicRevision = Number(event.entityRevision ?? event.serverSeq ?? event.seq ?? 0) || incomingPublicSeq;
-        setLanPlayers((current) => {
-          let matched = false;
-          const next = current.map((player) => {
-            if (!(player.key === event.fromKey || player.characterName === event.fromName)) return player;
-            matched = true;
-            const existingSeq = Number((player as any).publicSeq || (player as any).publicRevision || 0) || 0;
-            if (existingSeq > 0 && incomingPublicSeq > 0 && incomingPublicSeq < existingSeq) {
-              debugLanFlow('PLAYER_PUBLIC_STATUS_STALE_SKIPPED_FOR_BAR', {
-                eventId: event.id,
-                fromKey: event.fromKey,
-                incomingPublicSeq,
-                existingSeq,
-              });
-              return player;
-            }
-            const publicEffects = Array.isArray((event.publicState as any)?.effects)
-              ? (event.publicState as any).effects
-              : player.publicEffects;
-            return {
-              ...player,
-              hpCurrent: event.publicState!.hpCurrent,
-              hpMax: event.publicState!.hpMax,
-              tempHp: event.publicState!.tempHp ?? player.tempHp,
-              level: event.publicState!.level,
-              publicEffects,
-              publicSeq: incomingPublicSeq,
-              publicRevision: incomingPublicRevision,
-            };
-          });
-          if (matched) return next;
-          const key = String(event.fromKey || event.entityId || '').trim();
-          if (!key || key === 'master' || key === 'session') return next;
-          const publicEffects = Array.isArray((event.publicState as any)?.effects) ? (event.publicState as any).effects : [];
-          return [...next, {
-            key,
-            playerName: event.fromName || key,
-            characterName: event.fromName || key,
-            level: Number(event.publicState!.level || 1) || 1,
-            hpCurrent: Number(event.publicState!.hpCurrent || 0) || 0,
-            hpMax: Number(event.publicState!.hpMax || 0) || 0,
-            tempHp: Number(event.publicState!.tempHp || 0) || 0,
-            publicEffects,
-            isSelf: Boolean(selfKey && key === selfKey),
-            publicSeq: incomingPublicSeq,
-            publicRevision: incomingPublicRevision,
-          }];
+        debugLanFlow('PLAYER_PUBLIC_STATUS_IGNORED_VISUAL_ONLY_CUT6', {
+          eventId: event.id,
+          fromKey: event.fromKey,
+          fromName: event.fromName,
+          selfKey,
+          decision: 'public_status_no_gameplay_no_card_source',
         });
-        traceApp('PUBLIC_STATUS_APPLIED', 'PLAYER_PUBLIC_STATUS_APPLIED_TO_BAR', {
+        traceApp('PUBLIC_STATUS_RECEIVED', 'PLAYER_PUBLIC_STATUS_IGNORED_VISUAL_ONLY_CUT6', {
           screen: 'sheet',
           source: 'handleLanEvents',
           sessionId: sessionValue,
@@ -5058,7 +5189,6 @@ export default function CharacterSheetScreen() {
           eventId: event.id,
           eventType: event.type,
           fromKey: event.fromKey,
-          payload: event.publicState,
         });
         continue;
       }
@@ -5632,52 +5762,56 @@ export default function CharacterSheetScreen() {
   // 1. CÁLCULO DE VARIÁVEIS DERIVADAS (STATUS, HP, XP, CA) ANTES DAS FUNÇÕES
   // ==============================================================================
 
+  const renderCharacter = visibleCharacter || character;
+  const renderEquipment = visibleEquipment;
+  const renderEffects = visibleEffects;
+
   const getMod = (val: string) => Math.floor(((parseInt(val) || 10) - 10) / 2);
   
-  const forBase = parseInt(character.stats.FOR) || 10;
-  const forTemp = (parseInt(character.stats.temp_mods?.FOR) || 0) + getLanStatEffectBonus(character, 'FOR');
-  const forEquip = parseInt(character.stats.equip_mods?.FOR) || 0;
+  const forBase = parseInt(renderCharacter.stats.FOR) || 10;
+  const forTemp = (parseInt(renderCharacter.stats.temp_mods?.FOR) || 0) + getLanStatEffectBonus(renderCharacter, 'FOR');
+  const forEquip = parseInt(renderCharacter.stats.equip_mods?.FOR) || 0;
   const forMod = Math.floor(((forBase + forTemp + forEquip) - 10) / 2);
 
-  const desBase = parseInt(character.stats.DES) || 10;
-  const desTemp = (parseInt(character.stats.temp_mods?.DES) || 0) + getLanStatEffectBonus(character, 'DES');
-  const desEquip = parseInt(character.stats.equip_mods?.DES) || 0;
+  const desBase = parseInt(renderCharacter.stats.DES) || 10;
+  const desTemp = (parseInt(renderCharacter.stats.temp_mods?.DES) || 0) + getLanStatEffectBonus(renderCharacter, 'DES');
+  const desEquip = parseInt(renderCharacter.stats.equip_mods?.DES) || 0;
   const desMod = Math.floor(((desBase + desTemp + desEquip) - 10) / 2);
   
-  const conBase = parseInt(character.stats.CON) || 10;
-  const conTemp = (parseInt(character.stats.temp_mods?.CON) || 0) + getLanStatEffectBonus(character, 'CON');
-  const conEquip = parseInt(character.stats.equip_mods?.CON) || 0;
+  const conBase = parseInt(renderCharacter.stats.CON) || 10;
+  const conTemp = (parseInt(renderCharacter.stats.temp_mods?.CON) || 0) + getLanStatEffectBonus(renderCharacter, 'CON');
+  const conEquip = parseInt(renderCharacter.stats.equip_mods?.CON) || 0;
   const conModBase = Math.floor((conBase - 10) / 2);
   const conModTotal = Math.floor(((conBase + conTemp + conEquip) - 10) / 2);
   
-  const profBonusChar = Math.ceil(character.level / 4) + 1; 
+  const profBonusChar = Math.ceil(renderCharacter.level / 4) + 1; 
   
-  const hpBonusFromCon = (conModTotal - conModBase) * (character.level || 1);
-  const displayHpMax = Math.max(1, character.hp_max + hpBonusFromCon);
-  const displayHpCurrent = Math.max(0, character.hp_current + hpBonusFromCon);
+  const hpBonusFromCon = (conModTotal - conModBase) * (renderCharacter.level || 1);
+  const displayHpMax = Math.max(1, renderCharacter.hp_max + hpBonusFromCon);
+  const displayHpCurrent = Math.max(0, renderCharacter.hp_current + hpBonusFromCon);
 
-  const bagWeight = character.equipment.bag.reduce((acc: number, item: any) => acc + (item.weight * item.qty), 0);
-  const slotsWeight = Object.values(character.equipment.slots).reduce((acc: number, item: any) => acc + (item ? item.weight : 0), 0);
-  const totalWeight = bagWeight + slotsWeight + ((character.gp + character.sp + character.cp) * 0.01);
+  const bagWeight = renderEquipment.bag.reduce((acc: number, item: any) => acc + (item.weight * item.qty), 0);
+  const slotsWeight = Object.values(renderEquipment.slots).reduce((acc: number, item: any) => acc + (item ? item.weight : 0), 0);
+  const totalWeight = bagWeight + slotsWeight + ((renderCharacter.gp + renderCharacter.sp + renderCharacter.cp) * 0.01);
   const carryCap = (forBase + forTemp + forEquip) * 7.5;
 
   let baseCa = 10;
   let addDes = true;
-  if (character.equipment.slots.armor) {
-    const props = character.equipment.slots.armor.properties || '';
+  if (renderEquipment.slots.armor) {
+    const props = renderEquipment.slots.armor.properties || '';
     const match = props.match(/CA\s*(\d+)/i);
     if (match) baseCa = parseInt(match[1]);
     if (props.includes('CA 16') || props.includes('Armadura Completa') || props.includes('Pesada')) addDes = false; 
   }
-  const caTemp = parseInt(character.stats.temp_mods?.CA) || 0;
-  const caEquip = parseInt(character.stats.equip_mods?.CA) || 0;
-  const caLanEffect = getLanStatEffectBonus(character, 'CA');
+  const caTemp = parseInt(renderCharacter.stats.temp_mods?.CA) || 0;
+  const caEquip = parseInt(renderCharacter.stats.equip_mods?.CA) || 0;
+  const caLanEffect = getLanStatEffectBonus(renderCharacter, 'CA');
   const armorClassTotal = baseCa + (addDes ? desMod : 0) + caTemp + caEquip + caLanEffect;
   const caSumBuffs = caTemp + caEquip + caLanEffect;
   const caColor = caSumBuffs > 0 ? appColors.success : (caSumBuffs < 0 ? appColors.danger : appColors.textPrimary);
 
   const expectedLevel = expectedLevelByXp;
-  const isPendingLevelUp = expectedLevel > character.level;
+  const isPendingLevelUp = expectedLevel > renderCharacter.level;
   const xpTargetLabel = nextLevelXpRequired == null ? 'MAX' : String(nextLevelXpRequired);
 
   const checkProficiency = (idx: string, group: any[]) => group.includes(idx);
@@ -5685,9 +5819,9 @@ export default function CharacterSheetScreen() {
   const proficientSkills = dbSkills.filter((skill: any) => checkProficiency(skill.id, character.skill_values));
   const getAbilityModifierForAbility = (ability: string) => {
     const normalized = String(ability || '').toUpperCase();
-    const base = parseInt(character.stats?.[normalized]) || 10;
-    const temp = (parseInt(character.stats?.temp_mods?.[normalized]) || 0) + getLanStatEffectBonus(character, normalized);
-    const equip = parseInt(character.stats?.equip_mods?.[normalized]) || 0;
+    const base = parseInt(renderCharacter.stats?.[normalized]) || 10;
+    const temp = (parseInt(renderCharacter.stats?.temp_mods?.[normalized]) || 0) + getLanStatEffectBonus(renderCharacter, normalized);
+    const equip = parseInt(renderCharacter.stats?.equip_mods?.[normalized]) || 0;
     return Math.floor(((base + temp + equip) - 10) / 2);
   };
   const getSaveModifierForAbility = (ability: string) => {
@@ -5698,11 +5832,7 @@ export default function CharacterSheetScreen() {
     return abilityMod + (proficient ? profBonusChar : 0);
   };
   const isLanReadOnly = Boolean(lanInfo?.sessionId && lanSessionStatus && lanSessionStatus !== 'active');
-  const activeVisualEffects = getVisibleEffects(
-    Array.isArray(character.active_effects)
-      ? character.active_effects
-      : safeJsonParse<any[]>(character.active_effects_json, [])
-  );
+  const activeVisualEffects = getVisibleEffects(renderEffects);
   const conditionFrameStyle = getCurrentBreathFrameStyle(activeVisualEffects as any, effectFrame) || null;
   const activeConditionColor = conditionFrameStyle?.borderColor;
 
@@ -5967,6 +6097,7 @@ export default function CharacterSheetScreen() {
     }
   };
 
+  /** @deprecated Corte 4: consumo/equipamento LAN usam dispatchPlayerCommand e evento transacional unico. */
   const notifyInventoryPatch = async (
     equipment: any,
     reason: string,
@@ -6039,6 +6170,7 @@ export default function CharacterSheetScreen() {
     }
   };
 
+  /** @deprecated Corte 4: consumo LAN nao envia numberPatch separado; manter apenas para fluxos ainda legados. */
   const notifyNumberPatch = async (patch: LanSessionEvent['numberPatch'], reason: string) => {
     if (!lanInfo?.sessionId || !character || !patch) return;
     try {
@@ -6136,6 +6268,95 @@ export default function CharacterSheetScreen() {
     }
   };
 
+  const ensureSheetLanProjection = (sessionValue: string, selfKey: string) => {
+    if (!sessionValue || !selfKey || getLanProjection(sessionValue) || !characterRef.current) return;
+    const current = characterRef.current;
+    applyIncomingSnapshot({
+      sessionId: sessionValue,
+      serverSeq: Date.now(),
+      structural: true,
+      state: {
+        status: (lanSessionStatusRef.current || 'active') as any,
+        currentTurn: 1,
+        elapsedMinutes: 0,
+        players: [{
+          id: current.id,
+          sessionId: sessionValue,
+          remoteKey: selfKey,
+          playerName: current.playerName || current.name,
+          characterId: current.id,
+          sourceCharacterId: current.id,
+          characterName: current.name,
+          level: current.level || 1,
+          className: current.class || '',
+          race: current.race || '',
+          hpCurrent: current.hp_current,
+          hpMax: current.hp_max,
+          tempHp: current.temp_hp,
+          xp: current.xp,
+          gp: current.gp,
+          sp: current.sp,
+          cp: current.cp,
+          stats: current.stats || {},
+          equipment: normalizeSheetEquipment(current.equipment),
+          effects: Array.isArray(current.active_effects)
+            ? current.active_effects
+            : safeJsonParse<any[]>(current.active_effects_json, []),
+        }],
+      },
+    });
+  };
+
+  const dispatchSheetLanPlayerCommand = async (
+    command: LanCommand,
+    actionLabel: string,
+  ) => {
+    if (!activeLanSessionId || !activeLanPlayerKey || !characterRef.current) return false;
+    ensureSheetLanProjection(activeLanSessionId, activeLanPlayerKey);
+
+    const result = dispatchPlayerCommand(command);
+    const nextCharacter = result.projection.players[activeLanPlayerKey];
+    if (nextCharacter) {
+      const patch = lanCharacterToSheetPatch(nextCharacter);
+      setCharacter((current: any) => {
+        if (!current) return current;
+        const merged = { ...current, ...patch };
+        characterRef.current = merged;
+        return merged;
+      });
+      void persistFastLocalPatch({
+        hp_current: patch.hp_current,
+        hp_max: patch.hp_max,
+        temp_hp: patch.temp_hp,
+        xp: patch.xp,
+        gp: patch.gp,
+        sp: patch.sp,
+        cp: patch.cp,
+        stats: patch.stats,
+        equipment: patch.equipment,
+        active_effects_json: patch.active_effects_json,
+      }, `lan_player_engine_${command.type}`);
+    }
+
+    const event = authoritativeEventToSheetLanEvent(result.event, {
+      selfKey: activeLanPlayerKey,
+      characterName: characterRef.current.name || 'Jogador',
+    });
+    if (event) {
+      const sent = await sendLanEventWithRetry(event, `dispatchPlayerCommand:${command.type}`);
+      debugLanFlow('PLAYER_ENGINE_COMMAND_DISPATCHED', {
+        sessionId: activeLanSessionId,
+        playerKey: activeLanPlayerKey,
+        commandType: command.type,
+        commandId: command.commandId,
+        eventId: event.id,
+        actionLabel,
+        sent,
+      });
+    }
+    return true;
+  };
+
   const sendCoinSelfPatchRequest = async (
     nextCoins: Partial<Record<'gp' | 'sp' | 'cp', number>>,
     reason: string
@@ -6183,14 +6404,7 @@ export default function CharacterSheetScreen() {
     // setState posterior. Isso impede que timers antigos gravem 9 PO depois que
     // o jogador já clicou para 8/7/6 PO.
     coinOptimisticSeqRef.current = opSeq;
-    pendingSelfCoinStateRef.current = { ...next, totalCopper: nextTotalCopper, at: Date.now(), clientMsgId: eventId, opSeq };
-    setCharacter((prev: any) => {
-      const base = prev || currentCharacter;
-      const merged = { ...base, ...next };
-      characterRef.current = merged;
-      return merged;
-    });
-    void persistFastLocalPatch(next, 'lan_player_self_coin_optimistic', () => coinOptimisticSeqRef.current === opSeq);
+    pendingSelfCoinStateRef.current = null;
 
     if (coinPatchDebounceRef.current?.timer) {
       clearTimeout(coinPatchDebounceRef.current.timer);
@@ -6221,6 +6435,7 @@ export default function CharacterSheetScreen() {
     return true;
   };
 
+  /** @deprecated Corte 4: consumo LAN nao envia effectPatch separado; manter apenas para fluxos ainda legados. */
   const notifyEffectPatch = async (addEffects: any[], reason: string) => {
     if (!lanInfo?.sessionId || !character || addEffects.length === 0) return;
     const selfKey = getSelfLanKey(lanInfo.sessionId);
@@ -6825,12 +7040,33 @@ export default function CharacterSheetScreen() {
         return;
       }
 
+      const selfKey = getSelfLanKey(lanInfo.sessionId);
+      const requestId = makeLanEventId();
+      const itemInstanceId = String(tradeItem.id || tradeItem.inventoryItemId || tradeItem.stackKey || getInventoryStackKey(selectedBagItem.item));
+      const engineSent = await dispatchSheetLanPlayerCommand({
+        type: 'send_item',
+        commandId: requestId,
+        sessionId: lanInfo.sessionId,
+        actorKey: selfKey,
+        fromKey: selfKey,
+        toKey: target.key,
+        itemInstanceId,
+        qty: tradeItem.qty,
+        message: `${character.name} enviou ${tradeItem.qty}x ${tradeItem.name} para ${target.characterName}.`,
+      }, 'send_item');
+      if (engineSent) {
+        pendingOutgoingItemSendsRef.current.add(pendingKey);
+        setTimeout(() => pendingOutgoingItemSendsRef.current.delete(pendingKey), 8000);
+        showCustomAlert('Item enviado', `${target.characterName} recebera ${tradeItem.qty}x ${tradeItem.name}. O inventario sera sincronizado pela projection LAN.`);
+        setTargetPickerMode(null);
+        setSelectedBagItem(null);
+        return;
+      }
+
       try {
         pendingOutgoingItemSendsRef.current.add(pendingKey);
         setTimeout(() => pendingOutgoingItemSendsRef.current.delete(pendingKey), 8000);
 
-        const selfKey = getSelfLanKey(lanInfo.sessionId);
-        const requestId = makeLanEventId();
         const currentEquipment = characterRef.current?.equipment || character.equipment;
         const nextBag = [...(currentEquipment?.bag || [])];
         const itemIndex = nextBag.findIndex((entry: any, index: number) => (
@@ -7438,6 +7674,39 @@ export default function CharacterSheetScreen() {
     return resolutions;
   };
 
+  const getSheetItemInstanceId = (item: any) => String(
+    item?.inventoryItemId ||
+    item?.inventory_item_id ||
+    item?.itemId ||
+    item?.item_id ||
+    item?.id ||
+    getInventoryStackKey(item)
+  );
+
+  const consumeLanItemWithEngine = async (item: any, qty: number) => {
+    if (!activeLanSessionId || !activeLanPlayerKey || !characterRef.current) return false;
+    const hydrated = hydrateInventoryItemForEffects(item);
+    const commandId = `player_consume:${activeLanPlayerKey}:${getSheetItemInstanceId(hydrated)}:${Date.now()}`;
+    try {
+      const applied = await dispatchSheetLanPlayerCommand({
+        type: 'consume_item',
+        commandId,
+        sessionId: activeLanSessionId,
+        actorKey: activeLanPlayerKey,
+        targetKey: activeLanPlayerKey,
+        itemInstanceId: getSheetItemInstanceId(hydrated),
+        qty,
+      }, `consume:${hydrated.name || 'item'}`);
+      if (applied) {
+        showCustomAlert('Item usado', `${hydrated.name || 'Item'} foi usado pela engine LAN.`);
+      }
+      return applied;
+    } catch (error) {
+      showCustomAlert('Consumo bloqueado', error instanceof Error ? error.message : 'Nao foi possivel consumir este item.');
+      return false;
+    }
+  };
+
   const confirmAndApplyStructuredItemEffects = async (
     bagIndex: number,
     item: any,
@@ -7445,11 +7714,16 @@ export default function CharacterSheetScreen() {
     effects: any[],
     chosenAttr?: string,
   ) => {
+    if (isLanMode) {
+      await consumeLanItemWithEngine(item, qty);
+      return;
+    }
     const diceResolutions = await resolveStructuredItemDiceValues(item, qty, effects);
     if (diceResolutions === null) return;
     await applyStructuredItemEffects(bagIndex, item, qty, effects, chosenAttr, diceResolutions);
   };
 
+  /** @deprecated No modo LAN, consumo estruturado sai antes via consume_item na engine. */
   const applyStructuredItemEffects = async (
     bagIndex: number,
     rawItem: any,
@@ -7459,6 +7733,10 @@ export default function CharacterSheetScreen() {
     diceResolutions: Record<string, DiceValueResolution> = {},
   ) => {
     const item = hydrateInventoryItemForEffects(rawItem);
+    if (isLanMode) {
+      await consumeLanItemWithEngine(item, qty);
+      return;
+    }
 
     // v54: consumir/usar item próprio é ação autônoma do jogador.
     // Não vira item_use_request nem pede permissão do mestre; só envia patches vivos
@@ -7716,12 +7994,29 @@ export default function CharacterSheetScreen() {
     });
   };
 
+  /** @deprecated No modo LAN, este handler apenas confirma e despacha consume_item. */
   const processConsumeItem = (bagIndex: number, item: any, qty: number) => {
     if (!ensureLanWritable()) return;
 
     // Itens antigos na mochila podem estar sem effect_json/damage/duration.
     // Antes de consumir, reidrata pelo catálogo sem perder metadados customizados já existentes.
     item = hydrateInventoryItemForEffects(item);
+
+    if (isLanMode) {
+      showCustomAlert(
+        `Consumir ${qty}x ${item.name}`,
+        'Confirmar uso deste item na sessao LAN?',
+        [
+          { text: 'Cancelar', color: '#666' },
+          {
+            text: 'Usar',
+            color: '#00fa9a',
+            onPress: () => void consumeLanItemWithEngine(item, qty),
+          },
+        ]
+      );
+      return;
+    }
 
     const structuredEffects = parseStructuredEffects(item.effect_json);
     if (structuredEffects.length > 0) {
@@ -8127,9 +8422,38 @@ export default function CharacterSheetScreen() {
     return bonuses;
   };
 
+  /** @deprecated No modo LAN, este handler despacha equip_item/unequip_item antes do caminho local. */
   const handleEquipItem = (itemToEquip: any) => {
     if (!ensureLanWritable()) return;
     if (!activeSlot) return;
+    if (isLanMode && activeLanSessionId && activeLanPlayerKey) {
+      const slot = String(activeSlot);
+      const itemInstanceId = itemToEquip ? getSheetItemInstanceId(itemToEquip) : '';
+      void runSheetAction(`engine_equip:${slot}:${itemInstanceId || 'empty'}`, async () => {
+        try {
+          await dispatchSheetLanPlayerCommand(itemToEquip ? {
+            type: 'equip_item',
+            commandId: `player_equip:${activeLanPlayerKey}:${slot}:${itemInstanceId}:${Date.now()}`,
+            sessionId: activeLanSessionId,
+            actorKey: activeLanPlayerKey,
+            targetKey: activeLanPlayerKey,
+            slot,
+            itemInstanceId,
+          } : {
+            type: 'unequip_item',
+            commandId: `player_unequip:${activeLanPlayerKey}:${slot}:${Date.now()}`,
+            sessionId: activeLanSessionId,
+            actorKey: activeLanPlayerKey,
+            targetKey: activeLanPlayerKey,
+            slot,
+          }, itemToEquip ? `equip:${itemToEquip.name || slot}` : `unequip:${slot}`);
+          setSlotModalVisible(false);
+        } catch (error) {
+          showCustomAlert('Acao Bloqueada', error instanceof Error ? error.message : 'Nao foi possivel atualizar este equipamento.');
+        }
+      });
+      return;
+    }
     let equipTx: ReturnType<typeof equipLanInventoryItemAtomically>;
     try {
       equipTx = equipLanInventoryItemAtomically({
@@ -8524,7 +8848,7 @@ export default function CharacterSheetScreen() {
   };
 
   const renderEquipSlot = (slotKey: keyof typeof DEFAULT_SLOTS, label: string, icon: string) => {
-    const item = character.equipment.slots[slotKey];
+    const item = renderEquipment.slots[slotKey];
     const dbItem = item ? dbItemsCatalog.find(cat => cat.name === item.name) : null;
     
     const itemDamage = item?.damage || dbItem?.damage;
@@ -8648,8 +8972,8 @@ export default function CharacterSheetScreen() {
             }}>
               <Text style={styles.hpTextStyle}>
                 {displayHpCurrent} <Text style={styles.hpMaxTextStyle}>/ {displayHpMax}</Text>
-                {Number(character.temp_hp || 0) > 0 && (
-                  <Text style={{ color: appColors.success, fontWeight: '900' }}> +{Number(character.temp_hp || 0)}</Text>
+                {Number(renderCharacter.temp_hp || 0) > 0 && (
+                  <Text style={{ color: appColors.success, fontWeight: '900' }}> +{Number(renderCharacter.temp_hp || 0)}</Text>
                 )}
               </Text>
               <Text style={styles.combatLabel}>PONTOS DE VIDA {hpBonusFromCon !== 0 && `(CON ${hpBonusFromCon > 0 ? '+' : ''}${hpBonusFromCon})`}</Text>
@@ -8765,9 +9089,9 @@ export default function CharacterSheetScreen() {
             </View>
 
             <Text style={styles.sectionTitle}>AÇÕES DE ATAQUE</Text>
-            {renderAttackCard(character.equipment.slots.mainHand, 'mainHand', 'Mão Principal')}
-            {renderAttackCard(character.equipment.slots.offHand, 'offHand', 'Mão Secundária')}
-            {renderAttackCard(character.equipment.slots.ranged, 'ranged', 'Arma à Distância')}
+            {renderAttackCard(renderEquipment.slots.mainHand, 'mainHand', 'Mão Principal')}
+            {renderAttackCard(renderEquipment.slots.offHand, 'offHand', 'Mão Secundária')}
+            {renderAttackCard(renderEquipment.slots.ranged, 'ranged', 'Arma à Distância')}
 
             <View style={styles.headerSpaceBetween}>
               <Text style={styles.sectionTitle}>MOEDAS</Text>
@@ -8797,7 +9121,7 @@ export default function CharacterSheetScreen() {
             </View>
             
             <View style={styles.cardBlock}>
-              {character.equipment.bag.length > 0 ? character.equipment.bag.map((item: any, i: number) => {
+              {renderEquipment.bag.length > 0 ? renderEquipment.bag.map((item: any, i: number) => {
                   const p = (item.properties || '').toLowerCase();
                   const d = (item.damage || '').toLowerCase();
                   const dt = (item.damage_type || '').toLowerCase();

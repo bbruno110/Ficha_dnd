@@ -4,9 +4,11 @@ import type {
   LanAdvanceUnit,
   LanSessionPlayerState,
   LanSessionState,
-} from '@/services/lanSession';
-import type { LanEffectPatch } from '@/services/effects';
-import { debugLanFlow } from '@/services/lanRuntimeMode';
+} from '../services/lanSession';
+import type { LanEffectPatch } from '../services/effects';
+import { getLanProjection, registerLanProjectionSink } from '../services/lan/engine/LanEngineBridge';
+import { debugLanFlow } from '../services/lanRuntimeMode';
+import type { SessionProjection } from '../services/lan/engine/LanTypes';
 
 type RuntimeSource = 'runtime' | 'event' | 'sqlite' | 'snapshot' | 'public_status';
 
@@ -25,7 +27,9 @@ type RuntimeSession = {
 
 type RuntimeStore = {
   sessions: Record<string, RuntimeSession>;
+  projections: Record<string, SessionProjection | null>;
   setSessionState: (sessionId: string, state: LanSessionState | null) => void;
+  setProjection: (sessionId: string, projection: SessionProjection | null) => void;
   resetSession: (sessionId?: string) => void;
 };
 
@@ -36,6 +40,14 @@ const LIVE_FIELDS = ['hpCurrent', 'hpMax', 'tempHp', 'xp', 'gp', 'sp', 'cp', 'ef
 const PLAYER_REVISION_TIMESTAMP_THRESHOLD = 1000000;
 const REMOVED_RUNTIME_EFFECT_TOMBSTONE_TTL_MS = 120000;
 const removedRuntimeEffectIds = new Map<string, number>();
+
+function hasAuthoritativeProjection(sessionId: string) {
+  return Boolean(getLanProjection(sessionId));
+}
+
+function getCurrentRuntimeState(sessionId: string) {
+  return useLanSessionRuntimeStore.getState().sessions[sessionId]?.state || null;
+}
 
 function pruneRemovedRuntimeEffectIds() {
   const now = Date.now();
@@ -88,6 +100,7 @@ function maxCleanPlayerRevision(...values: unknown[]): number {
 
 export const useLanSessionRuntimeStore = create<RuntimeStore>((set) => ({
   sessions: {},
+  projections: {},
 
   setSessionState: (sessionId, state) => set((current) => ({
     sessions: {
@@ -99,13 +112,32 @@ export const useLanSessionRuntimeStore = create<RuntimeStore>((set) => ({
     },
   })),
 
+  setProjection: (sessionId, projection) => set((current) => ({
+    projections: {
+      ...current.projections,
+      [sessionId]: projection,
+    },
+  })),
+
   resetSession: (sessionId) => set((current) => {
-    if (!sessionId) return { sessions: {} };
+    if (!sessionId) return { sessions: {}, projections: {} };
     const next = { ...current.sessions };
+    const nextProjections = { ...current.projections };
     delete next[sessionId];
-    return { sessions: next };
+    delete nextProjections[sessionId];
+    return { sessions: next, projections: nextProjections };
   }),
 }));
+
+export function setLanRuntimeProjection(sessionId: string, projection: SessionProjection | null) {
+  useLanSessionRuntimeStore.getState().setProjection(sessionId, projection);
+}
+
+export function getLanRuntimeProjection(sessionId: string) {
+  return useLanSessionRuntimeStore.getState().projections[sessionId] || null;
+}
+
+registerLanProjectionSink(setLanRuntimeProjection);
 
 
 
@@ -187,11 +219,22 @@ function buildRuntimeStatsWithDerivedEquipMods(stats: Record<string, unknown>, e
   return nextStats;
 }
 
+/** @deprecated Fase 3: bootstrap vivo deve entrar por LanGameEngine.applySnapshot. */
 export function replaceLanRuntimeStateFromBootstrap(sessionId: string, state: LanSessionState | null) {
+  if (hasAuthoritativeProjection(sessionId)) {
+    const current = getCurrentRuntimeState(sessionId);
+    debugLanFlow('LAN_RUNTIME_BOOTSTRAP_SKIPPED_PROJECTION_SOURCE_CUT6', {
+      sessionId,
+      playerCount: current?.players?.length || 0,
+      decision: 'bootstrap_cache_cannot_override_projection',
+    });
+    return current;
+  }
   useLanSessionRuntimeStore.getState().setSessionState(sessionId, state);
   return state;
 }
 
+/** @deprecated Fase 3: merge de gameplay/snapshot deve ser centralizado na engine. */
 export function mergeSessionStatePreservingLiveFields(
   currentState: LanSessionState | null | undefined,
   incomingState: LanSessionState | null | undefined,
@@ -199,11 +242,21 @@ export function mergeSessionStatePreservingLiveFields(
   source: RuntimeSource = 'sqlite',
 ) {
   if (!incomingState) return currentState || null;
+  if (hasAuthoritativeProjection(sessionId)) {
+    debugLanFlow('LAN_RUNTIME_MERGE_SKIPPED_PROJECTION_SOURCE_CUT6', {
+      sessionId,
+      source,
+      currentPlayerCount: currentState?.players?.length || 0,
+      incomingPlayerCount: incomingState.players?.length || 0,
+      decision: 'sqlite_snapshot_cache_cannot_merge_gameplay',
+    });
+    return currentState || incomingState;
+  }
   if (!currentState) return replaceLanRuntimeStateFromBootstrap(sessionId, incomingState);
 
   const runtime = getRuntimeSession(sessionId);
   let preservedLiveField = false;
-  const currentByKey = new Map(currentState.players.map((player) => [getPlayerKey(sessionId, player), player]));
+  const currentByKey = new Map<string, LanSessionPlayerState>(currentState.players.map((player) => [getPlayerKey(sessionId, player), player]));
   const incomingKeys = new Set<string>();
   const nextPlayers: LanSessionPlayerState[] = [];
 
@@ -290,6 +343,7 @@ function areLanSessionStatesEqual(left: LanSessionState | null | undefined, righ
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+/** @deprecated Fase 3: alteracoes de HP/XP/moedas devem usar dispatchMasterCommand/applyAuthoritativeEvent. */
 export function applyHostNumberPatchRuntime(
   sessionId: string,
   currentState: LanSessionState | null | undefined,
@@ -297,6 +351,16 @@ export function applyHostNumberPatchRuntime(
   patch: NumberPatch,
   source: RuntimeSource = 'runtime',
 ) {
+  if (hasAuthoritativeProjection(sessionId)) {
+    debugLanFlow('LAN_RUNTIME_NUMBER_PATCH_SKIPPED_PROJECTION_SOURCE_CUT6', {
+      sessionId,
+      playerId,
+      patchKeys: Object.keys(patch || {}),
+      source,
+      decision: 'number_gameplay_goes_through_engine_projection',
+    });
+    return null;
+  }
   if (!currentState) return null;
   const player = currentState.players.find((entry) => entry.id === playerId);
   if (!player) return null;
@@ -325,6 +389,7 @@ export function applyHostNumberPatchRuntime(
   return { state: nextState, player: updatedPlayer, patch: cleanPatch, revision };
 }
 
+/** @deprecated Fase 3: deltas numericos devem virar comandos da engine. */
 export function applyHostNumberDeltaRuntime(
   sessionId: string,
   currentState: LanSessionState | null | undefined,
@@ -344,6 +409,7 @@ export function applyHostNumberDeltaRuntime(
   return applyHostNumberPatchRuntime(sessionId, currentState, playerId, { [field]: nextValue }, 'runtime');
 }
 
+/** @deprecated Fase 3: efeitos devem ser aplicados/removidos pela engine. */
 export function applyHostEffectPatchRuntime(
   sessionId: string,
   currentState: LanSessionState | null | undefined,
@@ -351,11 +417,20 @@ export function applyHostEffectPatchRuntime(
   patch: LanEffectPatch,
   source: RuntimeSource = 'runtime',
 ) {
+  if (hasAuthoritativeProjection(sessionId)) {
+    debugLanFlow('LAN_RUNTIME_EFFECT_PATCH_SKIPPED_PROJECTION_SOURCE_CUT6', {
+      sessionId,
+      targetKey,
+      source,
+      decision: 'effect_gameplay_goes_through_engine_projection',
+    });
+    return null;
+  }
   if (!currentState) return null;
   const player = currentState.players.find((entry) => entry.remoteKey === targetKey || entry.characterName === targetKey);
   if (!player) return null;
 
-  const removeSet = new Set((patch.remove || []).map(String));
+  const removeSet = new Set<string>((patch.remove || []).map(String));
   if (removeSet.size > 0) rememberRemovedRuntimeEffectIds(sessionId, targetKey, Array.from(removeSet));
   const byId = new Map<string, any>();
   if (patch.replace === true) {
@@ -409,6 +484,7 @@ export function applyHostEffectPatchRuntime(
 }
 
 
+/** @deprecated Fase 3: inventario/equipamento devem passar por comandos/eventos da engine. */
 export function applyHostInventoryPatchRuntime(
   sessionId: string,
   currentState: LanSessionState | null | undefined,
@@ -417,6 +493,15 @@ export function applyHostInventoryPatchRuntime(
   statsPatch?: Record<string, unknown>,
   source: RuntimeSource = 'runtime',
 ) {
+  if (hasAuthoritativeProjection(sessionId)) {
+    debugLanFlow('LAN_RUNTIME_INVENTORY_PATCH_SKIPPED_PROJECTION_SOURCE_CUT6', {
+      sessionId,
+      targetKey,
+      source,
+      decision: 'inventory_equipment_gameplay_goes_through_engine_projection',
+    });
+    return null;
+  }
   if (!currentState || !targetKey) return null;
   const player = currentState.players.find((entry) => (
     entry.remoteKey === targetKey ||
@@ -465,11 +550,20 @@ export function applyHostInventoryPatchRuntime(
   return { state: nextState, player: updatedPlayer, revision };
 }
 
+/** @deprecated Fase 3: passagem de tempo deve usar advance_turn na engine. */
 export function applyHostTurnRuntime(
   sessionId: string,
   currentState: LanSessionState | null | undefined,
   unit: LanAdvanceUnit,
 ) {
+  if (hasAuthoritativeProjection(sessionId)) {
+    debugLanFlow('LAN_RUNTIME_TURN_PATCH_SKIPPED_PROJECTION_SOURCE_CUT6', {
+      sessionId,
+      unit,
+      decision: 'turn_gameplay_goes_through_engine_projection',
+    });
+    return null;
+  }
   if (!currentState) return null;
 
   const minuteDelta = unit === 'minute' ? 1 : unit === 'hour' || unit === 'shortRest' ? 60 : unit === 'longRest' ? 480 : 0;
@@ -495,6 +589,7 @@ export function applyHostTurnRuntime(
   return { state: nextState, revision: sessionRevision };
 }
 
+/** @deprecated Fase 3: remocao de jogador deve virar evento autoritativo da engine. */
 export function removeHostPlayerRuntime(
   sessionId: string,
   currentState: LanSessionState | null | undefined,

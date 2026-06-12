@@ -1,7 +1,11 @@
-import type { LanEventApplyDecision } from '@/stores/lanRealtimeStore';
+import type { LanEventApplyDecision } from '../../stores/lanRealtimeStore';
 
 import type { LanSessionEvent } from '../lanSession';
 
+export const LAN_ENGINE_PROJECTION_MODE = true;
+
+// Corte 6: public_status fica fora dos eventos vivos. Ele pode existir no histórico/visual,
+// mas nunca participa de roteamento, resync, ACK de gameplay ou aplicação na projection/ficha.
 const LIVE_EVENT_TYPES = new Set<LanSessionEvent['type']>([
   'action_result',
   'skill_result',
@@ -30,7 +34,12 @@ const LIVE_EVENT_TYPES = new Set<LanSessionEvent['type']>([
   'spell_effect',
   'effect_expired',
   'pending_save_patch',
-  'public_status',
+  'character_transaction',
+  'party_transaction',
+  'spell_transaction',
+  'reward_transaction',
+  'resource_review',
+  'resource_request',
 ]);
 
 type PlayerRoutingInput = {
@@ -60,7 +69,7 @@ export function isLanSessionGlobalEvent(event: LanSessionEvent) {
   ) return true;
   if (event.toKey === 'all' || event.toKey === 'party' || event.toKey === 'session') return true;
   if (event.entityType === 'session') return true;
-  if (event.type === 'effect_catalog_patch' || event.type === 'public_status') return true;
+  if (event.type === 'effect_catalog_patch') return true;
   if (event.type === 'player_joined' && (event.toKey === 'session' || event.toKey === 'party' || event.toKey === 'all')) return true;
   return false;
 }

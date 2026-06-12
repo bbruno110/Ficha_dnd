@@ -2,6 +2,11 @@ import * as Network from 'expo-network';
 import { NativeModules } from 'react-native';
 
 import { traceApp, traceError, traceFunctionCall, traceFunctionReturn, traceSocket } from './debug/appTrace';
+import {
+  applyIncomingLegacyLanEvent,
+  applyIncomingSnapshot,
+} from './lan/engine/LanEngineBridge';
+import { legacyPayloadToLanSnapshot } from './lan/engine/LanSnapshotAdapter';
 import { shouldPlayerProcessLanEvent } from './lan/lanClientEngine';
 import { getLanEventEntityId, getLanEventEntityType } from './lan/lanEntityQueue';
 import {
@@ -110,14 +115,17 @@ function shouldReplayCriticalClientEvent(event?: LanSessionEvent | null) {
     event.type === 'inventory_patch' ||
     event.type === 'trade_result' ||
     event.type === 'send_item_result' ||
-    event.type === 'public_status' ||
     event.type === 'player_patch' ||
     event.type === 'effect_patch' ||
     event.type === 'pending_save_patch' ||
     event.type === 'player_progression_patch' ||
     event.type === 'session_patch' ||
     event.type === 'session_ended' ||
-    event.type === 'player_kicked'
+    event.type === 'player_kicked' ||
+    event.type === 'character_transaction' ||
+    event.type === 'party_transaction' ||
+    event.type === 'spell_transaction' ||
+    event.type === 'reward_transaction'
   );
 }
 
@@ -138,6 +146,22 @@ function scheduleCriticalClientEventReplay(event: LanSessionEvent, envelopeType?
       notifyClientUpdates({ reason: 'critical_event_replay', event, envelopeType });
     }, delayMs);
   });
+}
+
+function applyCommittedTransportEventToEngine(event: LanSessionEvent) {
+  if (!event?.id || event.type === 'public_status') return;
+  applyIncomingLegacyLanEvent(event);
+}
+
+function applyTransportPayloadSnapshot(
+  payload: LanSessionPayload,
+  options?: {
+    source?: 'session_snapshot' | 'payload_update' | 'bootstrap' | 'resync';
+    structural?: boolean;
+    snapshotSeq?: number;
+  },
+) {
+  applyIncomingSnapshot(legacyPayloadToLanSnapshot(payload, options));
 }
 
 let clientPayloadWaiters = new Set<ClientPayloadWaiter>();
@@ -187,6 +211,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
     hostUrl
   ) {
     hostPayload = payload;
+    applyTransportPayloadSnapshot(payload, { source: 'bootstrap', structural: true });
     try {
       const hostIp = await getLocalIpAddress({ allowHotspotFallback: true });
       hostUrl = `tcp://${hostIp}:${LAN_TCP_PORT}/${encodeURIComponent(payload.session.id)}`;
@@ -215,6 +240,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
   await stopLanTcpHost();
 
   hostPayload = payload;
+  applyTransportPayloadSnapshot(payload, { source: 'bootstrap', structural: true });
   hostJoinedRows = pendingJoinedRows;
   hostEvents = pendingEvents;
   hostKickedJoinKeys = pendingKickedJoinKeys;
@@ -536,6 +562,7 @@ export async function startLanTcpHost(payload: LanSessionPayload) {
         const event = normalizeWireEvent(message.event);
         bindHostConnection(socket, { playerKey: event.fromKey, clientId: (message.event as any)?.clientId });
         upsertByKey(hostEvents, event, 'id');
+        applyCommittedTransportEventToEngine(event);
         broadcastEnvelope({ type: 'event_commit', event });
         notifyHostUpdates({ reason: 'event_commit', event, envelopeType: message.type });
       }
@@ -634,6 +661,7 @@ export async function stopLanTcpHost() {
 export function updateLanTcpHostPayload(payload: LanSessionPayload, options?: { broadcast?: boolean }) {
   if (!hostServer || hostPayload?.session.id !== payload.session.id) return false;
   hostPayload = payload;
+  applyTransportPayloadSnapshot(payload, { source: 'payload_update', structural: true });
   if (options?.broadcast !== false) {
     broadcastHostPayload();
   }
@@ -1138,7 +1166,15 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       }
     };
 
-    const applyPayloadUpdate = (payload: LanSessionPayload, updateOptions?: { notify?: boolean }) => {
+    const applyPayloadUpdate = (
+      payload: LanSessionPayload,
+      updateOptions?: {
+        notify?: boolean;
+        source?: 'session_snapshot' | 'payload_update' | 'bootstrap' | 'resync';
+        structural?: boolean;
+        snapshotSeq?: number;
+      },
+    ) => {
       if (target.sessionId && payload.session.id !== target.sessionId) {
         traceApp('PAYLOAD_IGNORED', 'PAYLOAD_IGNORED_SESSION_MISMATCH', {
           source: 'lanTcpTransport.applyPayloadUpdate',
@@ -1153,11 +1189,16 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       clientSocket = socket;
       mergeClientPayloadEvents(payload, target.sessionId);
       resolveClientPayloadWaiters(payload);
+      applyTransportPayloadSnapshot(payload, {
+        source: updateOptions?.source || 'payload_update',
+        structural: updateOptions?.structural,
+        snapshotSeq: updateOptions?.snapshotSeq,
+      });
       const nextStatus = String(payload.state?.status || 'active');
       clientLastPayloadStatus = nextStatus;
-      if (updateOptions?.notify !== false) {
-        notifyClientUpdates({ reason: 'payload_update', payload });
-      }
+      // Fase 3 / Corte 2: payload/snapshot recebido e cache estrutural.
+      // Gameplay vivo entra por applyIncomingSnapshot; nao notifique a ficha como
+      // reconciliacao autoritativa cega.
       // Snapshot/payload nao deve atualizar HP/efeitos/inventario, mas status de
       // ciclo de vida e critico. Se o evento direto perdeu, cria evento sintetico
       // estavel para a UI entrar em pausa/encerrar sem esperar polling.
@@ -1174,7 +1215,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         sessionId: payload.session.id,
         payload: summarizeEnvelopePayload({ type: 'payload_update', payload }, undefined, payload),
         decision: 'structural_cache_only',
-        reason: updateOptions?.notify === false ? 'live_fields_not_notified' : 'client_payload_refreshed',
+        reason: 'engine_snapshot_applied_structural_cache',
       });
       return true;
     };
@@ -1200,7 +1241,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         timeout = null;
       }
 
-      applyPayloadUpdate(payload, { notify: false });
+      applyPayloadUpdate(payload, { notify: false, source: 'bootstrap', structural: true });
       startClientHeartbeat(socket, target.sessionId);
       resolve(payload);
     };
@@ -1275,12 +1316,23 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
 
       if (message.type === 'session_snapshot' || message.type === 'payload_update') {
         if (!settled) {
+          applyPayloadUpdate(message.payload, {
+            notify: false,
+            source: message.type,
+            structural: message.structural ?? true,
+            snapshotSeq: message.snapshotSeq,
+          });
           resolveOnce(message.payload);
         } else {
-          // v84: payload/snapshot também notifica a ficha como reconciliação autoritativa.
-          // Eventos vivos continuam sendo o caminho rápido; o payload só corrige roster/inventário
-          // quando o socket recebeu o frame, mas o listener da tela perdeu a janela durante rebind/reconnect.
-          applyPayloadUpdate(message.payload, { notify: true });
+          // Fase 3 / Corte 2: payload/snapshot ao vivo entra na engine como
+          // snapshot estrutural; nao notifique a ficha como reconciliacao
+          // autoritativa cega.
+          applyPayloadUpdate(message.payload, {
+            notify: false,
+            source: message.type,
+            structural: message.structural,
+            snapshotSeq: message.snapshotSeq,
+          });
         }
         return;
       }
@@ -1294,6 +1346,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
         for (const event of orderedEvents) {
           if (target.sessionId && event.sessionId !== target.sessionId) continue;
           const normalizedEvent = normalizeWireEvent(event);
+          applyCommittedTransportEventToEngine(normalizedEvent);
           const alreadyKnown = Boolean(normalizedEvent.id && clientEvents.some((entry) => entry.id === normalizedEvent.id));
           upsertByKey(clientEvents, normalizedEvent, 'id');
           if (clientEvents.length > LAN_NETWORK_LIMITS.socketQueueMaxPending * 2) {
@@ -1319,7 +1372,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
           });
         }
         if (message.payload) {
-          applyPayloadUpdate(message.payload, { notify: true });
+          applyPayloadUpdate(message.payload, { notify: false, source: 'resync', structural: true });
         }
         return;
       }
@@ -1327,6 +1380,7 @@ async function connectLanTcpClient(url: string, options?: { requestFresh?: boole
       if (message.type === 'event' || message.type === 'event_commit') {
         if (target.sessionId && message.event.sessionId !== target.sessionId) return;
         const normalizedEvent = normalizeWireEvent(message.event);
+        applyCommittedTransportEventToEngine(normalizedEvent);
         const alreadyKnown = Boolean(normalizedEvent.id && clientEvents.some((entry) => entry.id === normalizedEvent.id));
         upsertByKey(clientEvents, normalizedEvent, 'id');
         if (clientEvents.length > LAN_NETWORK_LIMITS.socketQueueMaxPending * 2) {
@@ -1448,7 +1502,8 @@ function makeSyntheticSessionStatusEvent(payload: LanSessionPayload, status: str
       toName: 'Todos',
       entityType: 'session',
       entityId: sessionId,
-      entityRevision: seq,
+      // Evento sintetico legado: seq/serverSeq sao ordem de transporte,
+      // nao revisao de dominio da engine.
       seq,
       serverSeq: seq,
       ackRequired: true,
@@ -1662,7 +1717,6 @@ function getEnvelopePriority(message: TcpEnvelope) {
     if (eventType === 'player_patch' || eventType === 'effect_patch' || eventType === 'inventory_patch' || eventType === 'pending_save_patch') return 97;
     if (eventType === 'player_progression_patch') return 96;
     if (eventType === 'send_item_result' || eventType === 'trade_result' || eventType === 'send_item_request' || String(eventType || '').startsWith('trade_')) return 95;
-    if (eventType === 'public_status') return 92;
     return 40;
   }
   if (message.type === 'resync_events') return 30;
@@ -1682,8 +1736,7 @@ function shouldRenotifyKnownClientEvent(event: LanSessionEvent) {
     eventType === 'session_ended' ||
     eventType === 'player_kicked' ||
     eventType === 'send_item_result' ||
-    eventType === 'trade_result' ||
-    eventType === 'public_status'
+    eventType === 'trade_result'
   );
 }
 
@@ -2042,7 +2095,6 @@ function makePublicPlayerJoinedEvent(base: LanSessionEvent, payload: LanSessionP
     toName: 'Sessao',
     entityType: 'session',
     entityId: base.sessionId,
-    entityRevision: seq,
     ackRequired: false,
     publicState: summarizePlayerForPublicStatus(player || {}),
     message: base.message || `${base.fromName} entrou na sessao.`,
@@ -2113,9 +2165,9 @@ function normalizeWireEvent(event: LanSessionEvent): LanSessionEvent {
     : Number.isFinite(Number(event.serverSeq)) && Number(event.serverSeq) > 0
       ? Number(event.serverSeq)
       : Math.max(1, getEventTimestamp(event));
-  const entityRevision = Number.isFinite(Number((event as any).entityRevision)) && Number((event as any).entityRevision) > 0
+  const legacyEntityRevision = Number.isFinite(Number((event as any).entityRevision)) && Number((event as any).entityRevision) > 0
     ? Number((event as any).entityRevision)
-    : seq;
+    : undefined;
 
   return {
     ...event,
@@ -2123,7 +2175,9 @@ function normalizeWireEvent(event: LanSessionEvent): LanSessionEvent {
     serverSeq: event.serverSeq ?? seq,
     entityType,
     entityId,
-    entityRevision,
+    // Compatibilidade de envelope antigo. A revisao de dominio real e calculada
+    // no LanLegacyAdapter; nunca use seq/Date.now daqui como aggregateRevision.
+    entityRevision: legacyEntityRevision,
     ackRequired: (event as any).ackRequired ?? shouldWireEventRequireAck(event),
   } as LanSessionEvent;
 }

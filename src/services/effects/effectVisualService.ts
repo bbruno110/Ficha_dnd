@@ -1,4 +1,9 @@
 import type { LanActiveEffectSnapshot } from './effectTypes';
+import {
+  isConditionVisualEffect,
+  isPermanentStatAdjustment,
+  isVisibleTemporaryEffect,
+} from '../lan/engine/LanEffectRules';
 
 const FALLBACK_COLOR = '#888888';
 const BREATH_MS_PER_EFFECT = 2000; // 2s por efeito visual.
@@ -6,15 +11,16 @@ const BREATH_TICK_MS = 50;
 
 function isEffectStillActive(effect: LanActiveEffectSnapshot | any) {
   if (!effect || effect.active === false) return false;
+  if (isPermanentStatAdjustment(effect)) return false;
   const unit = String(effect.unit || '').toLowerCase();
-  if (effect.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return true;
+  if (effect.isPermanent === true || unit === 'permanent' || unit === 'manual' || unit === 'while_equipped' || unit === 'concentration') return false;
   return Number(effect.remaining || 0) > 0;
 }
 
 export function getVisibleEffects(effects: LanActiveEffectSnapshot[] | unknown) {
   if (!Array.isArray(effects)) return [];
   return effects
-    .filter((effect) => effect && effect.visibleToPlayer !== false && effect.status !== 'permanent_item_effect' && isEffectStillActive(effect))
+    .filter((effect) => effect && effect.status !== 'permanent_item_effect' && isVisibleTemporaryEffect(effect) && isEffectStillActive(effect))
     .sort((a, b) => (Number(b.visualPriority || 0) - Number(a.visualPriority || 0)) || String(a.name).localeCompare(String(b.name)));
 }
 
@@ -24,6 +30,7 @@ export function getPrimaryEffect(effects: LanActiveEffectSnapshot[] | unknown) {
 
 export function getBorderColorsForPlayer(effects: LanActiveEffectSnapshot[] | unknown, limit = 4) {
   const colors = getVisibleEffects(effects)
+    .filter((effect) => isConditionVisualEffect(effect))
     .map((effect) => effect.color || effect.secondaryColor)
     .filter((color): color is string => Boolean(color));
   return Array.from(new Set(colors)).slice(0, limit);

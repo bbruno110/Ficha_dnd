@@ -12,7 +12,8 @@ import {
   type LanSessionEvent,
 } from '@/services/lanSession';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
-import { shouldPlayerProcessLanEvent } from '@/services/lan/lanClientEngine';
+import { LAN_ENGINE_PROJECTION_MODE, shouldPlayerProcessLanEvent } from '@/services/lan/lanClientEngine';
+import { applyIncomingLegacyLanEvent } from '@/services/lan/engine/LanEngineBridge';
 import { LAN_NETWORK_LIMITS } from '@/services/lan/lanNetworkPolicy';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
 
@@ -786,6 +787,32 @@ export function LanActiveRuntimeSync() {
 
       seenEventIdsRef.current.add(scopedKey);
       lastSeqRef.current = Math.max(lastSeqRef.current, getEventSeq(event));
+
+      if (LAN_ENGINE_PROJECTION_MODE) {
+        const eventType = String(event.type || '');
+        const projectionOnly = ['player_patch', 'effect_patch', 'inventory_patch', 'session_patch', 'session_ended'].includes(eventType);
+        if (eventType !== 'public_status') {
+          applyIncomingLegacyLanEvent(event);
+        }
+        if (!projectionOnly && eventType !== 'public_status') {
+          useLanRealtimeStore.getState().publishLiveEvent(event);
+        }
+        useLanRealtimeStore.getState().markEventApplied(event);
+        debugLanFlow('LAN_ACTIVE_RUNTIME_EVENT_FORWARDED_TO_PROJECTION_ONLY_CUT6', {
+          sessionId: binding.sessionId,
+          characterId: binding.characterId,
+          playerKey: binding.remoteKey,
+          source,
+          eventId: event.id,
+          type: event.type,
+          seq: event.seq,
+          entityRevision: event.entityRevision,
+          lastAppliedSeq: useLanRealtimeStore.getState().lastAppliedSeq,
+          decision: projectionOnly ? 'projection_only_no_live_event_store' : 'visual_event_published',
+        });
+        void ackActiveRuntimeEvent(binding, event);
+        return;
+      }
 
       // v99/v105: single writer. O runtime global publica estado vivo e tambem
       // publica eventos de UI (save request, pause, troca, item) para a ficha,

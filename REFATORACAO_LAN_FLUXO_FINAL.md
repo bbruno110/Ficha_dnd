@@ -1,138 +1,276 @@
-# Refatoracao LAN - Fluxo Final
+# Refatoração LAN - Fluxo Final
 
-## 1. Problemas encontrados
+## 1. Resumo
 
-- Eventos de dominios diferentes ainda podiam compartilhar o mesmo `revisionSeq` visual do jogador.
-- Consumo textual de item removia quantidade antes de concluir cura/efeito, quebrando atomicidade.
-- Equipamento ainda mantinha um fluxo incremental legado antes de recalcular o estado final.
-- Snapshot/cache podia competir com campos vivos quando o runtime nao carregava metadados por dominio.
-- O parser de dados nao resolvia modificadores de atributo como `1d6+CON`.
+A refatoração LAN consolidou o estado vivo multiplayer na engine/projection. A projection passa a ser a fonte primária para HP, HP máximo, PV temporário, XP, moedas, inventário, equipamento, CA, modificadores, efeitos, condições, turno, status da sessão, sessão encerrada, testes pendentes, transações de item e recompensas.
 
-## 2. Causas principais
+O estado antigo vindo de SQLite, snapshot, payload, reload, public_status, stores e hooks permanece apenas como bootstrap, cache, compatibilidade visual ou histórico. Quando existe projection viva, esses caminhos não devem sobrescrever gameplay.
 
-- Regras de inventario, equipamento, efeito e sincronismo estavam espalhadas nas telas.
-- SQLite/snapshot ainda apareciam como mecanismos de recuperacao defensiva perto de fluxo vivo.
-- A revisao de jogador era usada como atalho para efeito/inventario em partes do runtime.
-- Consumo de item era dividido em passos independentes.
+## 2. Causa raiz dos bugs
+
+A causa raiz era a concorrência entre várias fontes tentando corrigir a ficha ao mesmo tempo: snapshot antigo, SQLite, public_status, callbacks locais de hook, stores runtime, payload_update e eventos LAN. Isso gerava rollback de HP, cura dupla, item consumido reaparecendo, equipamento piscando, efeito removido voltando, sessão encerrada reabrindo e alerta duplicado de save.
 
 ## 3. Arquitetura anterior
 
-- `sheet.tsx` calculava consumo, efeitos, inventario, equipamento e envio LAN.
-- `lan-session.tsx` aplicava runtime e persistencia com muita regra no proprio componente.
-- `lanSessionRuntimeStore.ts` preservava campos vivos, mas sem chaves explicitas para efeito/inventario.
-- `diceFormulaService.ts` extraia dados simples, mas nao tinha contexto de atributo.
+A arquitetura anterior misturava transporte, store, SQLite, hooks e tela como fontes de gameplay. Eventos como `player_patch`, `effect_patch`, `inventory_patch`, `pending_save_patch`, `public_status` e payloads podiam aplicar estado por caminhos diferentes. O host também usava reload e locks defensivos para tentar evitar rollback, mas isso apenas mascarava a disputa de fontes.
 
 ## 4. Nova arquitetura
 
-- `lanInventoryDomain.ts`: normaliza inventario, consome item, equipa/desequipa e recalcula `equip_mods`.
-- `lanEffectDomain.ts`: normaliza efeito ativo, aplica stack policy e expira por turno/tempo.
-- `lanProjectionEngine.ts`: projection pura com evento idempotente, snapshot seguro e revisoes por dominio.
-- `diceFormulaService.ts`: parser de formula com `2d4+2`, texto como `Cura 2d4+2` e atributo como `1d6+CON`.
-- `sheet.tsx`: passou a usar comando atomico para consumo/equipamento.
+O fluxo novo é:
 
-## 5. Fonte de verdade
+1. tela cria comando;
+2. bridge despacha para engine;
+3. engine valida projection atual;
+4. engine gera evento autoritativo;
+5. reducer aplica evento na projection;
+6. transporte replica o evento;
+7. telas renderizam projection;
+8. SQLite persiste em background/cache.
 
-No LAN, a regra aplicada e documentada ficou:
+Single player continua SQLite-first. LAN é projection-first.
 
-1. evento vivo mais recente;
-2. runtime/projection;
-3. snapshot/resync;
-4. SQLite.
+## 5. Engine LAN
 
-SQLite continua como persistencia/cache. Ele nao deve vencer runtime vivo.
+A engine LAN fica em `src/services/lan/engine/*`. Ela contem tipos, comando -> evento, reducer, snapshot policy, bridge e adapter legado.
 
-## 6. Event Log e Projection
+Comandos suportados/consolidados:
 
-Foi criada uma projection pura com:
+- `apply_damage`;
+- `apply_heal`;
+- `apply_temp_hp`;
+- `apply_effect`;
+- `remove_effect`;
+- `advance_turn`;
+- `pause_session`;
+- `resume_session`;
+- `end_session`;
+- `consume_item`;
+- `equip_item`;
+- `unequip_item`;
+- `grant_xp`;
+- `set_xp`;
+- `add_coins`;
+- `set_coins`;
+- `request_reward`;
+- `grant_reward`;
+- `send_item`;
+- `donate_item`;
+- `trade_item`;
+- `use_spell`;
+- `apply_pending_save`;
+- `resolve_pending_save`;
+- `apply_self_effect`.
 
-- `playerRevision`;
-- `effectRevision`;
-- `inventoryRevision`;
-- `sessionRevision`;
-- `pendingSaveRevision`;
-- `tradeRevision`;
-- `appliedEventIds`.
+## 6. Projection única
 
-Evento duplicado por `eventId` nao reaplica. Snapshot antigo sem revisao nao sobrescreve entidade que ja recebeu evento vivo.
+`SessionProjection` agora guarda jogadores, pending saves e transações/histórico de trade/reward. `CharacterProjection` guarda HP, XP, moedas, inventário, equipamento, efeitos ativos, atributos base, atributos efetivos e derivados como CA.
 
-## 7. Fluxo Single Player
+A projection registra `appliedEventIds` e `appliedCommandIds`, impedindo replay de cura, consumo, save, magia, trade ou reward.
 
-Single player continua SQLite-first. O consumo/equipamento agora usa o mesmo dominio puro, mas persiste localmente pela tela.
+## 7. Revisões por agregado
 
-## 8. Fluxo Multiplayer
+A engine usa revisões separadas por agregado:
 
-No LAN, consumo/equipamento atualizam o estado local primeiro, enviam patch ao Mestre e deixam SQLite em background.
+- sessão;
+- player;
+- inventário;
+- efeito;
+- pending save;
+- trade;
+- transação.
 
-## 9. Consumo de Itens
+Isso evita que um evento antigo de inventário bloqueie HP novo, ou que um snapshot antigo restaure efeito/item removido. `Date.now()` do transporte não é usado como revisão de domínio quando o valor parece seq/timestamp legado.
 
-`consumeItemAtomically` valida item, quantidade, reduz stack e remove item zerado em uma unica transacao de estado.
+## 8. Fluxo do mestre
 
-## 10. Pocao de Cura 2d4+2
+O mestre deve enviar comandos para a engine para dano, cura, PV temporário, efeitos, turno, pausa, retomada, encerramento, XP, moedas, recompensa e resolução de saves. A UI do mestre pode manter lista visual/histórica, mas o gameplay vivo sai da projection.
 
-O parser reconhece `Cura 2d4+2` como formula `2d4+2`, rola dois d4 e soma modificador fixo `+2`. O teste garante que nao vira `2+2+2` fixo.
+## 9. Fluxo do jogador
 
-## 11. Equipamentos, CA e Modificadores
+O jogador lê a ficha por `useLanProjection`. Consumo, equipamento e envio direto de item podem passar por `dispatchPlayerCommand`. Ações que dependem de regra/autorização do mestre devem virar comando/evento autoritativo, não patch solto.
 
-`equipItemAtomically` calcula bag, slots e stats finais juntos. `equip_mods` e derivado dos slots finais, evitando bonus duplicado.
+## 10. HP, cura e dano
 
-## 12. Efeitos Temporarios
+HP, cura, dano e PV temporário são `player_patch` ou `effect_patch` gerados pela engine. Dano consome PV temporário antes de HP. Cura respeita `hpMax`. Replay do mesmo evento não altera HP novamente.
 
-`lanEffectDomain.ts` normaliza efeitos ativos, status e politica de stack. Efeitos temporarios carregam `remaining` e `unit`.
+## 11. XP e moedas
 
-## 13. Passagem de Turno
+Atualizacao Bug 2 (2026-06-12): comandos diretos de XP/moeda geram `character_transaction`; pedidos de recompensa usam `request_reward`/`grant_reward`; pedido legado de moeda com valor final usa `set_coins`; replay, snapshot antigo, ACK/NACK e `public_status` nao alteram XP/moedas.
 
-`advanceEffectsByUnit` reduz duracao e separa efeitos expirados. O runtime do Mestre tambem passou a guardar metadados de efeito separados de jogador.
+XP e moedas possuem comandos explícitos:
 
-## 14. Snapshot, Resync e Reconnect
+- `grant_xp` soma XP;
+- `set_xp` fixa XP;
+- `add_coins` soma moedas;
+- `set_coins` fixa moedas.
 
-Projection ignora snapshot antigo quando ja existe revisao viva. O runtime tambem preserva campos vivos considerando metadados de player, efeito e inventario.
+Snapshot antigo não reverte XP/moedas novas. ACK/NACK e `public_status` não alteram XP/moedas.
 
-## 15. Telas e Stores
+## 12. Consumo de itens
 
-- `sheet.tsx` foi reduzido nos fluxos de consumo/equipamento, que agora chamam dominios.
-- `lanSessionRuntimeStore.ts` separou metadados de player/effect/inventory.
-- A projection pura ainda nao substitui toda renderizacao de `lan-session.tsx`; ela foi introduzida como camada testavel para migracao incremental.
+`consume_item` é uma transação única: localiza item, aplica cura/efeito, baixa quantidade, remove se zerar e grava tombstone. A poção ou item não volta por snapshot antigo.
 
-## 16. Testes Criados
+## 13. Poção de Cura 2d4+2
 
-Script: `npm run test:lan`.
+A poção `Cura 2d4+2` é parseada pelo serviço de fórmula e rolada uma vez no evento. O evento carrega a rolagem e o patch final. Replay, ACK/NACK ou resync duplicado não curam novamente.
 
-Coberturas:
+## 14. Equipamentos, CA e modificadores
 
-- parser `2d4+2`;
-- parser `Cura 2d4+2`;
-- parser `1d6+CON`;
-- idempotencia por `eventId`;
-- snapshot antigo ignorado;
-- `effectRevision` nao bloqueia `playerRevision`;
-- consumir item quantidade 2 virar 1;
-- consumir item quantidade 1 remover item;
-- consumo/rolagem nao reexecutar por evento duplicado;
-- efeito temporario expirar por turno;
-- equipamento nao duplicar bonus;
-- equipamento nao produzir slot final vazio.
+`equip_item` e `unequip_item` usam transação da engine. A projection recalcula bônus derivados por equipamento, sem contaminar atributos base. Armadura/escudo podem alterar CA; desequipar remove o bônus.
 
-## 17. Cenarios Manuais
+## 15. Magias
 
-Nao foram validados em aparelhos reais nesta execucao:
+`use_spell` cobre a base de magia com cura, dano, efeitos/condições e save pendente. Se a magia tiver fórmula, ela é rolada uma vez no evento. Se tiver efeito, entra como efeito de origem `spell`. Se tiver save, cria pending save na projection.
 
-- Mestre e jogador em dois dispositivos.
-- Reconnect apos bloquear tela.
-- Encerramento de sessao com limpeza visual imediata.
-- Card LAN em rede real apos snapshot antigo.
-- Fluxo completo de dano/cura do Mestre apos consumo em TCP real.
+Pendência real: nem todo campo do banco/modelo de magias foi mapeado na UI para `use_spell`; regras incompletas do catálogo devem ser documentadas caso a caso.
 
-## 18. Checklist de Aceite
+## 16. Saves/testes de resistência
 
-- Parser e dominios puros: validado automaticamente.
-- TypeScript: validado.
-- Consumo/equipamento local: migrado para dominio atomico.
-- Projection unica em todas as telas: pendente de migracao completa.
-- Teste manual LAN real: pendente.
+`apply_pending_save` cria alerta pendente em `projection.pendingSaves`. `resolve_pending_save` resolve o alerta, registra resultado e pode remover efeitos vinculados ou aplicar efeito em falha. A idempotência impede alerta duplicado e snapshot antigo não reabre save resolvido.
 
-## 19. Pendencias
+## 17. Trocas, envio e doação
 
-- Migrar `lan-session.tsx` inteiro para consumir `SessionProjection` em vez de manter regras no componente.
-- Migrar hooks de jogador para projection unica.
-- Remover bloco legado de equipamento em `sheet.tsx` depois de validar comportamento visual no app.
-- Adicionar runner de testes formal ao projeto, caso a suite cresca alem dos testes de dominio.
+`send_item`, `donate_item` e `trade_item` são transações multi-alvo. O item sai de um jogador e entra no outro dentro do mesmo evento da engine. Replay do evento não duplica item.
+
+`sheet.tsx` foi ajustado para envio direto de item pela engine quando possível. A UI antiga de proposta/contra-proposta ainda existe como compatibilidade e deve ser removida quando for redesenhada para transaction-first.
+
+Atualizacao Bug 3 (2026-06-12): stack de inventario fica normalizado em `LanInventoryRules`. IDs transitorios (`id`, `inventoryItemId`, `clientMsgId`, `sourceId`, timestamps) nao separam stack. Itens stackaveis iguais, como `10 Dardos`, somam qty; itens com efeito diferente e equipamentos/magicos nao stackaveis permanecem separados. `send_item`, `donate_item`, `trade_item` e `grant_reward` usam projection/engine como fonte final, com SQLite em background.
+
+## 18. Efeitos temporários
+
+Efeitos vivem na projection. Avanço de turno/minuto/hora/descanso passa pela engine, decrementa duração e gera tombstone para efeitos expirados/removidos. PV temporário vinculado a efeito expira junto.
+
+## 19. Passagem de turno
+
+`advance_turn` chama `advanceProjectionTurn`. O reducer atualiza turno, tempo decorrido, efeitos alterados, efeitos expirados e PV temporário removido. Isso evita turno duplicado e decremento de efeito em caminhos paralelos.
+
+## 20. Snapshot, resync e reconnect
+
+Snapshot entra apenas por `applyIncomingSnapshot`. Se a projection já tem eventos aplicados, snapshot estrutural antigo é ignorado. Snapshot antigo não restaura efeito removido, item consumido, HP, XP, moedas, equipamento ou sessão encerrada.
+
+Reconnect/resync reaplica eventos por `eventId`/`commandId`; duplicatas não causam cura, consumo ou trade novamente.
+
+
+## Correção pós-logs reais de aparelhos
+
+Os logs reais do mestre e do jogador mostraram que alguns fluxos ainda chegavam pela camada legada: ajuste permanente de atributo entrava como `effect_patch` visual, XP/moedas aceitos ainda podiam virar `player_patch`, itens como `10 Dardos` duplicavam stack por causa de IDs transitorios e eventos transacionais novos nao eram serializados para todos os clientes.
+
+As correcoes aplicadas foram:
+
+1. `Ajuste permanente de INT` e outros ajustes permanentes agora usam `isPermanentStatAdjustment`; o reducer altera `baseStats`/`effectiveStats` e nao cria efeito ativo visual.
+2. Condicoes temporarias continuam visiveis e preservam `color`, `secondaryColor` e prioridade visual para breath/fade.
+3. A stack key de itens stackaveis ignora IDs transitorios e considera identidade real do item: nome, tipo/categoria, dano, tipo de dano, propriedades, descricao e efeito funcional.
+4. Patches de XP/moedas no mestre, quando ha projection, sao redirecionados para comandos da engine (`set_xp`, `set_coins`, `grant_xp`, `add_coins`) que geram transacao autoritativa.
+5. Aceite de pedido de jogador para XP/moeda agora aplica resultado via `grant_reward`; pedido antigo de moeda que traz valor final usa `set_coins`.
+6. Eventos `character_transaction`, `party_transaction`, `spell_transaction` e `reward_transaction` sao convertidos para envelopes LAN e tratados como eventos vivos pelo cliente.
+7. `effect_save_request` legado e convertido para `pending_save_patch` para entrar na projection de saves.
+
+Essas correcoes atacam diretamente os sintomas observados nos logs: card com ajuste permanente como efeito, moeda/XP aceitos sem atualizar, item duplicado em stack, condicao sem cor visual e eventos transacionais nao chegando ao jogador.
+
+## CorreÃ§Ã£o Bug 1 - ajuste permanente nao e efeito visual
+
+Em 2026-06-12, a regra foi revalidada para payloads legados: qualquer ajuste permanente com `target` de atributo (`FOR`, `DES`, `CON`, `INT`, `SAB`, `CAR`, `CA`) e `unit: "permanent"`/`isPermanent: true` altera `baseStats` e recalcula `effectiveStats`, mesmo se o payload vier como `kind: "buff"` ou `kind: "custom"`.
+
+Esse ajuste permanente nao entra em `activeEffects`, nao aparece em `getVisibleEffects`, nao ativa cor/breath/fade e nao expira por turno. Ajustes temporarios de atributo continuam entrando em `activeEffects`, somam em `effectiveStats` e expiram conforme duracao. Condicoes temporarias como `Paralisado` continuam visuais e preservam `color`/`secondaryColor`.
+
+## Correcao Bug 2 - XP, moedas e pedidos numericos
+
+Em 2026-06-12, XP/moedas foram fechados como projection-first:
+
+- `grant_xp`, `set_xp`, `add_coins` e `set_coins` geram `character_transaction`.
+- `request_reward` cria pedido pendente sem alterar a ficha.
+- `grant_reward` aplica XP/moedas e marca o pedido como `committed`.
+- `coin_self_patch_request` deixou de aplicar moeda direto; o host converte em `resource_request` revisavel.
+- A ficha do jogador nao faz mais atualizacao otimista de moeda em LAN; ela aguarda o evento autoritativo do mestre.
+- `reloadSessionState`, snapshot antigo, ACK/NACK e `public_status` nao vencem XP/moedas da projection.
+
+## Correcao Bug 3 - stack, envio, doacao e troca de itens
+
+Em 2026-06-12, inventario LAN foi fechado como projection-first para stack e transferencias:
+
+- `getInventoryStackKey` ignora ids transitorios e considera identidade real do item.
+- `canStackInventoryItem` separa stackavel de nao stackavel.
+- `addItemsToInventory`, `removeItemsFromInventory` e `compactInventoryBag` aplicam a mesma regra para recompensa, envio, doacao, troca e consumo.
+- `send_item`, `donate_item` e `trade_item` removem/adicionam em uma transacao da engine; se uma ponta falha, ninguem perde item.
+- `grant_reward` com item usa a mesma regra de stack.
+- `inventory_patch` legado, SQLite, reload, ACK/NACK e `public_status` nao sao fonte final de gameplay quando existe projection.
+
+## 21. Public status
+
+`public_status` é somente visual/histórico. Ele não altera projection, ficha, HP, XP, moedas, efeitos, inventário, equipamento, turno, pending save, trade ou resync autoritativo.
+
+## 22. Reload/recovery
+
+`reloadSessionState` fica restrito a bootstrap/cache/visual. Quando existe projection, reload não corrige gameplay vivo. Locks como `holdLiveRuntimeLock` foram rebaixados para compatibilidade/no-op quando a projection já protege contra rollback.
+
+## 23. SQLite
+
+No modo LAN, SQLite é cache/persistência em background. Ele não vence projection, não restaura item/efeito removido, não volta HP/XP/moedas antigos, não desfaz equipamento, não reabre sessão encerrada e não bloqueia ACK/clique.
+
+No single player, SQLite continua sendo fonte primária.
+
+## 24. Stores e hooks
+
+Stores e hooks podem guardar projection, status visual, logs, pending visual e status de conexão. Eles não devem aplicar gameplay manual fora da engine. Hooks de eventos encaminham para bridge/engine e pedem resync quando necessário.
+
+Ainda existem funções legadas marcadas como deprecated/no-op para compatibilidade com telas antigas.
+
+## 25. Transporte TCP
+
+`lanTcpTransport.ts` transporta eventos, comandos/propostas, snapshots, ACK/NACK e resync. Ele encaminha eventos commitados para a engine, mas não decide regra de gameplay. Eventos transacionais novos (`character_transaction`, `party_transaction`, `spell_transaction`, `reward_transaction`) foram incluídos como críticos para replay.
+
+## 26. Testes automatizados
+
+Executado:
+
+```bash
+npm run test:lan
+```
+
+Resultado: passou. Saída: `LAN engine/domain tests passed`.
+
+Executado:
+
+```bash
+npx tsc --noEmit
+```
+
+Resultado: passou sem erros.
+
+A suíte cobre:
+
+1. dano rápido do mestre;
+2. cura rápida do mestre;
+3. PV temporário e expiração;
+4. efeito de atributo e expiração;
+5. condição Paralisado por 3 turnos;
+6. Poção de Cura `Cura 2d4+2`;
+7. segunda poção removendo item;
+8. replay não cura de novo;
+9. ACK/NACK não altera projection;
+10. public_status não altera projection;
+11. snapshot antigo não restaura efeito;
+12. snapshot antigo não remove equipamento;
+13. snapshot antigo não reverte HP;
+14. snapshot antigo não reverte XP/moedas;
+15. reconnect/resync duplicado não reaplica evento;
+16. equipar armadura recalcula CA;
+17. desequipar armadura recalcula CA;
+18. envio/doação de item não duplica item;
+19. troca de item é transacional;
+20. pedido de save não duplica alerta;
+21. resolução de save remove alerta;
+22. magia com efeito passa pela engine;
+23. magia com cura/dano passa pela engine.
+
+## 27. Testes manuais
+
+NÃO TESTADO EM APARELHOS REAIS
+
+## 28. Pendências reais
+
+- Remover fisicamente a UI/fila legada de trade offer/counter, resource request, coin self request e alguns fluxos de magia quando as telas forem redesenhadas para command-first.
+- Mapear todos os campos reais do banco de magias para `use_spell`.
+- Fazer teste manual com mestre + 2 ou mais jogadores em aparelhos reais.
+- Conferir UX final de alertas pendentes lendo apenas `projection.pendingSaves`.
+- Conferir UX final de timeline/histórico lendo apenas `projection.trades`/event log, sem virar fonte de gameplay.

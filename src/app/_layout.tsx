@@ -17,7 +17,7 @@ export default function RootLayout() {
   }, []);
 
   return (
-    <SQLiteProvider databaseName="dnd_data_v009.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_data_v015.db" onInit={initializeDatabase}>
       <LanActiveRuntimeSync />
       <ThemeProvider value={DarkTheme}>
         <LinearGradient

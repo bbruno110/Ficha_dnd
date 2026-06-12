@@ -1,8 +1,10 @@
 import { create } from 'zustand';
 
-import { traceApp } from '@/services/debug/appTrace';
-import { getLanEventEntityId, getLanEventEntityType } from '@/services/lan/lanEntityQueue';
-import type { LanSessionEvent, LanSessionPlayerState } from '@/services/lanSession';
+import { traceApp } from '../services/debug/appTrace';
+import { registerLanProjectionSink } from '../services/lan/engine/LanEngineBridge';
+import { getLanEventEntityId, getLanEventEntityType } from '../services/lan/lanEntityQueue';
+import type { SessionProjection } from '../services/lan/engine/LanTypes';
+import type { LanSessionEvent, LanSessionPlayerState } from '../services/lanSession';
 
 export const LAN_REALTIME_STORE_VERSION = 'gap-checkpoint-v4-runtime-events';
 
@@ -105,8 +107,10 @@ export type LanRealtimeState = {
   pendingEvents: Record<string, PendingEvent>;
   livePlayerStates: Record<string, LivePlayerRuntimeState>;
   liveEvents: Record<string, LiveLanEventNotice>;
+  projections: Record<string, SessionProjection | null>;
 
   setConnection: (state: { sessionId?: string; clientId?: string; playerKey?: string; connected: boolean }) => void;
+  setProjection: (sessionId: string, projection: SessionProjection | null) => void;
   mergeLivePlayerState: (key: string, patch: Partial<LivePlayerRuntimeState>) => void;
   publishLiveEvent: (event: LanSessionEvent) => void;
   getEventApplyDecision: (event: LanSessionEvent) => LanEventApplyDecision;
@@ -176,10 +180,24 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
   pendingEvents: {},
   livePlayerStates: {},
   liveEvents: {},
+  projections: {},
 
   setConnection: (next) => set((state) => ({ ...state, ...next })),
 
+  setProjection: (sessionId, projection) => set((state) => ({
+    projections: {
+      ...state.projections,
+      [sessionId]: projection,
+    },
+  })),
+
   mergeLivePlayerState: (key, patch) => {
+    traceApp('EVENT_DECISION', 'LAN_REALTIME_MERGE_LIVE_PLAYER_STATE_DEPRECATED_NOOP_CUT6', {
+      key,
+      patchKeys: Object.keys(patch || {}),
+      decision: 'engine_projection_is_authoritative',
+    });
+    return;
     if (!key) return;
     set((state) => {
       const previous = state.livePlayerStates[key];
@@ -460,9 +478,22 @@ export const useLanRealtimeStore = create<LanRealtimeState>((set, get) => ({
             !key.startsWith(`${sessionId}:`) && value.event?.sessionId !== sessionId
           )))
         : {},
+      projections: sessionId
+        ? Object.fromEntries(Object.entries(state.projections || {}).filter(([key]) => key !== sessionId))
+        : {},
     };
   }),
 }));
+
+export function setLanRealtimeProjection(sessionId: string, projection: SessionProjection | null) {
+  useLanRealtimeStore.getState().setProjection(sessionId, projection);
+}
+
+export function getLanRealtimeProjection(sessionId: string) {
+  return useLanRealtimeStore.getState().projections[sessionId] || null;
+}
+
+registerLanProjectionSink(setLanRealtimeProjection);
 
 export const applyNumberPatchToCharacter = <T extends Record<string, unknown>>(character: T, patch: NumberPatch): T => ({
   ...character,

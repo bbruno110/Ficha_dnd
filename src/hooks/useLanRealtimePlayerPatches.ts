@@ -12,9 +12,15 @@ import {
 import {
   isLanSessionGlobalEvent,
   isLanLiveCommittedEvent,
+  LAN_ENGINE_PROJECTION_MODE,
   shouldPlayerProcessLanEvent,
   shouldRequestLanResync,
 } from '@/services/lan/lanClientEngine';
+import {
+  applyIncomingLegacyLanEvent,
+  applyIncomingSnapshot,
+} from '@/services/lan/engine/LanEngineBridge';
+import { legacyPayloadToLanSnapshot } from '@/services/lan/engine/LanSnapshotAdapter';
 import { LAN_NETWORK_LIMITS, isCriticalLanSessionEvent } from '@/services/lan/lanNetworkPolicy';
 import { debugLanFlow } from '@/services/lanRuntimeMode';
 import { getKnownLanEntityRevisions, useLanRealtimeStore } from '@/stores/lanRealtimeStore';
@@ -32,6 +38,17 @@ const GLOBAL_LAN_EVENT_APPLY_IN_FLIGHT = new Set<string>();
 // evita perder patches vivos quando a tela/rebind perde a notificação do socket,
 // mas outro evento posterior já avançou o lastAppliedSeq global.
 const POLL_OVERLAP_SEQ_WINDOW = 10000;
+const PROJECTION_ONLY_EVENT_TYPES = new Set<string>([
+  'player_patch',
+  'effect_patch',
+  'inventory_patch',
+]);
+
+function shouldKeepLegacyUiCallback(event: LanSessionEvent) {
+  return event.type === 'session_patch' ||
+    event.type === 'session_ended' ||
+    event.type === 'player_kicked';
+}
 
 export type UseLanRealtimePlayerPatchesParams = {
   enabled: boolean;
@@ -442,6 +459,31 @@ export function useLanRealtimePlayerPatches({
           entityRevision: event.entityRevision,
           numberPatch: event.numberPatch,
         });
+
+        if (LAN_ENGINE_PROJECTION_MODE) {
+          const eventType = String(event.type || '');
+          const projectionOnly = PROJECTION_ONLY_EVENT_TYPES.has(eventType);
+          if (eventType !== 'public_status') {
+            applyIncomingLegacyLanEvent(event);
+          }
+          if (!projectionOnly && eventType !== 'public_status') {
+            useLanRealtimeStore.getState().publishLiveEvent(event);
+          }
+
+          if (projectionOnly && !shouldKeepLegacyUiCallback(event)) {
+            useLanRealtimeStore.getState().markEventApplied(event);
+            debugLanFlow('PLAYER_EVENT_FORWARDED_TO_PROJECTION_ONLY_CUT6', {
+              eventId: event.id,
+              type: event.type,
+              sessionId,
+              selfKey,
+              decision: 'no_legacy_gameplay_callback_no_live_event_store',
+            });
+            releaseEventKey();
+            ackEventInBackground(event);
+            return;
+          }
+        }
 
         if (event.type === 'session_ended') {
           useLanRealtimeStore.getState().markEventApplied(event);
@@ -912,7 +954,14 @@ export function useLanRealtimePlayerPatches({
         // Snapshot/payload agora também serve como reconciliação autoritativa de roster/inventário.
         // Ele não substitui eventos vivos; apenas corrige a mochila se um inventory_patch/trade_result
         // foi recebido pelo transporte, mas perdeu a janela do listener durante reconnect/rebind.
-        void Promise.resolve(onPayloadUpdateRef.current?.(update.payload, update.reason)).catch(() => undefined);
+        if (LAN_ENGINE_PROJECTION_MODE) {
+          applyIncomingSnapshot(legacyPayloadToLanSnapshot(update.payload, {
+            source: String(update.reason || '').includes('resync') ? 'resync' : 'payload_update',
+            structural: true,
+          }));
+        } else {
+          void Promise.resolve(onPayloadUpdateRef.current?.(update.payload, update.reason)).catch(() => undefined);
+        }
       }
       if (update?.event) {
         const event = update.event;
