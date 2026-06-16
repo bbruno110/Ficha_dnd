@@ -1,4 +1,182 @@
 import { SQLiteDatabase } from 'expo-sqlite';
+import { seedRandomCreatorContent } from './randomContentSeed';
+
+async function ensureColumn(db: SQLiteDatabase, tableName: string, columnName: string, definition: string) {
+  const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${tableName})`);
+  if (!columns.some(column => column.name === columnName)) {
+    await db.execAsync(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition};`);
+  }
+}
+
+const TRACE_TABLES = [
+  { table: 'items', idColumn: 'id' },
+  { table: 'effects', idColumn: 'id' },
+  { table: 'races', idColumn: 'id' },
+  { table: 'classes', idColumn: 'id' },
+  { table: 'subclasses', idColumn: 'id' },
+  { table: 'spells', idColumn: 'id' },
+  { table: 'starting_kits', idColumn: 'id' },
+  { table: 'bg3_companions', idColumn: 'id' },
+  { table: 'random_lore_archetypes', idColumn: 'id' },
+  { table: 'random_lore_entries', idColumn: 'id' },
+  { table: 'random_name_parts', idColumn: 'id' },
+  { table: 'random_lore_connectors', idColumn: 'id' },
+  { table: 'random_race_language_rules', idColumn: 'id' },
+  { table: 'characters', idColumn: 'id' },
+  { table: 'spellcasting_progression', idColumn: 'id' },
+  { table: 'lan_device_identity', idColumn: 'id' },
+  { table: 'lan_sessions', idColumn: 'id' },
+  { table: 'lan_session_state', idColumn: 'session_id' },
+  { table: 'lan_session_players', idColumn: 'id' },
+  { table: 'lan_character_snapshots', idColumn: 'id' },
+  { table: 'lan_event_log', idColumn: 'id' },
+];
+
+async function ensureTraceTriggers(db: SQLiteDatabase) {
+  for (const config of TRACE_TABLES) {
+    const triggerBase = `trace_${config.table}`;
+    await db.execAsync(`
+      CREATE TRIGGER IF NOT EXISTS ${triggerBase}_insert
+      AFTER INSERT ON ${config.table}
+      BEGIN
+        INSERT INTO app_trace_logs (level, category, action, entity_table, entity_id, message)
+        VALUES ('debug', 'database', 'INSERT', '${config.table}', CAST(NEW.${config.idColumn} AS TEXT), 'Registro criado em ${config.table}');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS ${triggerBase}_update
+      AFTER UPDATE ON ${config.table}
+      BEGIN
+        INSERT INTO app_trace_logs (level, category, action, entity_table, entity_id, message)
+        VALUES ('debug', 'database', 'UPDATE', '${config.table}', CAST(NEW.${config.idColumn} AS TEXT), 'Registro atualizado em ${config.table}');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS ${triggerBase}_delete
+      AFTER DELETE ON ${config.table}
+      BEGIN
+        INSERT INTO app_trace_logs (level, category, action, entity_table, entity_id, message)
+        VALUES ('debug', 'database', 'DELETE', '${config.table}', CAST(OLD.${config.idColumn} AS TEXT), 'Registro removido de ${config.table}');
+      END;
+    `);
+  }
+}
+
+async function seedEffectIfMissing(
+  db: SQLiteDatabase,
+  sourceTable: 'items' | 'spells',
+  sourceName: string,
+  effect: {
+    effect_kind: string;
+    effect_type: string;
+    condition_name?: string | null;
+    value_mode: string;
+    dice_count?: number | null;
+    dice_sides?: number | null;
+    dice_bonus?: number | null;
+    fixed_value?: number | null;
+    chance_percent?: number;
+    duration_value?: number | null;
+    duration_unit?: string;
+    sort_order?: number;
+    metadata?: Record<string, unknown>;
+  }
+) {
+  const source = await db.getFirstAsync<{ id: number }>(`SELECT id FROM ${sourceTable} WHERE name = ? LIMIT 1`, [sourceName]);
+  if (!source?.id) return;
+
+  const existing = await db.getFirstAsync<{ id: number }>(
+    `SELECT id FROM effects
+     WHERE source_table = ? AND source_name = ? AND effect_kind = ? AND effect_type = ?
+       AND IFNULL(condition_name, '') = IFNULL(?, '') AND sort_order = ? AND criador = 'base'
+     LIMIT 1`,
+    [sourceTable, sourceName, effect.effect_kind, effect.effect_type, effect.condition_name || null, effect.sort_order || 0]
+  );
+  if (existing?.id) return;
+
+  await db.runAsync(
+    `INSERT INTO effects (
+      source_table, source_id, source_name, trigger, effect_kind, effect_type, condition_name,
+      value_mode, dice_count, dice_sides, dice_bonus, fixed_value, chance_percent,
+      duration_value, duration_unit, metadata, sort_order, criador
+    ) VALUES (?, ?, ?, 'on_use', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+    [
+      sourceTable,
+      source.id,
+      sourceName,
+      effect.effect_kind,
+      effect.effect_type,
+      effect.condition_name || null,
+      effect.value_mode,
+      effect.dice_count || null,
+      effect.dice_sides || null,
+      effect.dice_bonus || 0,
+      effect.fixed_value === undefined ? null : effect.fixed_value,
+      effect.chance_percent === undefined ? 100 : effect.chance_percent,
+      effect.duration_value || null,
+      effect.duration_unit || 'instant',
+      JSON.stringify(effect.metadata || {}),
+      effect.sort_order || 0,
+    ]
+  );
+}
+
+async function seedStructuredBaseEffects(db: SQLiteDatabase) {
+  await db.runAsync(
+    `UPDATE items
+     SET category = COALESCE(category, CASE
+       WHEN properties LIKE '%Consum%' THEN 'Consumivel'
+       WHEN properties LIKE '%Armadura%' THEN 'Armadura'
+       WHEN properties LIKE '%Escudo%' THEN 'Escudo'
+       WHEN properties LIKE '%Ferramenta%' THEN 'Ferramenta'
+       ELSE 'Outro'
+     END),
+     is_consumable = CASE WHEN properties LIKE '%Consum%' THEN 1 ELSE COALESCE(is_consumable, 0) END`
+  );
+
+  await db.runAsync(
+    `INSERT OR IGNORE INTO items (name, weight, damage, damage_type, category, is_consumable, properties, descricao, criador)
+     VALUES (
+       'Dardo Venenoso',
+       0.25,
+       '1d4 Perfurante + 10% Envenenado por 10 turnos',
+       'Perfurante, Veneno',
+       'Consumivel',
+       1,
+       'Arma, Arremesso, Consumivel',
+       'Dardo preparado com toxina instavel. Ao atingir, pode envenenar o alvo.',
+       'base'
+     )`
+  );
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Cura', {
+    effect_kind: 'healing',
+    effect_type: 'Cura',
+    value_mode: 'dice',
+    dice_count: 1,
+    dice_sides: 8,
+    duration_unit: 'instant',
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Dardo Venenoso', {
+    effect_kind: 'damage',
+    effect_type: 'Perfurante',
+    value_mode: 'dice',
+    dice_count: 1,
+    dice_sides: 4,
+    duration_unit: 'instant',
+    sort_order: 0,
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Dardo Venenoso', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Envenenado',
+    value_mode: 'none',
+    chance_percent: 10,
+    duration_value: 10,
+    duration_unit: 'turn',
+    sort_order: 1,
+  });
+}
 
 export async function initializeDatabase(db: SQLiteDatabase) {
   await db.execAsync(`PRAGMA journal_mode = WAL;`);
@@ -11,6 +189,8 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       weight REAL NOT NULL,
       damage TEXT,
       damage_type TEXT,
+      category TEXT,
+      is_consumable INTEGER DEFAULT 0,
       properties TEXT,
       descricao TEXT,
       criador TEXT DEFAULT 'base'
@@ -70,16 +250,54 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       category TEXT DEFAULT 'Magia', -- NOVA COLUNA: 'Magia', 'Habilidade' ou 'Passiva'
       classes TEXT NOT NULL,
       casting_time TEXT,
+      casting_time_value INTEGER,
+      casting_time_unit TEXT,
       range TEXT,
+      range_value REAL,
+      range_unit TEXT,
+      range_shape TEXT,
       components TEXT,
       duration TEXT,
+      duration_value INTEGER,
+      duration_unit TEXT,
       damage_dice TEXT,
       damage_type TEXT,
       saving_throw TEXT,
       description TEXT,
-      class_level_required INTEGER DEFAULT 1,
+      class_level_required TEXT DEFAULT '1',
       criador TEXT DEFAULT 'base'
     );
+
+    CREATE TABLE IF NOT EXISTS effects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_table TEXT NOT NULL,
+      source_id INTEGER NOT NULL,
+      source_name TEXT,
+      trigger TEXT NOT NULL DEFAULT 'on_use',
+      effect_kind TEXT NOT NULL,
+      effect_type TEXT NOT NULL,
+      condition_name TEXT,
+      value_mode TEXT NOT NULL DEFAULT 'none',
+      dice_count INTEGER,
+      dice_sides INTEGER,
+      dice_bonus INTEGER DEFAULT 0,
+      fixed_value REAL,
+      chance_percent REAL NOT NULL DEFAULT 100,
+      duration_value INTEGER,
+      duration_unit TEXT NOT NULL DEFAULT 'instant',
+      target TEXT,
+      stacking TEXT,
+      notes TEXT,
+      metadata TEXT DEFAULT '{}',
+      sort_order INTEGER DEFAULT 0,
+      criador TEXT DEFAULT 'base',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      CHECK(source_table IN ('items', 'spells')),
+      CHECK(value_mode IN ('none', 'fixed', 'dice')),
+      CHECK(chance_percent >= 0 AND chance_percent <= 100)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_effects_source ON effects(source_table, source_id);
 
     CREATE TABLE IF NOT EXISTS bg3_companions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,6 +315,49 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       backstory TEXT NOT NULL,
       allies TEXT NOT NULL,
       features TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS random_lore_archetypes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      allowed_classes TEXT DEFAULT '[]',
+      criador TEXT DEFAULT 'base'
+    );
+
+    CREATE TABLE IF NOT EXISTS random_lore_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      archetype_id INTEGER NOT NULL,
+      field TEXT NOT NULL,
+      value TEXT NOT NULL,
+      criador TEXT DEFAULT 'base',
+      UNIQUE(archetype_id, field, value)
+    );
+
+    CREATE TABLE IF NOT EXISTS random_name_parts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      gender TEXT NOT NULL DEFAULT 'any',
+      kind TEXT NOT NULL,
+      class_name TEXT NOT NULL DEFAULT '',
+      value TEXT NOT NULL,
+      criador TEXT DEFAULT 'base',
+      UNIQUE(gender, kind, class_name, value)
+    );
+
+
+    CREATE TABLE IF NOT EXISTS random_lore_connectors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      class_name TEXT NOT NULL DEFAULT '',
+      value TEXT NOT NULL,
+      criador TEXT DEFAULT 'base',
+      UNIQUE(class_name, value)
+    );
+
+    CREATE TABLE IF NOT EXISTS random_race_language_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      race_contains TEXT NOT NULL UNIQUE,
+      base_languages TEXT NOT NULL,
+      priority INTEGER DEFAULT 0,
+      criador TEXT DEFAULT 'base'
     );
 
     CREATE TABLE IF NOT EXISTS characters (
@@ -126,6 +387,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       cp INTEGER DEFAULT 0,
       hp_max INTEGER DEFAULT 0,
       hp_current INTEGER DEFAULT 0,
+      hp_temp INTEGER DEFAULT 0,
       level INTEGER DEFAULT 1,
       xp INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -176,6 +438,16 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       last_connected_at DATETIME
     );
 
+    CREATE TABLE IF NOT EXISTS lan_session_state (
+      session_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'open',
+      turn INTEGER DEFAULT 1,
+      campaign_minutes INTEGER DEFAULT 0,
+      paused INTEGER DEFAULT 0,
+      last_event_seq INTEGER DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS lan_session_players (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -202,11 +474,79 @@ export async function initializeDatabase(db: SQLiteDatabase) {
     CREATE TABLE IF NOT EXISTS lan_event_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT,
+      seq INTEGER,
+      event_id TEXT,
+      command_id TEXT,
       event_type TEXT NOT NULL,
+      actor_device_id TEXT,
+      actor_name TEXT,
+      target_device_id TEXT,
+      target_character_id INTEGER,
+      target_name TEXT,
+      previous_value TEXT,
+      current_value TEXT,
+      description TEXT,
       payload TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS app_trace_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      level TEXT NOT NULL DEFAULT 'debug',
+      category TEXT NOT NULL DEFAULT 'app',
+      action TEXT NOT NULL,
+      function_name TEXT,
+      source_file TEXT,
+      step TEXT,
+      request_id TEXT,
+      duration_ms INTEGER,
+      entity_table TEXT,
+      entity_id TEXT,
+      message TEXT NOT NULL,
+      metadata TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lan_event_log_event_id ON lan_event_log(event_id);
+    CREATE INDEX IF NOT EXISTS idx_lan_event_log_session_seq ON lan_event_log(session_id, seq DESC);
+    CREATE INDEX IF NOT EXISTS idx_app_trace_logs_created_at ON app_trace_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_app_trace_logs_entity ON app_trace_logs(entity_table, entity_id);
+    CREATE INDEX IF NOT EXISTS idx_app_trace_logs_function ON app_trace_logs(function_name, step);
   `);
+
+  await ensureColumn(db, 'bg3_companions', 'languages', 'TEXT');
+  await ensureColumn(db, 'bg3_companions', 'origin_traits', 'TEXT');
+  await ensureColumn(db, 'characters', 'hp_temp', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'items', 'category', 'TEXT');
+  await ensureColumn(db, 'items', 'is_consumable', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'effects', 'source_name', 'TEXT');
+  await ensureColumn(db, 'spells', 'casting_time_value', 'INTEGER');
+  await ensureColumn(db, 'spells', 'casting_time_unit', 'TEXT');
+  await ensureColumn(db, 'spells', 'range_value', 'REAL');
+  await ensureColumn(db, 'spells', 'range_unit', 'TEXT');
+  await ensureColumn(db, 'spells', 'range_shape', 'TEXT');
+  await ensureColumn(db, 'spells', 'duration_value', 'INTEGER');
+  await ensureColumn(db, 'spells', 'duration_unit', 'TEXT');
+  await ensureColumn(db, 'lan_sessions', 'paused_at', 'DATETIME');
+  await ensureColumn(db, 'lan_sessions', 'resumed_at', 'DATETIME');
+  await ensureColumn(db, 'lan_event_log', 'seq', 'INTEGER');
+  await ensureColumn(db, 'lan_event_log', 'event_id', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'command_id', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'actor_device_id', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'actor_name', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'target_device_id', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'target_character_id', 'INTEGER');
+  await ensureColumn(db, 'lan_event_log', 'target_name', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'previous_value', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'current_value', 'TEXT');
+  await ensureColumn(db, 'lan_event_log', 'description', 'TEXT');
+  await ensureColumn(db, 'app_trace_logs', 'function_name', 'TEXT');
+  await ensureColumn(db, 'app_trace_logs', 'source_file', 'TEXT');
+  await ensureColumn(db, 'app_trace_logs', 'step', 'TEXT');
+  await ensureColumn(db, 'app_trace_logs', 'request_id', 'TEXT');
+  await ensureColumn(db, 'app_trace_logs', 'duration_ms', 'INTEGER');
+  await ensureColumn(db, 'app_trace_logs', 'metadata', 'TEXT');
+  await ensureTraceTriggers(db);
 
   const checkDb = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM items');
   
@@ -771,4 +1111,6 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   } else {
     console.log('Banco de dados já populado. Pulando inserção.');
   }
+  await seedRandomCreatorContent(db);
+  await seedStructuredBaseEffects(db);
 }

@@ -3,7 +3,7 @@ import Constants from 'expo-constants'; // 1. Importar o Constants
 import { LinearGradient } from 'expo-linear-gradient';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { Alert, FlatList, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import CharacterCard, { Character } from '../components/CharacterCard';
 import { useLanSession } from '../contexts/LanSessionContext';
@@ -13,6 +13,7 @@ export default function HomeScreen() {
   const db = useSQLiteContext();
   const { activeSession } = useLanSession();
   const [charactersList, setCharactersList] = useState<Character[]>([]);
+  const lanNavigationLockRef = useRef(false);
 
   const appVersion = Constants.expoConfig?.version || '1.0.0';
 
@@ -53,6 +54,15 @@ export default function HomeScreen() {
     router.push(`/sheet?id=${character.id}`);
   };
 
+  const handleOpenLanSession = () => {
+    if (lanNavigationLockRef.current) return;
+    lanNavigationLockRef.current = true;
+    router.navigate('/lan-session' as any);
+    setTimeout(() => {
+      lanNavigationLockRef.current = false;
+    }, 700);
+  };
+
   return (
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
       <View style={styles.header}>
@@ -88,12 +98,17 @@ export default function HomeScreen() {
           <Text style={styles.advancedButtonText}>FERRAMENTAS DO MESTRE</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => router.push('/lan-session')}>
+        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={handleOpenLanSession}>
           <Ionicons name="wifi-outline" size={20} color="#00fa9a" style={{ marginRight: 10 }} />
           <View style={{ alignItems: 'center' }}>
-            <Text style={styles.lanButtonText}>SESSAO LAN</Text>
+            <Text style={styles.lanButtonText}>SESSÃO LAN</Text>
             {activeSession && <Text style={styles.lanButtonSub}>{activeSession.role === 'master' ? 'Mestre' : 'Jogador'} / {activeSession.name}</Text>}
           </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.tracerButton} activeOpacity={0.8} onPress={() => router.push('/tracer' as any)}>
+          <Ionicons name="bug-outline" size={20} color="#ffd166" style={{ marginRight: 10 }} />
+          <Text style={styles.tracerButtonText}>TRACER / DEBUG</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => router.push('/create')}>
@@ -114,7 +129,7 @@ const styles = StyleSheet.create({
   header: { paddingTop: 60, paddingHorizontal: 20, paddingBottom: 20 },
   headerTitle: { fontSize: 28, fontWeight: 'bold', color: '#ffffff', letterSpacing: 1 },
   
-  listContent: { paddingHorizontal: 20, paddingBottom: 235 },
+  listContent: { paddingHorizontal: 20, paddingBottom: 300 },
   
   emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 40, marginTop: -50 },
   emptyIcon: { fontSize: 60, marginBottom: 20, opacity: 0.8 },
@@ -129,6 +144,9 @@ const styles = StyleSheet.create({
   lanButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0, 250, 154, 0.1)', borderWidth: 1, borderColor: '#00fa9a', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
   lanButtonText: { fontSize: 14, fontWeight: 'bold', color: '#00fa9a', letterSpacing: 1 },
   lanButtonSub: { color: 'rgba(255,255,255,0.6)', fontSize: 10, marginTop: 3, fontWeight: 'bold' },
+
+  tracerButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255, 209, 102, 0.1)', borderWidth: 1, borderColor: '#ffd166', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
+  tracerButtonText: { fontSize: 14, fontWeight: 'bold', color: '#ffd166', letterSpacing: 1 },
   
   createButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#102b56', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 16, shadowColor: '#00bfff', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 5, elevation: 5 },
   createButtonIcon: { fontSize: 24, color: '#00bfff', marginRight: 10, fontWeight: '300' },

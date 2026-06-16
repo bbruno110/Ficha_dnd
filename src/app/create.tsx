@@ -24,6 +24,29 @@ type InventoryItem = { name: string; qty: number; weight: number };
 type StartingKit = { id: number; name: string; target_name: string; target_type?: string; items: string; criador?: string };
 type SpellProgression = { cantrips_known: number, spells_known: number, slot_1: number };
 
+
+type FeatureRequirement = string | { name?: string; level?: string | number; level_required?: string | number; minLevel?: string | number };
+
+const getFeatureRequirementLevel = (feature: FeatureRequirement) => {
+  if (typeof feature === 'string') return 1;
+  const rawLevel = feature.level_required ?? feature.level ?? feature.minLevel ?? 1;
+  const parsed = parseInt(String(rawLevel), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+};
+
+const parseFeatureNamesForLevel = (featuresJson?: string, characterLevel = 1) => {
+  try {
+    const parsed = JSON.parse(featuresJson || '[]') as FeatureRequirement[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(feature => getFeatureRequirementLevel(feature) <= characterLevel)
+      .map(feature => typeof feature === 'string' ? feature : feature.name)
+      .filter(Boolean) as string[];
+  } catch {
+    return [];
+  }
+};
+
 // Força a categoria para os contadores não quebrarem
 const getCategory = (spell?: SpellItem): string => {
   if (!spell) return 'Desconhecido';
@@ -223,164 +246,113 @@ export default function CreateCharacterScreen() {
     );
   };
 
-  const generateRandomLore = () => {
-    const archetypes = [
-      {
-        name: "O Malandro das Ruas",
-        allowedClasses: ['Ladino', 'Bardo', 'Guerreiro', 'Bruxo', 'Monge'],
-        traits: ['Sempre encontro uma forma de rir, mesmo nas piores situações.', 'Sempre desconfio das intenções de estranhos antes de confiar.', 'Gosto de testar os limites das pessoas só para ver como reagem.', 'Tenho dificuldade em levar qualquer autoridade a sério.', 'Falo o que penso, mesmo quando deveria ficar calado.'],
-        ideals: ['Liberdade. Correntes são feitas para serem quebradas.', 'Caos. A ordem excessiva sufoca a vida.', 'Comunidade. Devemos cuidar uns dos outros para sobreviver.'],
-        bonds: ['Fui expulso da minha vila e um dia voltarei para provar meu valor.', 'Tenho um rival que jurei superar em tudo.', 'Estou em busca de um ente querido que desapareceu há anos.'],
-        flaws: ['Tenho um vício em jogos de cartas que sempre me deixa pobre.', 'Impulsivo, ajo antes de pensar se a emoção falar mais alto.', 'Costumo mentir mesmo quando não há necessidade.', 'Não sei lidar bem com autoridade.'],
-        backstory: ['Cresci nas ruas da capital, aprendendo a sobreviver desde cedo furtando pães e frutas nas feiras.', 'Fui acusado injustamente de um crime e agora vivo fugindo.', 'Trabalhava como capanga de um agiota, até o dia em que decidi roubar dele e fugir.'],
-        allies: ['Tenho uma dívida eterna com a Taverneira do "Javali Saltitante".', 'Mantenho contato obscuro com o sindicato de contrabandistas do cais.', 'Tenho um informante nas masmorras da cidade.', 'Possuo um contato no mercado negro.'],
-        features: ['Consigo dormir profundamente em qualquer lugar, mesmo no chão de pedra.', 'Minha sombra parece se mover um segundo atrasada.', 'Tenho uma tolerância absurdamente alta para bebidas fortes.'],
-        extraLanguages: ['Goblin', 'Subcomum', 'Símbolos Secretos de Ladrões', 'Proficiência com Cartas de Baralho']
-      },
-      {
-        name: "O Devoto Fanático",
-        allowedClasses: ['Clérigo', 'Paladino', 'Monge'],
-        traits: ['Tudo o que faço é em nome da minha fé.', 'Vejo sinais divinos em pequenos acontecimentos.', 'Tenho dificuldade em entender quem não segue uma crença.', 'Costumo citar escrituras em momentos inadequados.'],
-        ideals: ['Fé. A verdadeira força vem da devoção absoluta.', 'Sacrifício. Grandes recompensas exigem grandes renúncias.', 'Purificação. O mal deve ser erradicado pela raiz.'],
-        bonds: ['Protejo um templo que foi quase destruído.', 'Minha vida pertence à divindade que me salvou.', 'Carrego uma relíquia sagrada que não pode cair em mãos erradas.'],
-        flaws: ['Sou intolerante com crenças opostas.', 'Posso ir longe demais ao tentar "corrigir" alguém.', 'Confundo minha vontade com a vontade divina.'],
-        backstory: ['Sobrevivi a uma tragédia que acredito ter sido intervenção divina.', 'Fui criado dentro de um templo e nunca conheci outra vida.', 'Recebi uma visão profética que mudou meu destino de uma hora para a outra.'],
-        allies: ['Sou respeitado por membros de minha ordem religiosa.', 'Recebo apoio discreto de um sacerdote influente.', 'Possuo contato com um inquisidor da fé.'],
-        features: ['Minha presença intimida hereges e cultistas.', 'Minha voz ecoa com autoridade quando falo de fé.', 'Possuo marcas sagradas discretas pelo corpo.'],
-        extraLanguages: ['Celestial', 'Infernal', 'Proficiência com Kit de Caligrafia', 'Abissal']
-      },
-      {
-        name: "O Alquimista/Estudioso Obcecado",
-        allowedClasses: ['Mago', 'Feiticeiro', 'Ladino', 'Bruxo', 'Artífice'],
-        traits: ['Anoto tudo em cadernos cheios de fórmulas e desenhos.', 'Vejo potencial explosivo em objetos comuns.', 'Fico empolgado demais ao testar hipóteses perigosas.', 'Perco a noção do tempo quando estou pesquisando algo novo.'],
-        ideals: ['Descoberta. Sempre há algo novo a ser criado ou entendido.', 'Transformação. Nada é fixo; tudo pode mudar.', 'Ambição. O impossível é apenas uma questão de tentativa e erro.'],
-        bonds: ['Busco aperfeiçoar a fórmula mágica que matou meu antigo mentor.', 'Protejo um manuscrito raro que contém conhecimento proibido.', 'Prometi achar a cura para uma praga que assola minha região.'],
-        flaws: ['Subestimo riscos de experimentos e feitiços instáveis.', 'Tenho dificuldade extrema em aceitar falhas.', 'Às vezes trato pessoas como cobaias involuntárias.'],
-        backstory: ['Fui aprendiz de um mestre excêntrico, até que o laboratório explodiu e tive que fugir.', 'Acabei expulso de uma academia mágica por práticas perigosas.', 'Descobri cedo meu talento para manipular substâncias raras e energias voláteis.'],
-        allies: ['Tenho contato com um fornecedor de ingredientes exóticos.', 'Recebo cartas criptografadas de um antigo colega de estudos.', 'Conheço um médico disposto a testar novas misturas sem fazer perguntas.'],
-        features: ['Cheiro constantemente a reagentes químicos e pergaminho velho.', 'Tenho pequenas queimaduras antigas nas pontas dos dedos.', 'Carrego frascos escondidos em bolsos secretos nas roupas.'],
-        extraLanguages: ['Dracônico', 'Proficiência com Kit de Alquimia', 'Proficiência com Kit de Herbalismo', 'Primordial']
-      },
-      {
-        name: "O Navegador Errante",
-        allowedClasses: ['Bardo', 'Guerreiro', 'Ladino', 'Patrulheiro'],
-        traits: ['Sempre conto histórias do mar, mesmo quando ninguém pediu.', 'Confio mais em mapas antigos do que em pessoas novas.', 'Acredito que o horizonte sempre guarda algo melhor do que o porto seguro.', 'Tenho extrema dificuldade em ficar muito tempo no mesmo lugar.'],
-        ideals: ['Liberdade. O mar e as estradas não pertencem a ninguém.', 'Descoberta. Sempre há novas rotas a serem traçadas.', 'Camaradagem. Uma tripulação unida sobrevive a qualquer tempestade.'],
-        bonds: ['Procuro um porto lendário que poucos acreditam existir.', 'Minha antiga tripulação foi destruída por piratas sanguinolentos.', 'Tenho um mapa incompleto que pode mudar a geografia do mundo conhecido.'],
-        flaws: ['Sou extremamente supersticioso quanto a presságios marítimos e climáticos.', 'Bebo além da conta quando estou muito tempo em terra firme.', 'Não resisto a uma aposta perigosa se envolver navegação ou rotas.'],
-        backstory: ['Cresci esfregando o convés de um navio mercante.', 'Sou o único sobrevivente de um naufrágio provocado por uma fera misteriosa.', 'Fugi de uma família abusiva para viver aventuras no mar sem fim.'],
-        allies: ['Tenho amizade fiel com um capitão aposentado e rabugento.', 'Sou bem-vindo em certos portos costeiros barra-pesada.', 'Mantenho contato com cartógrafos independentes.'],
-        features: ['Sinto mudanças no vento antes mesmo que aconteçam.', 'Tenho um equilíbrio excelente, mesmo em terreno muito instável.', 'Reconheço rotas e constelações com uma batida de olho.'],
-        extraLanguages: ['Primordial', 'Proficiência com Ferramentas de Navegação', 'Aquan', 'Proficiência com Veículos Aquáticos']
-      },
-      {
-        name: "O Assassino Calculista",
-        allowedClasses: ['Ladino', 'Patrulheiro', 'Monge', 'Guerreiro'],
-        traits: ['Raramente demonstro emoções ou levanto a voz.', 'Observo padrões de comportamento antes de agir ou falar com alguém.', 'Prefiro resolver problemas da forma mais rápida e silenciosa possível.', 'Nunca faço ameaças vazias.'],
-        ideals: ['Eficiência. O método mais limpo e letal é sempre o melhor.', 'Contrato. Um acordo selado deve ser cumprido, independente do alvo.', 'Equilíbrio. Às vezes, a morte de um é necessária para a sobrevivência de muitos.'],
-        bonds: ['Tenho uma dívida impagável com o mestre que me ensinou a lutar e desaparecer.', 'Busco vingança implacável contra quem traiu minha antiga guilda.', 'Protejo alguém importante que não faz a menor ideia da minha real profissão.'],
-        flaws: ['Tenho dificuldade gigantesca em confiar em aliados recém-chegados.', 'Subestimo o afeto e a compaixão como um fator de risco.', 'Vejo a maioria das pessoas apenas como peças em um tabuleiro.'],
-        backstory: ['Fui treinado desde jovem por uma guilda clandestina que não tolerava falhas.', 'Fui traído e deixado para morrer por meu antigo contratante.', 'Era um espião a serviço de um lorde corrupto, mas decidi trabalhar por conta própria.'],
-        allies: ['Tenho contato direto com um informante do submundo.', 'Possuo acesso a um falsificador talentosíssimo.', 'Sou conhecido - e temido - por um pequeno círculo de mercadores ilegais.'],
-        features: ['Meus passos são quase inaudíveis, não importa o calçado.', 'Nunca esqueço a rotina de um alvo após observá-lo por um dia.', 'Mantenho lâminas minúsculas escondidas em locais improváveis do corpo.'],
-        extraLanguages: ['Símbolos Secretos de Ladrões', 'Proficiência com Kit de Disfarce', 'Proficiência com Kit de Veneno', 'Subcomum']
-      },
-      {
-        name: "O Combatente Disciplinado",
-        allowedClasses: ['Guerreiro', 'Paladino', 'Bárbaro', 'Monge'],
-        traits: ['Não tenho tempo para brincadeiras, sou completamente focado no objetivo.', 'Não confio em sorte mágica, apenas no meu treino e preparação física.', 'Prefiro observar o campo de batalha em silêncio antes de desferir o primeiro golpe.'],
-        ideals: ['Honra. Se eu der minha palavra, eu a cumprirei, custe o que custar.', 'Justiça. Os culpados sempre devem pagar na mesma moeda.', 'Proteção. Os fracos e inocentes devem ser defendidos por aqueles que são fortes.'],
-        bonds: ['Luto para proteger aqueles que não conseguem empunhar uma arma.', 'Minha honra está eternamente ligada ao nome manchado da minha família.', 'Devo minha vida a um aventureiro veterano que me salvou da morte certa no passado.'],
-        flaws: ['Guardo rancor por tempo demais, às vezes anos.', 'Sou praticamente incapaz de recusar um desafio direto às minhas habilidades.', 'Tenho um temperamento rígido que muitas vezes aliena meus aliados.', 'Tenho extrema dificuldade em admitir quando meu plano tático está errado.'],
-        backstory: ['Fui um antigo guarda da cidade que se cansou da corrupção dos nobres, jogou o distintivo fora e pegou a estrada.', 'Servi bravamente no exército durante uma guerra violenta que o reino preferiu esquecer.', 'Sou sobrevivente de um ataque de saqueadores; jurei treinar até que nunca mais fosse fraco.'],
-        allies: ['Sou bastante respeitado por um pequeno clã de mercenários independentes.', 'Tenho amizade velada com um capitão da guarda local.', 'Tenho um velho companheiro de batalhões sempre disposto a ajudar por uma caneca de cerveja.'],
-        features: ['Possuo dezenas de cicatrizes de batalha, cada uma com uma história militar.', 'Tenho memória afiada para terrenos e posições táticas.', 'Nunca esqueço o rosto de quem já lutou ao meu lado - ou contra mim.'],
-        extraLanguages: ['Gigante', 'Orc', 'Proficiência com Ferramentas de Ferreiro', 'Proficiência com Ferramentas de Carpinteiro']
-      },
-      {
-        name: "O Estudioso Místico",
-        allowedClasses: ['Mago', 'Bruxo', 'Clérigo', 'Bardo', 'Druida'],
-        traits: ['Fico instantaneamente fascinado com qualquer relíquia ou bugiganga arcana.', 'Tenho uma curiosidade perigosa, grande demais para o meu próprio bem.', 'Sempre tento mediar conflitos usando lógica e razão antes que virem violência desenfreada.'],
-        ideals: ['Conhecimento. A verdade oculta está acima de qualquer poder temporal.', 'Destino. Meu caminho e minhas descobertas já foram traçados por forças maiores.', 'Equilíbrio. A magia da luz e as artes das trevas precisam coexistir para o mundo não ruir.', 'Iluminação. Todos merecem compartilhar o dom da sabedoria.'],
-        bonds: ['Protejo um segredo ancestral que, se revelado, poderia iniciar uma guerra santa.', 'Devo lealdade irrestrita a uma ordem hermética que o povo acha que já não existe mais.', 'Fui salvo de uma maldição por uma entidade misteriosa e sinto que a ela devo a vida.'],
-        flaws: ['Confio rápido demais em promessas intelectuais e charadas.', 'Frequentemente subestimo inimigos braçais que me parecem estúpidos ou fracos.', 'Fico incrivelmente paranoico quando sinto perturbações no tecido mágico local.', 'Posso sacrificar minha própria segurança por um livro raro.'],
-        backstory: ['Eu era um arquivista de biblioteca que percebeu que ler sobre o mundo não era nada comparado a desvendá-lo pessoalmente.', 'Fui treinado arduamente em um mosteiro místico isolado no topo das montanhas.', 'Era aprendiz de um arquimago excêntrico que desapareceu subitamente sem deixar um único rastro físico.', 'Escapei por pouco de um culto sombrio tentando invocar coisas que não deveriam despertar.'],
-        allies: ['Recebo permissões especiais em grandes bibliotecas e academias de magia.', 'Sou observado e ocasionalmente ajudado por um corvo familiar ou criatura feérica.', 'Sou membro de base de uma aliança secreta de arcanistas espalhados pelo continente.', 'Possuo um mestre ancião que envia mensagens mágicas enigmáticas de vez em quando.'],
-        features: ['Possuo uma tatuagem mística ou cicatriz rúnica que formiga perto de magia intensa.', 'Minhas mãos são sempre frias ao toque, independentemente do clima escaldante.', 'Meus olhos mudam levemente de tonalidade quando eu conjuro ou concentro energia.'],
-        extraLanguages: ['Celestial', 'Silvestre', 'Abissal', 'Proficiência com Ferramentas de Caligrafia']
-      },
-      {
-        name: "O Nobre Vaidoso",
-        allowedClasses: ['Bardo', 'Paladino', 'Feiticeiro', 'Guerreiro'],
-        traits: ['Acredito veementemente que o dinheiro e a influência resolvem absolutamente qualquer problema.', 'Sou excessivamente educado, de forma condescendente, até com meus piores inimigos.', 'Adoro monopolizar a conversa com histórias exageradas sobre minhas proezas.', 'Detesto sujeira e reclamo frequentemente da falta de conforto.'],
-        ideals: ['Poder. Eu farei o que for preciso para elevar o prestígio da minha linhagem.', 'Glória. Quero que meu nome seja eternizado em estátuas de mármore e canções épicas.', 'Noblesse Oblige. É meu dever guiar as massas não instruídas, pois sou superior.', 'Tradição. O sangue nobre e as antigas formas de governar existem por um excelente motivo.'],
-        bonds: ['Guardo o anel de sinete da minha casa, a única prova do meu verdadeiro berço.', 'Jurei limpar o nome da minha família após um escândalo político arruinar nosso feudo.', 'Carrego comigo uma joia de valor inestimável que pertenceu à minha falecida mãe.'],
-        flaws: ['No fundo, acredito que sou ontologicamente superior a todos que não têm berço de ouro.', 'Sou obcecado por aparências físicas, vestimentas luxuosas e culinária fina.', 'Tenho um medo paralisante de falhar, passar vergonha ou parecer fraco em público.', 'Suborno as pessoas impulsivamente em vez de lidar com os problemas.'],
-        backstory: ['Nasci cercado de veludo e servos, mas um golpe de estado tirou tudo de mim, forçando-me a aventurar.', 'Descobri recentemente que sou o filho bastardo de um regente importantíssimo.', 'Entediei-me com a política letárgica da corte e fugi em busca de emoções reais no mundo sujo.', 'Fui deserdado por desonrar minha casa paterna e agora busco glória para esfregar na cara deles.'],
-        allies: ['Ainda mantenho o favor de alguns cortesãos leais e servos saudosos do castelo.', 'Tenho amizade com comandantes da guarda real que outrora protegeram minha família.', 'Possuo crédito (e muitas dívidas) nos maiores bancos mercantis da capital central.', 'Sou apadrinhado à distância por um duque de reputação questionável.'],
-        features: ['Tenho uma risada polida e inconfundível, acompanhada de um olhar de cima para baixo.', 'Meu sotaque denuncia imediatamente uma criação requintada e anos de tutores particulares.', 'Caminho com uma postura reta tão artificial que pareço carregar uma tábua nas costas.'],
-        extraLanguages: ['Dracônico', 'Proficiência com Instrumentos de Sopro', 'Élfico (Alta Sociedade)', 'Proficiência com Ferramentas de Joalheiro']
-      },
-      {
-        name: "O Forasteiro Selvagem",
-        allowedClasses: ['Bárbaro', 'Druida', 'Patrulheiro'],
-        traits: ['Sou profundamente supersticioso, interpretando o voo dos pássaros e o uivo dos lobos.', 'Sempre desconfio das invenções da "civilização" e durmo com um olho aberto em cidades.', 'Prefiro ficar em silêncio absoluto observando os arredores antes de abrir a boca.', 'Fico tenso em locais fechados ou multidões esmagadoras.'],
-        ideals: ['Exploração. O mundo natural precisa ter seus cantos respeitados, não pavimentados.', 'Autossuficiência. Eu sou a minha própria arma; só posso depender do meu suor e sangue.', 'Harmonia Primordial. O ciclo de presa e predador é sagrado e não deve ser corrompido.', 'Liberdade. As paredes das cidades são apenas gaiolas enfeitadas com pedras.'],
-        bonds: ['Meu clã foi dizimado por bestas, e jurei caçar até o último responsável na face da terra.', 'Sou o guardião ungido de um bosque ancestral que a civilização tenta invadir.', 'Tenho uma conexão empática inexplicável com um predador que me salvou na juventude.'],
-        flaws: ['Tenho o hábito perturbador de guardar troféus macabros de minhas caçadas.', 'Sou impulsivo para a fúria se insultarem meus costumes ou a natureza ao meu redor.', 'Tenho pavor de magia necromântica e abominações que quebram o ciclo natural da vida.', 'Somo péssimo com etiquetas sociais e falo brutalmente o que me vem à cabeça.'],
-        backstory: ['Sobrevivi sozinho na selva brutal por dez anos após me separar da minha tribo em uma tempestade.', 'Fui criado e moldado pelas feéricas profundas em uma floresta esquecida pelo tempo.', 'Era um rastreador de recompensas nas estepes congeladas do norte, acostumado ao sangue no gelo.', 'Nasci durante uma tempestade mística e meu povo sempre me viu como um avatar da fúria elemental.'],
-        allies: ['Não tenho senhores; minha aliança primária é com a própria terra e as feras locais.', 'Sou respeitado e temido por tribos nômades que conhecem meu nome de caça.', 'Uma cabala de druidas eremitas ocasionalmente me fornece ervas e direção.', 'Tenho passe-livre em territórios controlados por centauros e outros povos silvestres.'],
-        features: ['Tenho um senso de direção magnético; quase nunca me perco sob céu aberto.', 'Consigo imitar perfeitamente o som de alarme de pássaros e ganidos de lobos.', 'Sinto o cheiro metálico de chuva e o ozônio de tempestades horas antes delas caírem.', 'A maioria dos animais domésticos parece se intimidar ou reverenciar minha presença física.'],
-        extraLanguages: ['Silvestre', 'Primordial', 'Proficiência com Instrumentos de Percussão', 'Proficiência em Kit de Herbalismo']
+  type RandomLoreArchetypeRow = { id: number; name: string; allowed_classes?: string };
+  type RandomLoreEntryRow = { value: string };
+  type RandomNamePartRow = { value: string };
+  type RandomConnectorRow = { value: string };
+  type RandomRaceLanguageRuleRow = { base_languages: string };
+
+  const pickRandom = <T,>(items: T[], fallback: T): T => {
+    if (!items || items.length === 0) return fallback;
+    return items[Math.floor(Math.random() * items.length)];
+  };
+
+  const parseAllowedClasses = (value?: string) => {
+    try {
+      const parsed = JSON.parse(value || '[]');
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const getRandomLoreValue = async (archetypeId: number, field: string, fallback: string) => {
+    const rows = await db.getAllAsync<RandomLoreEntryRow>(
+      `SELECT value FROM random_lore_entries WHERE archetype_id = ? AND field = ? ORDER BY RANDOM() LIMIT 1`,
+      [archetypeId, field]
+    );
+    return rows[0]?.value || fallback;
+  };
+
+  const getRandomLoreConnector = async (className: string) => {
+    const rows = await db.getAllAsync<RandomConnectorRow>(
+      `SELECT value FROM random_lore_connectors
+       WHERE class_name = '' OR class_name = ?
+       ORDER BY RANDOM() LIMIT 1`,
+      [className]
+    );
+    return rows[0]?.value ? rows[0].value.replace('{classe}', className) : '';
+  };
+
+  const getBaseLanguagesFromDb = async (raceName: string) => {
+    const rows = await db.getAllAsync<RandomRaceLanguageRuleRow>(
+      `SELECT base_languages FROM random_race_language_rules
+       WHERE race_contains = '*' OR instr(?, race_contains) > 0
+       ORDER BY priority DESC, id ASC
+       LIMIT 1`,
+      [raceName]
+    );
+    return rows[0]?.base_languages || 'Comum';
+  };
+
+  const buildRandomLanguages = async (raceName: string, archetypeId: number) => {
+    const baseLanguages = await getBaseLanguagesFromDb(raceName);
+    const extraLanguage = await getRandomLoreValue(archetypeId, 'extraLanguages', 'mais uma proficiência ou idioma à escolha');
+    return `Idiomas: ${baseLanguages}.\nHerança do Passado: ${extraLanguage}.`;
+  };
+
+  const generateRandomLore = async (classNameOverride?: string, raceNameOverride?: string) => {
+    try {
+      const className = classNameOverride && !classNameOverride.includes('Selecione') ? classNameOverride : charClass;
+      const rows = await db.getAllAsync<RandomLoreArchetypeRow>(
+        `SELECT id, name, allowed_classes FROM random_lore_archetypes ORDER BY name`
+      );
+
+      let validArchetypes = rows;
+      if (className && !className.includes('Selecione')) {
+        validArchetypes = rows.filter(row => {
+          const allowed = parseAllowedClasses(row.allowed_classes);
+          return allowed.length === 0 || allowed.includes(className);
+        });
       }
-    ];
+      if (validArchetypes.length === 0) validArchetypes = rows;
 
-    let validArchetypes = archetypes;
-    if (charClass && charClass !== 'Selecione uma classe') {
-      validArchetypes = archetypes.filter(a => a.allowedClasses.includes(charClass));
-      if (validArchetypes.length === 0) validArchetypes = archetypes; 
+      const chosen = pickRandom(validArchetypes, rows[0]);
+      if (!chosen?.id) {
+        setPersonalityTraits('Aventureiro de personalidade marcante, ainda construindo sua lenda.');
+        setIdeals('Destino. Meu caminho ainda será escrito.');
+        setBonds('Tenho uma ligação forte com meu grupo de aventura.');
+        setFlaws('Às vezes ajo antes de pensar.');
+        setBackstory('Minha história começou longe dos grandes salões, mas agora caminho rumo a feitos maiores.');
+        setAlliesOrganizations('Contatos locais, antigos conhecidos e possíveis aliados de estrada.');
+        setFeaturesTraits('Tenho marcas, hábitos ou talentos que chamam atenção.');
+        setLanguages('Comum');
+        return;
+      }
+
+      setPersonalityTraits(await getRandomLoreValue(chosen.id, 'traits', 'Sou cauteloso antes de confiar em estranhos.'));
+      setIdeals(await getRandomLoreValue(chosen.id, 'ideals', 'Liberdade. Ninguém deve viver acorrentado.'));
+      setBonds(await getRandomLoreValue(chosen.id, 'bonds', 'Protejo alguém ou algo importante para mim.'));
+      setFlaws(await getRandomLoreValue(chosen.id, 'flaws', 'Tenho dificuldade em recuar quando sou provocado.'));
+
+      const baseBackstory = await getRandomLoreValue(chosen.id, 'backstory', 'Cresci em meio a conflitos e aprendi cedo a sobreviver.');
+      const connector = className && !className.includes('Selecione') ? await getRandomLoreConnector(className) : '';
+      setBackstory([baseBackstory, connector].filter(Boolean).join(' '));
+
+      setAlliesOrganizations(await getRandomLoreValue(chosen.id, 'allies', 'Tenho alguns contatos que podem ajudar, pelo preço certo.'));
+      setFeaturesTraits(await getRandomLoreValue(chosen.id, 'features', 'Carrego uma marca ou costume incomum.'));
+      setLanguages(await buildRandomLanguages(raceNameOverride || race, chosen.id));
+    } catch (error) {
+      console.error('Erro ao gerar lore aleatória pelo banco:', error);
+      showCustomAlert('Erro', 'Não foi possível gerar história aleatória pelo banco de dados.');
     }
-
-    const chosenArchetype = validArchetypes[Math.floor(Math.random() * validArchetypes.length)];
-    setPersonalityTraits(chosenArchetype.traits[Math.floor(Math.random() * chosenArchetype.traits.length)]);
-    setIdeals(chosenArchetype.ideals[Math.floor(Math.random() * chosenArchetype.ideals.length)]);
-    setBonds(chosenArchetype.bonds[Math.floor(Math.random() * chosenArchetype.bonds.length)]);
-    setFlaws(chosenArchetype.flaws[Math.floor(Math.random() * chosenArchetype.flaws.length)]);
-    
-    let generatedBackstory = chosenArchetype.backstory[Math.floor(Math.random() * chosenArchetype.backstory.length)];
-    if (charClass && charClass !== 'Selecione uma classe') {
-        const connectors = [
-          ` O destino e a dureza da vida acabaram forjando minhas habilidades como ${charClass}.`,
-          ` Abraçar o caminho de ${charClass} foi a única maneira que encontrei para sobreviver a esse passado.`,
-          ` Essa história me deixou marcas profundas e despertou minha vocação como ${charClass}.`
-        ];
-        generatedBackstory += connectors[Math.floor(Math.random() * connectors.length)];
-    }
-    setBackstory(generatedBackstory);
-
-    setAlliesOrganizations(chosenArchetype.allies[Math.floor(Math.random() * chosenArchetype.allies.length)]);
-    setFeaturesTraits(chosenArchetype.features[Math.floor(Math.random() * chosenArchetype.features.length)]);
-    
-    let baseLangs = "Comum";
-    if (race.includes('Elfo')) baseLangs += ", Élfico";
-    else if (race.includes('Anão')) baseLangs += ", Anão";
-    else if (race.includes('Halfling')) baseLangs += ", Halfling";
-    else if (race.includes('Draconato')) baseLangs += ", Dracônico";
-    else if (race.includes('Gnomo')) baseLangs += ", Gnômico";
-    else if (race.includes('Orc')) baseLangs += ", Orc";
-    else if (race.includes('Tiefling')) baseLangs += ", Infernal";
-    else if (race.includes('Githyanki')) baseLangs += ", Gith (Subcomum)";
-    else baseLangs += " e mais um idioma racial à escolha";
-
-    const extraLang = chosenArchetype.extraLanguages[Math.floor(Math.random() * chosenArchetype.extraLanguages.length)];
-    setLanguages(`Idiomas: ${baseLangs}.\nHerança do Passado: ${extraLang}.`);
   };
 
   const handleRandomizeClick = () => {
     const isDirty = name.trim() !== '' || race !== 'Selecione uma raça' || charClass !== 'Selecione uma classe';
     
     if (!isDirty || hasConfirmedRandomize.current) {
-      generateRandomCharacter();
+      void generateRandomCharacter();
       return;
     }
 
@@ -400,7 +372,7 @@ export default function CreateCharacterScreen() {
                   { text: "Não", color: "#666" },
                   { text: "Sim, gerar do zero", color: "#ff6666", style: "destructive", onPress: () => {
                       hasConfirmedRandomize.current = true;
-                      generateRandomCharacter();
+                      void generateRandomCharacter();
                     } 
                   }
                 ]);
@@ -410,7 +382,7 @@ export default function CreateCharacterScreen() {
           { 
             text: "Apenas História", 
             color: "#00fa9a",
-            onPress: generateRandomLore 
+            onPress: () => { void generateRandomLore(); }
           }
         ]
       );
@@ -422,7 +394,7 @@ export default function CreateCharacterScreen() {
           { text: "Cancelar", color: "#666" },
           { text: "Sim, sortear", color: "#ff6666", style: "destructive", onPress: () => {
               hasConfirmedRandomize.current = true;
-              generateRandomCharacter();
+              void generateRandomCharacter();
             } 
           }
         ]
@@ -430,13 +402,34 @@ export default function CreateCharacterScreen() {
     }
   };
 
+  const fetchRandomNameFromDb = async (className: string) => {
+    const gender = Math.random() > 0.5 ? 'male' : 'female';
+    const names = await db.getAllAsync<RandomNamePartRow>(
+      `SELECT value FROM random_name_parts
+       WHERE kind = 'first_name' AND gender IN (?, 'any')
+       ORDER BY RANDOM() LIMIT 1`,
+      [gender]
+    );
+    const titles = await db.getAllAsync<RandomNamePartRow>(
+      `SELECT value FROM random_name_parts
+       WHERE kind = 'title'
+         AND gender IN (?, 'any')
+         AND (class_name = '' OR class_name = ?)
+       ORDER BY RANDOM() LIMIT 1`,
+      [gender, className]
+    );
+
+    const firstName = names[0]?.value || 'Aventureiro';
+    const title = titles[0]?.value || 'sem nome';
+    return `${firstName} ${title}`.trim();
+  };
+
   const generateRandomCharacter = async () => {
     if (dbRaces.length === 0 || dbClasses.length === 0) { showCustomAlert("Aguarde", "Carregando o banco de dados..."); return; }
     isRandomizing.current = true;
-    
-    if (Math.random() < 0.12) {
-      try {
-        const companionsDB = await db.getAllAsync('SELECT * FROM bg3_companions ORDER BY RANDOM() LIMIT 1');
+    try {
+      if (Math.random() < 0.12) {
+        const companionsDB = await db.getAllAsync<any>('SELECT * FROM bg3_companions ORDER BY RANDOM() LIMIT 1');
         if (companionsDB.length > 0) {
           const companion: any = companionsDB[0];
           companion.skills = JSON.parse(companion.skills);
@@ -448,15 +441,9 @@ export default function CreateCharacterScreen() {
           const matchedClass = dbClasses.find(c => c.name.toLowerCase().includes(companion.class.toLowerCase())) || dbClasses[0];
 
           setName(companion.name); setRace(matchedRace.name); setCharClass(matchedClass.name); setAllowedOriginFeature(companion.originSpell || null);
-          
-          // CONVERSÃO DE STRING OBRIGATÓRIA PARA O TEXTINPUT NÃO BUBAR!
           setStats({
-            FOR: String(companion.stats.FOR), 
-            DES: String(companion.stats.DES), 
-            CON: String(companion.stats.CON),
-            INT: String(companion.stats.INT), 
-            SAB: String(companion.stats.SAB), 
-            CAR: String(companion.stats.CAR),
+            FOR: String(companion.stats.FOR), DES: String(companion.stats.DES), CON: String(companion.stats.CON),
+            INT: String(companion.stats.INT), SAB: String(companion.stats.SAB), CAR: String(companion.stats.CAR),
           });
 
           const totalCompStats = Object.values(companion.stats).reduce((acc: number, val: any) => acc + parseInt(val as string), 0);
@@ -464,125 +451,41 @@ export default function CreateCharacterScreen() {
 
           setPersonalityTraits(companion.personality); setIdeals(companion.ideals); setBonds(companion.bonds);
           setFlaws(companion.flaws); setBackstory(companion.backstory); setAlliesOrganizations(companion.allies);
-          
-          // --- DICIONÁRIO DE LORE DOS COMPANHEIROS BG3 ---
-          const bg3Extras: Record<string, { langs: string, traits: string }> = {
-            'Astarion': {
-              langs: 'Comum, Élfico, Subcomum.\nProficiência: Ferramentas de Ladrão, Kit de Disfarce.',
-              traits: 'Vampiro Gerado: Não envelhece, precisa de sangue para sustento. Resiste ao sol graças ao parasita ilitide. Possui cicatrizes infernais nas costas.'
-            },
-            'Lae\'zel': {
-              langs: 'Comum, Gith.\nProficiência: Navegação Astral.',
-              traits: 'Treinamento Militar da Creche K\'liir: Conhecimento tático sobre devoradores de mentes. Foco militar implacável e parasita adormecido.'
-            },
-            'Gale': {
-              langs: 'Comum, Élfico, Dracônico, Celestial.\nProficiência: Tabuleiros de Xadrez de Lança.',
-              traits: 'Prodígio de Waterdeep: Carrega um fragmento corrompido da Trama Netheresa no peito (Orbe) que exige consumo de magia. Mantém tara, uma tressym, como familiar.'
-            },
-            'Shadowheart': {
-              langs: 'Comum, Élfico.\nProficiência: Kit de Venenos, Ferramentas de Ladrão.',
-              traits: 'Agente de Shar: Memórias seladas voluntariamente para proteger os segredos do claustro. Possui uma marca mágica na mão que ocasionalmente causa intensa dor.'
-            },
-            'Umbralma': {
-              langs: 'Comum, Élfico.\nProficiência: Kit de Venenos, Ferramentas de Ladrão.',
-              traits: 'Agente de Shar: Memórias seladas voluntariamente para proteger os segredos do claustro. Possui uma marca mágica na mão que ocasionalmente causa intensa dor.'
-            },
-            'Karlach': {
-              langs: 'Comum, Infernal.\nProficiência: Veículos terrestres (Máquinas de Avernus).',
-              traits: 'Motor Infernal: O coração foi substituído por um motor de Zariel que queima com o calor do inferno. Impossibilitada de tocar as pessoas sem queimá-las no plano material.'
-            },
-            'Wyll': {
-              langs: 'Comum, Infernal.\nProficiência: Jogos de Cartas e Dados.',
-              traits: 'A Lâmina da Fronteira: Fama como caçador de monstros heroico. Possui um olho de envio de pedra que pertence à sua patrona demônio, Mizora.'
-            },
-            'Halsin': {
-              langs: 'Comum, Élfico, Silvestre, Primordial.\nProficiência: Kit de Herbalismo.',
-              traits: 'Ancião do Bosque: Porte físico colossal de urso. Conhecimento ancestral sobre rituais da natureza e sobre a Maldição das Sombras que aflige as terras de Ketheric.'
-            },
-            'Jaheira': {
-              langs: 'Comum, Élfico, Silvestre.\nProficiência: Kit de Venenos, Ferramentas de Navegação.',
-              traits: 'Alto Harpista: Lidera uma rede de espiões e informantes. Possui conhecimento tático de séculos atrás e guarda em sua casa relíquias de aventuras passadas.'
-            },
-            'Minsc': {
-              langs: 'Comum.\nProficiência: Nenhuma em especial, mas Boo compensa.',
-              traits: 'Herói de Rashemen: Possui uma força de vontade e fúria indomáveis. Sempre acompanhado por Boo, seu fiel Hamster Espacial Gigante em Miniatura, a quem pede conselhos.'
-            }
-          };
-
-          const extras = bg3Extras[companion.short_name] || bg3Extras[companion.name] || {
-            langs: 'Comum e idiomas raciais associados.',
-            traits: 'Sobrevivente do Nautiloide Ilitide. Carrega um parasita no cérebro.'
-          };
-
-          setFeaturesTraits(extras.traits);
-          setLanguages(extras.langs);
+          setFeaturesTraits(companion.origin_traits || 'Sobrevivente do Nautiloide Ilitide. Carrega um parasita no cérebro.');
+          setLanguages(companion.languages || 'Comum e idiomas raciais associados.');
           setGp(matchedClass.starting_gold || 100);
 
           await setupCharacterExtras(matchedRace, matchedClass, companion, companion.stats);
         }
-      } catch (error) { console.error("Erro ao buscar companheiros de origem:", error); }
-    } else {
-      const randRace = dbRaces[Math.floor(Math.random() * dbRaces.length)];
-      const randClass = dbClasses[Math.floor(Math.random() * dbClasses.length)];
-      setRace(randRace.name); setCharClass(randClass.name); setAllowedOriginFeature(null);
+      } else {
+        const randRace = dbRaces[Math.floor(Math.random() * dbRaces.length)];
+        const randClass = dbClasses[Math.floor(Math.random() * dbClasses.length)];
+        setRace(randRace.name); setCharClass(randClass.name); setAllowedOriginFeature(null);
 
-      const maleNames = ['Bruno', 'João', 'Pedro', 'Bentinho', 'Tiago', 'Rafael', 'Kaelen', 'Thorin', 'Silas', 'Bram', 'Dorian', 'Faelan', 'Gael', 'Orion', 'Beren', 'Nícolas', 'Zoltan', 'Vagner', 'Rurik', 'Luiz', 'Gustavo', 'Leonardo', 'Matheus', 'Felipe', 'Wilker', 'Dante', 'Vítor', 'Enzo', 'Ramon', 'Aldric', 'Cedric', 'Theron', 'Kael', 'Edrin', 'Lucan', 'Magnus', 'Hadrian', 'Alaric', 'Tiberius', 'Cassian', 'Rowan', 'Darion', 'Valen', 'Arthos', 'Kieran', 'Ulric', 'Fenris', 'Maelor', 'Talon', 'Aeron', 'Gareth', 'Eamon', 'Soren', 'Draven'];
-      const femaleNames = ['Karoline', 'Maria', 'Ana', 'Beatriz', 'Mariana', 'Amanda', 'Lyra', 'Elara', 'Ilyana', 'Ayla', 'Morgana', 'Bianca', 'Catarine', 'Fernanda', 'Isabela', 'Sofia', 'Camila', 'Larissa', 'Yanaele', 'Evelyn', 'Alícia', 'Lívia', 'Giovanna', 'Carla', 'Júlia', 'Seraphine', 'Nyx', 'Thalia', 'Isolde', 'Rhiannon', 'Selene', 'Freya', 'Arwen', 'Kaelis', 'Vespera', 'Aurora', 'Elysia', 'Maeryn', 'Zara', 'Lyanna', 'Ophelia', 'Kallista', 'Ysolda', 'Miriel', 'Aerin', 'Velanna', 'Lunara', 'Sylphie'];
-      const isMale = Math.random() > 0.5;
-      const randomFirstName = isMale ? maleNames[Math.floor(Math.random() * maleNames.length)] : femaleNames[Math.floor(Math.random() * femaleNames.length)];
+        setName(await fetchRandomNameFromDb(randClass.name));
 
-      const classTitles: Record<string, string[]> = {
-        'Bárbaro': isMale ? ['o Bárbaro', 'o Implacável', 'o Feroz', 'o Quebra-Crânios'] : ['a Bárbara', 'a Implacável', 'a Feroz', 'a Quebra-Crânios'],
-        'Bardo': isMale ? ['o Bardo', 'o Cancioneiro', 'o Galante', 'Voz-de-Ouro'] : ['a Barda', 'a Cancioneira', 'a Galante', 'Voz-de-Ouro'],
-        'Bruxo': isMale ? ['o Bruxo', 'o Amaldiçoado', 'o Ocultista', 'Corta-Sombras'] : ['a Bruxa', 'a Amaldiçoada', 'a Ocultista', 'Corta-Sombras'],
-        'Clérigo': isMale ? ['o Clérigo', 'o Devoto', 'o Curandeiro', 'Luz-Divina', 'Bicuda Santa', 'Bazuca Celestial'] : ['a Clériga', 'a Devota', 'a Curandeira', 'Luz-Divina', 'Bicuda Santa', 'Bazuca Celestial'],
-        'Druida': isMale ? ['o Druida', 'o Selvagem', 'Fala-com-Feras', 'da Floresta'] : ['a Druida', 'a Selvagem', 'Fala-com-Feras', 'da Floresta'],
-        'Feiticeiro': isMale ? ['o Feiticeiro', 'o Nato', 'Sangue-Mágico', 'o Canalizador'] : ['a Feiticeira', 'a Nata', 'Sangue-Mágico', 'a Canalizadora'],
-        'Guerreiro': isMale ? ['o Guerreiro', 'o Veterano', 'Braço-de-Ferro', 'o Colosso'] : ['a Guerreira', 'a Veterana', 'Braço-de-Ferro', 'a Colosso'],
-        'Ladino': isMale ? ['o Ladino', 'Pé-Ligeiro', 'Mão-Leve', 'o Vigarista', 'das Sombras'] : ['a Ladina', 'Pé-Ligeiro', 'Mão-Leve', 'a Vigarista', 'das Sombras'],
-        'Mago': isMale ? ['o Mago', 'o Sábio', 'o Estudioso', 'Tomo-Vivo'] : ['a Maga', 'a Sábia', 'a Estudiosa', 'Tomo-Vivo'],
-        'Monge': isMale ? ['o Monge', 'Punho-de-Aço', 'o Calmo', 'Passo-Leve'] : ['a Monge', 'Punho-de-Aço', 'a Calma', 'Passo-Leve'],
-        'Paladino': isMale ? ['o Paladino', 'o Justo', 'o Cruzado', 'Escudo-Radiante'] : ['a Paladina', 'a Justa', 'a Cruzada', 'Escudo-Radiante'],
-        'Patrulheiro': isMale ? ['o Patrulheiro', 'o Caçador', 'Olho-de-Águia', 'o Errante'] : ['a Patrulheira', 'a Caçadora', 'Olho-de-Águia', 'a Errante'],
-      };
+        const baseStats = JSON.parse(randClass.recommended_stats || '{}');
+        const bonuses = JSON.parse(randRace.stat_bonuses || '{}') as Record<string, number>;
+        const totalBonus = Object.values(bonuses).reduce((acc, val) => acc + (val || 0), 0);
+        setMaxStatsSum(72 + totalBonus);
+        
+        const calculatedStats = {
+          FOR: String((baseStats.FOR || 10) + (bonuses.FOR || 0)), DES: String((baseStats.DES || 10) + (bonuses.DES || 0)), CON: String((baseStats.CON || 10) + (bonuses.CON || 0)),
+          INT: String((baseStats.INT || 10) + (bonuses.INT || 0)), SAB: String((baseStats.SAB || 10) + (bonuses.SAB || 0)), CAR: String((baseStats.CAR || 10) + (bonuses.CAR || 0)),
+        };
+        setStats(calculatedStats);
+        setGp(randClass.starting_gold || 0);
 
-      const genericTitles = isMale 
-        ? [
-            'de Tal', 'Sem-Teto', 'da Taberna', 'o Azarado', 'o Magnífico', 
-            'meio Tan Tan', 'o Errante', 'o Imortal', 'o Inquebrável', 'o Destemido', 
-            'o Caído', 'o Renascido', 'Sangue-de-Ferro', 'Sussurro-da-Noite', 
-            'Punho-Sombrio', 'Lâmina-Veloz', 'de Rívia', 'Universitário', 'Pedra de tropeço', 'Batutinha'
-          ] 
-        : [
-            'de Tal', 'Sem-Teto', 'da Taberna', 'a Azarada', 'a Magnífica', 
-            'meio Tan Tan', 'a Errante', 'a Imortal', 'a Inquebrável', 'a Destemida', 
-            'a Caída', 'a Renascida', 'Sangue-de-Ferro', 'Sussurro-da-Noite', 
-            'Punho-Sombrio', 'Lâmina-Veloz', 'de Rívia', 'Universitária', 'Pedra de tropeço', 'Batutinha'
-          ];
-
-      const validTitles = [...(classTitles[randClass.name] || []), ...genericTitles];
-      const randomTitle = validTitles[Math.floor(Math.random() * validTitles.length)];
-
-      setName(`${randomFirstName} ${randomTitle}`);
-
-      const baseStats = JSON.parse(randClass.recommended_stats || '{}');
-      const bonuses = JSON.parse(randRace.stat_bonuses || '{}') as Record<string, number>;
-      const totalBonus = Object.values(bonuses).reduce((acc, val) => acc + (val || 0), 0);
-      setMaxStatsSum(72 + totalBonus);
-      
-      const calculatedStats = {
-        FOR: String((baseStats.FOR || 10) + (bonuses.FOR || 0)), DES: String((baseStats.DES || 10) + (bonuses.DES || 0)), CON: String((baseStats.CON || 10) + (bonuses.CON || 0)),
-        INT: String((baseStats.INT || 10) + (bonuses.INT || 0)), SAB: String((baseStats.SAB || 10) + (bonuses.SAB || 0)), CAR: String((baseStats.CAR || 10) + (bonuses.CAR || 0)),
-      };
-      setStats(calculatedStats);
-      setGp(randClass.starting_gold || 0);
-
-      generateRandomLore();
-      await setupCharacterExtras(randRace, randClass, null, calculatedStats);
+        await generateRandomLore(randClass.name, randRace.name);
+        await setupCharacterExtras(randRace, randClass, null, calculatedStats);
+      }
+    } catch (error) {
+      console.error("Erro ao gerar personagem aleatório:", error);
+      showCustomAlert('Erro', 'Não foi possível gerar personagem aleatório. Verifique os dados base do banco.');
+    } finally {
+      setStep(7);
+      setTimeout(() => { isRandomizing.current = false; }, 500);
     }
-    
-    setStep(7); 
-    setTimeout(() => { isRandomizing.current = false; }, 500);
   };
 
   const setupCharacterExtras = async (r: RaceItem, c: ClassItem, companion?: any, generatedStats?: any) => {
@@ -625,8 +528,8 @@ export default function CreateCharacterScreen() {
     let raceFeatures: string[] = [];
     let classFeaturesListed: string[] = [];
     try {
-      if (r.features) raceFeatures = JSON.parse(r.features).map((f:any) => typeof f === 'string' ? f : f.name);
-      if (c.features) classFeaturesListed = JSON.parse(c.features).map((f:any) => typeof f === 'string' ? f : f.name);
+      if (r.features) raceFeatures = parseFeatureNamesForLevel(r.features, 1);
+      if (c.features) classFeaturesListed = parseFeatureNamesForLevel(c.features, 1);
     } catch(e) {}
 
     if (companion && companion.originSpell) { raceFeatures.push(companion.originSpell); }
@@ -795,8 +698,8 @@ export default function CreateCharacterScreen() {
      let rFeats: string[] = [];
      let cFeats: string[] = [];
      
-     try { if (currentRace && currentRace.features) rFeats = JSON.parse(currentRace.features).map((f:any) => typeof f === 'string' ? f : f.name); } catch(e){}
-     try { if (currentClass && currentClass.features) cFeats = JSON.parse(currentClass.features).map((f:any) => typeof f === 'string' ? f : f.name); } catch(e){}
+     try { if (currentRace && currentRace.features) rFeats = parseFeatureNamesForLevel(currentRace.features, 1); } catch(e){}
+     try { if (currentClass && currentClass.features) cFeats = parseFeatureNamesForLevel(currentClass.features, 1); } catch(e){}
      
      if (race === 'Githyanki' && !rFeats.includes('Mãos Mágicas (Githyanki)')) rFeats.push('Mãos Mágicas (Githyanki)');
      
@@ -934,7 +837,7 @@ export default function CreateCharacterScreen() {
         ]
       );
       const newCharacterId = Number((result as any).lastInsertRowId || 0);
-      if (activeSession && newCharacterId > 0) {
+      if (activeSession?.role === 'player' && newCharacterId > 0) {
         await linkCharacterToActiveSession(newCharacterId);
         await broadcastCharacter(newCharacterId, 'character-created');
         router.replace(`/sheet?id=${newCharacterId}`);
@@ -977,7 +880,7 @@ export default function CreateCharacterScreen() {
         <View style={styles.formGroup}><Text style={styles.label}>CLASSE</Text><TouchableOpacity style={styles.selectButton} onPress={() => openSelectionModal('class')}><Text style={[styles.selectButtonText, charClass.includes('Selecione') && {color:'rgba(255,255,255,0.3)'}]}>{charClass}</Text><Text style={styles.selectIcon}>▼</Text></TouchableOpacity></View>
         <View style={styles.statsSection}>
           <View style={styles.statsHeader}><Text style={styles.sectionTitle}>ATRIBUTOS BÁSICOS</Text><Text style={styles.counterText}>SOMA: {totalStats}/{maxStatsSum}</Text></View>
-          <View style={styles.statsGrid}>{Object.keys(stats).map((key) => <View key={key} style={styles.statBox}><Text style={styles.statLabel}>{key}</Text><TextInput style={styles.statInput} keyboardType="numeric" maxLength={2} value={stats[key as keyof typeof stats]} onChangeText={(val) => updateStat(key as keyof typeof stats, val)} /></View>)}</View>
+          <View style={styles.statsGrid}>{Object.keys(stats).map((key) => <View key={key} style={styles.statBox}><Text style={styles.statLabel}>{key}</Text><TextInput style={styles.statInput} keyboardType="numeric" selectTextOnFocus textAlign="center" maxLength={2} value={stats[key as keyof typeof stats]} onChangeText={(val) => updateStat(key as keyof typeof stats, val)} /></View>)}</View>
         </View>
       </View>
     );
@@ -1107,7 +1010,7 @@ export default function CreateCharacterScreen() {
       <Text style={styles.label}>MOEDAS INICIAIS</Text>
       <View style={styles.coinsRow}>
         {[ {l: 'Ouro (PO)', v: gp, s: setGp, c: '#ffd700'}, {l: 'Prata (PP)', v: sp, s: setSp, c: '#c0c0c0'}, {l: 'Cobre (PC)', v: cp, s: setCp, c: '#cd7f32'} ].map((c, i) => (
-          <View key={i} style={styles.coinBox}><Text style={[styles.coinLabel, { color: c.c }]}>{c.l}</Text><TextInput style={styles.coinInput} keyboardType="numeric" value={String(c.v)} onChangeText={t => c.s(parseInt(t) || 0)} /></View>
+          <View key={i} style={styles.coinBox}><Text style={[styles.coinLabel, { color: c.c }]}>{c.l}</Text><TextInput style={styles.coinInput} keyboardType="numeric" selectTextOnFocus textAlign="center" value={String(c.v)} onChangeText={t => c.s(parseInt(t) || 0)} /></View>
         ))}
       </View>
       

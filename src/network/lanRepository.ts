@@ -2,9 +2,12 @@ import { SQLiteDatabase } from 'expo-sqlite';
 import {
   LanCharacterSnapshot,
   LanContentTable,
+  LanCampaignState,
   LanCustomContentPayload,
   LanCustomContentRef,
   LanCustomContentType,
+  LanOfficialEventMessage,
+  LanOfficialEventType,
   LanRole,
   LanSessionRecord,
   LanSessionStatus,
@@ -17,6 +20,7 @@ export const CUSTOM_CONTENT_DEFINITIONS: {
   subtitleFields: string[];
 }[] = [
   { type: 'Item', tableName: 'items', titleField: 'name', subtitleFields: ['properties', 'damage'] },
+  { type: 'Efeito', tableName: 'effects', titleField: 'effect_type', subtitleFields: ['effect_kind', 'source_table'] },
   { type: 'Raca', tableName: 'races', titleField: 'name', subtitleFields: ['speed'] },
   { type: 'Classe', tableName: 'classes', titleField: 'name', subtitleFields: ['hit_dice', 'saves'] },
   { type: 'Subclasse', tableName: 'subclasses', titleField: 'name', subtitleFields: ['class_name', 'level_required'] },
@@ -25,7 +29,30 @@ export const CUSTOM_CONTENT_DEFINITIONS: {
 ];
 
 const TABLE_COLUMNS: Record<LanContentTable, string[]> = {
-  items: ['name', 'weight', 'damage', 'damage_type', 'properties', 'descricao', 'criador'],
+  items: ['name', 'weight', 'damage', 'damage_type', 'category', 'is_consumable', 'properties', 'descricao', 'criador'],
+  effects: [
+    'source_table',
+    'source_id',
+    'source_name',
+    'trigger',
+    'effect_kind',
+    'effect_type',
+    'condition_name',
+    'value_mode',
+    'dice_count',
+    'dice_sides',
+    'dice_bonus',
+    'fixed_value',
+    'chance_percent',
+    'duration_value',
+    'duration_unit',
+    'target',
+    'stacking',
+    'notes',
+    'metadata',
+    'sort_order',
+    'criador',
+  ],
   races: ['name', 'stat_bonuses', 'speed', 'features', 'criador'],
   classes: [
     'name',
@@ -46,9 +73,16 @@ const TABLE_COLUMNS: Record<LanContentTable, string[]> = {
     'category',
     'classes',
     'casting_time',
+    'casting_time_value',
+    'casting_time_unit',
     'range',
+    'range_value',
+    'range_unit',
+    'range_shape',
     'components',
     'duration',
+    'duration_value',
+    'duration_unit',
     'damage_dice',
     'damage_type',
     'saving_throw',
@@ -78,6 +112,7 @@ const TABLE_COLUMNS: Record<LanContentTable, string[]> = {
 
 const TABLE_KEY_COLUMNS: Record<LanContentTable, string[]> = {
   items: ['name'],
+  effects: ['source_table', 'source_name', 'effect_kind', 'effect_type', 'sort_order'],
   races: ['name'],
   classes: ['name'],
   subclasses: ['name', 'class_name'],
@@ -130,17 +165,43 @@ export async function updateLocalPlayerName(db: SQLiteDatabase, playerName: stri
   );
 }
 
+function toJsonText(value: unknown) {
+  if (value === undefined || value === null) return null;
+  return JSON.stringify(value);
+}
+
+function fromJsonText(value?: string | null) {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function makeEventId(sessionId: string, seq: number) {
+  return `evt_${sessionId}_${seq}_${Date.now().toString(36)}`;
+}
+
+export async function getLocalPlayerName(db: SQLiteDatabase) {
+  const row = await db.getFirstAsync<{ player_name?: string | null }>(
+    `SELECT player_name FROM lan_device_identity WHERE id = 'local'`
+  );
+
+  return row?.player_name || 'Jogador';
+}
+
 export async function closeOpenLanSessions(db: SQLiteDatabase, role?: LanRole) {
   if (role) {
     await db.runAsync(
-      `UPDATE lan_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE role = ? AND status IN ('open', 'connected')`,
+      `UPDATE lan_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE role = ? AND status IN ('open', 'connected', 'paused')`,
       [role]
     );
     return;
   }
 
   await db.runAsync(
-    `UPDATE lan_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE status IN ('open', 'connected')`
+    `UPDATE lan_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE status IN ('open', 'connected', 'paused')`
   );
 }
 
@@ -167,22 +228,239 @@ export async function saveLanSession(db: SQLiteDatabase, session: LanSessionReco
       session.last_connected_at || null,
     ]
   );
+
+  await ensureLanSessionState(db, session.id, session.status);
 }
 
 export async function setLanSessionStatus(db: SQLiteDatabase, sessionId: string, status: LanSessionStatus) {
   await db.runAsync(
     `UPDATE lan_sessions
      SET status = ?, closed_at = CASE WHEN ? = 'closed' THEN CURRENT_TIMESTAMP ELSE closed_at END,
+         paused_at = CASE WHEN ? = 'paused' THEN CURRENT_TIMESTAMP ELSE paused_at END,
+         resumed_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE resumed_at END,
          last_connected_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE last_connected_at END
      WHERE id = ?`,
-    [status, status, status, sessionId]
+    [status, status, status, status, status, sessionId]
+  );
+
+  await db.runAsync(
+    `UPDATE lan_session_state
+     SET status = ?, paused = CASE WHEN ? = 'paused' THEN 1 ELSE 0 END, updated_at = CURRENT_TIMESTAMP
+     WHERE session_id = ?`,
+    [status, status, sessionId]
   );
 }
 
 export async function getActiveLanSession(db: SQLiteDatabase) {
   return db.getFirstAsync<LanSessionRecord>(
-    `SELECT * FROM lan_sessions WHERE status IN ('open', 'connected') ORDER BY opened_at DESC LIMIT 1`
+    `SELECT * FROM lan_sessions WHERE status IN ('open', 'connected', 'paused') ORDER BY opened_at DESC LIMIT 1`
   );
+}
+
+export async function ensureLanSessionState(db: SQLiteDatabase, sessionId: string, status: LanSessionStatus = 'open') {
+  await db.runAsync(
+    `INSERT OR IGNORE INTO lan_session_state (session_id, status, turn, campaign_minutes, paused, last_event_seq)
+     VALUES (?, ?, 1, 0, ?, 0)`,
+    [sessionId, status, status === 'paused' ? 1 : 0]
+  );
+}
+
+export async function getLanSessionState(db: SQLiteDatabase, sessionId: string): Promise<LanCampaignState> {
+  await ensureLanSessionState(db, sessionId);
+  const row = await db.getFirstAsync<{
+    session_id: string;
+    status: LanSessionStatus;
+    turn: number;
+    campaign_minutes: number;
+    paused: number;
+    updated_at: string;
+  }>(`SELECT * FROM lan_session_state WHERE session_id = ?`, [sessionId]);
+
+  return {
+    sessionId,
+    status: row?.status || 'open',
+    turn: Number(row?.turn || 1),
+    campaignMinutes: Number(row?.campaign_minutes || 0),
+    paused: Boolean(row?.paused),
+    updatedAt: row?.updated_at || new Date().toISOString(),
+  };
+}
+
+export async function updateLanSessionState(
+  db: SQLiteDatabase,
+  sessionId: string,
+  updates: Partial<Pick<LanCampaignState, 'status' | 'turn' | 'campaignMinutes' | 'paused'>>
+) {
+  await ensureLanSessionState(db, sessionId);
+  const entries: [string, string | number][] = [];
+  if (updates.status) entries.push(['status', updates.status]);
+  if (updates.turn !== undefined) entries.push(['turn', updates.turn]);
+  if (updates.campaignMinutes !== undefined) entries.push(['campaign_minutes', updates.campaignMinutes]);
+  if (updates.paused !== undefined) entries.push(['paused', updates.paused ? 1 : 0]);
+  if (entries.length === 0) return;
+
+  await db.runAsync(
+    `UPDATE lan_session_state SET ${entries.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
+    [...entries.map(([, value]) => value), sessionId]
+  );
+}
+
+export async function getNextLanEventSeq(db: SQLiteDatabase, sessionId: string) {
+  await ensureLanSessionState(db, sessionId);
+  const row = await db.getFirstAsync<{ last_event_seq: number }>(
+    `SELECT last_event_seq FROM lan_session_state WHERE session_id = ?`,
+    [sessionId]
+  );
+  const nextSeq = Number(row?.last_event_seq || 0) + 1;
+  await db.runAsync(`UPDATE lan_session_state SET last_event_seq = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?`, [
+    nextSeq,
+    sessionId,
+  ]);
+  return nextSeq;
+}
+
+export async function appendLanOfficialEvent(
+  db: SQLiteDatabase,
+  input: {
+    sessionId: string;
+    eventType: LanOfficialEventType;
+    commandId?: string | null;
+    actorDeviceId?: string | null;
+    actorName?: string | null;
+    targetDeviceId?: string | null;
+    targetCharacterId?: number | null;
+    targetName?: string | null;
+    previousValue?: unknown;
+    currentValue?: unknown;
+    description: string;
+    payload?: Record<string, unknown>;
+  }
+): Promise<LanOfficialEventMessage> {
+  const seq = await getNextLanEventSeq(db, input.sessionId);
+  const at = new Date().toISOString();
+  const event: LanOfficialEventMessage = {
+    type: 'LAN_EVENT',
+    sessionId: input.sessionId,
+    eventId: makeEventId(input.sessionId, seq),
+    seq,
+    commandId: input.commandId || null,
+    eventType: input.eventType,
+    actorDeviceId: input.actorDeviceId || null,
+    actorName: input.actorName || null,
+    targetDeviceId: input.targetDeviceId || null,
+    targetCharacterId: input.targetCharacterId || null,
+    targetName: input.targetName || null,
+    previousValue: input.previousValue,
+    currentValue: input.currentValue,
+    description: input.description,
+    payload: input.payload || {},
+    at,
+  };
+
+  await db.runAsync(
+    `INSERT OR IGNORE INTO lan_event_log (
+      session_id, seq, event_id, command_id, event_type, actor_device_id, actor_name,
+      target_device_id, target_character_id, target_name, previous_value, current_value,
+      description, payload, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      event.sessionId,
+      event.seq,
+      event.eventId,
+      event.commandId || null,
+      event.eventType,
+      event.actorDeviceId || null,
+      event.actorName || null,
+      event.targetDeviceId || null,
+      event.targetCharacterId || null,
+      event.targetName || null,
+      toJsonText(event.previousValue),
+      toJsonText(event.currentValue),
+      event.description,
+      JSON.stringify(event.payload || {}),
+      event.at,
+    ]
+  );
+
+  return event;
+}
+
+export async function saveLanOfficialEvent(db: SQLiteDatabase, event: LanOfficialEventMessage) {
+  await ensureLanSessionState(db, event.sessionId);
+  await db.runAsync(
+    `INSERT OR IGNORE INTO lan_event_log (
+      session_id, seq, event_id, command_id, event_type, actor_device_id, actor_name,
+      target_device_id, target_character_id, target_name, previous_value, current_value,
+      description, payload, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      event.sessionId,
+      event.seq,
+      event.eventId,
+      event.commandId || null,
+      event.eventType,
+      event.actorDeviceId || null,
+      event.actorName || null,
+      event.targetDeviceId || null,
+      event.targetCharacterId || null,
+      event.targetName || null,
+      toJsonText(event.previousValue),
+      toJsonText(event.currentValue),
+      event.description,
+      JSON.stringify(event.payload || {}),
+      event.at,
+    ]
+  );
+
+  const row = await db.getFirstAsync<{ last_event_seq: number }>(
+    `SELECT last_event_seq FROM lan_session_state WHERE session_id = ?`,
+    [event.sessionId]
+  );
+  if (event.seq > Number(row?.last_event_seq || 0)) {
+    await db.runAsync(`UPDATE lan_session_state SET last_event_seq = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?`, [
+      event.seq,
+      event.sessionId,
+    ]);
+  }
+}
+
+function rowToOfficialEvent(row: Record<string, unknown>): LanOfficialEventMessage {
+  return {
+    type: 'LAN_EVENT',
+    sessionId: String(row.session_id || ''),
+    eventId: String(row.event_id || ''),
+    seq: Number(row.seq || 0),
+    commandId: (row.command_id as string | null) || null,
+    eventType: String(row.event_type || 'SNAPSHOT_SYNCED') as LanOfficialEventType,
+    actorDeviceId: (row.actor_device_id as string | null) || null,
+    actorName: (row.actor_name as string | null) || null,
+    targetDeviceId: (row.target_device_id as string | null) || null,
+    targetCharacterId: row.target_character_id === null || row.target_character_id === undefined ? null : Number(row.target_character_id),
+    targetName: (row.target_name as string | null) || null,
+    previousValue: fromJsonText(row.previous_value as string | null),
+    currentValue: fromJsonText(row.current_value as string | null),
+    description: String(row.description || ''),
+    payload: (fromJsonText(row.payload as string | null) as Record<string, unknown>) || {},
+    at: String(row.created_at || new Date().toISOString()),
+  };
+}
+
+export async function getLanHistoryPage(db: SQLiteDatabase, sessionId: string, page = 0, pageSize = 20) {
+  const safePageSize = Math.min(100, Math.max(1, pageSize));
+  const offset = Math.max(0, page) * safePageSize;
+  const rows = await db.getAllAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_event_log WHERE session_id = ? ORDER BY seq DESC, id DESC LIMIT ? OFFSET ?`,
+    [sessionId, safePageSize, offset]
+  );
+  return rows.map(rowToOfficialEvent);
+}
+
+export async function getLanEventsSince(db: SQLiteDatabase, sessionId: string, sinceSeq = 0, limit = 100) {
+  const rows = await db.getAllAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_event_log WHERE session_id = ? AND IFNULL(seq, 0) > ? ORDER BY seq ASC LIMIT ?`,
+    [sessionId, sinceSeq, limit]
+  );
+  return rows.map(rowToOfficialEvent);
 }
 
 export async function linkCharacterToSession(db: SQLiteDatabase, sessionId: string, characterId: number | null) {
@@ -192,7 +470,7 @@ export async function linkCharacterToSession(db: SQLiteDatabase, sessionId: stri
 export async function getCustomContentRefs(db: SQLiteDatabase): Promise<LanCustomContentRef[]> {
   const refs: LanCustomContentRef[] = [];
 
-  for (const definition of CUSTOM_CONTENT_DEFINITIONS) {
+  for (const definition of CUSTOM_CONTENT_DEFINITIONS.filter(definition => definition.tableName !== 'effects')) {
     const rows = await db.getAllAsync<Record<string, unknown>>(
       `SELECT * FROM ${definition.tableName} WHERE criador IN ('proprio', 'importado') ORDER BY ${definition.titleField} ASC`
     );
@@ -248,6 +526,22 @@ export async function getSelectedCustomContentPayloads(
       if (['classes', 'subclasses', 'races'].includes(definition.tableName) && typeof row.name === 'string') {
         progressionSourceNames.push(row.name);
       }
+
+      if (['items', 'spells'].includes(definition.tableName)) {
+        const effectRows = await db.getAllAsync<Record<string, unknown>>(
+          `SELECT * FROM effects WHERE source_table = ? AND source_id = ? ORDER BY sort_order ASC`,
+          [definition.tableName, id]
+        );
+
+        for (const effectRow of effectRows) {
+          const { id: _id, ...data } = effectRow;
+          payloads.push({
+            type: 'Efeito',
+            tableName: 'effects',
+            data,
+          });
+        }
+      }
     }
   }
 
@@ -283,6 +577,20 @@ export async function upsertCustomContentPayloads(db: SQLiteDatabase, records: L
     for (const column of allowedColumns) {
       if (column === 'criador') data[column] = 'importado';
       else if (column in record.data) data[column] = record.data[column];
+    }
+
+    if (tableName === 'effects' && typeof data.source_table === 'string' && typeof data.source_name === 'string') {
+      const sourceTable = data.source_table;
+      if (sourceTable === 'items' || sourceTable === 'spells') {
+        const source = await db.getFirstAsync<{ id: number }>(
+          `SELECT id FROM ${sourceTable} WHERE name = ? LIMIT 1`,
+          [data.source_name]
+        );
+
+        if (source?.id) {
+          data.source_id = source.id;
+        }
+      }
     }
 
     const hasKeys = keyColumns.every(column => data[column] !== undefined && data[column] !== null);
@@ -368,10 +676,23 @@ export async function getLanPlayers(db: SQLiteDatabase, sessionId: string) {
   return db.getAllAsync<{
     device_id: string;
     player_name: string;
+    character_id?: number | null;
     character_name?: string | null;
     connected: number;
     last_seen_at: string;
-  }>(`SELECT * FROM lan_session_players WHERE session_id = ? ORDER BY last_seen_at DESC`, [sessionId]);
+    snapshot_payload?: string | null;
+    snapshot_updated_at?: string | null;
+  }>(
+    `SELECT p.*, s.payload AS snapshot_payload, s.updated_at AS snapshot_updated_at
+     FROM lan_session_players p
+     LEFT JOIN lan_character_snapshots s
+       ON s.session_id = p.session_id
+      AND s.owner_device_id = p.device_id
+      AND s.remote_character_id = CAST(p.character_id AS TEXT)
+     WHERE p.session_id = ?
+     ORDER BY p.last_seen_at DESC`,
+    [sessionId]
+  );
 }
 
 export function selectedContentFromSession(session: LanSessionRecord | null | undefined) {

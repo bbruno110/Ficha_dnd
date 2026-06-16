@@ -7,7 +7,7 @@ import { initializeDatabase } from '../database/init';
 
 export default function RootLayout() {
   return (
-    <SQLiteProvider databaseName="dnd_dados33333.db" onInit={initializeDatabase}>
+    <SQLiteProvider databaseName="dnd_dados4.db" onInit={initializeDatabase}>
       <LanSessionProvider>
         <ThemeProvider value={DarkTheme}>
           <LinearGradient
@@ -24,6 +24,9 @@ export default function RootLayout() {
               <Stack.Screen name="index" options={{ headerShown: false }} />
               <Stack.Screen name="create" options={{ headerShown: false }} />
               <Stack.Screen name="lan-session" options={{ headerShown: false }} />
+              <Stack.Screen name="lan-master-setup" options={{ headerShown: false }} />
+              <Stack.Screen name="lan-player-join" options={{ headerShown: false }} />
+              <Stack.Screen name="tracer" options={{ headerShown: false }} />
             </Stack>
           </LinearGradient>
         </ThemeProvider>

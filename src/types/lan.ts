@@ -1,7 +1,7 @@
 export const LAN_DEFAULT_PORT = 45555;
 
 export type LanRole = 'master' | 'player';
-export type LanSessionStatus = 'open' | 'connected' | 'closed';
+export type LanSessionStatus = 'open' | 'connected' | 'paused' | 'closed';
 
 export type LanSessionRecord = {
   id: string;
@@ -18,11 +18,23 @@ export type LanSessionRecord = {
   created_at?: string;
   opened_at?: string | null;
   closed_at?: string | null;
+  paused_at?: string | null;
+  resumed_at?: string | null;
   last_connected_at?: string | null;
+};
+
+export type LanCampaignState = {
+  sessionId: string;
+  status: LanSessionStatus;
+  turn: number;
+  campaignMinutes: number;
+  paused: boolean;
+  updatedAt: string;
 };
 
 export type LanCustomContentType =
   | 'Item'
+  | 'Efeito'
   | 'Raca'
   | 'Classe'
   | 'Subclasse'
@@ -32,6 +44,7 @@ export type LanCustomContentType =
 
 export type LanContentTable =
   | 'items'
+  | 'effects'
   | 'races'
   | 'classes'
   | 'subclasses'
@@ -103,11 +116,110 @@ export type LanCharacterMessage = {
   snapshot: LanCharacterSnapshot;
 };
 
+export type LanCommandKind =
+  | 'PLAYER_INVENTORY_UPDATE'
+  | 'PLAYER_ITEM_DONATE'
+  | 'PLAYER_ITEM_DROP'
+  | 'PLAYER_ITEM_THROW'
+  | 'PLAYER_ITEM_CONSUME'
+  | 'PLAYER_EQUIP_ITEM'
+  | 'PLAYER_UNEQUIP_ITEM'
+  | 'PLAYER_REQUEST_HP'
+  | 'PLAYER_REQUEST_XP'
+  | 'PLAYER_REQUEST_COINS'
+  | 'PLAYER_REQUEST_ATTRIBUTE'
+  | 'MASTER_APPLY_HP'
+  | 'MASTER_APPLY_TEMP_HP'
+  | 'MASTER_APPLY_ATTRIBUTE'
+  | 'MASTER_APPLY_XP'
+  | 'MASTER_APPLY_COINS'
+  | 'MASTER_APPLY_ITEM'
+  | 'MASTER_REMOVE_ITEM'
+  | 'MASTER_APPLY_EFFECT'
+  | 'MASTER_ADVANCE_TURN'
+  | 'MASTER_ADVANCE_TIME'
+  | 'MASTER_SHORT_REST'
+  | 'MASTER_LONG_REST'
+  | 'MASTER_PAUSE_SESSION'
+  | 'MASTER_RESUME_SESSION'
+  | 'MASTER_END_SESSION'
+  | 'REQUEST_RESYNC';
+
+export type LanCommandMessage = {
+  type: 'LAN_COMMAND';
+  sessionId: string;
+  commandId: string;
+  deviceId: string;
+  actorName?: string;
+  characterId?: number | null;
+  command: LanCommandKind;
+  payload?: Record<string, unknown>;
+  clientSeq?: number;
+  at: string;
+};
+
+export type LanOfficialEventType =
+  | 'SESSION_STARTED'
+  | 'SESSION_PAUSED'
+  | 'SESSION_RESUMED'
+  | 'SESSION_CLOSED'
+  | 'TURN_CHANGED'
+  | 'TIME_CHANGED'
+  | 'REST_APPLIED'
+  | 'HP_CHANGED'
+  | 'TEMP_HP_CHANGED'
+  | 'XP_CHANGED'
+  | 'COINS_CHANGED'
+  | 'ATTRIBUTE_CHANGED'
+  | 'ITEM_ADDED'
+  | 'ITEM_REMOVED'
+  | 'ITEM_TRANSFERRED'
+  | 'ITEM_CONSUMED'
+  | 'ITEM_EQUIPPED'
+  | 'ITEM_UNEQUIPPED'
+  | 'EFFECT_APPLIED'
+  | 'EFFECT_EXPIRED'
+  | 'PLAYER_REQUESTED'
+  | 'PLAYER_JOINED'
+  | 'PLAYER_LEFT'
+  | 'SNAPSHOT_SYNCED'
+  | 'COMMAND_REJECTED';
+
+export type LanOfficialEventMessage = {
+  type: 'LAN_EVENT';
+  sessionId: string;
+  eventId: string;
+  seq: number;
+  commandId?: string | null;
+  eventType: LanOfficialEventType;
+  actorDeviceId?: string | null;
+  actorName?: string | null;
+  targetDeviceId?: string | null;
+  targetCharacterId?: number | null;
+  targetName?: string | null;
+  previousValue?: unknown;
+  currentValue?: unknown;
+  description: string;
+  payload?: Record<string, unknown>;
+  at: string;
+};
+
+export type LanSessionSnapshotMessage = {
+  type: 'SESSION_SNAPSHOT';
+  sessionId: string;
+  seq: number;
+  state: LanCampaignState;
+  players: Record<string, unknown>[];
+  recentEvents: LanOfficialEventMessage[];
+  at: string;
+};
+
 export type LanNoticeMessage = {
-  type: 'NOTICE' | 'ERROR' | 'PING';
+  type: 'NOTICE' | 'ERROR' | 'PING' | 'SNAPSHOT_REQUEST';
   sessionId?: string;
   message?: string;
   at?: string;
+  sinceSeq?: number;
 };
 
 export type LanMessage =
@@ -115,6 +227,9 @@ export type LanMessage =
   | LanWelcomeMessage
   | LanCustomContentMessage
   | LanCharacterMessage
+  | LanCommandMessage
+  | LanOfficialEventMessage
+  | LanSessionSnapshotMessage
   | LanNoticeMessage;
 
 export type ParsedSessionCode = {

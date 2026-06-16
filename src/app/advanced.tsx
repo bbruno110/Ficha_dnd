@@ -8,24 +8,47 @@ import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { EffectDraft, EffectDurationUnit, EffectKind, EffectValueMode, formatEffectSummary } from '../types/effects';
 
 // ================= TIPAGENS =================
 type SpellClassReq = { name: string; minLevel: string }; 
 type SelectedFeature = { name: string; level: string };
 type SpellItem = { id: number; name: string; level: string; category?: string; casting_time?: string; range?: string; damage?: string; description?: string; classes?: string; };
+type AdvancedEffectDraft = EffectDraft & { label?: string };
 
 const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Acervo'];
 const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capacete', 'Capa', 'Bota', 'Luva', 'Consumível', 'Ferramenta', 'Mochila/Saco', 'Outro'];
-const EFFECT_CATEGORIES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Outro'];
 const ITEM_PROPS = ['Acuidade', 'Leve', 'Pesada', 'Duas mãos', 'Versátil', 'Arremesso', 'Munição', 'Alcance', 'Recarga', 'Especial', 'Foco Arcano', 'Foco Divino', 'Foco Druídico', 'Consumível', 'Mágico'];
 
-const SPELL_RANGES = ['Pessoal', 'Toque', '9m', '18m', '36m', 'Cubo', 'Cone'];
 const SPELL_COMPONENTS = ['V', 'S', 'M'];
 const SPELL_DURATION_TYPES = ['Instantânea', 'Rodada(s)', 'Minuto(s)', 'Hora(s)', 'Dia(s)', 'Concentração', 'Permanente'];
 const SPELL_SAVES = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'];
 const SPELL_DAMAGE_TYPES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'Outro'];
 
-const VALID_TABLES = ['items', 'races', 'classes', 'subclasses', 'spells', 'starting_kits', 'spellcasting_progression'];
+const VALID_TABLES = ['items', 'effects', 'races', 'classes', 'subclasses', 'spells', 'starting_kits', 'spellcasting_progression'];
+const RANGE_UNITS = ['m', 'km', 'cm'];
+const STRUCTURED_RANGES = ['Pessoal', 'Toque', 'Distancia', 'Cubo', 'Cone', 'Linha'];
+const EFFECT_KINDS: { value: EffectKind; label: string }[] = [
+  { value: 'damage', label: 'Dano' },
+  { value: 'healing', label: 'Cura' },
+  { value: 'condition', label: 'Condicao' },
+  { value: 'stat_modifier', label: 'Atributo/CA' },
+  { value: 'utility', label: 'Utilidade' },
+];
+const DAMAGE_TYPES = ['Cortante', 'Perfurante', 'Concussao', 'Fogo', 'Frio', 'Veneno', 'Acido', 'Psiquico', 'Necrotico', 'Radiante', 'Eletrico', 'Trovejante', 'Forca'];
+const CONDITIONS = ['Envenenado', 'Cego', 'Surdo', 'Paralisado', 'Atordoado', 'Caido', 'Agarrado', 'Amedrontado', 'Encantado', 'Inconsciente'];
+const STAT_EFFECT_TYPES = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo'];
+const UTILITY_EFFECT_TYPES = ['Luz', 'Empurrao', 'Derrubar', 'Vantagem', 'Desvantagem', 'Teleporte', 'Invocar'];
+const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
+const DURATION_UNITS: { value: EffectDurationUnit; label: string }[] = [
+  { value: 'instant', label: 'Instantaneo' },
+  { value: 'turn', label: 'Turnos' },
+  { value: 'round', label: 'Rodadas' },
+  { value: 'minute', label: 'Minutos' },
+  { value: 'hour', label: 'Horas' },
+  { value: 'day', label: 'Dias' },
+  { value: 'permanent', label: 'Permanente' },
+];
 
 export default function AdvancedCreatorScreen() {
   const router = useRouter();
@@ -39,13 +62,19 @@ export default function AdvancedCreatorScreen() {
   const [weight, setWeight] = useState('1');
   const [itemCategory, setItemCategory] = useState('Arma');
   const [properties, setProperties] = useState<string[]>([]);
-  const [itemEffects, setItemEffects] = useState<any[]>([]);
+  const [itemEffects, setItemEffects] = useState<AdvancedEffectDraft[]>([]);
   const [itemDescription, setItemDescription] = useState(''); 
   
-  const [tempEffVal, setTempEffVal] = useState('');
   const [tempEffType, setTempEffType] = useState('Cortante');
-  const [tempEffDuration, setTempEffDuration] = useState(''); 
-  const [tempEffTurns, setTempEffTurns] = useState(''); 
+  const [tempEffectKind, setTempEffectKind] = useState<EffectKind>('damage');
+  const [tempValueMode, setTempValueMode] = useState<EffectValueMode>('dice');
+  const [tempDiceCount, setTempDiceCount] = useState('1');
+  const [tempDiceSides, setTempDiceSides] = useState('8');
+  const [tempDiceBonus, setTempDiceBonus] = useState('0');
+  const [tempFixedValue, setTempFixedValue] = useState('1');
+  const [tempChancePercent, setTempChancePercent] = useState('100');
+  const [tempDurationValue, setTempDurationValue] = useState('1');
+  const [tempDurationUnit, setTempDurationUnit] = useState<EffectDurationUnit>('instant');
 
   // Estados de Raça & Classe
   const [stats, setStats] = useState({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' });
@@ -79,14 +108,14 @@ export default function AdvancedCreatorScreen() {
   const [tempSpellClassLvl, setTempSpellClassLvl] = useState('1');
   const [castTimeValue, setCastTimeValue] = useState('1');
   const [castTimeType, setCastTimeType] = useState('Ação');
-  const [spellRange, setSpellRange] = useState('18m');
+  const [spellRangeShape, setSpellRangeShape] = useState('Distancia');
+  const [spellRangeValue, setSpellRangeValue] = useState('18');
+  const [spellRangeUnit, setSpellRangeUnit] = useState('m');
   const [spellComponents, setSpellComponents] = useState<string[]>(['V', 'S']);
   const [spellDurationValue, setSpellDurationValue] = useState('');
   const [spellDurationType, setSpellDurationType] = useState('Instantânea');
-  const [spellEffectsList, setSpellEffectsList] = useState<any[]>([]);
-  const [tempSpellDice, setTempSpellDice] = useState('');
+  const [spellEffectsList, setSpellEffectsList] = useState<AdvancedEffectDraft[]>([]);
   const [tempSpellDmgType, setTempSpellDmgType] = useState('Fogo');
-  const [tempSpellCustomType, setTempSpellCustomType] = useState('');
   const [spellSaves, setSpellSaves] = useState<string[]>([]);
   const [spellDescription, setSpellDescription] = useState('');
 
@@ -156,6 +185,9 @@ export default function AdvancedCreatorScreen() {
       { text: "Cancelar", style: "cancel" },
       { text: "Deletar", style: "destructive", onPress: async () => {
           await db.runAsync(`DELETE FROM ${tableName} WHERE id = ?`, [id]);
+          if(tableName === 'items' || tableName === 'spells') {
+              await db.runAsync(`DELETE FROM effects WHERE source_table = ?AND source_id = ?`, [tableName, id]);
+          }
           if(tableName === 'classes' || tableName === 'subclasses' || tableName === 'races') {
               await db.runAsync(`DELETE FROM spellcasting_progression WHERE source_name = ?`, [itemName]);
           }
@@ -164,7 +196,7 @@ export default function AdvancedCreatorScreen() {
     ]);
   };
 
-  const toggleSelection = (uniqueId: string) => setSelectedAcervo(prev => prev.includes(uniqueId) ? prev.filter(i => i !== uniqueId) : [...prev, uniqueId]);
+  const toggleSelection = (uniqueId: string) => setSelectedAcervo(prev => prev.includes(uniqueId) ?prev.filter(i => i !== uniqueId) : [...prev, uniqueId]);
   
   // ================= SISTEMA DE IMPORTAÇÃO E EXPORTAÇÃO =================
 
@@ -176,6 +208,14 @@ export default function AdvancedCreatorScreen() {
     
     try {
       let itemsToExport = myCreations.filter(item => selectedAcervo.includes(`${item.tableName}-${item.id}`));
+      const effectsToExport: any[] = [];
+      for (const item of itemsToExport) {
+        if (item.tableName === 'items' || item.tableName === 'spells') {
+          const rows = await db.getAllAsync(`SELECT * FROM effects WHERE source_table = ?AND source_id = ?ORDER BY sort_order ASC`, [item.tableName, item.id]);
+          effectsToExport.push(...rows.map((effect: any) => ({ ...effect, type: 'Efeito', tableName: 'effects' })));
+        }
+      }
+      itemsToExport = [...itemsToExport, ...effectsToExport];
       
       const classesToExport = itemsToExport.filter(i => i.tableName === 'classes' || i.tableName === 'subclasses' || i.tableName === 'races').map(i => i.name);
       
@@ -227,6 +267,16 @@ export default function AdvancedCreatorScreen() {
         
         const { tableName, type, id, ...fields } = item;
         fields.criador = 'importado';
+
+        if (tableName === 'effects' && typeof fields.source_table === 'string' && typeof fields.source_name === 'string') {
+          if (fields.source_table === 'items' || fields.source_table === 'spells') {
+            const source = await db.getFirstAsync<{ id: number }>(
+              `SELECT id FROM ${fields.source_table} WHERE name = ?LIMIT 1`,
+              [fields.source_name]
+            );
+            if (source?.id) fields.source_id = source.id;
+          }
+        }
         
         try{
           const keys = Object.keys(fields);
@@ -249,22 +299,142 @@ export default function AdvancedCreatorScreen() {
   // ================= FIM DO SISTEMA =================
 
   const resetForms = () => {
-    setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffVal(''); setTempEffType('Cortante'); setTempEffDuration(''); setTempEffTurns(''); setItemDescription('');
+    setName(''); setWeight('1'); setItemCategory('Arma'); setProperties([]); setItemEffects([]); setTempEffType('Cortante'); setItemDescription(''); resetEffectDraft();
     setStats({ FOR: '0', DES: '0', CON: '0', INT: '0', SAB: '0', CAR: '0' }); setSpeed('9m'); setHitDice('8'); setGold('10'); setSubclassLevel('3'); setIsCaster(false); setSaves([]);
     setSubclassParents([]); setSubclassSearch(''); setTempSubclassLevel('3'); setBonusSkills('0');
     if(dbClasses.length > 0) setTempSubclassParent(dbClasses[0].name);
     setSpellCategory('Magia'); setSpellLevel('Truque'); setSpellClassesReq([]); setSpellClassSearch(''); setTempSpellClassLvl('1');
     if(dbClasses.length > 0) setTempSpellClass(dbClasses[0].name);
-    setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRange('18m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
-    setSpellEffectsList([]); setTempSpellDice(''); setTempSpellDmgType('Fogo'); setTempSpellCustomType(''); setSpellSaves([]); setSpellDescription(''); 
+    setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRangeShape('Distancia'); setSpellRangeValue('18'); setSpellRangeUnit('m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
+    setSpellEffectsList([]); setTempSpellDmgType('Fogo'); setSpellSaves([]); setSpellDescription(''); 
     setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
     setSelectedFeatures([]); setCasterType('total');
   };
 
   const handleTabChange = (tab: string) => { setActiveTab(tab); if (tab !== 'Acervo') resetForms(); };
-  const toggleArrayItem = (setter: React.Dispatch<React.SetStateAction<string[]>>, item: string) => setter(prev => prev.includes(item) ? prev.filter(i => i !== item) : [...prev, item]);
+  const toggleArrayItem = (setter: React.Dispatch<React.SetStateAction<string[]>>, item: string) => setter(prev => prev.includes(item) ?prev.filter(i => i !== item) : [...prev, item]);
+  const onlyInt = (value: string) => value.replace(/[^0-9-]/g, '');
+  const onlyPositiveInt = (value: string) => value.replace(/[^0-9]/g, '');
+  const onlyDecimal = (value: string) => value.replace(/[^0-9.,]/g, '').replace(',', '.');
+  const clampNumber = (value: string, fallback: number, min: number, max: number) => Math.min(max, Math.max(min, Number(value || fallback) || fallback));
+
+  const getEffectTypeOptions = (kind: EffectKind) => {
+    if (kind === 'damage') return DAMAGE_TYPES;
+    if (kind === 'healing') return ['Cura'];
+    if (kind === 'condition') return CONDITIONS;
+    if (kind === 'stat_modifier') return STAT_EFFECT_TYPES;
+    return UTILITY_EFFECT_TYPES;
+  };
+
+  const makeStructuredEffect = (): AdvancedEffectDraft => {
+    const typeOptions = getEffectTypeOptions(tempEffectKind);
+    const effectType = typeOptions.includes(tempEffType) ?tempEffType : typeOptions[0];
+    const valueMode = tempEffectKind === 'condition' || tempEffectKind === 'utility' ?'none' : tempValueMode;
+    const durationUnit = tempDurationUnit;
+
+    return {
+      effect_kind: tempEffectKind,
+      effect_type: tempEffectKind === 'condition' ?'Condicao' : effectType,
+      condition_name: tempEffectKind === 'condition' ?effectType : null,
+      value_mode: valueMode,
+      dice_count: valueMode === 'dice' ?clampNumber(tempDiceCount, 1, 1, 99) : null,
+      dice_sides: valueMode === 'dice' ?clampNumber(tempDiceSides, 8, 2, 100) : null,
+      dice_bonus: valueMode === 'dice' ?clampNumber(tempDiceBonus, 0, -99, 99) : 0,
+      fixed_value: valueMode === 'fixed' ?clampNumber(tempFixedValue, 1, -999, 999) : null,
+      chance_percent: clampNumber(tempChancePercent, 100, 0, 100),
+      duration_value: durationUnit === 'instant' || durationUnit === 'permanent' ?null : clampNumber(tempDurationValue, 1, 1, 999),
+      duration_unit: durationUnit,
+      metadata: {},
+    };
+  };
+
+  const resetEffectDraft = () => {
+    setTempEffectKind('damage');
+    setTempEffType('Cortante');
+    setTempValueMode('dice');
+    setTempDiceCount('1');
+    setTempDiceSides('8');
+    setTempDiceBonus('0');
+    setTempFixedValue('1');
+    setTempChancePercent('100');
+    setTempDurationValue('1');
+    setTempDurationUnit('instant');
+  };
+
+  const buildRangeData = () => {
+    if (spellRangeShape === 'Pessoal' || spellRangeShape === 'Toque') {
+      return {
+        label: spellRangeShape,
+        value: null,
+        unit: null,
+        shape: spellRangeShape,
+      };
+    }
+
+    const value = clampNumber(spellRangeValue, 18, 0, 999999);
+    return {
+      label: spellRangeShape === 'Distancia' ?`${value}${spellRangeUnit}` : `${spellRangeShape} ${value}${spellRangeUnit}`,
+      value,
+      unit: spellRangeUnit,
+      shape: spellRangeShape,
+    };
+  };
+
+  const buildDurationData = () => {
+    const unitMap: Record<string, string> = {
+      'Instantânea': 'instant',
+      'Rodada(s)': 'round',
+      'Minuto(s)': 'minute',
+      'Hora(s)': 'hour',
+      'Dia(s)': 'day',
+      'Concentração': 'concentration',
+      'Permanente': 'permanent',
+    };
+    const unit = unitMap[spellDurationType] || spellDurationType;
+    const value = spellDurationValue ?clampNumber(spellDurationValue, 1, 1, 999) : null;
+
+    return {
+      label: value ?`${value} ${spellDurationType}` : spellDurationType,
+      value,
+      unit,
+    };
+  };
+
+  const insertEffects = async (sourceTable: 'items' | 'spells', sourceId: number, sourceName: string, effects: AdvancedEffectDraft[]) => {
+    for (const [index, effect] of effects.entries()) {
+      await db.runAsync(
+        `INSERT INTO effects (
+          source_table, source_id, source_name, trigger, effect_kind, effect_type, condition_name,
+          value_mode, dice_count, dice_sides, dice_bonus, fixed_value, chance_percent,
+          duration_value, duration_unit, target, stacking, notes, metadata, sort_order, criador
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
+        [
+          sourceTable,
+          sourceId,
+          sourceName,
+          'on_use',
+          effect.effect_kind,
+          effect.effect_type,
+          effect.condition_name || null,
+          effect.value_mode,
+          effect.dice_count || null,
+          effect.dice_sides || null,
+          effect.dice_bonus || 0,
+          effect.fixed_value === undefined ? null : effect.fixed_value,
+          effect.chance_percent,
+          effect.duration_value || null,
+          effect.duration_unit,
+          effect.target || null,
+          null,
+          effect.notes || null,
+          JSON.stringify(effect.metadata || {}),
+          index,
+        ]
+      );
+    }
+  };
   
-  const updateStat = (key: keyof typeof stats, value: string) => setStats(prev => ({ ...prev, [key]: value.replace(/[^0-9-]/g, '') }));
+  const updateStat = (key: keyof typeof stats, value: string) => setStats(prev => ({ ...prev, [key]: onlyInt(value) }));
   const updateKitQty = (index: number, delta: number) => {
     const newKit = [...kitItems]; newKit[index].qty += delta;
     if(newKit[index].qty <= 0) newKit.splice(index, 1);
@@ -285,6 +455,156 @@ export default function AdvancedCreatorScreen() {
     }
   };
 
+  const updateSelectedFeatureLevel = (featName: string, level: string) => {
+    const safeLevel = onlyPositiveInt(level);
+    setSelectedFeatures(prev => prev.map(feature => (
+      feature.name === featName ? { ...feature, level: safeLevel } : feature
+    )));
+  };
+
+  const buildFeatureRequirementsPayload = () => JSON.stringify(
+    selectedFeatures.map(feature => ({
+      name: feature.name,
+      level_required: Math.max(1, parseInt(feature.level || '1', 10) || 1),
+    }))
+  );
+
+
+  const renderStructuredEffectBuilder = (
+    effects: AdvancedEffectDraft[],
+    setEffects: React.Dispatch<React.SetStateAction<AdvancedEffectDraft[]>>
+  ) => {
+    const typeOptions = getEffectTypeOptions(tempEffectKind);
+    const selectedType = typeOptions.includes(tempEffType) ?tempEffType : typeOptions[0];
+    const needsValue = tempEffectKind === 'damage' || tempEffectKind === 'healing' || tempEffectKind === 'stat_modifier';
+    const usesDuration = tempEffectKind === 'condition' || tempEffectKind === 'stat_modifier' || tempDurationUnit !== 'instant';
+
+    return (
+      <>
+        <Text style={styles.label}>CONSTRUTOR DE EFEITOS</Text>
+        <View style={styles.effectBuilder}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              {EFFECT_KINDS.map(kind => (
+                <TouchableOpacity
+                  key={kind.value}
+                  style={[styles.limitBtn, tempEffectKind === kind.value && styles.limitBtnActive]}
+                  onPress={() => {
+                    setTempEffectKind(kind.value);
+                    const nextType = getEffectTypeOptions(kind.value)[0];
+                    setTempEffType(nextType);
+                    setTempValueMode(kind.value === 'condition' || kind.value === 'utility' ?'none' : 'dice');
+                    if (kind.value === 'condition') setTempDurationUnit('turn');
+                  }}
+                >
+                  <Text style={[styles.limitBtnText, tempEffectKind === kind.value && styles.limitBtnTextActive]}>{kind.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              {typeOptions.map(option => (
+                <TouchableOpacity key={option} style={[styles.limitBtn, selectedType === option && styles.limitBtnActive]} onPress={() => setTempEffType(option)}>
+                  <Text style={[styles.limitBtnText, selectedType === option && styles.limitBtnTextActive]}>{option}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </ScrollView>
+
+          {needsValue && (
+            <View style={{ marginBottom: 12 }}>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 10 }}>
+                {(['dice', 'fixed'] as EffectValueMode[]).map(mode => (
+                  <TouchableOpacity key={mode} style={[styles.limitBtn, tempValueMode === mode && styles.limitBtnActive]} onPress={() => setTempValueMode(mode)}>
+                    <Text style={[styles.limitBtnText, tempValueMode === mode && styles.limitBtnTextActive]}>{mode === 'dice' ?'Dado' : 'Valor fixo'}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {tempValueMode === 'dice' ?(
+                <View style={{ gap: 10 }}>
+                  <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center' }}>
+                    <TextInput style={[styles.input, { flex: 1, textAlign: 'center' }]} keyboardType="numeric" selectTextOnFocus textAlign="center" value={tempDiceCount} onChangeText={v => setTempDiceCount(onlyPositiveInt(v))} placeholder="Qtd" placeholderTextColor="#666" />
+                    <Text style={{ color: '#fff', fontWeight: 'bold' }}>d</Text>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 2 }}>
+                      <View style={{ flexDirection: 'row', gap: 8 }}>
+                        {DICE_SIDES.map(side => (
+                          <TouchableOpacity key={side} style={[styles.limitBtn, tempDiceSides === String(side) && styles.limitBtnActive]} onPress={() => setTempDiceSides(String(side))}>
+                            <Text style={[styles.limitBtnText, tempDiceSides === String(side) && styles.limitBtnTextActive]}>d{side}</Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    </ScrollView>
+                  </View>
+                  <TextInput style={[styles.input, { textAlign: 'center' }]} keyboardType="numeric" selectTextOnFocus textAlign="center" value={tempDiceBonus} onChangeText={v => setTempDiceBonus(onlyInt(v))} placeholder="Bonus do dado (opcional)" placeholderTextColor="#666" />
+                </View>
+              ) : (
+                <TextInput style={[styles.input, { textAlign: 'center' }]} keyboardType="numeric" selectTextOnFocus textAlign="center" value={tempFixedValue} onChangeText={v => setTempFixedValue(onlyInt(v))} placeholder="Valor" placeholderTextColor="#666" />
+              )}
+            </View>
+          )}
+
+          <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.label, { fontSize: 9 }]}>CHANCE (%)</Text>
+              <TextInput style={[styles.input, { textAlign: 'center' }]} keyboardType="numeric" selectTextOnFocus textAlign="center" value={tempChancePercent} onChangeText={v => setTempChancePercent(onlyPositiveInt(v))} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.label, { fontSize: 9 }]}>DURACAO</Text>
+              <TextInput
+                style={[styles.input, { textAlign: 'center', opacity: tempDurationUnit === 'instant' || tempDurationUnit === 'permanent' ?0.45 : 1 }]}
+                keyboardType="numeric" selectTextOnFocus textAlign="center"
+                editable={tempDurationUnit !== 'instant' && tempDurationUnit !== 'permanent'}
+                value={tempDurationUnit === 'instant' || tempDurationUnit === 'permanent' ?'' : tempDurationValue}
+                onChangeText={v => setTempDurationValue(onlyPositiveInt(v))}
+                placeholder="Qtd"
+                placeholderTextColor="#666"
+              />
+            </View>
+          </View>
+
+          {(usesDuration || true) && (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                {DURATION_UNITS.map(unit => (
+                  <TouchableOpacity key={unit.value} style={[styles.limitBtn, tempDurationUnit === unit.value && styles.limitBtnActive]} onPress={() => setTempDurationUnit(unit.value)}>
+                    <Text style={[styles.limitBtnText, tempDurationUnit === unit.value && styles.limitBtnTextActive]}>{unit.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </ScrollView>
+          )}
+
+          <TouchableOpacity
+            style={styles.addEffectBtn}
+            onPress={() => {
+              const effect = makeStructuredEffect();
+              setEffects([...effects, effect]);
+              resetEffectDraft();
+            }}
+          >
+            <Text style={styles.addEffectBtnText}>+ ADICIONAR EFEITO</Text>
+          </TouchableOpacity>
+        </View>
+
+        {effects.length > 0 && (
+          <View style={{ marginBottom: 20 }}>
+            {effects.map((effect, index) => (
+              <View key={index} style={styles.effectRow}>
+                <Text style={styles.effectText}>{formatEffectSummary(effect)}</Text>
+                <TouchableOpacity onPress={() => setEffects(effects.filter((_, idx) => idx !== index))}>
+                  <Ionicons name="trash" size={20} color="#ff6666" />
+                </TouchableOpacity>
+              </View>
+            ))}
+          </View>
+        )}
+      </>
+    );
+  };
+
   const insertMagicProgression = async (sourceType: string, sourceName: string) => {
       let query = `INSERT INTO spellcasting_progression (source_type, source_name, level, cantrips_known, spells_known, slot_1, slot_2, slot_3, slot_4, slot_5, slot_6, slot_7, slot_8, slot_9, criador) VALUES `;
       let values: any[] = [];
@@ -294,33 +614,33 @@ export default function AdvancedCreatorScreen() {
          let s1=0, s2=0, s3=0, s4=0, s5=0, s6=0, s7=0, s8=0, s9=0;
 
          if (casterType === 'total') {
-            cantrips = level < 4 ? 3 : (level < 10 ? 4 : 5);
-            s1 = level === 1 ? 2 : (level === 2 ? 3 : 4);
-            s2 = level < 3 ? 0 : (level === 3 ? 2 : 3);
-            s3 = level < 5 ? 0 : (level === 5 ? 2 : 3);
-            s4 = level < 7 ? 0 : (level === 7 ? 1 : (level === 8 ? 2 : 3));
-            s5 = level < 9 ? 0 : (level === 9 ? 1 : (level < 18 ? 2 : 3));
-            s6 = level < 11 ? 0 : (level < 19 ? 1 : 2);
-            s7 = level < 13 ? 0 : (level < 20 ? 1 : 2);
-            s8 = level < 15 ? 0 : 1;
-            s9 = level < 17 ? 0 : 1;
+            cantrips = level < 4 ?3 : (level < 10 ?4 : 5);
+            s1 = level === 1 ?2 : (level === 2 ?3 : 4);
+            s2 = level < 3 ?0 : (level === 3 ?2 : 3);
+            s3 = level < 5 ?0 : (level === 5 ?2 : 3);
+            s4 = level < 7 ?0 : (level === 7 ?1 : (level === 8 ?2 : 3));
+            s5 = level < 9 ?0 : (level === 9 ?1 : (level < 18 ?2 : 3));
+            s6 = level < 11 ?0 : (level < 19 ?1 : 2);
+            s7 = level < 13 ?0 : (level < 20 ?1 : 2);
+            s8 = level < 15 ?0 : 1;
+            s9 = level < 17 ?0 : 1;
          } else if (casterType === 'meio') {
-            s1 = level < 2 ? 0 : (level < 5 ? 2 : (level < 9 ? 4 : 4));
-            s2 = level < 5 ? 0 : (level < 9 ? 2 : 3);
-            s3 = level < 9 ? 0 : (level < 13 ? 2 : 3);
-            s4 = level < 13 ? 0 : (level < 17 ? 1 : 3);
-            s5 = level < 17 ? 0 : (level < 19 ? 1 : 2);
+            s1 = level < 2 ?0 : (level < 5 ?2 : (level < 9 ?4 : 4));
+            s2 = level < 5 ?0 : (level < 9 ?2 : 3);
+            s3 = level < 9 ?0 : (level < 13 ?2 : 3);
+            s4 = level < 13 ?0 : (level < 17 ?1 : 3);
+            s5 = level < 17 ?0 : (level < 19 ?1 : 2);
          } else if (casterType === 'terco') {
-            cantrips = level < 10 ? 2 : 3;
-            s1 = level < 3 ? 0 : (level < 4 ? 2 : (level < 7 ? 3 : 4));
-            s2 = level < 7 ? 0 : (level < 10 ? 2 : 3);
-            s3 = level < 13 ? 0 : (level < 16 ? 2 : 3);
-            s4 = level < 19 ? 0 : 1;
+            cantrips = level < 10 ?2 : 3;
+            s1 = level < 3 ?0 : (level < 4 ?2 : (level < 7 ?3 : 4));
+            s2 = level < 7 ?0 : (level < 10 ?2 : 3);
+            s3 = level < 13 ?0 : (level < 16 ?2 : 3);
+            s4 = level < 19 ?0 : 1;
          } else if (casterType === 'pacto') {
-            cantrips = level < 4 ? 2 : (level < 10 ? 3 : 4);
-            known = level < 10 ? level + 1 : (level < 11 ? 10 : (level < 13 ? 11 : (level < 15 ? 12 : (level < 17 ? 13 : (level < 19 ? 14 : 15)))));
-            const slotN = level < 3 ? 1 : (level < 5 ? 2 : (level < 7 ? 3 : (level < 9 ? 4 : 5)));
-            const slotQtd = level < 2 ? 1 : (level < 11 ? 2 : (level < 17 ? 3 : 4));
+            cantrips = level < 4 ?2 : (level < 10 ?3 : 4);
+            known = level < 10 ?level + 1 : (level < 11 ?10 : (level < 13 ?11 : (level < 15 ?12 : (level < 17 ?13 : (level < 19 ?14 : 15)))));
+            const slotN = level < 3 ?1 : (level < 5 ?2 : (level < 7 ?3 : (level < 9 ?4 : 5)));
+            const slotQtd = level < 2 ?1 : (level < 11 ?2 : (level < 17 ?3 : 4));
             
             if(slotN===1) s1=slotQtd; else if(slotN===2) s2=slotQtd; else if(slotN===3) s3=slotQtd; else if(slotN===4) s4=slotQtd; else if(slotN===5) s5=slotQtd;
          }
@@ -335,29 +655,58 @@ export default function AdvancedCreatorScreen() {
     if (!name.trim()) { Alert.alert('Erro', 'O nome é obrigatório!'); return; }
     try {
       if (activeTab === 'Magia/Skill') {
-        let finalCastTime = castTimeType === 'Passiva' ? 'Passiva' : `${castTimeValue} ${castTimeType}`.trim();
-        const finalDuration = spellDurationValue ? `${spellDurationValue} ${spellDurationType}` : spellDurationType;
+        let finalCastTime = castTimeType === 'Passiva' ?'Passiva' : `${castTimeValue} ${castTimeType}`.trim();
+        const durationData = buildDurationData();
+        const rangeData = buildRangeData();
+        const finalDuration = durationData.label;
         
         let damageParts: string[] = [];
         let typeParts: string[] = [];
         
         spellEffectsList.forEach(eff => {
-          if (eff.type === 'Cura') damageParts.push(eff.dice ? `Cura ${eff.dice}` : 'Cura');
-          else if (eff.type === 'Outro') damageParts.push(eff.dice || 'Efeito Especial');
-          else { damageParts.push(`${eff.dice}`); typeParts.push(eff.type); }
+          damageParts.push(formatEffectSummary(eff));
+          if (eff.effect_kind === 'damage') typeParts.push(eff.effect_type);
+          if (eff.effect_kind === 'healing') typeParts.push('Cura');
         });
 
-        const finalDamageDice = damageParts.length > 0 ? damageParts.join(' + ') : '-';
-        const finalDamageType = Array.from(new Set(typeParts)).length > 0 ? Array.from(new Set(typeParts)).join(', ') : 'Nenhum';
-        const finalSaves = spellSaves.length > 0 ? spellSaves.join(', ') : 'Nenhum';
+        const finalDamageDice = damageParts.length > 0 ?damageParts.join(' + ') : '-';
+        const finalDamageType = Array.from(new Set(typeParts)).length > 0 ?Array.from(new Set(typeParts)).join(', ') : 'Nenhum';
+        const finalSaves = spellSaves.length > 0 ?spellSaves.join(', ') : 'Nenhum';
         const classReqString = spellClassesReq.map(c => `${c.name}:${c.minLevel}`).join(', ') || 'Nenhum';
         const justClassNames = spellClassesReq.map(c => c.name).join(',') || 'Nenhum';
 
         // SALVA EXATAMENTE A CATEGORIA ESCOLHIDA NA TELA
-        await db.runAsync(
-          `INSERT INTO spells (name, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type, saving_throw, description, class_level_required, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, spellLevel, spellCategory, justClassNames, finalCastTime, spellRange, spellComponents.join(', '), finalDuration, finalDamageDice, finalDamageType, finalSaves, spellDescription, classReqString]
+        const result = await db.runAsync(
+          `INSERT INTO spells (
+            name, level, category, classes, casting_time, casting_time_value, casting_time_unit,
+            range, range_value, range_unit, range_shape, components, duration, duration_value,
+            duration_unit, damage_dice, damage_type, saving_throw, description, class_level_required, criador
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
+          [
+            name,
+            spellLevel,
+            spellCategory,
+            justClassNames,
+            finalCastTime,
+            castTimeType === 'Passiva' ?null : parseInt(castTimeValue) || 1,
+            castTimeType,
+            rangeData.label,
+            rangeData.value,
+            rangeData.unit,
+            rangeData.shape,
+            spellComponents.join(', '),
+            finalDuration,
+            durationData.value,
+            durationData.unit,
+            finalDamageDice,
+            finalDamageType,
+            finalSaves,
+            spellDescription,
+            classReqString,
+          ]
         );
+        const spellId = Number((result as any).lastInsertRowId || 0);
+        if (spellId > 0) await insertEffects('spells', spellId, name, spellEffectsList);
       }
       else if (activeTab === 'Item') {
         let damageValueParts: string[] = [];
@@ -365,40 +714,29 @@ export default function AdvancedCreatorScreen() {
         let extraProps: string[] = [];
 
         itemEffects.forEach(eff => {
-          let suffix = eff.duration ? (eff.duration === 'Temp' && eff.turns ? ` (Temp: ${eff.turns} turnos)` : ` (${eff.duration})`) : '';
-          
-          // Se for atributo, Cura ou efeito especial de "Outro", o tipo vai no valor da string
-          if (['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo', 'Cura'].includes(eff.type)) {
-              if (eff.type === 'Escolher Atributo') damageValueParts.push(`Escolher ${eff.val}${suffix}`);
-              else if (eff.type === 'Cura') damageValueParts.push(`Cura ${eff.val}`);
-              else damageValueParts.push(`${eff.type} ${eff.val}${suffix}`);
-          } 
-          else if (eff.type === 'Outro') {
-              damageValueParts.push(eff.val);
-          }
-          // Se for um tipo de dano (Fogo, Cortante, etc), separamos o dado (1d6) do tipo (Fogo)
-          else {
-              damageValueParts.push(eff.val); 
-              damageTypeParts.push(eff.type);
-          }
+          damageValueParts.push(formatEffectSummary(eff));
+          if (eff.effect_kind === 'damage') damageTypeParts.push(eff.effect_type);
         });
 
-        const finalDamage = damageValueParts.length > 0 ? damageValueParts.join(' + ') : '-';
-        const finalDamageType = damageTypeParts.length > 0 ? damageTypeParts.join(', ') : '-';
+        const finalDamage = damageValueParts.length > 0 ?damageValueParts.join(' + ') : '-';
+        const finalDamageType = damageTypeParts.length > 0 ?damageTypeParts.join(', ') : '-';
         const finalProps = [itemCategory, ...extraProps, ...properties].filter(Boolean).join(', ');
+        const isConsumable = itemCategory.includes('Consum') || properties.some(prop => prop.includes('Consum')) ?1 : 0;
 
-        await db.runAsync(
-          `INSERT INTO items (name, weight, damage, damage_type, properties, descricao, criador) VALUES (?, ?, ?, ?, ?, ?, 'proprio')`,
-          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, finalProps, itemDescription]
+        const result = await db.runAsync(
+          `INSERT INTO items (name, weight, damage, damage_type, category, is_consumable, properties, descricao, criador) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proprio')`,
+          [name, parseFloat(weight) || 0, finalDamage, finalDamageType, itemCategory, isConsumable, finalProps, itemDescription]
         );
+        const itemId = Number((result as any).lastInsertRowId || 0);
+        if (itemId > 0) await insertEffects('items', itemId, name, itemEffects);
       } 
       else if (activeTab === 'Raça') {
         const bonificadores = Object.fromEntries(Object.entries(stats).map(([k, v]) => [k, parseInt(v) || 0]));
-        await db.runAsync(`INSERT INTO races (name, stat_bonuses, speed, features, criador) VALUES (?, ?, ?, ?, 'proprio')`, [name, JSON.stringify(bonificadores), speed, JSON.stringify(selectedFeatures.map(f=>f.name))]);
+        await db.runAsync(`INSERT INTO races (name, stat_bonuses, speed, features, criador) VALUES (?, ?, ?, ?, 'proprio')`, [name, JSON.stringify(bonificadores), speed, buildFeatureRequirementsPayload()]);
       }
       else if (activeTab === 'Classe') {
         const parsedSaves = saves.map(s => `save_${s.toLowerCase()}`);
-        await db.runAsync(`INSERT INTO classes (name, recommended_stats, starting_equipment, starting_gold, hit_dice, saves, subclass_level, is_caster, features, criador) VALUES (?, '{}', '[]', ?, ?, ?, ?, ?, ?, 'proprio')`, [name, parseInt(gold) || 0, parseInt(hitDice) || 8, JSON.stringify(parsedSaves), parseInt(subclassLevel) || 3, isCaster ? 1 : 0, JSON.stringify(selectedFeatures.map(f=>f.name))]);
+        await db.runAsync(`INSERT INTO classes (name, recommended_stats, starting_equipment, starting_gold, hit_dice, saves, subclass_level, is_caster, features, criador) VALUES (?, '{}', '[]', ?, ?, ?, ?, ?, ?, 'proprio')`, [name, parseInt(gold) || 0, parseInt(hitDice) || 8, JSON.stringify(parsedSaves), parseInt(subclassLevel) || 3, isCaster ?1 : 0, buildFeatureRequirementsPayload()]);
         if(isCaster) await insertMagicProgression('class', name);
       }
       else if (activeTab === 'Subclasse') {
@@ -407,7 +745,7 @@ export default function AdvancedCreatorScreen() {
         const mainLevelReq = parseInt(subclassParents[0].minLevel) || 3;
         const bnsSkills = parseInt(bonusSkills) || 0;
         
-        await db.runAsync(`INSERT INTO subclasses (name, class_name, level_required, bonus_skills, features, criador) VALUES (?, ?, ?, ?, ?, 'proprio')`, [name, parentNames, mainLevelReq, bnsSkills, JSON.stringify(selectedFeatures.map(f=>f.name))]);
+        await db.runAsync(`INSERT INTO subclasses (name, class_name, level_required, bonus_skills, features, criador) VALUES (?, ?, ?, ?, ?, 'proprio')`, [name, parentNames, mainLevelReq, bnsSkills, buildFeatureRequirementsPayload()]);
         if(isCaster) await insertMagicProgression('subclass', name);
       }
       else if (activeTab === 'Kit') {
@@ -432,12 +770,26 @@ export default function AdvancedCreatorScreen() {
 
   const renderFeatureSelection = () => (
     <View style={styles.formGroup}>
-      <Text style={styles.label}>HABILIDADES PASSIVAS E INATAS</Text>
+      <Text style={styles.label}>HABILIDADES PASSIVAS, INATAS E BÔNUS POR NÍVEL</Text>
+      <Text style={[styles.catalogItemSub, { marginBottom: 10 }]}>Defina em qual nível a raça, classe ou subclasse libera cada habilidade/bônus.</Text>
       
       <View style={{flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10}}>
-        {selectedFeatures.map((feat, index) => (
+        {selectedFeatures.map((feat) => (
           <View key={feat.name} style={styles.featureBadge}>
             <Text style={styles.featureBadgeText}>{feat.name}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginRight: 6 }}>
+              <Text style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, fontWeight: 'bold' }}>Nv.</Text>
+              <TextInput
+                style={styles.featureBadgeInput}
+                keyboardType="numeric"
+                selectTextOnFocus
+                value={feat.level || '1'}
+                onChangeText={(value) => updateSelectedFeatureLevel(feat.name, value)}
+                onBlur={() => {
+                  if (!feat.level || feat.level === '0') updateSelectedFeatureLevel(feat.name, '1');
+                }}
+              />
+            </View>
             <TouchableOpacity onPress={() => toggleFeature(feat.name)}>
               <Ionicons name="close-circle" size={16} color="#ff6666" />
             </TouchableOpacity>
@@ -467,7 +819,7 @@ export default function AdvancedCreatorScreen() {
                       <Text style={styles.catalogItemName}>{item.name}</Text>
                       <Text style={styles.catalogItemSub} numberOfLines={2}>{item.description}</Text>
                     </View>
-                    {isSelected ? (
+                    {isSelected ?(
                        <Ionicons name="checkmark-circle" size={28} color="#00fa9a" />
                     ) : (
                        <Ionicons name="add-circle-outline" size={28} color="#00bfff" />
@@ -486,110 +838,52 @@ export default function AdvancedCreatorScreen() {
     </View>
   );
 
-  const renderItemForm = () => {
-    const isAttribute = ['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR', 'Escolher Atributo'].includes(tempEffType);
-
-    return (
-      <View>
-        <View style={styles.formGroup}>
-          <Text style={styles.label}>PESO (kg)</Text>
-          <TextInput style={styles.input} keyboardType="numeric" value={weight} onChangeText={setWeight} />
-        </View>
-
-        <Text style={styles.label}>CATEGORIA DO ITEM</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 20}}>
-          <View style={{flexDirection: 'row', gap: 10}}>
-            {ITEM_CATEGORIES.map(cat => (
-              <TouchableOpacity key={cat} style={[styles.toggleBtn, itemCategory === cat && styles.toggleBtnActive]} onPress={() => setItemCategory(cat)}>
-                <Text style={[styles.toggleBtnText, itemCategory === cat && styles.toggleBtnTextActive]}>{cat}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </ScrollView>
-
-        <Text style={styles.label}>CONSTRUTOR DE EFEITOS (Dano, Cura, Atributos)</Text>
-        <View style={styles.effectBuilder}>
-          <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} placeholder="Valor (Ex: 1d6, 2, +1)" placeholderTextColor="#888" value={tempEffVal} onChangeText={setTempEffVal} />
-          
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
-            <View style={{flexDirection: 'row', gap: 8}}>
-              {EFFECT_CATEGORIES.map(cat => (
-                <TouchableOpacity key={cat} style={[styles.limitBtn, tempEffType === cat && styles.limitBtnActive]} onPress={() => { setTempEffType(cat); setTempEffDuration(''); }}>
-                  <Text style={[styles.limitBtnText, tempEffType === cat && styles.limitBtnTextActive]}>{cat}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </ScrollView>
-
-          {isAttribute && (
-            <View style={{marginBottom: 15}}>
-              <Text style={[styles.label, {fontSize: 9, color: 'rgba(255,255,255,0.5)'}]}>DURAÇÃO DO ATRIBUTO</Text>
-              <View style={{flexDirection: 'row', gap: 10, alignItems: 'center'}}>
-                <TouchableOpacity style={[styles.limitBtn, tempEffDuration === 'Temp' && styles.limitBtnActive]} onPress={() => setTempEffDuration(tempEffDuration === 'Temp' ? '' : 'Temp')}>
-                  <Text style={[styles.limitBtnText, tempEffDuration === 'Temp' && styles.limitBtnTextActive]}>Temporário</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={[styles.limitBtn, tempEffDuration === 'Perm' && styles.limitBtnActive]} onPress={() => { setTempEffDuration(tempEffDuration === 'Perm' ? '' : 'Perm'); setTempEffTurns(''); }}>
-                  <Text style={[styles.limitBtnText, tempEffDuration === 'Perm' && styles.limitBtnTextActive]}>Permanente</Text>
-                </TouchableOpacity>
-                
-                {tempEffDuration === 'Temp' && (
-                  <TextInput style={[styles.input, {flex: 1, paddingVertical: 5, backgroundColor: 'rgba(0,0,0,0.4)', textAlign: 'center'}]} placeholder="Turnos (Op)" placeholderTextColor="#888" keyboardType="numeric" value={tempEffTurns} onChangeText={setTempEffTurns} />
-                )}
-              </View>
-            </View>
-          )}
-          
-          <TouchableOpacity style={styles.addEffectBtn} onPress={() => {
-            if(!tempEffVal && tempEffType !== 'Outro') {
-                Alert.alert("Aviso", "Insira um valor ou dado para o efeito.");
-                return;
-            }
-            setItemEffects([...itemEffects, {val: tempEffVal, type: tempEffType, duration: isAttribute ? tempEffDuration : '', turns: tempEffTurns}]);
-            setTempEffVal(''); setTempEffDuration(''); setTempEffTurns('');
-          }}>
-            <Text style={styles.addEffectBtnText}>+ ADICIONAR EFEITO</Text>
-          </TouchableOpacity>
-        </View>
-
-        {itemEffects.length > 0 && (
-          <View style={{marginBottom: 20}}>
-            {itemEffects.map((eff, i) => {
-              let displayText = '';
-              const suffix = eff.duration ? (eff.duration === 'Temp' && eff.turns ? ` (Temp: ${eff.turns} turnos)` : ` (${eff.duration})`) : '';
-              if (eff.type === 'Cura') displayText = `Cura ${eff.val}`;
-              else if (eff.type === 'Outro') displayText = eff.val;
-              else if (eff.type === 'Escolher Atributo') displayText = `Escolher ${eff.val}${suffix}`;
-              else if (['CA', 'FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'].includes(eff.type)) displayText = `${eff.type} ${eff.val}${suffix}`;
-              else displayText = `${eff.val} ${eff.type}`;
-
-              return (
-                <View key={i} style={styles.effectRow}>
-                  <Text style={styles.effectText}>{displayText}</Text>
-                  <TouchableOpacity onPress={() => setItemEffects(itemEffects.filter((_, idx) => idx !== i))}><Ionicons name="trash" size={20} color="#ff6666" /></TouchableOpacity>
-                </View>
-              );
-            })}
-          </View>
-        )}
-
-        <Text style={styles.label}>PROPRIEDADES EXTRAS (Opcional)</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 20}}>
-          <View style={{flexDirection: 'row', gap: 10}}>
-            {ITEM_PROPS.map(prop => (
-              <TouchableOpacity key={prop} style={[styles.toggleBtn, properties.includes(prop) && styles.toggleBtnActive]} onPress={() => toggleArrayItem(setProperties, prop)}>
-                <Text style={[styles.toggleBtnText, properties.includes(prop) && styles.toggleBtnTextActive]}>{prop}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </ScrollView>
-
-        <View style={styles.formGroup}>
-          <Text style={styles.label}>DESCRIÇÃO / HISTÓRIA (Opcional)</Text>
-          <TextInput style={[styles.input, {minHeight: 100, textAlignVertical: 'top'}]} multiline value={itemDescription} onChangeText={setItemDescription} placeholder="A lenda do item..." placeholderTextColor="#666" />
-        </View>
+  const renderItemForm = () => (
+    <View>
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>PESO (kg)</Text>
+        <TextInput style={styles.input} keyboardType="numeric" selectTextOnFocus textAlign="center" value={weight} onChangeText={value => setWeight(onlyDecimal(value))} />
       </View>
-    );
-  };
+
+      <Text style={styles.label}>CATEGORIA DO ITEM</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 20 }}>
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          {ITEM_CATEGORIES.map(cat => (
+            <TouchableOpacity
+              key={cat}
+              style={[styles.toggleBtn, itemCategory === cat && styles.toggleBtnActive]}
+              onPress={() => {
+                setItemCategory(cat);
+                if (cat === 'Consumivel' || cat.includes('Consum')) {
+                  setProperties(prev => (prev.some(prop => prop.includes('Consum')) ?prev : [...prev, 'Consumivel']));
+                }
+              }}
+            >
+              <Text style={[styles.toggleBtnText, itemCategory === cat && styles.toggleBtnTextActive]}>{cat}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </ScrollView>
+
+      {renderStructuredEffectBuilder(itemEffects, setItemEffects)}
+
+      <Text style={styles.label}>PROPRIEDADES EXTRAS (Opcional)</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 20 }}>
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          {ITEM_PROPS.map(prop => (
+            <TouchableOpacity key={prop} style={[styles.toggleBtn, properties.includes(prop) && styles.toggleBtnActive]} onPress={() => toggleArrayItem(setProperties, prop)}>
+              <Text style={[styles.toggleBtnText, properties.includes(prop) && styles.toggleBtnTextActive]}>{prop}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </ScrollView>
+
+      <View style={styles.formGroup}>
+        <Text style={styles.label}>DESCRICAO / HISTORIA (Opcional)</Text>
+        <TextInput style={[styles.input, { minHeight: 100, textAlignVertical: 'top' }]} multiline value={itemDescription} onChangeText={setItemDescription} placeholder="A lenda do item..." placeholderTextColor="#666" />
+      </View>
+    </View>
+  );
 
   const getLevelsByCategory = (cat: string) => {
       if (cat === 'Magia') return ['Truque', 'Nível 1', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6', 'Nível 7', 'Nível 8', 'Nível 9'];
@@ -621,12 +915,12 @@ export default function AdvancedCreatorScreen() {
                 setCastTimeType('Passiva');
                 setSpellDurationType('Permanente');
                 setSpellComponents([]);
-                setSpellRange('Pessoal');
+                setSpellRangeShape('Pessoal');
               } else {
                 setSpellLevel('Nível 1');
                 setCastTimeType('Ação Bônus');
                 setSpellComponents([]);
-                setSpellRange('Pessoal');
+                setSpellRangeShape('Pessoal');
               }
             }}>
               <Text style={[styles.toggleBtnText, spellCategory === cat && styles.toggleBtnTextActive]}>{cat}</Text>
@@ -650,14 +944,14 @@ export default function AdvancedCreatorScreen() {
           {(castTimeType !== 'Passiva' && castTimeType !== 'Especial') && (
             <TextInput 
               style={[styles.input, {flex: 0.25, textAlign: 'center', paddingHorizontal: 5}]} 
-              keyboardType="numeric" 
+              keyboardType="numeric" selectTextOnFocus textAlign="center" 
               value={castTimeValue} 
-              onChangeText={setCastTimeValue} 
+              onChangeText={value => setCastTimeValue(onlyPositiveInt(value))} 
               placeholder="Qtd" 
               placeholderTextColor="#666"
             />
           )}
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: (castTimeType === 'Passiva' || castTimeType === 'Especial') ? 1 : 0.75}}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: (castTimeType === 'Passiva' || castTimeType === 'Especial') ?1 : 0.75}}>
             <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
               {availableCastingTimes.map(ct => (
                 <TouchableOpacity key={ct} style={[styles.limitBtn, castTimeType === ct && styles.limitBtnActive]} onPress={() => setCastTimeType(ct)}>
@@ -669,18 +963,31 @@ export default function AdvancedCreatorScreen() {
         </View>
 
         <View style={styles.row}>
-          <View style={[styles.formGroup, {flex: 1, marginRight: 10}]}>
+          <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
             <Text style={styles.label}>ALCANCE</Text>
-            <TextInput style={styles.input} value={spellRange} onChangeText={setSpellRange} placeholder="Ex: 18m, Toque" placeholderTextColor="#666"/>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginTop: 8}}>
-              <View style={{flexDirection: 'row', gap: 5}}>
-                {SPELL_RANGES.map(r => (
-                  <TouchableOpacity key={r} style={[styles.limitBtn, spellRange === r && styles.limitBtnActive, {paddingVertical: 4, paddingHorizontal: 8}]} onPress={() => setSpellRange(r)}>
-                    <Text style={[styles.limitBtnText, spellRange === r && styles.limitBtnTextActive, {fontSize: 9}]}>{r}</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 8 }}>
+              <View style={{ flexDirection: 'row', gap: 5 }}>
+                {STRUCTURED_RANGES.map(range => (
+                  <TouchableOpacity key={range} style={[styles.limitBtn, spellRangeShape === range && styles.limitBtnActive, { paddingVertical: 4, paddingHorizontal: 8 }]} onPress={() => setSpellRangeShape(range)}>
+                    <Text style={[styles.limitBtnText, spellRangeShape === range && styles.limitBtnTextActive, { fontSize: 9 }]}>{range}</Text>
                   </TouchableOpacity>
                 ))}
               </View>
             </ScrollView>
+            {spellRangeShape !== 'Pessoal' && spellRangeShape !== 'Toque' && (
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                <TextInput style={[styles.input, { flex: 1, textAlign: 'center' }]} keyboardType="numeric" selectTextOnFocus textAlign="center" value={spellRangeValue} onChangeText={value => setSpellRangeValue(onlyDecimal(value))} placeholder="Valor" placeholderTextColor="#666" />
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }}>
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                    {RANGE_UNITS.map(unit => (
+                      <TouchableOpacity key={unit} style={[styles.limitBtn, spellRangeUnit === unit && styles.limitBtnActive]} onPress={() => setSpellRangeUnit(unit)}>
+                        <Text style={[styles.limitBtnText, spellRangeUnit === unit && styles.limitBtnTextActive]}>{unit}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </ScrollView>
+              </View>
+            )}
           </View>
           
           {spellCategory === 'Magia' && (
@@ -702,9 +1009,9 @@ export default function AdvancedCreatorScreen() {
           {(spellDurationType !== 'Instantânea' && spellDurationType !== 'Concentração' && spellDurationType !== 'Permanente') && (
             <TextInput 
               style={[styles.input, {flex: 0.25, textAlign: 'center', paddingHorizontal: 5}]} 
-              keyboardType="numeric" 
+              keyboardType="numeric" selectTextOnFocus textAlign="center" 
               value={spellDurationValue} 
-              onChangeText={setSpellDurationValue} 
+              onChangeText={value => setSpellDurationValue(onlyPositiveInt(value))} 
               placeholder="Qtd" 
               placeholderTextColor="#666"
             />
@@ -720,51 +1027,7 @@ export default function AdvancedCreatorScreen() {
           </ScrollView>
         </View>
 
-        <Text style={styles.label}>CONSTRUTOR DE EFEITOS (Adicione múltiplos)</Text>
-        <View style={styles.effectBuilder}>
-          <TextInput style={[styles.input, {marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.4)'}]} placeholder="Valor/Dado (Ex: 8d6, +2 ou vazio)" placeholderTextColor="#888" value={tempSpellDice} onChangeText={setTempSpellDice} />
-          
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
-            <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
-              {SPELL_DAMAGE_TYPES.map(dt => (
-                <TouchableOpacity key={dt} style={[styles.limitBtn, tempSpellDmgType === dt && styles.limitBtnActive]} onPress={() => setTempSpellDmgType(dt)}>
-                  <Text style={[styles.limitBtnText, tempSpellDmgType === dt && styles.limitBtnTextActive]}>{dt}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </ScrollView>
-
-          {tempSpellDmgType === 'Outro' && (
-            <TextInput style={[styles.input, {marginBottom: 15, backgroundColor: 'rgba(0,0,0,0.4)'}]} placeholder="Qual o efeito? (Ex: Cegueira, Empurrão...)" value={tempSpellCustomType} onChangeText={setTempSpellCustomType} placeholderTextColor="#888" />
-          )}
-          
-          <TouchableOpacity style={styles.addEffectBtn} onPress={() => {
-            const finalType = tempSpellDmgType === 'Outro' ? tempSpellCustomType : tempSpellDmgType;
-            if (!finalType) { Alert.alert('Aviso', 'Defina o nome do efeito especial.'); return; }
-            if (!tempSpellDice && tempSpellDmgType !== 'Outro' && tempSpellDmgType !== 'Cura') {
-              Alert.alert('Aviso', 'Adicione um dado/valor para este tipo de dano.'); return; 
-            }
-            
-            setSpellEffectsList([...spellEffectsList, {dice: tempSpellDice, type: finalType}]);
-            setTempSpellDice(''); setTempSpellCustomType(''); setTempSpellDmgType('Fogo');
-          }}>
-            <Text style={styles.addEffectBtnText}>+ ADICIONAR EFEITO</Text>
-          </TouchableOpacity>
-        </View>
-
-        {spellEffectsList.length > 0 && (
-          <View style={{marginBottom: 20}}>
-            {spellEffectsList.map((eff, i) => {
-              const displayText = eff.dice ? `${eff.dice} (${eff.type})` : `${eff.type}`;
-              return (
-                <View key={i} style={styles.effectRow}>
-                  <Text style={styles.effectText}>{displayText}</Text>
-                  <TouchableOpacity onPress={() => setSpellEffectsList(spellEffectsList.filter((_, idx) => idx !== i))}><Ionicons name="trash" size={20} color="#ff6666" /></TouchableOpacity>
-                </View>
-              );
-            })}
-          </View>
-        )}
+        {renderStructuredEffectBuilder(spellEffectsList, setSpellEffectsList)}
 
         <Text style={styles.label}>TESTES DE RESISTÊNCIA NECESSÁRIOS</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 20}}>
@@ -783,7 +1046,7 @@ export default function AdvancedCreatorScreen() {
             <View style={styles.effectBuilder}>
               <View style={{flexDirection: 'row', gap: 10, marginBottom: 15, alignItems: 'center'}}>
                 <TextInput style={[styles.input, {flex: 0.7, backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 10}]} placeholder="Buscar classe..." placeholderTextColor="#666" value={spellClassSearch} onChangeText={setSpellClassSearch} />
-                <TextInput style={[styles.input, {flex: 0.3, backgroundColor: 'rgba(0,0,0,0.4)', textAlign: 'center', paddingVertical: 10}]} placeholder="Nível" placeholderTextColor="#666" keyboardType="numeric" value={tempSpellClassLvl} onChangeText={setTempSpellClassLvl} />
+                <TextInput style={[styles.input, {flex: 0.3, backgroundColor: 'rgba(0,0,0,0.4)', textAlign: 'center', paddingVertical: 10}]} placeholder="Nível" placeholderTextColor="#666" keyboardType="numeric" selectTextOnFocus textAlign="center" value={tempSpellClassLvl} onChangeText={value => setTempSpellClassLvl(onlyPositiveInt(value))} />
               </View>
 
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
@@ -838,7 +1101,7 @@ export default function AdvancedCreatorScreen() {
         
         <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15, marginTop: 10}}>
           <Text style={[styles.sectionTitle, {marginBottom: 0, marginTop: 0}]}>BÔNUS DE ATRIBUTOS</Text>
-          <Text style={styles.counterText}>Total Bônus: {totalStats > 0 ? `+${totalStats}` : totalStats}</Text>
+          <Text style={styles.counterText}>Total Bônus: {totalStats > 0 ?`+${totalStats}` : totalStats}</Text>
         </View>
 
         <View style={styles.statsGrid}>
@@ -876,14 +1139,14 @@ export default function AdvancedCreatorScreen() {
   const renderClassForm = () => (
     <View>
       <View style={styles.row}>
-        <View style={[styles.formGroup, {flex: 1, marginRight: 10}]}><Text style={styles.label}>DADO DE VIDA (d)</Text><TextInput style={styles.input} keyboardType="numeric" value={hitDice} onChangeText={setHitDice} placeholder="8" placeholderTextColor="#666"/></View>
-        <View style={[styles.formGroup, {flex: 1}]}><Text style={styles.label}>OURO INICIAL</Text><TextInput style={styles.input} keyboardType="numeric" value={gold} onChangeText={setGold} placeholder="10" placeholderTextColor="#666"/></View>
+        <View style={[styles.formGroup, {flex: 1, marginRight: 10}]}><Text style={styles.label}>DADO DE VIDA (d)</Text><TextInput style={styles.input} keyboardType="numeric" selectTextOnFocus textAlign="center" value={hitDice} onChangeText={value => setHitDice(onlyPositiveInt(value))} placeholder="8" placeholderTextColor="#666"/></View>
+        <View style={[styles.formGroup, {flex: 1}]}><Text style={styles.label}>OURO INICIAL</Text><TextInput style={styles.input} keyboardType="numeric" selectTextOnFocus textAlign="center" value={gold} onChangeText={value => setGold(onlyPositiveInt(value))} placeholder="10" placeholderTextColor="#666"/></View>
       </View>
       <View style={styles.row}>
-        <View style={[styles.formGroup, {flex: 1, marginRight: 10}]}><Text style={styles.label}>NÍVEL SUBCLASSE</Text><TextInput style={styles.input} keyboardType="numeric" value={subclassLevel} onChangeText={setSubclassLevel} placeholder="3" placeholderTextColor="#666"/></View>
+        <View style={[styles.formGroup, {flex: 1, marginRight: 10}]}><Text style={styles.label}>NÍVEL SUBCLASSE</Text><TextInput style={styles.input} keyboardType="numeric" selectTextOnFocus textAlign="center" value={subclassLevel} onChangeText={value => setSubclassLevel(onlyPositiveInt(value))} placeholder="3" placeholderTextColor="#666"/></View>
         <View style={[styles.formGroup, {flex: 1, alignItems: 'center', justifyContent: 'center'}]}>
           <Text style={styles.label}>USA MAGIA?</Text>
-          <Switch value={isCaster} onValueChange={(val) => { setIsCaster(val); if(val) setProgressionModalVisible(true); }} trackColor={{ false: "#767577", true: "#00bfff" }} thumbColor={isCaster ? "#fff" : "#f4f3f4"} />
+          <Switch value={isCaster} onValueChange={(val) => { setIsCaster(val); if(val) setProgressionModalVisible(true); }} trackColor={{ false: "#767577", true: "#00bfff" }} thumbColor={isCaster ?"#fff" : "#f4f3f4"} />
         </View>
       </View>
       
@@ -917,7 +1180,7 @@ export default function AdvancedCreatorScreen() {
       <View style={styles.effectBuilder}>
         <View style={{flexDirection: 'row', gap: 10, marginBottom: 15, alignItems: 'center'}}>
           <TextInput style={[styles.input, {flex: 0.7, backgroundColor: 'rgba(0,0,0,0.4)', paddingVertical: 10}]} placeholder="Buscar classe..." placeholderTextColor="#666" value={subclassSearch} onChangeText={setSubclassSearch} />
-          <TextInput style={[styles.input, {flex: 0.3, backgroundColor: 'rgba(0,0,0,0.4)', textAlign: 'center', paddingVertical: 10}]} placeholder="Nível" placeholderTextColor="#666" keyboardType="numeric" value={tempSubclassLevel} onChangeText={setTempSubclassLevel} />
+          <TextInput style={[styles.input, {flex: 0.3, backgroundColor: 'rgba(0,0,0,0.4)', textAlign: 'center', paddingVertical: 10}]} placeholder="Nível" placeholderTextColor="#666" keyboardType="numeric" selectTextOnFocus textAlign="center" value={tempSubclassLevel} onChangeText={value => setTempSubclassLevel(onlyPositiveInt(value))} />
         </View>
 
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom: 15}}>
@@ -957,10 +1220,10 @@ export default function AdvancedCreatorScreen() {
         <Text style={styles.label}>PERÍCIAS EXTRAS (Opcional)</Text>
         <TextInput 
           style={styles.input} 
-          keyboardType="numeric" 
+          keyboardType="numeric" selectTextOnFocus textAlign="center" 
           value={bonusSkills} 
-          onChangeText={setBonusSkills} 
-          placeholder="Quantas perícias o jogador ganha? (Ex: 0, 1, 3...)" 
+          onChangeText={value => setBonusSkills(onlyPositiveInt(value))} 
+          placeholder="Quantas perícias o jogador ganha?(Ex: 0, 1, 3...)" 
           placeholderTextColor="#666"
         />
         <Text style={[styles.label, {color: 'rgba(255,255,255,0.4)', fontSize: 9, marginTop: 5}]}>
@@ -969,8 +1232,8 @@ export default function AdvancedCreatorScreen() {
       </View>
 
       <View style={styles.formGroup}>
-         <Text style={styles.label}>SUBCLASSE DE CONJURADOR? (Ex: Cavaleiro Arcano)</Text>
-         <Switch value={isCaster} onValueChange={(val) => { setIsCaster(val); if(val) setProgressionModalVisible(true); }} trackColor={{ false: "#767577", true: "#00bfff" }} thumbColor={isCaster ? "#fff" : "#f4f3f4"} />
+         <Text style={styles.label}>SUBCLASSE DE CONJURADOR?(Ex: Cavaleiro Arcano)</Text>
+         <Switch value={isCaster} onValueChange={(val) => { setIsCaster(val); if(val) setProgressionModalVisible(true); }} trackColor={{ false: "#767577", true: "#00bfff" }} thumbColor={isCaster ?"#fff" : "#f4f3f4"} />
       </View>
       {isCaster && (
          <View style={{marginBottom: 20, backgroundColor: 'rgba(0,191,255,0.1)', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#00bfff'}}>
@@ -1041,7 +1304,7 @@ export default function AdvancedCreatorScreen() {
       </View>
 
       <View style={styles.cardBlock}>
-        {kitItems.length > 0 ? kitItems.map((item, i) => (
+        {kitItems.length > 0 ?kitItems.map((item, i) => (
             <View key={i} style={{flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)'}}>
                 <View style={{flexDirection: 'row', alignItems: 'center', gap: 8, marginRight: 15, backgroundColor: 'rgba(255, 255, 255, 0.1)', borderRadius: 8}}>
                     <TouchableOpacity onPress={() => updateKitQty(i, -1)} style={{paddingHorizontal: 12, paddingVertical: 6}}><Text style={{color: '#00bfff', fontSize: 18, fontWeight: 'bold'}}>-</Text></TouchableOpacity>
@@ -1067,7 +1330,7 @@ export default function AdvancedCreatorScreen() {
                         <TouchableOpacity style={styles.catalogItem} onPress={() => addItemToKit(item)}>
                             <View style={{flex: 1}}>
                               <Text style={styles.catalogItemName}>
-                                {item.name} {item.criador === 'proprio' || item.criador === 'importado' ? <Text style={{color: '#00bfff', fontSize: 10}}>[Custom]</Text> : null}
+                                {item.name} {item.criador === 'proprio' || item.criador === 'importado' ?<Text style={{color: '#00bfff', fontSize: 10}}>[Custom]</Text> : null}
                               </Text>
                               <Text style={styles.catalogItemSub}>{item.weight}kg {item.damage && item.damage !== '-' && `• ⚔️ ${item.damage}`}</Text>
                             </View>
@@ -1107,7 +1370,7 @@ export default function AdvancedCreatorScreen() {
          </TouchableOpacity>
       </View>
 
-      {myCreations.length > 0 ? (
+      {myCreations.length > 0 ?(
         myCreations.map((item) => {
           const uniqueId = `${item.tableName}-${item.id}`;
           const isSelected = selectedAcervo.includes(uniqueId);
@@ -1157,23 +1420,23 @@ export default function AdvancedCreatorScreen() {
               <Text style={styles.modalTitle}>Modelo de Progressão Mágica</Text>
               <Text style={[styles.hpHint, {marginBottom: 20}]}>Escolha o modelo que será aplicado do nível 1 ao 20 para esta classe.</Text>
               
-              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'total' ? 'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('total'); setProgressionModalVisible(false); }}>
-                 <Text style={[styles.catalogItemName, {color: casterType === 'total' ? '#00bfff' : '#fff'}]}>Conjurador Total</Text>
+              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'total' ?'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('total'); setProgressionModalVisible(false); }}>
+                 <Text style={[styles.catalogItemName, {color: casterType === 'total' ?'#00bfff' : '#fff'}]}>Conjurador Total</Text>
                  <Text style={styles.catalogItemSub}>Tem Truques. Chega a magias de Nível 9 (Ex: Mago, Bardo, Clérigo).</Text>
               </TouchableOpacity>
 
-              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'meio' ? 'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('meio'); setProgressionModalVisible(false); }}>
-                 <Text style={[styles.catalogItemName, {color: casterType === 'meio' ? '#00bfff' : '#fff'}]}>Meio-Conjurador</Text>
+              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'meio' ?'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('meio'); setProgressionModalVisible(false); }}>
+                 <Text style={[styles.catalogItemName, {color: casterType === 'meio' ?'#00bfff' : '#fff'}]}>Meio-Conjurador</Text>
                  <Text style={styles.catalogItemSub}>Sem Truques. Magias começam Nível 2 e vão até Nível 5 (Ex: Paladino, Patrulheiro).</Text>
               </TouchableOpacity>
 
-              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'terco' ? 'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('terco'); setProgressionModalVisible(false); }}>
-                 <Text style={[styles.catalogItemName, {color: casterType === 'terco' ? '#00bfff' : '#fff'}]}>1/3 Conjurador</Text>
+              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'terco' ?'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('terco'); setProgressionModalVisible(false); }}>
+                 <Text style={[styles.catalogItemName, {color: casterType === 'terco' ?'#00bfff' : '#fff'}]}>1/3 Conjurador</Text>
                  <Text style={styles.catalogItemSub}>Tem Truques. Magias começam Nível 3 e vão até Nível 4 (Ex: Cavaleiro Arcano).</Text>
               </TouchableOpacity>
 
-              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'pacto' ? 'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('pacto'); setProgressionModalVisible(false); }}>
-                 <Text style={[styles.catalogItemName, {color: casterType === 'pacto' ? '#00bfff' : '#fff'}]}>Magia de Pacto</Text>
+              <TouchableOpacity style={[styles.catalogItem, {flexDirection: 'column', alignItems: 'flex-start', backgroundColor: casterType === 'pacto' ?'rgba(0,191,255,0.2)' : 'transparent', padding: 15, borderRadius: 12}]} onPress={() => { setCasterType('pacto'); setProgressionModalVisible(false); }}>
+                 <Text style={[styles.catalogItemName, {color: casterType === 'pacto' ?'#00bfff' : '#fff'}]}>Magia de Pacto</Text>
                  <Text style={styles.catalogItemSub}>Poucos espaços, mas sempre no nível máximo possível (Ex: Bruxo).</Text>
               </TouchableOpacity>
 
@@ -1181,14 +1444,14 @@ export default function AdvancedCreatorScreen() {
         </Pressable>
       </Modal>
 
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ?'padding' : 'height'}>
         <ScrollView contentContainerStyle={styles.scrollContent}>
-          {activeTab !== 'Acervo' ? (
+          {activeTab !== 'Acervo' ?(
             <>
               <View style={styles.cardBlock}>
                 <View style={styles.formGroup}>
                   <Text style={styles.label}>NOME DO(A) {activeTab.toUpperCase()}</Text>
-                  <TextInput style={styles.input} value={name} onChangeText={setName} placeholder={`Ex: ${activeTab === 'Magia/Skill' ? 'Bola de Fogo' : 'Necromante'}...`} placeholderTextColor="#666" />
+                  <TextInput style={styles.input} value={name} onChangeText={setName} placeholder={`Ex: ${activeTab === 'Magia/Skill' ?'Bola de Fogo' : 'Necromante'}...`} placeholderTextColor="#666" />
                 </View>
 
                 {activeTab === 'Item' && renderItemForm()}

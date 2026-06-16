@@ -38,6 +38,27 @@ const getCategory = (spell: any): string => {
   return 'Habilidade';
 };
 
+
+type FeatureRequirement = string | { name?: string; level?: string | number; level_required?: string | number; minLevel?: string | number };
+
+const parseFeatureNamesForLevel = (featuresJson?: string, characterLevel = 1) => {
+  try {
+    const parsed = JSON.parse(featuresJson || '[]') as FeatureRequirement[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(feature => {
+        if (typeof feature === 'string') return true;
+        const rawLevel = feature.level_required ?? feature.level ?? feature.minLevel ?? 1;
+        const requiredLevel = parseInt(String(rawLevel), 10) || 1;
+        return requiredLevel <= characterLevel;
+      })
+      .map(feature => typeof feature === 'string' ? feature : feature.name)
+      .filter(Boolean) as string[];
+  } catch {
+    return [];
+  }
+};
+
 // Lista de magias/features que pertencem EXCLUSIVAMENTE aos personagens de BG3
 const BG3_ORIGIN_FEATURES = [
   "Mãos Mágicas (Githyanki)", 
@@ -180,16 +201,16 @@ export default function EditCharacterScreen() {
     let cFeats: string[] = [];
 
     const currentRace = dbRaces.find(r => r.name === character.race);
-    try { if (currentRace && currentRace.features) rFeats = JSON.parse(currentRace.features); } catch(e){}
+    try { if (currentRace && currentRace.features) rFeats = parseFeatureNamesForLevel(currentRace.features, targetLevel); } catch(e){}
 
     classesData.forEach(cls => {
       if (cls.level > 0) {
         const currentClass = dbClasses.find(c => c.name === cls.name);
-        try { if (currentClass && currentClass.features) cFeats.push(...JSON.parse(currentClass.features)); } catch(e){}
+        try { if (currentClass && currentClass.features) cFeats.push(...parseFeatureNamesForLevel(currentClass.features, cls.level)); } catch(e){}
         
         if (cls.subclass) {
           const currentSub = dbSubclasses.find(s => s.name === cls.subclass && s.class_name === cls.name);
-          try { if (currentSub && currentSub.features) cFeats.push(...JSON.parse(currentSub.features)); } catch(e){}
+          try { if (currentSub && currentSub.features) cFeats.push(...parseFeatureNamesForLevel(currentSub.features, cls.level)); } catch(e){}
         }
       }
     });
@@ -586,7 +607,7 @@ export default function EditCharacterScreen() {
           <Text style={styles.hpPlusIcon}>+</Text>
           <View style={styles.hpInputBox}>
             <Text style={styles.hpLabel}>NOVO HP (GANHO)</Text>
-            <TextInput style={styles.hpInput} keyboardType="numeric" value={hpIncrease} onChangeText={setHpIncrease} placeholder="0" placeholderTextColor="#666" />
+            <TextInput style={styles.hpInput} keyboardType="numeric" selectTextOnFocus textAlign="center" value={hpIncrease} onChangeText={setHpIncrease} placeholder="0" placeholderTextColor="#666" />
           </View>
         </View>
 
