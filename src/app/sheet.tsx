@@ -6,6 +6,7 @@ import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-rou
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useLanSession } from '../contexts/LanSessionContext';
 
 const XP_TABLE = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000, 85000, 100000, 120000, 140000, 165000, 195000, 225000, 265000, 305000, 355000];
 
@@ -34,6 +35,7 @@ export default function CharacterSheetScreen() {
   const { id } = useLocalSearchParams();
   const router = useRouter();
   const db = useSQLiteContext();
+  const { activeSession, broadcastCharacter } = useLanSession();
 
   const [activeTab, setActiveTab] = useState<'stats' | 'profs' | 'inv' | 'spells'>('stats');
   const [character, setCharacter] = useState<any>(null);
@@ -252,6 +254,9 @@ export default function CharacterSheetScreen() {
       const values = entries.map(([_, val]) => (typeof val === 'object' ? JSON.stringify(val) : val));
       await db.runAsync(`UPDATE characters SET ${setString} WHERE id = ?`, [...values, character.id]);
       setCharacter((prev: any) => ({ ...prev, ...updates }));
+      if (activeSession) {
+        await broadcastCharacter(character.id, 'sheet-update');
+      }
     } catch (e) { console.error(e); }
   };
 
@@ -787,6 +792,12 @@ export default function CharacterSheetScreen() {
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarBack} onPress={() => router.back()}><Text style={styles.topBarBackText}>{"<"}</Text></TouchableOpacity>
         <Text style={styles.topBarTitle}>{character.name}</Text>
+        {activeSession && (
+          <TouchableOpacity style={styles.topBarLanBadge} onPress={() => router.push('/lan-session')}>
+            <Ionicons name="wifi-outline" size={14} color="#00fa9a" />
+            <Text style={styles.topBarLanText}>LAN</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       <View>
@@ -1485,6 +1496,8 @@ const styles = StyleSheet.create({
   topBar: { paddingTop: 60, paddingBottom: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.2)', position: 'relative' },
   topBarBack: { position: 'absolute', left: 20, bottom: 12, padding: 5, zIndex: 10 },
   topBarBackText: { color: '#00bfff', fontSize: 16, fontWeight: 'bold' },
+  topBarLanBadge: { position: 'absolute', right: 20, bottom: 14, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(0,250,154,0.12)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.35)', borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
+  topBarLanText: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold' },
   topBarTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   
   tabContainer: { paddingHorizontal: 20, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },

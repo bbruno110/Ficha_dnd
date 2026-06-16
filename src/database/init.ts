@@ -150,6 +150,62 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       criador TEXT DEFAULT 'base',
       UNIQUE(source_type, source_name, level)
     );
+
+    CREATE TABLE IF NOT EXISTS lan_device_identity (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      player_name TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_sessions (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'closed',
+      session_code TEXT UNIQUE,
+      host_ip TEXT,
+      port INTEGER,
+      sync_custom_content INTEGER DEFAULT 0,
+      selected_content TEXT DEFAULT '[]',
+      allow_existing_character INTEGER DEFAULT 1,
+      linked_character_id INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      opened_at DATETIME,
+      closed_at DATETIME,
+      last_connected_at DATETIME
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_session_players (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      player_name TEXT,
+      character_id INTEGER,
+      character_name TEXT,
+      connected INTEGER DEFAULT 0,
+      last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, device_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_character_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      owner_device_id TEXT NOT NULL,
+      remote_character_id TEXT,
+      character_name TEXT,
+      payload TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, owner_device_id, remote_character_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lan_event_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT,
+      event_type TEXT NOT NULL,
+      payload TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   const checkDb = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM items');

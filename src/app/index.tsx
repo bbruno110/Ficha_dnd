@@ -6,10 +6,12 @@ import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useState } from 'react';
 import { Alert, FlatList, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import CharacterCard, { Character } from '../components/CharacterCard';
+import { useLanSession } from '../contexts/LanSessionContext';
 
 export default function HomeScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
+  const { activeSession } = useLanSession();
   const [charactersList, setCharactersList] = useState<Character[]>([]);
 
   const appVersion = Constants.expoConfig?.version || '1.0.0';
@@ -86,6 +88,14 @@ export default function HomeScreen() {
           <Text style={styles.advancedButtonText}>FERRAMENTAS DO MESTRE</Text>
         </TouchableOpacity>
 
+        <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={() => router.push('/lan-session')}>
+          <Ionicons name="wifi-outline" size={20} color="#00fa9a" style={{ marginRight: 10 }} />
+          <View style={{ alignItems: 'center' }}>
+            <Text style={styles.lanButtonText}>SESSAO LAN</Text>
+            {activeSession && <Text style={styles.lanButtonSub}>{activeSession.role === 'master' ? 'Mestre' : 'Jogador'} / {activeSession.name}</Text>}
+          </View>
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => router.push('/create')}>
           <Text style={styles.createButtonIcon}>+</Text>
           <Text style={styles.createButtonText}>NOVO PERSONAGEM</Text>
@@ -104,7 +114,7 @@ const styles = StyleSheet.create({
   header: { paddingTop: 60, paddingHorizontal: 20, paddingBottom: 20 },
   headerTitle: { fontSize: 28, fontWeight: 'bold', color: '#ffffff', letterSpacing: 1 },
   
-  listContent: { paddingHorizontal: 20, paddingBottom: 180 },
+  listContent: { paddingHorizontal: 20, paddingBottom: 235 },
   
   emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 40, marginTop: -50 },
   emptyIcon: { fontSize: 60, marginBottom: 20, opacity: 0.8 },
@@ -115,6 +125,10 @@ const styles = StyleSheet.create({
   
   advancedButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
   advancedButtonText: { fontSize: 14, fontWeight: 'bold', color: '#00bfff', letterSpacing: 1 },
+
+  lanButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0, 250, 154, 0.1)', borderWidth: 1, borderColor: '#00fa9a', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
+  lanButtonText: { fontSize: 14, fontWeight: 'bold', color: '#00fa9a', letterSpacing: 1 },
+  lanButtonSub: { color: 'rgba(255,255,255,0.6)', fontSize: 10, marginTop: 3, fontWeight: 'bold' },
   
   createButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#102b56', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 16, shadowColor: '#00bfff', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 5, elevation: 5 },
   createButtonIcon: { fontSize: 24, color: '#00bfff', marginRight: 10, fontWeight: '300' },

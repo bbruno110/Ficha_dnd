@@ -5,6 +5,7 @@ import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useLanSession } from '../contexts/LanSessionContext';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
 import SpellSelector from '../components/SpellSelector';
@@ -56,6 +57,7 @@ export default function EditCharacterScreen() {
   const { id, levelUpTo } = useLocalSearchParams();
   const router = useRouter();
   const db = useSQLiteContext();
+  const { activeSession, broadcastCharacter } = useLanSession();
 
   const [loading, setLoading] = useState(true);
   const [character, setCharacter] = useState<any>(null);
@@ -510,6 +512,10 @@ export default function EditCharacterScreen() {
       );
       
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!
+      if (activeSession) {
+        await broadcastCharacter(character.id, 'character-edited');
+      }
+
       if (router.canGoBack()) {
         router.back();
       } else {

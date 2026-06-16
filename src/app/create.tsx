@@ -10,6 +10,7 @@ import {
   ScrollView,
   StyleSheet, Text, TextInput, TouchableOpacity, View
 } from 'react-native';
+import { useLanSession } from '../contexts/LanSessionContext';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE
 import SpellSelector, { SpellItem } from '../components/SpellSelector';
@@ -50,6 +51,7 @@ const BASE_CLASS_FEATURES = [
 export default function CreateCharacterScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
+  const { activeSession, linkCharacterToActiveSession, broadcastCharacter } = useLanSession();
   const isRandomizing = useRef(false);
 
   const hasConfirmedRandomize = useRef(false);
@@ -916,7 +918,7 @@ export default function CreateCharacterScreen() {
     const activeSkillsToSave = proficiencies.filter(p => p.startsWith('skill_'));
 
     try {
-      await db.runAsync(
+      const result = await db.runAsync(
         `INSERT INTO characters (
           name, race, class, stats, prof_bonus, inspiration, proficiencies, 
           save_values, skill_values, personality_traits, ideals, bonds, flaws, 
@@ -931,7 +933,14 @@ export default function CreateCharacterScreen() {
           JSON.stringify(selectedSpells), '{}', JSON.stringify(cleanInventory), gp, sp, cp, hpMax, hpMax, 1, 0 
         ]
       );
-      router.back();
+      const newCharacterId = Number((result as any).lastInsertRowId || 0);
+      if (activeSession && newCharacterId > 0) {
+        await linkCharacterToActiveSession(newCharacterId);
+        await broadcastCharacter(newCharacterId, 'character-created');
+        router.replace(`/sheet?id=${newCharacterId}`);
+      } else {
+        router.back();
+      }
     } catch (error) {}
   };
 
