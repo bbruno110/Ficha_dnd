@@ -15,6 +15,7 @@ type SpellClassReq = { name: string; minLevel: string };
 type SelectedFeature = { name: string; level: string };
 type SpellItem = { id: number; name: string; level: string; category?: string; casting_time?: string; range?: string; damage?: string; description?: string; classes?: string; };
 type AdvancedEffectDraft = EffectDraft & { label?: string };
+type ConditionCatalogItem = { id: number; name: string; description?: string | null; color: string; criador?: string | null };
 
 const CATEGORIES = ['Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Acervo'];
 const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capacete', 'Capa', 'Bota', 'Luva', 'Consumível', 'Ferramenta', 'Mochila/Saco', 'Outro'];
@@ -49,6 +50,15 @@ const DURATION_UNITS: { value: EffectDurationUnit; label: string }[] = [
   { value: 'day', label: 'Dias' },
   { value: 'permanent', label: 'Permanente' },
 ];
+const MASTER_TOOL_CATEGORIES = [...CATEGORIES.slice(0, -1), 'Efeitos', 'Acervo'];
+const IMPORT_VALID_TABLES = [...VALID_TABLES, 'condition_effects'];
+const CONDITION_COLOR_PALETTE = ['#7ED957', '#F4A84D', '#8B5CF6', '#EF4444', '#38BDF8', '#FACC15', '#EC4899', '#64748B'];
+const isValidHexColor = (value: string) => /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value.trim());
+const normalizeHexColorInput = (value: string) => {
+  const cleaned = value.replace(/[^0-9a-fA-F#]/g, '');
+  const withoutHash = cleaned.replace(/#/g, '').slice(0, 6);
+  return `#${withoutHash}`;
+};
 
 export default function AdvancedCreatorScreen() {
   const router = useRouter();
@@ -136,6 +146,21 @@ export default function AdvancedCreatorScreen() {
   const [acervoFilter, setAcervoFilter] = useState('Todos');
   const [myCreations, setMyCreations] = useState<any[]>([]);
   const [selectedAcervo, setSelectedAcervo] = useState<string[]>([]);
+  const [conditionCatalog, setConditionCatalog] = useState<ConditionCatalogItem[]>([]);
+  const [conditionDescription, setConditionDescription] = useState('');
+  const [conditionColor, setConditionColor] = useState('#F4A84D');
+
+  const loadConditionCatalog = async () => {
+    try {
+      const rows = await db.getAllAsync<ConditionCatalogItem>('SELECT id, name, description, color, criador FROM condition_effects ORDER BY name');
+      setConditionCatalog(rows.map(row => ({
+        ...row,
+        color: isValidHexColor(row.color || '') ? row.color : '#F4A84D',
+      })));
+    } catch (error) {
+      setConditionCatalog([]);
+    }
+  };
 
   useEffect(() => {
     async function fetchData() {
@@ -149,6 +174,7 @@ export default function AdvancedCreatorScreen() {
         setDbClasses(classes);
         setDbItemsCatalog(items);
         setDbFeatures(features);
+        await loadConditionCatalog();
         
         if(classes.length > 0) {
           setTempSpellClass(classes[0].name);
@@ -167,6 +193,7 @@ export default function AdvancedCreatorScreen() {
     try {
       const tableMap: Record<string, string> = { 'Item': 'items', 'Raça': 'races', 'Classe': 'classes', 'Subclasse': 'subclasses', 'Magia/Skill': 'spells', 'Kit': 'starting_kits' };
       let data: any[] = [];
+      tableMap.Efeitos = 'condition_effects';
       const fetchTable = async (label: string, tableName: string) => {
         const rows = await db.getAllAsync(`SELECT * FROM ${tableName} WHERE criador IN ('proprio', 'importado')`);
         return rows.map((r: any) => ({ ...r, type: label, tableName }));
@@ -263,7 +290,7 @@ export default function AdvancedCreatorScreen() {
 
       for (const item of importedData) {
         if (!item.tableName || (!item.name && item.tableName !== 'spellcasting_progression')) continue; 
-        if (!VALID_TABLES.includes(item.tableName)) continue; 
+        if (!IMPORT_VALID_TABLES.includes(item.tableName)) continue;
         
         const { tableName, type, id, ...fields } = item;
         fields.criador = 'importado';
@@ -309,6 +336,7 @@ export default function AdvancedCreatorScreen() {
     setSpellEffectsList([]); setTempSpellDmgType('Fogo'); setSpellSaves([]); setSpellDescription(''); 
     setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
     setSelectedFeatures([]); setCasterType('total');
+    setConditionDescription(''); setConditionColor('#F4A84D');
   };
 
   const handleTabChange = (tab: string) => { setActiveTab(tab); if (tab !== 'Acervo') resetForms(); };
@@ -321,7 +349,7 @@ export default function AdvancedCreatorScreen() {
   const getEffectTypeOptions = (kind: EffectKind) => {
     if (kind === 'damage') return DAMAGE_TYPES;
     if (kind === 'healing') return ['Cura'];
-    if (kind === 'condition') return CONDITIONS;
+    if (kind === 'condition') return conditionCatalog.length > 0 ? conditionCatalog.map(effect => effect.name) : CONDITIONS;
     if (kind === 'stat_modifier') return STAT_EFFECT_TYPES;
     return UTILITY_EFFECT_TYPES;
   };
@@ -331,6 +359,7 @@ export default function AdvancedCreatorScreen() {
     const effectType = typeOptions.includes(tempEffType) ?tempEffType : typeOptions[0];
     const valueMode = tempEffectKind === 'condition' || tempEffectKind === 'utility' ?'none' : tempValueMode;
     const durationUnit = tempDurationUnit;
+    const selectedCondition = tempEffectKind === 'condition' ? conditionCatalog.find(effect => effect.name === effectType) : null;
 
     return {
       effect_kind: tempEffectKind,
@@ -344,7 +373,11 @@ export default function AdvancedCreatorScreen() {
       chance_percent: clampNumber(tempChancePercent, 100, 0, 100),
       duration_value: durationUnit === 'instant' || durationUnit === 'permanent' ?null : clampNumber(tempDurationValue, 1, 1, 999),
       duration_unit: durationUnit,
-      metadata: {},
+      metadata: selectedCondition ? {
+        condition_id: selectedCondition.id,
+        condition_color: selectedCondition.color,
+        condition_description: selectedCondition.description || '',
+      } : {},
     };
   };
 
@@ -505,11 +538,17 @@ export default function AdvancedCreatorScreen() {
 
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
             <View style={{ flexDirection: 'row', gap: 8 }}>
-              {typeOptions.map(option => (
-                <TouchableOpacity key={option} style={[styles.limitBtn, selectedType === option && styles.limitBtnActive]} onPress={() => setTempEffType(option)}>
-                  <Text style={[styles.limitBtnText, selectedType === option && styles.limitBtnTextActive]}>{option}</Text>
-                </TouchableOpacity>
-              ))}
+              {typeOptions.map(option => {
+                const condition = tempEffectKind === 'condition' ? conditionCatalog.find(effect => effect.name === option) : null;
+                return (
+                  <TouchableOpacity key={option} style={[styles.limitBtn, selectedType === option && styles.limitBtnActive]} onPress={() => setTempEffType(option)}>
+                    <View style={styles.effectOptionContent}>
+                      {condition ? <View style={[styles.effectColorDot, { backgroundColor: condition.color }]} /> : null}
+                      <Text style={[styles.limitBtnText, selectedType === option && styles.limitBtnTextActive]}>{option}</Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
             </View>
           </ScrollView>
 
@@ -654,7 +693,19 @@ export default function AdvancedCreatorScreen() {
   const handleSave = async () => {
     if (!name.trim()) { Alert.alert('Erro', 'O nome é obrigatório!'); return; }
     try {
-      if (activeTab === 'Magia/Skill') {
+      if (activeTab === 'Efeitos') {
+        const safeColor = conditionColor.trim();
+        if (!isValidHexColor(safeColor)) {
+          Alert.alert('Erro', 'Informe uma cor hexadecimal valida, por exemplo #F4A84D.');
+          return;
+        }
+        await db.runAsync(
+          `INSERT INTO condition_effects (name, description, color, criador) VALUES (?, ?, ?, 'proprio')`,
+          [name.trim(), conditionDescription.trim(), safeColor.toUpperCase()]
+        );
+        await loadConditionCatalog();
+      }
+      else if (activeTab === 'Magia/Skill') {
         let finalCastTime = castTimeType === 'Passiva' ?'Passiva' : `${castTimeValue} ${castTimeType}`.trim();
         const durationData = buildDurationData();
         const rangeData = buildRangeData();
@@ -837,6 +888,73 @@ export default function AdvancedCreatorScreen() {
       </Modal>
     </View>
   );
+
+  const renderConditionEffectForm = () => {
+    const safeColor = isValidHexColor(conditionColor) ? conditionColor : '#2A3654';
+    return (
+      <View>
+        <View style={styles.formGroup}>
+          <Text style={styles.label}>DESCRICAO DO EFEITO</Text>
+          <TextInput
+            style={[styles.input, { minHeight: 100, textAlignVertical: 'top' }]}
+            multiline
+            value={conditionDescription}
+            onChangeText={setConditionDescription}
+            placeholder="Ex: sofre dano de fogo recorrente ou fica marcado por uma maldicao."
+            placeholderTextColor="#666"
+          />
+        </View>
+
+        <View style={styles.formGroup}>
+          <Text style={styles.label}>COR HEXADECIMAL</Text>
+          <View style={styles.colorInputRow}>
+            <View style={[styles.colorPreview, { backgroundColor: safeColor }]} />
+            <TextInput
+              style={[styles.input, { flex: 1 }]}
+              autoCapitalize="characters"
+              value={conditionColor}
+              onChangeText={value => setConditionColor(normalizeHexColorInput(value))}
+              placeholder="#F4A84D"
+              placeholderTextColor="#666"
+            />
+          </View>
+          <View style={styles.colorPalette}>
+            {CONDITION_COLOR_PALETTE.map(color => (
+              <TouchableOpacity
+                key={color}
+                style={[styles.colorSwatch, { backgroundColor: color }, conditionColor.toUpperCase() === color && styles.colorSwatchActive]}
+                onPress={() => setConditionColor(color)}
+              />
+            ))}
+          </View>
+        </View>
+
+        <Text style={styles.label}>PREVIEW</Text>
+        <View style={[styles.conditionPreviewCard, { borderColor: safeColor }]}>
+          <View style={[styles.effectColorDot, { backgroundColor: safeColor }]} />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.conditionPreviewTitle}>{name.trim() || 'Nome do efeito'}</Text>
+            <Text style={styles.conditionPreviewSub}>{conditionDescription.trim() || 'Descricao amigavel do efeito.'}</Text>
+          </View>
+        </View>
+
+        <Text style={[styles.label, { marginTop: 20 }]}>EFEITOS CADASTRADOS</Text>
+        {conditionCatalog.length === 0 ? (
+          <Text style={styles.emptyText}>Nenhum efeito cadastrado ainda.</Text>
+        ) : (
+          conditionCatalog.map(effect => (
+            <View key={effect.id} style={styles.conditionListItem}>
+              <View style={[styles.effectColorDot, { backgroundColor: effect.color }]} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.catalogItemName}>{effect.name}</Text>
+                <Text style={styles.catalogItemSub} numberOfLines={2}>{effect.description || 'Sem descricao.'}</Text>
+              </View>
+            </View>
+          ))
+        )}
+      </View>
+    );
+  };
 
   const renderItemForm = () => (
     <View>
@@ -1352,7 +1470,7 @@ export default function AdvancedCreatorScreen() {
   const renderAcervo = () => (
     <View style={{ flex: 1, minHeight: 400 }}>
       <View style={styles.acervoTabs}>
-        {['Todos', 'Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit'].map(tab => (
+        {['Todos', 'Item', 'Raça', 'Classe', 'Subclasse', 'Magia/Skill', 'Kit', 'Efeitos'].map(tab => (
           <TouchableOpacity key={tab} style={[styles.acervoTabBtn, acervoFilter === tab && styles.acervoTabBtnActive]} onPress={() => setAcervoFilter(tab)}>
             <Text style={[styles.acervoTabBtnText, acervoFilter === tab && styles.acervoTabBtnTextActive]}>{tab}</Text>
           </TouchableOpacity>
@@ -1405,7 +1523,7 @@ export default function AdvancedCreatorScreen() {
       </View>
       <View style={styles.tabsContainer}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{gap: 10}}>
-          {CATEGORIES.map(tab => (
+          {MASTER_TOOL_CATEGORIES.map(tab => (
             <TouchableOpacity key={tab} style={[styles.tabBtn, activeTab === tab && styles.tabBtnActive]} onPress={() => handleTabChange(tab)}>
               <Text style={[styles.tabBtnText, activeTab === tab && styles.tabBtnTextActive]}>{tab}</Text>
             </TouchableOpacity>
@@ -1460,6 +1578,7 @@ export default function AdvancedCreatorScreen() {
                 {activeTab === 'Subclasse' && renderSubclassForm()}
                 {activeTab === 'Magia/Skill' && renderSpellForm()}
                 {activeTab === 'Kit' && renderKitForm()}
+                {activeTab === 'Efeitos' && renderConditionEffectForm()}
               </View>
               <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
                 <Ionicons name="save-outline" size={20} color="#02112b" />
@@ -1510,6 +1629,17 @@ const styles = StyleSheet.create({
   addEffectBtnText: { color: '#00bfff', fontWeight: 'bold', fontSize: 12 },
   effectRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', padding: 15, borderRadius: 12, marginBottom: 8, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },
   effectText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+  effectOptionContent: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  effectColorDot: { width: 12, height: 12, borderRadius: 6 },
+  colorInputRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  colorPreview: { width: 48, height: 48, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)' },
+  colorPalette: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 12 },
+  colorSwatch: { width: 34, height: 34, borderRadius: 17, borderWidth: 2, borderColor: 'rgba(255,255,255,0.18)' },
+  colorSwatchActive: { borderColor: '#fff' },
+  conditionPreviewCard: { minHeight: 74, flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 14, padding: 14, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, marginBottom: 8 },
+  conditionPreviewTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+  conditionPreviewSub: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4, lineHeight: 17 },
+  conditionListItem: { minHeight: 62, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
   saveBtn: { backgroundColor: '#00fa9a', padding: 18, borderRadius: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
   saveBtnText: { color: '#02112b', fontSize: 16, fontWeight: 'bold', letterSpacing: 1 },
   acervoTabs: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 15, justifyContent: 'center' },

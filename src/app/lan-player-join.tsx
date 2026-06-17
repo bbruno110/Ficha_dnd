@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
@@ -24,6 +24,7 @@ export default function LanPlayerJoinScreen() {
   const [playerName, setPlayerName] = useState('');
   const [scannerVisible, setScannerVisible] = useState(false);
   const [joining, setJoining] = useState(false);
+  const scanLockRef = useRef(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
   const returnToLanSession = () => {
@@ -48,13 +49,13 @@ export default function LanPlayerJoinScreen() {
     setScannerVisible(true);
   };
 
-  const handleJoin = async () => {
+  const handleJoin = async (codeOverride?: string) => {
     if (joining) return;
 
     try {
       setJoining(true);
       await joinPlayerSession({
-        code: joinCode,
+        code: codeOverride || joinCode,
         playerName,
         linkedCharacterId: null,
       });
@@ -63,6 +64,7 @@ export default function LanPlayerJoinScreen() {
       Alert.alert('Erro LAN', error instanceof Error ? error.message : 'Não foi possível entrar na sessão.');
     } finally {
       setJoining(false);
+      scanLockRef.current = false;
     }
   };
 
@@ -124,7 +126,7 @@ export default function LanPlayerJoinScreen() {
               </View>
             </View>
 
-            <TouchableOpacity style={[styles.primaryButton, joining && styles.disabledButton]} disabled={joining} onPress={handleJoin}>
+            <TouchableOpacity style={[styles.primaryButton, joining && styles.disabledButton]} disabled={joining} onPress={() => handleJoin()}>
               <Ionicons name="people-outline" size={20} color="#02112b" />
               <Text style={styles.primaryButtonText}>{joining ? 'ENTRANDO...' : 'ENTRAR COMO JOGADOR'}</Text>
             </TouchableOpacity>
@@ -139,8 +141,11 @@ export default function LanPlayerJoinScreen() {
             facing="back"
             barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
             onBarcodeScanned={({ data }) => {
+              if (scanLockRef.current) return;
+              scanLockRef.current = true;
               setJoinCode(data);
               setScannerVisible(false);
+              void handleJoin(data);
             }}
           />
           <View style={styles.scannerTop}>

@@ -11,9 +11,10 @@ import { useLanSession } from '../contexts/LanSessionContext';
 export default function HomeScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
-  const { activeSession } = useLanSession();
+  const { activeSession, closeActiveSession, linkCharacterToActiveSession } = useLanSession();
   const [charactersList, setCharactersList] = useState<Character[]>([]);
   const lanNavigationLockRef = useRef(false);
+  const sheetNavigationLockRef = useRef(false);
 
   const appVersion = Constants.expoConfig?.version || '1.0.0';
 
@@ -36,6 +37,10 @@ export default function HomeScreen() {
 
   const handleDeleteCharacter = async (id: number) => {
     try {
+      if (activeSession?.linked_character_id === id) {
+        await linkCharacterToActiveSession(null);
+        await closeActiveSession();
+      }
       await db.runAsync(`DELETE FROM characters WHERE id = ?`, [id]);
       loadCharacters();
     } catch (error) {
@@ -51,7 +56,18 @@ export default function HomeScreen() {
   };
 
   const handleOpenSheet = (character: Character) => {
-    router.push(`/sheet?id=${character.id}`);
+    if (sheetNavigationLockRef.current) return;
+    sheetNavigationLockRef.current = true;
+    router.navigate(`/sheet?id=${character.id}` as any);
+    setTimeout(() => {
+      sheetNavigationLockRef.current = false;
+    }, 700);
+  };
+
+  const handleUnlinkSession = async (id: number) => {
+    if (activeSession?.linked_character_id !== id) return;
+    await linkCharacterToActiveSession(null);
+    await closeActiveSession();
   };
 
   const handleOpenLanSession = () => {
@@ -79,6 +95,8 @@ export default function HomeScreen() {
               onPress={() => handleOpenSheet(item)}
               onDelete={handleDeleteCharacter}
               onEdit={handleEditCharacter}
+              onUnlinkSession={handleUnlinkSession}
+              isLinkedToSession={activeSession?.linked_character_id === item.id}
             />
           )}
           contentContainerStyle={styles.listContent}

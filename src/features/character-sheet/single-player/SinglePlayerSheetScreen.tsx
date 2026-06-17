@@ -6,6 +6,7 @@ import { Stack, useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useLanSession } from '@/contexts/LanSessionContext';
 import { addTraceLog } from '@/network/traceRepository';
 import { EffectDraft, formatEffectSummary } from '@/types/effects';
 
@@ -62,6 +63,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const id = Array.isArray(characterId) ? characterId[0] : characterId;
   const router = useRouter();
   const db = useSQLiteContext();
+  const { activeSession, sendLanCommand, players } = useLanSession();
 
   const [activeTab, setActiveTab] = useState<'stats' | 'profs' | 'inv' | 'spells'>('stats');
   const [character, setCharacter] = useState<any>(null);
@@ -119,6 +121,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const [selectedSpell, setSelectedSpell] = useState<any>(null);
   const spellScaleAnim = useRef(new Animated.Value(0.85)).current;
   const spellFadeAnim = useRef(new Animated.Value(0)).current;
+  const effectPulseAnim = useRef(new Animated.Value(0)).current;
+  const [effectPulseIndex, setEffectPulseIndex] = useState(0);
 
   useEffect(() => {
     if (selectedSpell) {
@@ -139,6 +143,35 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       ]).start();
     }
   }, [selectedSpell]);
+
+  const activeVisualEffects = Array.isArray(character?.stats?.timed_effects) ? character.stats.timed_effects : [];
+  const coloredVisualEffects = activeVisualEffects.filter((effect: any) => (effect?.kind !== 'temp_hp' || Number(character?.hp_temp || 0) > 0) && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(effect?.color || '')));
+  const currentPulseEffect = coloredVisualEffects.length > 0 ? coloredVisualEffects[effectPulseIndex % coloredVisualEffects.length] : null;
+
+  useEffect(() => {
+    if (coloredVisualEffects.length === 0) {
+      effectPulseAnim.stopAnimation();
+      effectPulseAnim.setValue(0);
+      return;
+    }
+
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(effectPulseAnim, { toValue: 0.22, duration: 1000, useNativeDriver: true }),
+        Animated.timing(effectPulseAnim, { toValue: 0.06, duration: 1000, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [coloredVisualEffects.length, effectPulseAnim]);
+
+  useEffect(() => {
+    if (coloredVisualEffects.length <= 1) return;
+    const timer = setInterval(() => {
+      setEffectPulseIndex(prev => prev + 1);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [coloredVisualEffects.length]);
 
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string}[]) => {
     setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: '#00bfff' }] });
@@ -191,6 +224,10 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         const parsedStats = JSON.parse((result as any).stats || '{}');
         if(!parsedStats.temp_mods) parsedStats.temp_mods = {};
         if(!parsedStats.equip_mods) parsedStats.equip_mods = {};
+        parsedStats.timed_effects = Array.isArray(parsedStats.timed_effects) ? parsedStats.timed_effects : [];
+        if (Number((result as any).hp_temp || 0) <= 0) {
+          parsedStats.timed_effects = parsedStats.timed_effects.filter((effect: any) => effect?.kind !== 'temp_hp');
+        }
 
         const charData: any = {
           ...(result as any),
@@ -263,6 +300,15 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const hpBonusFromCon = (conModTotal - conModBase) * (character.level || 1);
   const displayHpMax = Math.max(1, character.hp_max + hpBonusFromCon);
   const displayHpCurrent = Math.max(0, character.hp_current + hpBonusFromCon);
+  const activeEffects = activeVisualEffects;
+  const tempHpValue = Math.max(0, Number(character.hp_temp || 0));
+  const effectLabel = (effect: any) => {
+    const base = effect?.label || (effect?.kind === 'temp_hp' ? `PV temp +${effect.amount || 0}` : `${effect?.stat || 'Efeito'} ${Number(effect?.amount || 0) >= 0 ? '+' : ''}${effect?.amount || 0}`);
+    if (effect?.durationUnit === 'short_rest') return `${base} / descanso curto`;
+    if (effect?.durationUnit === 'long_rest') return `${base} / descanso longo`;
+    if (effect?.durationUnit) return `${base} / ${effect.durationValue || 1} ${effect.durationUnit}`;
+    return String(base);
+  };
 
   const bagWeight = character.equipment.bag.reduce((acc: number, item: any) => acc + (item.weight * item.qty), 0);
   const slotsWeight = Object.values(character.equipment.slots).reduce((acc: number, item: any) => acc + (item ? item.weight : 0), 0);
@@ -288,6 +334,47 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     if (character.xp >= XP_TABLE[i]) { expectedLevel = i + 1; break; } 
   }
   const isPendingLevelUp = expectedLevel > character.level;
+  const isLanPlayerControlledSheet = activeSession?.role === 'player' && Number(activeSession.linked_character_id || 0) === Number(character.id);
+  const isDeadInLan = isLanPlayerControlledSheet && displayHpCurrent <= 0;
+
+  const parseLanSnapshot = (player: any) => {
+    try {
+      const snapshot = typeof player?.snapshot_payload === 'string' ? JSON.parse(player.snapshot_payload) : player?.snapshot_payload;
+      const data = snapshot?.data || {};
+      return {
+        name: snapshot?.name || player?.character_name || player?.player_name || 'Jogador',
+        level: Number(data.level ?? snapshot?.level ?? 1),
+        hpCurrent: Math.max(0, Number(data.hp_current ?? 0)),
+        hpMax: Math.max(1, Number(data.hp_max ?? 1)),
+        hpTemp: Math.max(0, Number(data.hp_temp ?? 0)),
+      };
+    } catch {
+      return {
+        name: player?.character_name || player?.player_name || 'Jogador',
+        level: 1,
+        hpCurrent: 0,
+        hpMax: 1,
+        hpTemp: 0,
+      };
+    }
+  };
+
+  const lanPlayersWithCharacters = players.filter((player: any) => player.character_id);
+  const lanPanelPlayers = isLanPlayerControlledSheet
+    ? [
+        ...lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) === Number(character.id)),
+        ...lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) !== Number(character.id)),
+      ]
+    : [];
+
+  const requestMasterApproval = async (command: 'PLAYER_REQUEST_HP' | 'PLAYER_REQUEST_XP' | 'PLAYER_REQUEST_COINS' | 'PLAYER_REQUEST_ATTRIBUTE', payload: Record<string, unknown>, notice = 'Solicitacao enviada ao mestre.') => {
+    await sendLanCommand(command, {
+      characterName: character.name,
+      targetCharacterId: character.id,
+      ...payload,
+    });
+    showCustomAlert('Solicitacao enviada', notice);
+  };
 
   const checkProficiency = (idx: string, group: any[]) => group.includes(idx);
   const proficientSaves = dbSaves.filter((save: any) => checkProficiency(save.id, character.save_values));
@@ -311,8 +398,19 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     } catch (e) { console.error(e); }
   };
 
-  const handleXP = (action: 'add' | 'remove') => {
+  const handleXP = async (action: 'add' | 'remove') => {
     const amount = parseInt(inputValue) || 0;
+
+    if (isLanPlayerControlledSheet) {
+      await requestMasterApproval('PLAYER_REQUEST_XP', {
+        amount: action === 'add' ? amount : -amount,
+        action,
+      }, `${action === 'add' ? 'Adicionar' : 'Remover'} ${amount} XP foi solicitado ao mestre.`);
+      setXpModalVisible(false);
+      setInputValue('');
+      return;
+    }
+
     let newXp = Math.max(0, action === 'add' ? character.xp + amount : character.xp - amount);
     
     let calcNewLevel = 1;
@@ -330,8 +428,18 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     setInputValue('');
   };
 
-  const handleHP = (action: 'damage' | 'heal') => {
+  const handleHP = async (action: 'damage' | 'heal') => {
     const amount = parseInt(inputValue) || 0;
+
+    if (isLanPlayerControlledSheet) {
+      await requestMasterApproval('PLAYER_REQUEST_HP', {
+        mode: action,
+        amount,
+      }, `${action === 'heal' ? 'Cura' : 'Dano'} de ${amount} PV foi solicitado ao mestre.`);
+      setHpModalVisible(false);
+      setInputValue('');
+      return;
+    }
     
     let newDisplayCurrent = action === 'damage' 
       ? Math.max(0, displayHpCurrent - amount) 
@@ -344,9 +452,23 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     setInputValue('');
   };
 
-  const handleTempBuffSubmit = () => {
+  const handleTempBuffSubmit = async () => {
     let newStats = { ...character.stats };
     const val = parseInt(tempBuffValue) || 0;
+
+    if (isLanPlayerControlledSheet) {
+      await requestMasterApproval('PLAYER_REQUEST_ATTRIBUTE', {
+        stat: activeBuffStat,
+        amount: val,
+        durationMode: 'temporary',
+        durationUnit: 'turn',
+        durationValue: 1,
+      }, `Buff ${activeBuffStat} ${val >= 0 ? '+' : ''}${val} foi solicitado ao mestre.`);
+      setTempBuffModalVisible(false);
+      setTempBuffValue('');
+      return;
+    }
+
     if (val === 0) delete newStats.temp_mods[activeBuffStat];
     else newStats.temp_mods[activeBuffStat] = val;
     updateDB({ stats: newStats });
@@ -354,8 +476,23 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     setTempBuffValue('');
   };
 
-  const clearTempBuff = () => {
+  const clearTempBuff = async () => {
     let newStats = { ...character.stats };
+
+    if (isLanPlayerControlledSheet) {
+      const currentBuff = parseInt(newStats.temp_mods?.[activeBuffStat]) || 0;
+      await requestMasterApproval('PLAYER_REQUEST_ATTRIBUTE', {
+        stat: activeBuffStat,
+        amount: -currentBuff,
+        durationMode: 'temporary',
+        durationUnit: 'turn',
+        durationValue: 1,
+      }, `Remover buff ${activeBuffStat} foi solicitado ao mestre.`);
+      setTempBuffModalVisible(false);
+      setTempBuffValue('');
+      return;
+    }
+
     delete newStats.temp_mods[activeBuffStat];
     updateDB({ stats: newStats });
     setTempBuffModalVisible(false);
@@ -367,14 +504,57 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     router.push(`/edit?id=${character.id}&levelUpTo=${newLevelData}`);
   };
 
-  const handleCoinSubmit = () => {
-    updateDB({ [activeCoinType]: Math.max(0, parseInt(inputValue) || 0) });
+  const handleCoinSubmit = async () => {
+    const nextValue = Math.max(0, parseInt(inputValue) || 0);
+    const currentValue = Number(character[activeCoinType] || 0);
+    const delta = nextValue - currentValue;
+
+    if (isLanPlayerControlledSheet) {
+      if (delta !== 0) {
+        await requestMasterApproval('PLAYER_REQUEST_COINS', {
+          gp: activeCoinType === 'gp' ? delta : 0,
+          sp: activeCoinType === 'sp' ? delta : 0,
+          cp: activeCoinType === 'cp' ? delta : 0,
+          coinType: activeCoinType,
+          amount: delta,
+        }, `Alteracao de moedas (${activeCoinType.toUpperCase()} ${delta >= 0 ? '+' : ''}${delta}) foi solicitada ao mestre.`);
+      }
+      setCoinModalVisible(false);
+      setInputValue('');
+      return;
+    }
+
+    updateDB({ [activeCoinType]: nextValue });
     setCoinModalVisible(false); setInputValue('');
   };
 
-  const updateCoins = (type: 'gp' | 'sp' | 'cp', delta: number) => updateDB({ [type]: Math.max(0, character[type] + delta) });
+  const updateCoins = async (type: 'gp' | 'sp' | 'cp', delta: number) => {
+    if (isLanPlayerControlledSheet) {
+      await requestMasterApproval('PLAYER_REQUEST_COINS', {
+        gp: type === 'gp' ? delta : 0,
+        sp: type === 'sp' ? delta : 0,
+        cp: type === 'cp' ? delta : 0,
+        coinType: type,
+        amount: delta,
+      }, `Alteracao de moedas (${type.toUpperCase()} ${delta >= 0 ? '+' : ''}${delta}) foi solicitada ao mestre.`);
+      return;
+    }
+    updateDB({ [type]: Math.max(0, character[type] + delta) });
+  };
 
-  const executeCoinConversion = (sourceAmount: number, targetAmount: number) => {
+  const executeCoinConversion = async (sourceAmount: number, targetAmount: number) => {
+    if (isLanPlayerControlledSheet) {
+      await requestMasterApproval('PLAYER_REQUEST_COINS', {
+        gp: (convertFrom === 'gp' ? -sourceAmount : 0) + (convertTo === 'gp' ? targetAmount : 0),
+        sp: (convertFrom === 'sp' ? -sourceAmount : 0) + (convertTo === 'sp' ? targetAmount : 0),
+        cp: (convertFrom === 'cp' ? -sourceAmount : 0) + (convertTo === 'cp' ? targetAmount : 0),
+        conversion: { from: convertFrom, to: convertTo, sourceAmount, targetAmount },
+      }, 'Conversao de moedas solicitada ao mestre.');
+      setConvertModalVisible(false);
+      setConvertAmount('');
+      return;
+    }
+
     updateDB({
       [convertFrom]: character[convertFrom] - sourceAmount,
       [convertTo]: character[convertTo] + targetAmount
@@ -392,11 +572,47 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     return { ...baseEquipment, bag: normalizedBag };
   };
 
-  const updateBagQty = (index: number, delta: number) => {
+  const isLanPlayerLockedInventory = () => activeSession?.role === 'player' && Boolean(activeSession.linked_character_id);
+
+  const requestItemQuantityFromMaster = async (item: any, requestedDelta: number, currentQty = 0) => {
+    await sendLanCommand('PLAYER_INVENTORY_UPDATE', {
+      action: 'REQUEST_ITEM_QUANTITY_INCREASE',
+      itemName: item?.name || 'Item',
+      item,
+      quantity: Math.abs(requestedDelta),
+      requestedDelta,
+      currentQty,
+      requestedQty: currentQty + requestedDelta,
+      characterName: character?.name || null,
+      previousValue: { qty: currentQty },
+      currentValue: { qty: currentQty + requestedDelta },
+    });
+    showCustomAlert(
+      'Solicitacao enviada',
+      `Voce pediu ao mestre +${Math.abs(requestedDelta)}x ${item?.name || 'item'}. A quantidade nao muda ate o mestre aprovar.`
+    );
+  };
+
+  const updateBagQty = async (index: number, delta: number) => {
+    const item = character.equipment?.bag?.[index];
+    if (!item) return;
+
+    if (delta > 0 && isLanPlayerLockedInventory()) {
+      await requestItemQuantityFromMaster(item, delta, Number(item.qty) || 0);
+      return;
+    }
+
     updateDB({ equipment: buildEquipmentWithBagQtyDelta(index, delta) });
   };
 
-  const addItemToBag = (item: any) => {
+  const addItemToBag = async (item: any) => {
+    if (isLanPlayerLockedInventory()) {
+      await requestItemQuantityFromMaster(item, 1, 0);
+      setItemModalVisible(false);
+      setItemSearch('');
+      return;
+    }
+
     let newBag = [...character.equipment.bag];
     const existingIndex = newBag.findIndex((i: any) => i.name === item.name);
     if (existingIndex > -1) newBag[existingIndex].qty += 1;
@@ -483,6 +699,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     const newStats = { ...character.stats };
     if (!newStats.temp_mods) newStats.temp_mods = {};
     if (!newStats.equip_mods) newStats.equip_mods = {};
+    if (!Array.isArray(newStats.timed_effects)) newStats.timed_effects = [];
 
     const dbUpdates: any = {};
     const msgParts: string[] = [];
@@ -525,8 +742,28 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       }
 
       if (effect.effect_kind === 'condition') {
+        const chance = Math.max(0, Math.min(100, Number(effect.chance_percent ?? 100)));
+        const applied = chance >= 100 || Math.random() * 100 < chance;
+        const metadata = effect.metadata || {};
+        const conditionName = effect.condition_name || effect.effect_type;
         const duration = effect.duration_unit === 'instant' ? '' : ` por ${effect.duration_value || 1} ${effect.duration_unit}`;
-        msgParts.push(`Efeito: ${effect.condition_name || effect.effect_type}${duration}${chanceText}.`);
+        if (applied) {
+          newStats.timed_effects.push({
+            id: `item_${effect.id || conditionName}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            kind: 'condition',
+            label: conditionName,
+            conditionName,
+            description: String(metadata.condition_description || ''),
+            color: String(metadata.condition_color || '#F4A84D'),
+            source: item.name,
+            durationUnit: effect.duration_unit,
+            durationValue: effect.duration_value || 1,
+            createdAt: new Date().toISOString(),
+          });
+          msgParts.push(`Efeito aplicado: ${conditionName}${duration}${chanceText}.`);
+        } else {
+          msgParts.push(`Efeito nao aplicado: ${conditionName}${chanceText}.`);
+        }
       }
     }
 
@@ -987,6 +1224,79 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   // 3. COMPONENTES DE RENDERIZAÇÃO
   // ==============================================================================
 
+  const renderLanSessionPanel = () => {
+    if (!isLanPlayerControlledSheet) return null;
+
+    const ownEffects = activeEffects.filter((effect: any) => effect?.kind !== 'temp_hp' || tempHpValue > 0);
+    const rows = lanPanelPlayers.length > 0
+      ? lanPanelPlayers
+      : [{
+          device_id: 'local',
+          player_name: character.name,
+          character_id: character.id,
+          character_name: character.name,
+          connected: 1,
+          snapshot_payload: JSON.stringify({
+            localId: character.id,
+            name: character.name,
+            level: character.level,
+            data: { hp_current: character.hp_current, hp_max: character.hp_max, hp_temp: character.hp_temp, level: character.level },
+          }),
+        }];
+
+    return (
+      <View style={styles.lanSessionBox}>
+        <View style={styles.lanSessionHeader}>
+          <View>
+            <Text style={styles.lanSessionTitle}>SESSÃO LAN</Text>
+            <Text style={styles.lanSessionHint}>Jogadores veem apenas vida e nível do grupo.</Text>
+          </View>
+          <Ionicons name="people-outline" size={22} color="#00bfff" />
+        </View>
+
+        {rows.map((player: any) => {
+          const snapshot = Number(player.character_id) === Number(character.id)
+            ? { name: character.name, level: character.level, hpCurrent: displayHpCurrent, hpMax: displayHpMax, hpTemp: tempHpValue }
+            : parseLanSnapshot(player);
+          const isSelf = Number(player.character_id) === Number(character.id);
+          const percent = snapshot.hpMax > 0 ? Math.max(0, Math.min(100, (snapshot.hpCurrent / snapshot.hpMax) * 100)) : 0;
+          const dead = snapshot.hpCurrent <= 0;
+          return (
+            <View key={`${player.device_id}-${player.character_id}`} style={styles.lanPlayerRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.lanPlayerName} numberOfLines={1}>
+                  {snapshot.name}{isSelf ? ' (você)' : ''}
+                </Text>
+                <Text style={styles.lanPlayerSub}>
+                  {player.connected ? 'Ativo' : 'Offline'} • Nível {snapshot.level}
+                </Text>
+              </View>
+              <View style={styles.lanHpSide}>
+                <Text style={[styles.lanHpText, dead && styles.lanHpDeadText]}>
+                  {dead ? '☠️' : `${snapshot.hpCurrent}/${snapshot.hpMax}${snapshot.hpTemp > 0 ? ` +${snapshot.hpTemp}` : ''}`}
+                </Text>
+                <View style={styles.lanHpTrack}>
+                  <View style={[styles.lanHpFill, dead ? styles.lanHpFillDead : null, { width: `${dead ? 100 : percent}%` }]} />
+                </View>
+              </View>
+            </View>
+          );
+        })}
+
+        <View style={styles.lanEffectsBox}>
+          <Text style={styles.lanEffectsTitle}>SEUS EFEITOS</Text>
+          {ownEffects.length > 0 ? (
+            ownEffects.map((effect: any, index: number) => (
+              <Text key={String(effect.id || index)} style={styles.lanEffectText}>• {effectLabel(effect)}</Text>
+            ))
+          ) : (
+            <Text style={styles.lanEffectMuted}>Nenhum efeito ativo em você.</Text>
+          )}
+        </View>
+      </View>
+    );
+  };
+
   const renderAttackCard = (item: any, slotKey: string, title: string) => {
     if (!item) {
       if (slotKey !== 'mainHand') return null;
@@ -1067,6 +1377,25 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
   return (
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+      {currentPulseEffect ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.activeEffectAura,
+            {
+              backgroundColor: String(currentPulseEffect.color),
+              borderColor: String(currentPulseEffect.color),
+              opacity: effectPulseAnim,
+            },
+          ]}
+        />
+      ) : null}
+      {isDeadInLan ? (
+        <View pointerEvents="none" style={styles.deathOverlay}>
+          <Text style={styles.deathSkull}>☠️</Text>
+          <Text style={styles.deathText}>você morreu</Text>
+        </View>
+      ) : null}
       <Stack.Screen options={{ headerShown: false }} />
 
       <View style={styles.topBar}>
@@ -1097,6 +1426,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         {/* ABA STATUS */}
         {activeTab === 'stats' && (
           <>
+            {renderLanSessionPanel()}
+
             <View style={styles.headerBlock}>
               <Text style={styles.charClassRace}>{character.race} • {character.class}</Text>
               
@@ -1116,9 +1447,30 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
             </View>
 
             <TouchableOpacity style={[styles.combatBoxHp, hpBonusFromCon !== 0 && {borderColor: hpBonusFromCon > 0 ? '#00fa9a' : '#ff6666', borderWidth: 1}]} onPress={openHpManager}>
-              <Text style={styles.hpValue}>{displayHpCurrent} <Text style={styles.hpMax}>/ {displayHpMax}</Text></Text>
-              <Text style={styles.combatLabel}>PONTOS DE VIDA {hpBonusFromCon !== 0 && `(CON ${hpBonusFromCon > 0 ? '+' : ''}${hpBonusFromCon})`}</Text>
+              <Text style={styles.hpValue}>
+                {displayHpCurrent <= 0 ? '☠️' : `${displayHpCurrent}/${displayHpMax}${tempHpValue > 0 ? ` +${tempHpValue}` : ''}`}
+              </Text>
+              <Text style={styles.combatLabel}>
+                PONTOS DE VIDA {hpBonusFromCon !== 0 && `(CON ${hpBonusFromCon > 0 ? '+' : ''}${hpBonusFromCon})`}
+              </Text>
             </TouchableOpacity>
+
+            {activeEffects.length > 0 && (
+              <View style={styles.activeEffectsBox}>
+                <Text style={styles.activeEffectsTitle}>EFEITOS ATIVOS</Text>
+                <View style={styles.activeEffectsWrap}>
+                  {activeEffects.map((effect: any, index: number) => {
+                    const effectColor = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(effect?.color || '')) ? String(effect.color) : '';
+                    return (
+                      <View key={String(effect.id || index)} style={[styles.activeEffectChip, effect.kind === 'temp_hp' && styles.activeEffectChipTempHp, effectColor ? { borderColor: effectColor } : null]}>
+                        <Ionicons name={effect.kind === 'temp_hp' ? 'heart-circle-outline' : 'sparkles-outline'} size={13} color={effect.kind === 'temp_hp' ? '#00fa9a' : effectColor || '#ffd166'} />
+                        <Text style={styles.activeEffectText} numberOfLines={1}>{effectLabel(effect)}</Text>
+                      </View>
+                    );
+                  })}
+                </View>
+              </View>
+            )}
 
             <View style={styles.combatStatsRow}>
               <TouchableOpacity style={[styles.combatStatSmall, caSumBuffs !== 0 && {borderColor: caColor, borderWidth: 1}]} 
@@ -1810,7 +2162,12 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  container: { flex: 1, position: 'relative' },
+  activeEffectAura: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 1,
+    borderWidth: 4,
+  },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#02112b' },
   errorText: { color: '#ff6666', fontWeight: 'bold' },
   topBar: { paddingTop: 60, paddingBottom: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.2)', position: 'relative' },
@@ -1840,6 +2197,12 @@ const styles = StyleSheet.create({
   hpValue: { fontSize: 36, fontWeight: 'bold', color: '#ff6666' },
   hpMax: { fontSize: 20, color: 'rgba(255,102,102,0.4)' },
   combatLabel: { fontSize: 9, color: 'rgba(255,255,255,0.5)', marginTop: 5, letterSpacing: 1, fontWeight: 'bold' },
+  activeEffectsBox: { borderRadius: 16, padding: 12, marginBottom: 15, backgroundColor: 'rgba(255,209,102,0.08)', borderWidth: 1, borderColor: 'rgba(255,209,102,0.24)' },
+  activeEffectsTitle: { color: '#ffd166', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, marginBottom: 8 },
+  activeEffectsWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  activeEffectChip: { maxWidth: '100%', flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 7, backgroundColor: 'rgba(255,209,102,0.1)', borderWidth: 1, borderColor: 'rgba(255,209,102,0.25)' },
+  activeEffectChipTempHp: { backgroundColor: 'rgba(0,250,154,0.1)', borderColor: 'rgba(0,250,154,0.28)' },
+  activeEffectText: { color: '#fff', fontSize: 11, fontWeight: 'bold', flexShrink: 1 },
   combatStatsRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
   combatStatSmall: { flex: 1, backgroundColor: 'rgba(255,255,255,0.05)', padding: 15, borderRadius: 15, alignItems: 'center' },
   combatStatValue: { fontSize: 18, color: '#fff', fontWeight: 'bold' },
@@ -1985,5 +2348,33 @@ const styles = StyleSheet.create({
   customAlertBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 10, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', minWidth: '30%' },
   customAlertBtnText: { fontWeight: 'bold', fontSize: 14 },
   modalCloseButton: { marginTop: 20, paddingVertical: 15, width: '100%', alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: 12 },
-  modalCloseText: { color: '#00bfff', fontWeight: 'bold' }
+  modalCloseText: { color: '#00bfff', fontWeight: 'bold' },
+
+  lanSessionBox: {
+    backgroundColor: 'rgba(0, 191, 255, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.28)',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 18,
+  },
+  lanSessionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.08)', marginBottom: 10 },
+  lanSessionTitle: { color: '#00bfff', fontSize: 15, fontWeight: 'bold', letterSpacing: 1.5 },
+  lanSessionHint: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4 },
+  lanPlayerRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
+  lanPlayerName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+  lanPlayerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },
+  lanHpSide: { width: 122, alignItems: 'flex-end' },
+  lanHpText: { color: '#ff7d7d', fontSize: 14, fontWeight: 'bold', marginBottom: 7 },
+  lanHpDeadText: { fontSize: 20 },
+  lanHpTrack: { width: '100%', height: 8, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.08)', overflow: 'hidden' },
+  lanHpFill: { height: '100%', borderRadius: 10, backgroundColor: '#ff7474' },
+  lanHpFillDead: { backgroundColor: '#5f1220' },
+  lanEffectsBox: { marginTop: 12, backgroundColor: 'rgba(0,0,0,0.22)', borderRadius: 14, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.07)' },
+  lanEffectsTitle: { color: '#00bfff', fontSize: 11, fontWeight: 'bold', letterSpacing: 1, marginBottom: 6 },
+  lanEffectText: { color: 'rgba(255,255,255,0.82)', fontSize: 12, lineHeight: 18 },
+  lanEffectMuted: { color: 'rgba(255,255,255,0.45)', fontSize: 12 },
+  deathOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.52)', alignItems: 'center', justifyContent: 'center', zIndex: 20 },
+  deathSkull: { fontSize: 76, marginBottom: 10 },
+  deathText: { color: '#fff', fontSize: 24, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 1 },
 });

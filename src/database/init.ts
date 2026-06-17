@@ -11,6 +11,7 @@ async function ensureColumn(db: SQLiteDatabase, tableName: string, columnName: s
 const TRACE_TABLES = [
   { table: 'items', idColumn: 'id' },
   { table: 'effects', idColumn: 'id' },
+  { table: 'condition_effects', idColumn: 'id' },
   { table: 'races', idColumn: 'id' },
   { table: 'classes', idColumn: 'id' },
   { table: 'subclasses', idColumn: 'id' },
@@ -175,7 +176,35 @@ async function seedStructuredBaseEffects(db: SQLiteDatabase) {
     duration_value: 10,
     duration_unit: 'turn',
     sort_order: 1,
+    metadata: {
+      condition_color: '#7ED957',
+      condition_description: 'Sofre uma toxina ativa. Use a regra da mesa para penalidades, testes ou dano recorrente.',
+    },
   });
+}
+
+async function seedConditionEffectCatalog(db: SQLiteDatabase) {
+  const baseEffects = [
+    { name: 'Envenenado', description: 'Sofre uma toxina ativa. Use a regra da mesa para penalidades, testes ou dano recorrente.', color: '#7ED957' },
+    { name: 'Cego', description: 'Nao enxerga normalmente e pode sofrer desvantagem em ataques e testes visuais.', color: '#9CA3AF' },
+    { name: 'Surdo', description: 'Nao escuta sons comuns e pode falhar em sinais ou percepcoes auditivas.', color: '#38BDF8' },
+    { name: 'Paralisado', description: 'Movimento bloqueado ou severamente limitado ate o efeito terminar.', color: '#A78BFA' },
+    { name: 'Atordoado', description: 'Reage mal e perde controle fino de acoes durante a duracao.', color: '#FACC15' },
+    { name: 'Caido', description: 'Esta no chao ou fora de postura de combate.', color: '#94A3B8' },
+    { name: 'Agarrado', description: 'Esta preso por criatura, magia, objeto ou terreno.', color: '#FB7185' },
+    { name: 'Amedrontado', description: 'Medo ativo contra uma fonte definida pelo mestre.', color: '#C084FC' },
+    { name: 'Encantado', description: 'Influenciado por magia, carisma ou compulsao sobrenatural.', color: '#F472B6' },
+    { name: 'Inconsciente', description: 'Nao age normalmente ate acordar, estabilizar ou ser removido do estado.', color: '#64748B' },
+    { name: 'Queimadura', description: 'Chamas, calor ou acido deixam um efeito persistente.', color: '#F4A84D' },
+    { name: 'Amaldicoado', description: 'Uma maldicao ativa altera sorte, corpo, mente ou destino do alvo.', color: '#8B5CF6' },
+  ];
+
+  for (const effect of baseEffects) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO condition_effects (name, description, color, criador) VALUES (?, ?, ?, 'base')`,
+      [effect.name, effect.description, effect.color]
+    );
+  }
 }
 
 export async function initializeDatabase(db: SQLiteDatabase) {
@@ -298,6 +327,18 @@ export async function initializeDatabase(db: SQLiteDatabase) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_effects_source ON effects(source_table, source_id);
+
+    CREATE TABLE IF NOT EXISTS condition_effects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      color TEXT NOT NULL DEFAULT '#F4A84D',
+      criador TEXT DEFAULT 'base',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      CHECK(color LIKE '#%')
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_condition_effects_name ON condition_effects(name);
 
     CREATE TABLE IF NOT EXISTS bg3_companions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1112,5 +1153,6 @@ export async function initializeDatabase(db: SQLiteDatabase) {
     console.log('Banco de dados já populado. Pulando inserção.');
   }
   await seedRandomCreatorContent(db);
+  await seedConditionEffectCatalog(db);
   await seedStructuredBaseEffects(db);
 }

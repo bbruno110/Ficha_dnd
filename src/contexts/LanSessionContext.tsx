@@ -143,6 +143,107 @@ function addItemToEquipment(equipmentValue: unknown, item: Record<string, unknow
   return { ...equipment, bag };
 }
 
+function normalizeStats(value: unknown): Record<string, any> {
+  const stats = parseJsonValue<Record<string, any>>(value, {});
+  return {
+    ...stats,
+    temp_mods: { ...(stats.temp_mods || {}) },
+    timed_effects: Array.isArray(stats.timed_effects) ? [...stats.timed_effects] : [],
+  };
+}
+
+function removeTimedEffect(statsValue: unknown, effectId: string, hpTemp = 0) {
+  const stats = normalizeStats(statsValue);
+  const effect = stats.timed_effects.find((entry: any) => String(entry.id) === String(effectId));
+  if (!effect) return { stats, hpTemp, removed: null as any };
+
+  if (effect.kind === 'attribute' && effect.stat) {
+    const nextValue = Number(stats.temp_mods?.[effect.stat] || 0) - Number(effect.amount || 0);
+    if (nextValue === 0) delete stats.temp_mods[effect.stat];
+    else stats.temp_mods[effect.stat] = nextValue;
+  }
+
+  let nextHpTemp = hpTemp;
+  if (effect.kind === 'temp_hp') {
+    nextHpTemp = Math.max(0, hpTemp - Math.abs(Number(effect.amount || 0)));
+  }
+
+  stats.timed_effects = stats.timed_effects.filter((entry: any) => String(entry.id) !== String(effectId));
+  return { stats, hpTemp: nextHpTemp, removed: effect };
+}
+
+function clearTempHpEffects(statsValue: unknown) {
+  const stats = normalizeStats(statsValue);
+  stats.timed_effects = stats.timed_effects.filter((entry: any) => entry.kind !== 'temp_hp');
+  return stats;
+}
+
+function progressTimedEffects(
+  statsValue: unknown,
+  hpTempValue: number,
+  progress: { turns?: number; minutes?: number; restType?: 'short_rest' | 'long_rest' }
+) {
+  const stats = normalizeStats(statsValue);
+  let hpTemp = Math.max(0, Number(hpTempValue || 0));
+  const expired: any[] = [];
+  const remaining: any[] = [];
+  let changed = false;
+
+  const removeSideEffects = (effect: any) => {
+    if (effect.kind === 'attribute' && effect.stat) {
+      const nextValue = Number(stats.temp_mods?.[effect.stat] || 0) - Number(effect.amount || 0);
+      if (nextValue === 0) delete stats.temp_mods[effect.stat];
+      else stats.temp_mods[effect.stat] = nextValue;
+    }
+
+    if (effect.kind === 'temp_hp') {
+      hpTemp = Math.max(0, hpTemp - Math.abs(Number(effect.amount || 0)));
+    }
+  };
+
+  for (const effect of stats.timed_effects) {
+    const nextEffect = { ...effect };
+    const unit = String(nextEffect.durationUnit || nextEffect.duration_unit || '');
+    let remove = false;
+
+    if (progress.restType) {
+      remove = unit === progress.restType || (progress.restType === 'long_rest' && unit === 'short_rest');
+    }
+
+    if (!remove && progress.turns && (unit === 'turn' || unit === 'round')) {
+      nextEffect.durationValue = Math.max(0, Number(nextEffect.durationValue || 1) - progress.turns);
+      changed = true;
+      remove = nextEffect.durationValue <= 0;
+    }
+
+    if (!remove && progress.minutes && unit === 'minute') {
+      nextEffect.durationValue = Math.max(0, Number(nextEffect.durationValue || 1) - progress.minutes);
+      changed = true;
+      remove = nextEffect.durationValue <= 0;
+    }
+
+    if (!remove && progress.minutes && unit === 'hour') {
+      const hours = Math.floor(progress.minutes / 60);
+      if (hours > 0) {
+        nextEffect.durationValue = Math.max(0, Number(nextEffect.durationValue || 1) - hours);
+        changed = true;
+        remove = nextEffect.durationValue <= 0;
+      }
+    }
+
+    if (remove) {
+      changed = true;
+      expired.push(nextEffect);
+      removeSideEffects(nextEffect);
+    } else {
+      remaining.push(nextEffect);
+    }
+  }
+
+  stats.timed_effects = remaining;
+  return { stats, hpTemp, expired, changed };
+}
+
 export function LanSessionProvider({ children }: { children: React.ReactNode }) {
   const db = useSQLiteContext();
   const [activeSession, setActiveSession] = useState<LanSessionRecord | null>(null);
@@ -223,14 +324,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       const session = activeSessionRef.current;
       if (!session) return;
 
-      if (
-        event.targetCharacterId &&
-        session.role === 'player' &&
-        session.linked_character_id &&
-        event.targetCharacterId !== session.linked_character_id
-      ) {
-        return;
-      }
+      // Jogadores tambem precisam aplicar eventos dos outros personagens nos snapshots
+      // para que o quadro da Sessao LAN mostre vida/nivel do grupo em tempo real.
+      // A ficha local so e atualizada quando o targetDeviceId for o aparelho atual.
 
       if (event.eventType === 'SESSION_PAUSED') {
         await setLanSessionStatus(db, event.sessionId, 'paused');
@@ -289,23 +385,53 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       const shouldUpdateLocalCharacter = !event.targetDeviceId || event.targetDeviceId === deviceIdRef.current;
 
       if (event.eventType === 'HP_CHANGED') {
-        const currentValue = event.currentValue as { hp_current?: number } | undefined;
+        const currentValue = event.currentValue as { hp_current?: number; hp_temp?: number; stats?: Record<string, unknown> } | undefined;
         if (typeof currentValue?.hp_current === 'number') {
           if (shouldUpdateLocalCharacter) {
-            await db.runAsync(`UPDATE characters SET hp_current = ? WHERE id = ?`, [currentValue.hp_current, event.targetCharacterId]);
+            if (typeof currentValue.hp_temp === 'number' && currentValue.stats) {
+              await db.runAsync(`UPDATE characters SET hp_current = ?, hp_temp = ?, stats = ? WHERE id = ?`, [
+                currentValue.hp_current,
+                currentValue.hp_temp,
+                JSON.stringify(currentValue.stats),
+                event.targetCharacterId,
+              ]);
+            } else if (typeof currentValue.hp_temp === 'number') {
+              await db.runAsync(`UPDATE characters SET hp_current = ?, hp_temp = ? WHERE id = ?`, [
+                currentValue.hp_current,
+                currentValue.hp_temp,
+                event.targetCharacterId,
+              ]);
+            } else {
+              await db.runAsync(`UPDATE characters SET hp_current = ? WHERE id = ?`, [currentValue.hp_current, event.targetCharacterId]);
+            }
           }
-          await patchRemoteSnapshot({ hp_current: currentValue.hp_current });
+          await patchRemoteSnapshot({
+            hp_current: currentValue.hp_current,
+            ...(typeof currentValue.hp_temp === 'number' ? { hp_temp: currentValue.hp_temp } : {}),
+            ...(currentValue.stats ? { stats: JSON.stringify(currentValue.stats) } : {}),
+          });
           didMutateCharacter = true;
         }
       }
 
       if (event.eventType === 'TEMP_HP_CHANGED') {
-        const currentValue = event.currentValue as { hp_temp?: number } | undefined;
+        const currentValue = event.currentValue as { hp_temp?: number; stats?: Record<string, unknown> } | undefined;
         if (typeof currentValue?.hp_temp === 'number') {
           if (shouldUpdateLocalCharacter) {
-            await db.runAsync(`UPDATE characters SET hp_temp = ? WHERE id = ?`, [currentValue.hp_temp, event.targetCharacterId]);
+            if (currentValue.stats) {
+              await db.runAsync(`UPDATE characters SET hp_temp = ?, stats = ? WHERE id = ?`, [
+                currentValue.hp_temp,
+                JSON.stringify(currentValue.stats),
+                event.targetCharacterId,
+              ]);
+            } else {
+              await db.runAsync(`UPDATE characters SET hp_temp = ? WHERE id = ?`, [currentValue.hp_temp, event.targetCharacterId]);
+            }
           }
-          await patchRemoteSnapshot({ hp_temp: currentValue.hp_temp });
+          await patchRemoteSnapshot({
+            hp_temp: currentValue.hp_temp,
+            ...(currentValue.stats ? { stats: JSON.stringify(currentValue.stats) } : {}),
+          });
           didMutateCharacter = true;
         }
       }
@@ -353,6 +479,29 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
       }
 
+      if (event.eventType === 'EFFECT_APPLIED') {
+        const currentValue = event.currentValue as { stats?: Record<string, unknown>; hp_temp?: number } | undefined;
+        if (currentValue?.stats) {
+          const statsText = JSON.stringify(currentValue.stats);
+          if (shouldUpdateLocalCharacter) {
+            if (typeof currentValue.hp_temp === 'number') {
+              await db.runAsync(`UPDATE characters SET stats = ?, hp_temp = ? WHERE id = ?`, [
+                statsText,
+                Math.max(0, Number(currentValue.hp_temp || 0)),
+                event.targetCharacterId,
+              ]);
+            } else {
+              await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [statsText, event.targetCharacterId]);
+            }
+          }
+          await patchRemoteSnapshot({
+            stats: statsText,
+            ...(typeof currentValue.hp_temp === 'number' ? { hp_temp: Math.max(0, Number(currentValue.hp_temp || 0)) } : {}),
+          });
+          didMutateCharacter = true;
+        }
+      }
+
       if (event.eventType === 'ITEM_ADDED') {
         const currentValue = event.currentValue as { equipment?: Record<string, unknown> } | undefined;
         if (currentValue?.equipment) {
@@ -361,6 +510,22 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             await db.runAsync(`UPDATE characters SET equipment = ? WHERE id = ?`, [equipmentText, event.targetCharacterId]);
           }
           await patchRemoteSnapshot({ equipment: equipmentText });
+          didMutateCharacter = true;
+        }
+      }
+
+      if (event.eventType === 'EFFECT_EXPIRED') {
+        const currentValue = event.currentValue as { stats?: Record<string, unknown>; hp_temp?: number } | undefined;
+        if (currentValue?.stats) {
+          const statsText = JSON.stringify(currentValue.stats);
+          if (shouldUpdateLocalCharacter) {
+            await db.runAsync(`UPDATE characters SET stats = ?, hp_temp = ? WHERE id = ?`, [
+              statsText,
+              Math.max(0, Number(currentValue.hp_temp || 0)),
+              event.targetCharacterId,
+            ]);
+          }
+          await patchRemoteSnapshot({ stats: statsText, hp_temp: Math.max(0, Number(currentValue.hp_temp || 0)) });
           didMutateCharacter = true;
         }
       }
@@ -478,9 +643,11 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (inventoryEventType) {
         const itemName = String(command.payload?.itemName || command.payload?.name || 'item');
         const quantity = Number(command.payload?.quantity || command.payload?.qty || 1);
+        const inventoryAction = String(command.payload?.action || '');
+        const isQuantityRequest = inventoryAction === 'REQUEST_ITEM_QUANTITY_INCREASE';
         await emitOfficialEvent({
           sessionId: session.id,
-          eventType: inventoryEventType,
+          eventType: isQuantityRequest ? 'PLAYER_REQUESTED' : inventoryEventType,
           commandId: command.commandId,
           actorDeviceId: command.deviceId,
           actorName: command.actorName || 'Jogador',
@@ -489,7 +656,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           targetName: String(command.payload?.characterName || command.actorName || 'Personagem'),
           previousValue: command.payload?.previousValue,
           currentValue: command.payload?.currentValue,
-          description: `${command.actorName || 'Jogador'} registrou ${quantity}x ${itemName} no inventario.`,
+          description: isQuantityRequest
+            ? `${command.actorName || 'Jogador'} solicitou +${quantity}x ${itemName} ao mestre.`
+            : `${command.actorName || 'Jogador'} registrou ${quantity}x ${itemName} no inventario.`,
           payload: { command: command.command, ...command.payload },
         });
         return;
@@ -502,7 +671,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           commandId: command.commandId,
           actorDeviceId: command.deviceId,
           actorName: command.actorName || 'Jogador',
+          targetDeviceId: command.deviceId,
           targetCharacterId: command.characterId || null,
+          targetName: String(command.payload?.characterName || command.actorName || 'Personagem'),
           description: `${command.actorName || 'Jogador'} solicitou ${command.command.replace('PLAYER_REQUEST_', '').toLowerCase()}.`,
           payload: { command: command.command, ...command.payload },
         });
@@ -559,6 +730,81 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         return;
       }
 
+      if (command.command === 'MASTER_DENY_REQUEST') {
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'COMMAND_REJECTED',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || 'Mestre',
+          targetDeviceId: String(command.payload?.targetDeviceId || '') || null,
+          targetCharacterId: command.payload?.targetCharacterId ? Number(command.payload.targetCharacterId) : null,
+          targetName: command.payload?.targetName ? String(command.payload.targetName) : null,
+          description: String(command.payload?.reason || 'Mestre recusou a solicitacao.'),
+          payload: {
+            requestCommandId: command.payload?.requestCommandId || null,
+            originalPayload: command.payload?.originalPayload || null,
+          },
+        });
+        return;
+      }
+
+      const progressSessionEffects = async (progress: { turns?: number; minutes?: number; restType?: 'short_rest' | 'long_rest' }) => {
+        const linkedPlayers = await db.getAllAsync<any>(
+          `SELECT device_id, character_id, character_name FROM lan_session_players WHERE session_id = ? AND character_id IS NOT NULL`,
+          [session.id]
+        );
+
+        for (const player of linkedPlayers) {
+          const characterId = Number(player.character_id || 0);
+          if (!characterId) continue;
+
+          let character = await db.getFirstAsync<any>(`SELECT id, name, stats, hp_temp FROM characters WHERE id = ?`, [characterId]);
+          if (!character) {
+            const snapshotRow = await db.getFirstAsync<{ payload: string }>(
+              `SELECT payload FROM lan_character_snapshots
+               WHERE session_id = ? AND owner_device_id = ? AND remote_character_id = ?
+               ORDER BY updated_at DESC LIMIT 1`,
+              [session.id, player.device_id, String(characterId)]
+            );
+            if (snapshotRow?.payload) {
+              try {
+                const snapshot = JSON.parse(snapshotRow.payload);
+                character = { ...(snapshot?.data || {}), name: snapshot?.name || snapshot?.data?.name || player.character_name };
+              } catch {
+                character = null;
+              }
+            }
+          }
+
+          if (!character) continue;
+          const previousStats = normalizeStats(character.stats);
+          if (previousStats.timed_effects.length === 0) continue;
+
+          const previousHpTemp = Number(character.hp_temp || 0);
+          const result = progressTimedEffects(previousStats, previousHpTemp, progress);
+          if (!result.changed) continue;
+
+          await emitOfficialEvent({
+            sessionId: session.id,
+            eventType: result.expired.length > 0 ? 'EFFECT_EXPIRED' : 'EFFECT_APPLIED',
+            commandId: command.commandId,
+            actorDeviceId: command.deviceId,
+            actorName: command.actorName || 'Mestre',
+            targetDeviceId: player.device_id || null,
+            targetCharacterId: characterId,
+            targetName: character.name || player.character_name || 'Personagem',
+            previousValue: { stats: previousStats, hp_temp: previousHpTemp },
+            currentValue: { stats: result.stats, hp_temp: result.hpTemp },
+            description:
+              result.expired.length > 0
+                ? `${result.expired.length} efeito(s) expiraram em ${character.name || player.character_name || 'Personagem'}.`
+                : `Duracao dos efeitos atualizada em ${character.name || player.character_name || 'Personagem'}.`,
+            payload: { progress, expiredEffects: result.expired },
+          });
+        }
+      };
+
       if (command.command === 'MASTER_ADVANCE_TURN') {
         const delta = numberFromPayload(command.payload, 'delta', 1);
         const previous = state.turn;
@@ -574,6 +820,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           currentValue: current,
           description: `Turno alterado de ${previous} para ${current}.`,
         });
+        if (delta > 0) await progressSessionEffects({ turns: delta });
         return;
       }
 
@@ -592,6 +839,22 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           currentValue: current,
           description: `Tempo da campanha avancou ${minutes} minuto(s).`,
         });
+        if (minutes > 0) await progressSessionEffects({ minutes });
+        return;
+      }
+
+      if (command.command === 'MASTER_SHORT_REST' || command.command === 'MASTER_LONG_REST') {
+        const restType = command.command === 'MASTER_SHORT_REST' ? 'short_rest' : 'long_rest';
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'REST_APPLIED',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || 'Mestre',
+          description: restType === 'short_rest' ? 'Mestre aplicou descanso curto.' : 'Mestre aplicou descanso longo.',
+          payload: { restType },
+        });
+        await progressSessionEffects({ restType });
         return;
       }
 
@@ -630,11 +893,31 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (command.command === 'MASTER_APPLY_HP') {
         const amount = numberFromPayload(command.payload, 'amount', 0);
         const mode = String(command.payload?.mode || 'damage');
-        const previous = { hp_current: Number(target?.hp_current || 0), hp_max: Number(target?.hp_max || 0) };
-        const nextHp =
-          mode === 'heal'
-            ? Math.min(previous.hp_max, previous.hp_current + Math.abs(amount))
-            : Math.max(0, previous.hp_current - Math.abs(amount));
+        const previousStats = normalizeStats(target?.stats);
+        const previous = {
+          hp_current: Number(target?.hp_current || 0),
+          hp_max: Number(target?.hp_max || 0),
+          hp_temp: Number(target?.hp_temp || 0),
+          stats: previousStats,
+        };
+        let nextHp = previous.hp_current;
+        let nextTempHp = previous.hp_temp;
+        let nextStats = previousStats;
+        let absorbedByTemp = 0;
+
+        if (mode === 'heal') {
+          nextHp = Math.min(previous.hp_max, previous.hp_current + Math.abs(amount));
+        } else {
+          let remainingDamage = Math.abs(amount);
+          absorbedByTemp = Math.min(previous.hp_temp, remainingDamage);
+          nextTempHp = Math.max(0, previous.hp_temp - absorbedByTemp);
+          remainingDamage = Math.max(0, remainingDamage - absorbedByTemp);
+          nextHp = Math.max(0, previous.hp_current - remainingDamage);
+          if (previous.hp_temp > 0 && nextTempHp === 0) {
+            nextStats = clearTempHpEffects(previousStats);
+          }
+        }
+
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'HP_CHANGED',
@@ -645,9 +928,12 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           targetCharacterId,
           targetName,
           previousValue: previous,
-          currentValue: { ...previous, hp_current: nextHp },
-          description: `${command.actorName || 'Mestre'} ${mode === 'heal' ? 'curou' : 'aplicou dano de'} ${Math.abs(amount)} PV em ${targetName}.`,
-          payload: { mode, amount: Math.abs(amount) },
+          currentValue: { hp_current: nextHp, hp_max: previous.hp_max, hp_temp: nextTempHp, stats: nextStats },
+          description:
+            mode === 'heal'
+              ? `${command.actorName || 'Mestre'} curou ${Math.abs(amount)} PV em ${targetName}.`
+              : `${command.actorName || 'Mestre'} aplicou ${Math.abs(amount)} dano em ${targetName}${absorbedByTemp > 0 ? ` (${absorbedByTemp} absorvido por PV temporario)` : ''}.`,
+          payload: { mode, amount: Math.abs(amount), absorbedByTemp },
         });
         return;
       }
@@ -657,10 +943,24 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         const mode = String(command.payload?.mode || 'add');
         const durationUnit = String(command.payload?.durationUnit || 'short_rest');
         const durationValue = numberFromPayload(command.payload, 'durationValue', 1);
-        const previous = { hp_temp: Number(target?.hp_temp || 0) };
+        const previousStats = normalizeStats(target?.stats);
+        const previous = { hp_temp: Number(target?.hp_temp || 0), stats: previousStats };
         const current = {
           hp_temp: mode === 'set' ? Math.max(0, amount) : Math.max(0, previous.hp_temp + amount),
+          stats: previousStats,
         };
+        if (amount > 0) {
+          current.stats.timed_effects.push({
+            id: command.commandId,
+            kind: 'temp_hp',
+            label: `PV temporario +${Math.abs(amount)}`,
+            source: 'master',
+            amount: Math.abs(amount),
+            durationUnit,
+            durationValue,
+            createdAt: new Date().toISOString(),
+          });
+        }
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'TEMP_HP_CHANGED',
@@ -690,7 +990,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
 
         const previousStats = parseJsonValue<Record<string, any>>(target?.stats, {});
-        const nextStats = {
+        const nextStats: Record<string, any> = {
           ...previousStats,
           temp_mods: { ...(previousStats.temp_mods || {}) },
           timed_effects: Array.isArray(previousStats.timed_effects) ? [...previousStats.timed_effects] : [],
@@ -707,6 +1007,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           nextStats.temp_mods[stat] = Number(nextStats.temp_mods[stat] || 0) + amount;
           nextStats.timed_effects.push({
             id: command.commandId,
+            kind: 'attribute',
+            label: `${stat} ${amount > 0 ? '+' : ''}${amount}`,
             source: 'master',
             stat,
             amount,
@@ -729,6 +1031,76 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           currentValue: { stats: nextStats },
           description: `Mestre aplicou ${amount > 0 ? '+' : ''}${amount} em ${stat} para ${targetName}.`,
           payload: { stat, amount, durationMode, durationUnit, durationValue },
+        });
+        return;
+      }
+
+      if (command.command === 'MASTER_APPLY_EFFECT') {
+        const effectName = String(command.payload?.effectName || command.payload?.name || 'Efeito');
+        const effectDescription = String(command.payload?.description || '');
+        const effectColor = String(command.payload?.color || '#F4A84D');
+        const durationUnit = String(command.payload?.durationUnit || 'turn');
+        const durationValue = numberFromPayload(command.payload, 'durationValue', 1);
+        const previousStats = normalizeStats(target?.stats);
+        const nextStats = normalizeStats(previousStats);
+        nextStats.timed_effects.push({
+          id: command.commandId,
+          kind: 'condition',
+          label: effectName,
+          conditionName: effectName,
+          description: effectDescription,
+          color: effectColor,
+          source: 'master',
+          durationUnit,
+          durationValue,
+          createdAt: new Date().toISOString(),
+        });
+
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'EFFECT_APPLIED',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || 'Mestre',
+          targetDeviceId: targetDeviceId || null,
+          targetCharacterId,
+          targetName,
+          previousValue: { stats: previousStats, hp_temp: Number(target?.hp_temp || 0) },
+          currentValue: { stats: nextStats, hp_temp: Number(target?.hp_temp || 0) },
+          description: `Mestre aplicou ${effectName} em ${targetName} por ${durationValue} ${durationUnit}.`,
+          payload: { effectName, effectDescription, effectColor, durationUnit, durationValue },
+        });
+        return;
+      }
+
+      if (command.command === 'MASTER_REMOVE_EFFECT') {
+        const effectId = String(command.payload?.effectId || '');
+        if (!effectId) {
+          await rejectCommand(session.id, command, 'Efeito sem identificador para remocao.', peerId);
+          return;
+        }
+
+        const previousStats = normalizeStats(target?.stats);
+        const previousHpTemp = Number(target?.hp_temp || 0);
+        const result = removeTimedEffect(previousStats, effectId, previousHpTemp);
+        if (!result.removed) {
+          await rejectCommand(session.id, command, 'Efeito nao encontrado no personagem.', peerId);
+          return;
+        }
+
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'EFFECT_EXPIRED',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || 'Mestre',
+          targetDeviceId: targetDeviceId || null,
+          targetCharacterId,
+          targetName,
+          previousValue: { stats: previousStats, hp_temp: previousHpTemp },
+          currentValue: { stats: result.stats, hp_temp: result.hpTemp },
+          description: `Mestre removeu o efeito ${result.removed.label || result.removed.stat || result.removed.kind || effectId} de ${targetName}.`,
+          payload: { effectId, removedEffect: result.removed },
         });
         return;
       }
@@ -967,6 +1339,17 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
               player.character_name || null,
               Boolean(player.connected)
             );
+
+            if (player.snapshot_payload) {
+              try {
+                const characterSnapshot = typeof player.snapshot_payload === 'string' ? JSON.parse(player.snapshot_payload) : player.snapshot_payload;
+                if (characterSnapshot?.localId) {
+                  await saveCharacterSnapshot(db, snapshot.sessionId, String(player.device_id), characterSnapshot);
+                }
+              } catch {
+                // Snapshot de jogador invalido nao deve bloquear a sessao.
+              }
+            }
           }
         }
         for (const event of snapshot.recentEvents) {
@@ -1220,6 +1603,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     setPlayers([]);
 
     if (session) {
+      await linkCharacterToSession(db, session.id, null);
       await setLanSessionStatus(db, session.id, 'closed');
     }
     setActiveSession(null);

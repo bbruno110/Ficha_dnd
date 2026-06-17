@@ -136,6 +136,7 @@ export type LanCommandKind =
   | 'MASTER_APPLY_ITEM'
   | 'MASTER_REMOVE_ITEM'
   | 'MASTER_APPLY_EFFECT'
+  | 'MASTER_REMOVE_EFFECT'
   | 'MASTER_ADVANCE_TURN'
   | 'MASTER_ADVANCE_TIME'
   | 'MASTER_SHORT_REST'
@@ -143,6 +144,7 @@ export type LanCommandKind =
   | 'MASTER_PAUSE_SESSION'
   | 'MASTER_RESUME_SESSION'
   | 'MASTER_END_SESSION'
+  | 'MASTER_DENY_REQUEST'
   | 'REQUEST_RESYNC';
 
 export type LanCommandMessage = {

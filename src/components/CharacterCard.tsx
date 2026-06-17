@@ -14,9 +14,11 @@ type Props = {
   onPress: () => void;
   onDelete: (id: number) => void;
   onEdit: (id: number) => void;
+  onUnlinkSession?: (id: number) => void;
+  isLinkedToSession?: boolean;
 };
 
-export default function CharacterCard({ character, onPress, onDelete, onEdit }: Props) {
+export default function CharacterCard({ character, onPress, onDelete, onEdit, onUnlinkSession, isLinkedToSession = false }: Props) {
   // Estados que controlam o nosso Menu Customizado
   const [modalVisible, setModalVisible] = useState(false);
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
@@ -41,6 +43,11 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit }: 
 
   const handleDeleteClick = () => {
     setIsConfirmingDelete(true); // Muda o conteúdo do modal para a pergunta de confirmação
+  };
+
+  const handleUnlinkSession = () => {
+    handleClose();
+    onUnlinkSession?.(character.id);
   };
 
   const handleConfirmDelete = () => {
@@ -90,6 +97,12 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit }: 
                   <Text style={styles.optionText}>✏️ Editar Ficha</Text>
                 </TouchableOpacity>
                 
+                {isLinkedToSession && (
+                  <TouchableOpacity style={styles.optionButton} onPress={handleUnlinkSession}>
+                    <Text style={styles.unlinkText}>Desvincular da sessao LAN</Text>
+                  </TouchableOpacity>
+                )}
+
                 <TouchableOpacity style={[styles.optionButton, styles.optionButtonNoBorder]} onPress={handleDeleteClick}>
                   <Text style={styles.deleteText}>🗑️ Excluir Personagem</Text>
                 </TouchableOpacity>
@@ -228,6 +241,11 @@ const styles = StyleSheet.create({
   deleteText: {
     fontSize: 16,
     color: '#ff6666',
+    fontWeight: '600',
+  },
+  unlinkText: {
+    fontSize: 16,
+    color: '#00fa9a',
     fontWeight: '600',
   },
   confirmDeleteButton: {
