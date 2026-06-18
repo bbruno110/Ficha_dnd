@@ -19,7 +19,7 @@ import {
   View,
 } from 'react-native';
 import { useLanSession } from '../contexts/LanSessionContext';
-import { CUSTOM_CONTENT_DEFINITIONS, getCustomContentRefs } from '../network/lanRepository';
+import { CUSTOM_CONTENT_DEFINITIONS, LAN_ALL_CUSTOM_CONTENT_KEY, getCustomContentRefs } from '../network/lanRepository';
 import { LanCustomContentRef } from '../types/lan';
 
 export default function LanMasterSetupScreen() {
@@ -30,7 +30,7 @@ export default function LanMasterSetupScreen() {
   const [sessionName, setSessionName] = useState(activeSession?.role === 'master' ? activeSession.name : '');
   const [syncCustomContent, setSyncCustomContent] = useState(true);
   const [allowExistingCharacter, setAllowExistingCharacter] = useState(true);
-  const [selectedContentKeys, setSelectedContentKeys] = useState<string[]>([]);
+  const [selectedContentKeys, setSelectedContentKeys] = useState<string[]>([LAN_ALL_CUSTOM_CONTENT_KEY]);
   const [contentRefs, setContentRefs] = useState<LanCustomContentRef[]>([]);
   const [contentModalVisible, setContentModalVisible] = useState(false);
   const [contentSearch, setContentSearch] = useState('');
@@ -65,10 +65,18 @@ export default function LanMasterSetupScreen() {
     });
   }, [contentRefs, contentFilter, contentSearch]);
 
-  const selectedContentCount = selectedContentKeys.length;
+  const isAllCustomContentSelected = selectedContentKeys.includes(LAN_ALL_CUSTOM_CONTENT_KEY);
+  const selectedContentCount = isAllCustomContentSelected ? contentRefs.length : selectedContentKeys.length;
 
   const toggleContent = (key: string) => {
-    setSelectedContentKeys(prev => (prev.includes(key) ? prev.filter(item => item !== key) : [...prev, key]));
+    setSelectedContentKeys(prev => {
+      const withoutAll = prev.filter(item => item !== LAN_ALL_CUSTOM_CONTENT_KEY);
+      return withoutAll.includes(key) ? withoutAll.filter(item => item !== key) : [...withoutAll, key];
+    });
+  };
+
+  const toggleAllCustomContent = () => {
+    setSelectedContentKeys(prev => (prev.includes(LAN_ALL_CUSTOM_CONTENT_KEY) ? [] : [LAN_ALL_CUSTOM_CONTENT_KEY]));
   };
 
   const handleStartMaster = async () => {
@@ -109,7 +117,7 @@ export default function LanMasterSetupScreen() {
             <Ionicons name="shield-half-outline" size={32} color="#00fa9a" />
             <View style={{ flex: 1 }}>
               <Text style={styles.heroTitle}>Configuração do Mestre</Text>
-              <Text style={styles.heroSub}>Configure a campanha, escolha as regras de ficha e inicie o servidor TCP local.</Text>
+              <Text style={styles.heroSub}>Configure a campanha, escolha as regras de ficha e inicie a mesa LAN local.</Text>
             </View>
           </View>
 
@@ -143,7 +151,7 @@ export default function LanMasterSetupScreen() {
             {syncCustomContent && (
               <TouchableOpacity style={styles.selectContentButton} onPress={() => setContentModalVisible(true)}>
                 <Ionicons name="albums-outline" size={20} color="#00fa9a" />
-                <Text style={styles.selectContentText}>Selecionar conteudos ({selectedContentCount})</Text>
+                <Text style={styles.selectContentText}>Selecionar conteudos ({isAllCustomContentSelected ? 'Todos' : selectedContentCount})</Text>
                 <Ionicons name="chevron-forward" size={18} color="#00fa9a" />
               </TouchableOpacity>
             )}
@@ -182,6 +190,16 @@ export default function LanMasterSetupScreen() {
               placeholderTextColor="rgba(255,255,255,0.35)"
             />
 
+            <TouchableOpacity
+              style={[styles.selectAllButton, isAllCustomContentSelected && styles.selectAllButtonActive]}
+              onPress={toggleAllCustomContent}
+            >
+              <Ionicons name={isAllCustomContentSelected ? 'checkmark-circle' : 'ellipse-outline'} size={20} color={isAllCustomContentSelected ? '#02112b' : '#00fa9a'} />
+              <Text style={[styles.selectAllText, isAllCustomContentSelected && styles.selectAllTextActive]}>
+                Sincronizar todos, incluindo novos
+              </Text>
+            </TouchableOpacity>
+
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
               {['Todos', ...CUSTOM_CONTENT_DEFINITIONS.map(definition => definition.type)].map(filter => (
                 <TouchableOpacity
@@ -199,7 +217,7 @@ export default function LanMasterSetupScreen() {
               keyExtractor={item => item.key}
               style={{ width: '100%' }}
               renderItem={({ item }) => {
-                const selected = selectedContentKeys.includes(item.key);
+                const selected = isAllCustomContentSelected || selectedContentKeys.includes(item.key);
                 return (
                   <TouchableOpacity style={[styles.contentItem, selected && styles.contentItemActive]} onPress={() => toggleContent(item.key)}>
                     <View style={[styles.checkbox, selected && styles.checkboxActive]}>
@@ -219,7 +237,7 @@ export default function LanMasterSetupScreen() {
             />
 
             <TouchableOpacity style={styles.modalDoneButton} onPress={() => setContentModalVisible(false)}>
-              <Text style={styles.modalDoneText}>CONCLUIR ({selectedContentCount})</Text>
+              <Text style={styles.modalDoneText}>CONCLUIR ({isAllCustomContentSelected ? 'TODOS' : selectedContentCount})</Text>
             </TouchableOpacity>
           </Pressable>
         </Pressable>
@@ -336,6 +354,23 @@ const styles = StyleSheet.create({
     padding: 13,
     marginBottom: 12,
   },
+  selectAllButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(0,250,154,0.35)',
+    backgroundColor: 'rgba(0,250,154,0.08)',
+    marginBottom: 12,
+  },
+  selectAllButtonActive: {
+    backgroundColor: '#00fa9a',
+    borderColor: '#00fa9a',
+  },
+  selectAllText: { color: '#00fa9a', fontSize: 13, fontWeight: 'bold', flex: 1 },
+  selectAllTextActive: { color: '#02112b' },
   filterRow: { gap: 8, paddingBottom: 12 },
   filterChip: {
     paddingVertical: 8,

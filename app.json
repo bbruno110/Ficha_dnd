@@ -2,7 +2,7 @@
   "expo": {
     "name": "Ficha D&D",
     "slug": "ficha-dnd",
-    "version": "1.0.14.248",
+    "version": "1.0.28.262",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "fichadnd",
@@ -11,12 +11,15 @@
       "icon": "./assets/expo.icon"
     },
     "android": {
-      "versionCode": 5,
+      "versionCode": 12,
+      "allowBackup": false,
       "permissions": [
         "INTERNET",
         "ACCESS_NETWORK_STATE",
         "ACCESS_WIFI_STATE",
         "CHANGE_WIFI_MULTICAST_STATE",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_DATA_SYNC",
         "CAMERA"
       ],
       "adaptiveIcon": {

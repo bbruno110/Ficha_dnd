@@ -534,7 +534,9 @@ export default function EditCharacterScreen() {
       
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!
       if (activeSession) {
-        await broadcastCharacter(character.id, 'character-edited');
+        await broadcastCharacter(character.id, 'character-edited').catch(error => {
+          console.warn('Ficha salva localmente, mas a sincronizacao LAN falhou:', error);
+        });
       }
 
       if (router.canGoBack()) {

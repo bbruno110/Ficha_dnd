@@ -1,7 +1,7 @@
 export const LAN_DEFAULT_PORT = 45555;
 
 export type LanRole = 'master' | 'player';
-export type LanSessionStatus = 'open' | 'connected' | 'paused' | 'closed';
+export type LanSessionStatus = 'open' | 'connected' | 'paused' | 'inactive' | 'closed';
 
 export type LanSessionRecord = {
   id: string;
@@ -86,23 +86,6 @@ export type LanSessionConfig = {
   selectedContent: string[];
 };
 
-export type LanHelloMessage = {
-  type: 'HELLO';
-  sessionId: string;
-  deviceId: string;
-  playerName: string;
-  characterId?: number | null;
-  characterName?: string | null;
-};
-
-export type LanWelcomeMessage = {
-  type: 'WELCOME';
-  sessionId: string;
-  deviceId: string;
-  masterName: string;
-  config: LanSessionConfig;
-};
-
 export type LanCustomContentMessage = {
   type: 'CUSTOM_CONTENT';
   sessionId: string;
@@ -124,6 +107,9 @@ export type LanCommandKind =
   | 'PLAYER_ITEM_CONSUME'
   | 'PLAYER_EQUIP_ITEM'
   | 'PLAYER_UNEQUIP_ITEM'
+  | 'PLAYER_TRADE_OFFER'
+  | 'PLAYER_TRADE_ACCEPT'
+  | 'PLAYER_TRADE_DECLINE'
   | 'PLAYER_REQUEST_HP'
   | 'PLAYER_REQUEST_XP'
   | 'PLAYER_REQUEST_COINS'
@@ -144,8 +130,7 @@ export type LanCommandKind =
   | 'MASTER_PAUSE_SESSION'
   | 'MASTER_RESUME_SESSION'
   | 'MASTER_END_SESSION'
-  | 'MASTER_DENY_REQUEST'
-  | 'REQUEST_RESYNC';
+  | 'MASTER_DENY_REQUEST';
 
 export type LanCommandMessage = {
   type: 'LAN_COMMAND';
@@ -179,6 +164,9 @@ export type LanOfficialEventType =
   | 'ITEM_CONSUMED'
   | 'ITEM_EQUIPPED'
   | 'ITEM_UNEQUIPPED'
+  | 'TRADE_OFFERED'
+  | 'TRADE_ACCEPTED'
+  | 'TRADE_DECLINED'
   | 'EFFECT_APPLIED'
   | 'EFFECT_EXPIRED'
   | 'PLAYER_REQUESTED'
@@ -216,27 +204,9 @@ export type LanSessionSnapshotMessage = {
   at: string;
 };
 
-export type LanNoticeMessage = {
-  type: 'NOTICE' | 'ERROR' | 'PING' | 'SNAPSHOT_REQUEST';
-  sessionId?: string;
-  message?: string;
-  at?: string;
-  sinceSeq?: number;
-};
-
-export type LanMessage =
-  | LanHelloMessage
-  | LanWelcomeMessage
-  | LanCustomContentMessage
-  | LanCharacterMessage
-  | LanCommandMessage
-  | LanOfficialEventMessage
-  | LanSessionSnapshotMessage
-  | LanNoticeMessage;
-
 export type ParsedSessionCode = {
   sessionId: string;
   hostIp: string;
+  hostCandidates?: string[];
   port: number;
 };
-

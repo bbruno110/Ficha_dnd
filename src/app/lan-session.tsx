@@ -19,7 +19,7 @@ import {
 import QRCode from 'react-native-qrcode-svg';
 import { useLanSession } from '../contexts/LanSessionContext';
 import { getLanSessionState } from '../network/lanRepository';
-import { LanOfficialEventMessage } from '../types/lan';
+import { LanOfficialEventMessage, LanSessionRecord } from '../types/lan';
 
 type CharacterOption = {
   id: number;
@@ -61,7 +61,9 @@ export default function LanSessionScreen() {
   const navigationLockRef = useRef(false);
   const {
     activeSession,
+    savedSessions,
     isTransportReady,
+    connectionStatus,
     peerCount,
     lastError,
     lastNotice,
@@ -72,6 +74,8 @@ export default function LanSessionScreen() {
     broadcastCharacter,
     sendLanCommand,
     getHistoryPage,
+    resumeLanSession,
+    refreshSavedSessions,
     pauseActiveSession,
     resumeActiveSession,
     refreshPlayers,
@@ -83,11 +87,11 @@ export default function LanSessionScreen() {
   const [history, setHistory] = useState<LanOfficialEventMessage[]>([]);
   const [historyPage, setHistoryPage] = useState(0);
   const [selectedTargetCharacterId, setSelectedTargetCharacterId] = useState<number | null>(null);
-  const [masterAmount, setMasterAmount] = useState('1');
-  const [coinGp, setCoinGp] = useState('0');
-  const [coinSp, setCoinSp] = useState('0');
-  const [coinCp, setCoinCp] = useState('0');
-  const [playerRequestAmount, setPlayerRequestAmount] = useState('1');
+  const [masterAmount, setMasterAmount] = useState('');
+  const [coinGp, setCoinGp] = useState('');
+  const [coinSp, setCoinSp] = useState('');
+  const [coinCp, setCoinCp] = useState('');
+  const [playerRequestAmount, setPlayerRequestAmount] = useState('');
   const [cardAmounts, setCardAmounts] = useState<Record<string, string>>({});
   const [cardCoins, setCardCoins] = useState<Record<string, { gp: string; sp: string; cp: string }>>({});
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
@@ -100,14 +104,20 @@ export default function LanSessionScreen() {
   const [selectedEffectIds, setSelectedEffectIds] = useState<number[]>([]);
   const [effectDurationValue, setEffectDurationValue] = useState('3');
   const [effectDurationUnit, setEffectDurationUnit] = useState<'turn' | 'minute' | 'hour' | 'short_rest' | 'long_rest'>('turn');
-  const [globalXp, setGlobalXp] = useState('0');
-  const [globalCoins, setGlobalCoins] = useState({ gp: '0', sp: '0', cp: '0' });
+  const [globalXp, setGlobalXp] = useState('');
+  const [globalHp, setGlobalHp] = useState('');
+  const [globalCoins, setGlobalCoins] = useState({ gp: '', sp: '', cp: '' });
   const [campaignTurn, setCampaignTurn] = useState(1);
   const [campaignMinutes, setCampaignMinutes] = useState(0);
-  const [timeAmount, setTimeAmount] = useState('10');
+  const [timeAmount, setTimeAmount] = useState('');
   const [timeUnit, setTimeUnit] = useState<'turn' | 'minute' | 'hour' | 'short_rest' | 'long_rest'>('turn');
   const [masterModal, setMasterModal] = useState<MasterModalState | null>(null);
   const [handledRequestIds, setHandledRequestIds] = useState<Record<string, boolean>>({});
+  const [tradeModal, setTradeModal] = useState<LanOfficialEventMessage | null>(null);
+  const [tradeCounterItems, setTradeCounterItems] = useState<any[]>([]);
+  const [tradeCounterItemIndex, setTradeCounterItemIndex] = useState<number | null>(null);
+  const [tradeCounterQty, setTradeCounterQty] = useState('1');
+  const [tradeCoins, setTradeCoins] = useState({ gp: '', sp: '', cp: '' });
 
   const loadLocalData = useCallback(async () => {
     const chars = await db.getAllAsync<CharacterOption>(
@@ -126,7 +136,7 @@ export default function LanSessionScreen() {
 
   const loadHistory = useCallback(
     async (page = 0) => {
-      const rows = await getHistoryPage(page, 20);
+      const rows = await getHistoryPage(page, 50);
       setHistory(rows);
       setHistoryPage(page);
     },
@@ -140,9 +150,21 @@ export default function LanSessionScreen() {
     setCampaignMinutes(state.campaignMinutes);
   }, [activeSession, db]);
 
+  const refreshSessionViews = useCallback(
+    async (includeState = false) => {
+      await Promise.all([
+        refreshPlayers(),
+        loadHistory(0),
+        includeState ? loadSessionState() : Promise.resolve(),
+      ]);
+    },
+    [loadHistory, loadSessionState, refreshPlayers]
+  );
+
   useEffect(() => {
     loadLocalData();
-  }, [loadLocalData]);
+    refreshSavedSessions();
+  }, [loadLocalData, refreshSavedSessions]);
 
   useEffect(() => {
     if (activeSession) {
@@ -161,8 +183,9 @@ export default function LanSessionScreen() {
   useEffect(() => {
     if (activeSession && lastNotice) {
       loadHistory(0);
+      refreshSavedSessions();
     }
-  }, [activeSession, lastNotice, loadHistory]);
+  }, [activeSession, lastNotice, loadHistory, refreshSavedSessions]);
 
   useEffect(() => {
     if (activeSession) {
@@ -224,19 +247,24 @@ export default function LanSessionScreen() {
 
   const playerActionKey = (player: typeof players[number]) => `${player.device_id}_${player.character_id || 'none'}`;
 
-  const getCardAmount = (player: typeof players[number]) => cardAmounts[playerActionKey(player)] ?? '1';
+  const getCardAmount = (player: typeof players[number]) => cardAmounts[playerActionKey(player)] ?? '';
   const setCardAmount = (player: typeof players[number], value: string) => {
     const key = playerActionKey(player);
     setCardAmounts(prev => ({ ...prev, [key]: onlyNumberText(value) }));
   };
 
-  const getCardCoins = (player: typeof players[number]) => cardCoins[playerActionKey(player)] ?? { gp: '0', sp: '0', cp: '0' };
+  const getCardCoins = (player: typeof players[number]) => cardCoins[playerActionKey(player)] ?? { gp: '', sp: '', cp: '' };
   const setCardCoinValue = (player: typeof players[number], coin: 'gp' | 'sp' | 'cp', value: string) => {
     const key = playerActionKey(player);
     setCardCoins(prev => {
-      const current = prev[key] ?? { gp: '0', sp: '0', cp: '0' };
+      const current = prev[key] ?? { gp: '', sp: '', cp: '' };
       return { ...prev, [key]: { ...current, [coin]: onlyNumberText(value) } };
     });
+  };
+
+  const resetCardCoins = (player: typeof players[number]) => {
+    const key = playerActionKey(player);
+    setCardCoins(prev => ({ ...prev, [key]: { gp: '', sp: '', cp: '' } }));
   };
 
   const statValue = (stats: any, key: string) => {
@@ -310,6 +338,31 @@ export default function LanSessionScreen() {
     }, 700);
   };
 
+  const sessionStatusLabel = (session: LanSessionRecord) => {
+    if (activeSession?.id === session.id && isTransportReady) return 'ATIVA';
+    if (session.status === 'paused') return 'PAUSADA';
+    if (session.status === 'inactive') return 'INATIVA';
+    if (session.status === 'open' || session.status === 'connected') return 'RETOMAVEL';
+    return 'ENCERRADA';
+  };
+
+  const sessionStatusColor = (session: LanSessionRecord) => {
+    const label = sessionStatusLabel(session);
+    if (label === 'ATIVA') return '#00fa9a';
+    if (label === 'PAUSADA') return '#ffd166';
+    if (label === 'INATIVA') return '#9aa7b7';
+    return '#00bfff';
+  };
+
+  const handleResumeSavedSession = async (session: LanSessionRecord) => {
+    try {
+      await resumeLanSession(session.id);
+      await refreshSavedSessions();
+    } catch (error) {
+      Alert.alert('Nao foi possivel retomar', error instanceof Error ? error.message : String(error));
+    }
+  };
+
   const handleActiveCharacterChange = async (characterId: number | null) => {
     setSelectedCharacterId(characterId);
     if (activeSession) {
@@ -326,15 +379,18 @@ export default function LanSessionScreen() {
       Alert.alert('Escolha um alvo', 'Selecione um jogador com ficha vinculada.');
       return;
     }
+    const amount = Math.max(0, numericValue(masterAmount, 0));
+    if (amount <= 0) return;
 
     await sendLanCommand('MASTER_APPLY_HP', {
       targetCharacterId: selectedTargetCharacterId,
       targetDeviceId: selectedTargetPlayer?.device_id || null,
       targetName: selectedTargetPlayer?.character_name || 'Personagem',
       mode,
-      amount: Math.max(0, numericValue(masterAmount, 0)),
+      amount,
     });
-    loadHistory(0);
+    setMasterAmount('');
+    await refreshSessionViews();
   };
 
   const handleMasterXp = async () => {
@@ -342,14 +398,17 @@ export default function LanSessionScreen() {
       Alert.alert('Escolha um alvo', 'Selecione um jogador com ficha vinculada.');
       return;
     }
+    const amount = numericValue(masterAmount, 0);
+    if (amount === 0) return;
 
     await sendLanCommand('MASTER_APPLY_XP', {
       targetCharacterId: selectedTargetCharacterId,
       targetDeviceId: selectedTargetPlayer?.device_id || null,
       targetName: selectedTargetPlayer?.character_name || 'Personagem',
-      amount: numericValue(masterAmount, 0),
+      amount,
     });
-    loadHistory(0);
+    setMasterAmount('');
+    await refreshSessionViews();
   };
 
   const handleMasterCoins = async () => {
@@ -357,88 +416,112 @@ export default function LanSessionScreen() {
       Alert.alert('Escolha um alvo', 'Selecione um jogador com ficha vinculada.');
       return;
     }
+    const coins = {
+      gp: numericValue(coinGp, 0),
+      sp: numericValue(coinSp, 0),
+      cp: numericValue(coinCp, 0),
+    };
+    if (coins.gp === 0 && coins.sp === 0 && coins.cp === 0) return;
 
     await sendLanCommand('MASTER_APPLY_COINS', {
       targetCharacterId: selectedTargetCharacterId,
       targetDeviceId: selectedTargetPlayer?.device_id || null,
       targetName: selectedTargetPlayer?.character_name || 'Personagem',
-      gp: numericValue(coinGp, 0),
-      sp: numericValue(coinSp, 0),
-      cp: numericValue(coinCp, 0),
+      ...coins,
     });
-    loadHistory(0);
+    setCoinGp('');
+    setCoinSp('');
+    setCoinCp('');
+    await refreshSessionViews();
   };
 
   const handleMasterHpForPlayer = async (player: typeof players[number], mode: 'damage' | 'heal') => {
     if (!player.character_id) return;
+    const amount = Math.max(0, numericValue(getCardAmount(player), 0));
+    if (amount <= 0) return;
     await sendLanCommand('MASTER_APPLY_HP', {
       targetCharacterId: Number(player.character_id),
       targetDeviceId: player.device_id,
       targetName: player.character_name || 'Personagem',
       mode,
-      amount: Math.max(0, numericValue(getCardAmount(player), 0)),
+      amount,
     });
-    loadHistory(0);
+    setCardAmount(player, '');
+    await refreshSessionViews();
   };
 
   const handleMasterXpForPlayer = async (player: typeof players[number]) => {
     if (!player.character_id) return;
+    const amount = numericValue(getCardAmount(player), 0);
+    if (amount === 0) return;
     await sendLanCommand('MASTER_APPLY_XP', {
       targetCharacterId: Number(player.character_id),
       targetDeviceId: player.device_id,
       targetName: player.character_name || 'Personagem',
-      amount: numericValue(getCardAmount(player), 0),
+      amount,
     });
+    setCardAmount(player, '');
     setMasterModal(null);
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const handleMasterCoinsForPlayer = async (player: typeof players[number]) => {
     if (!player.character_id) return;
     const coins = getCardCoins(player);
+    const coinDelta = {
+      gp: numericValue(coins.gp, 0),
+      sp: numericValue(coins.sp, 0),
+      cp: numericValue(coins.cp, 0),
+    };
+    if (coinDelta.gp === 0 && coinDelta.sp === 0 && coinDelta.cp === 0) return;
     await sendLanCommand('MASTER_APPLY_COINS', {
       targetCharacterId: Number(player.character_id),
       targetDeviceId: player.device_id,
       targetName: player.character_name || 'Personagem',
-      gp: numericValue(coins.gp, 0),
-      sp: numericValue(coins.sp, 0),
-      cp: numericValue(coins.cp, 0),
+      ...coinDelta,
     });
+    resetCardCoins(player);
     setMasterModal(null);
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const handleMasterTempHpForPlayer = async (player: typeof players[number]) => {
     if (!player.character_id) return;
     const tempHp = getCardTempHp(player);
+    const amount = Math.max(0, numericValue(tempHp.amount, 0));
+    if (amount <= 0) return;
     await sendLanCommand('MASTER_APPLY_TEMP_HP', {
       targetCharacterId: Number(player.character_id),
       targetDeviceId: player.device_id,
       targetName: player.character_name || 'Personagem',
-      amount: Math.max(0, numericValue(tempHp.amount, 0)),
+      amount,
       mode: 'add',
       durationUnit: tempHp.durationUnit,
       durationValue: numericValue(tempHp.durationValue, 1),
     });
+    setCardTempHpValue(player, { amount: '', durationValue: '1' });
     setMasterModal(null);
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const handleMasterAttributeForPlayer = async (player: typeof players[number]) => {
     if (!player.character_id) return;
     const buff = getCardBuff(player);
+    const amount = numericValue(buff.amount, 0);
+    if (amount === 0) return;
     await sendLanCommand('MASTER_APPLY_ATTRIBUTE', {
       targetCharacterId: Number(player.character_id),
       targetDeviceId: player.device_id,
       targetName: player.character_name || 'Personagem',
       stat: buff.stat,
-      amount: numericValue(buff.amount, 0),
+      amount,
       durationMode: buff.mode,
       durationUnit: buff.durationUnit,
       durationValue: numericValue(buff.durationValue, 1),
     });
+    setCardBuffValue(player, { amount: '', durationValue: '1' });
     setMasterModal(null);
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const handleMasterRemoveEffect = async (player: typeof players[number], effectId: string) => {
@@ -449,7 +532,7 @@ export default function LanSessionScreen() {
       targetName: player.character_name || 'Personagem',
       effectId,
     });
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const toggleSelectedEffect = (effectId: number) => {
@@ -479,7 +562,7 @@ export default function LanSessionScreen() {
 
     setSelectedEffectIds([]);
     setMasterModal(null);
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const handleMasterGiveItem = async (player: typeof players[number], item: ItemOption, quantity = 1) => {
@@ -491,8 +574,10 @@ export default function LanSessionScreen() {
       quantity: Math.max(1, quantity),
       item,
     });
+    setCardAmount(player, '');
+    setCardItemSearch(prev => ({ ...prev, [playerActionKey(player)]: '' }));
     setMasterModal(null);
-    loadHistory(0);
+    await refreshSessionViews();
   };
 
   const handleGlobalXp = async () => {
@@ -511,7 +596,25 @@ export default function LanSessionScreen() {
         amount: share,
       });
     }
-    loadHistory(0);
+    setGlobalXp('');
+    await refreshSessionViews();
+  };
+
+  const handleGlobalHp = async (mode: 'damage' | 'heal') => {
+    const targets = targetPlayers;
+    const amount = Math.max(0, numericValue(globalHp, 0));
+    if (targets.length === 0 || amount <= 0) return;
+    for (const player of targets) {
+      await sendLanCommand('MASTER_APPLY_HP', {
+        targetCharacterId: Number(player.character_id),
+        targetDeviceId: player.device_id,
+        targetName: player.character_name || 'Personagem',
+        mode,
+        amount,
+      });
+    }
+    setGlobalHp('');
+    await refreshSessionViews();
   };
 
   const handleGlobalCoins = async () => {
@@ -535,24 +638,23 @@ export default function LanSessionScreen() {
         ...share,
       });
     }
-    loadHistory(0);
+    setGlobalCoins({ gp: '', sp: '', cp: '' });
+    await refreshSessionViews();
   };
 
   const handleAdvanceTurn = async (delta = 1) => {
     await sendLanCommand('MASTER_ADVANCE_TURN', { delta });
-    await loadSessionState();
-    loadHistory(0);
+    await refreshSessionViews(true);
   };
 
   const handleAdvanceMinutes = async (minutes: number) => {
     await sendLanCommand('MASTER_ADVANCE_TIME', { minutes });
-    await loadSessionState();
-    loadHistory(0);
+    await refreshSessionViews(true);
   };
 
   const handleApplyRest = async (kind: 'short_rest' | 'long_rest') => {
     await sendLanCommand(kind === 'short_rest' ? 'MASTER_SHORT_REST' : 'MASTER_LONG_REST', {});
-    loadHistory(0);
+    await refreshSessionViews(true);
   };
 
   const handleAdvanceTime = async () => {
@@ -566,9 +668,9 @@ export default function LanSessionScreen() {
     } else {
       await sendLanCommand(timeUnit === 'short_rest' ? 'MASTER_SHORT_REST' : 'MASTER_LONG_REST', {});
     }
+    setTimeAmount('');
     setMasterModal(null);
-    await loadSessionState();
-    loadHistory(0);
+    await refreshSessionViews(true);
   };
 
   const openPlayerSheetFromMaster = (player: typeof players[number]) => {
@@ -577,11 +679,14 @@ export default function LanSessionScreen() {
   };
 
   const handlePlayerRequest = async (command: 'PLAYER_REQUEST_HP' | 'PLAYER_REQUEST_XP' | 'PLAYER_REQUEST_COINS') => {
+    const amount = Math.max(0, numericValue(playerRequestAmount, 0));
+    if (amount <= 0) return;
     await sendLanCommand(command, {
-      amount: Math.max(0, numericValue(playerRequestAmount, 0)),
+      amount,
       characterName: selectedCharacter?.name || null,
     });
-    loadHistory(0);
+    setPlayerRequestAmount('');
+    await refreshSessionViews();
   };
 
   const markRequestHandled = (event: LanOfficialEventMessage) => {
@@ -589,11 +694,83 @@ export default function LanSessionScreen() {
     if (key) setHandledRequestIds(prev => ({ ...prev, [key]: true }));
   };
 
-  const pendingMasterRequests = history.filter(event => event.eventType === 'PLAYER_REQUESTED' && !handledRequestIds[event.commandId || event.eventId]);
+  const resolvedRequestIds = new Set(
+    Object.entries(handledRequestIds)
+      .filter(([, handled]) => handled)
+      .map(([requestId]) => requestId)
+  );
+  for (const event of history) {
+    const requestCommandId = String((event.payload as any)?.requestCommandId || '');
+    if (requestCommandId && event.eventType !== 'PLAYER_REQUESTED') {
+      resolvedRequestIds.add(requestCommandId);
+    }
+  }
+  const pendingMasterRequests = history.filter(event => {
+    const requestId = event.commandId || event.eventId;
+    return event.eventType === 'PLAYER_REQUESTED' && !resolvedRequestIds.has(requestId);
+  });
+
+  const resolvedTradeOfferIds = new Set<string>();
+  for (const event of history) {
+    const offerCommandId = String((event.payload as any)?.offerCommandId || '');
+    if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED')) {
+      resolvedTradeOfferIds.add(offerCommandId);
+    }
+  }
+  const pendingTradeOffers = history.filter(event => {
+    const offerCommandId = event.commandId || event.eventId;
+    return (
+      activeSession?.role === 'player' &&
+      event.eventType === 'TRADE_OFFERED' &&
+      Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
+      !resolvedTradeOfferIds.has(offerCommandId)
+    );
+  });
+
+  const openTradeModal = async (event: LanOfficialEventMessage) => {
+    if (!activeSession?.linked_character_id) return;
+    const row = await db.getFirstAsync<any>(
+      `SELECT equipment FROM characters WHERE id = ? LIMIT 1`,
+      [activeSession.linked_character_id]
+    );
+    const parsedEquipment = safeJson(row?.equipment, {});
+    const bag = Array.isArray(parsedEquipment) ? parsedEquipment : Array.isArray(parsedEquipment?.bag) ? parsedEquipment.bag : [];
+    setTradeCounterItems(bag);
+    setTradeCounterItemIndex(null);
+    setTradeCounterQty('1');
+    setTradeCoins({ gp: '', sp: '', cp: '' });
+    setTradeModal(event);
+  };
+
+  const handleDeclineTrade = async (event: LanOfficialEventMessage) => {
+    await sendLanCommand('PLAYER_TRADE_DECLINE', {
+      offerCommandId: event.commandId || event.eventId,
+    });
+    setTradeModal(current => ((current?.commandId || current?.eventId) === (event.commandId || event.eventId) ? null : current));
+    await refreshSessionViews();
+  };
+
+  const handleAcceptTrade = async () => {
+    if (!tradeModal) return;
+    const selectedItem = tradeCounterItemIndex !== null ? tradeCounterItems[tradeCounterItemIndex] : null;
+    const qty = selectedItem ? Math.max(1, Math.min(Number(selectedItem.qty || 1), numericValue(tradeCounterQty, 1))) : 0;
+    await sendLanCommand('PLAYER_TRADE_ACCEPT', {
+      offerCommandId: tradeModal.commandId || tradeModal.eventId,
+      counterItem: selectedItem || null,
+      counterQuantity: selectedItem ? qty : 0,
+      gp: Math.max(0, numericValue(tradeCoins.gp, 0)),
+      sp: Math.max(0, numericValue(tradeCoins.sp, 0)),
+      cp: Math.max(0, numericValue(tradeCoins.cp, 0)),
+    });
+    setTradeModal(null);
+    setTradeCounterItems([]);
+    await refreshSessionViews();
+  };
 
   const handleApproveRequest = async (event: LanOfficialEventMessage) => {
     const payload = (event.payload || {}) as any;
     const requestCommand = String(payload.command || '');
+    const requestCommandId = event.commandId || event.eventId;
     const targetCharacterId = Number(event.targetCharacterId || payload.targetCharacterId || 0);
     const targetDeviceId = String(event.targetDeviceId || event.actorDeviceId || payload.targetDeviceId || '');
     const targetName = event.targetName || payload.characterName || event.actorName || 'Personagem';
@@ -610,9 +787,10 @@ export default function LanSessionScreen() {
         targetName,
         item: payload.item || { name: payload.itemName || 'Item' },
         quantity: Math.max(1, numericValue(String(payload.quantity || payload.requestedDelta || 1), 1)),
+        requestCommandId,
       });
       markRequestHandled(event);
-      await loadHistory(0);
+      await refreshSessionViews();
       return;
     }
 
@@ -623,9 +801,10 @@ export default function LanSessionScreen() {
         targetName,
         mode: payload.mode || 'heal',
         amount: Math.max(0, Number(payload.amount || 0)),
+        requestCommandId,
       });
       markRequestHandled(event);
-      await loadHistory(0);
+      await refreshSessionViews();
       return;
     }
 
@@ -635,9 +814,10 @@ export default function LanSessionScreen() {
         targetDeviceId,
         targetName,
         amount: Number(payload.amount || 0),
+        requestCommandId,
       });
       markRequestHandled(event);
-      await loadHistory(0);
+      await refreshSessionViews();
       return;
     }
 
@@ -649,9 +829,10 @@ export default function LanSessionScreen() {
         gp: Number(payload.gp || 0),
         sp: Number(payload.sp || 0),
         cp: Number(payload.cp || 0),
+        requestCommandId,
       });
       markRequestHandled(event);
-      await loadHistory(0);
+      await refreshSessionViews();
       return;
     }
 
@@ -665,9 +846,10 @@ export default function LanSessionScreen() {
         durationMode: payload.durationMode || 'temporary',
         durationUnit: payload.durationUnit || 'turn',
         durationValue: Number(payload.durationValue || 1),
+        requestCommandId,
       });
       markRequestHandled(event);
-      await loadHistory(0);
+      await refreshSessionViews();
       return;
     }
 
@@ -684,7 +866,7 @@ export default function LanSessionScreen() {
       originalPayload: event.payload || {},
     });
     markRequestHandled(event);
-    await loadHistory(0);
+    await refreshSessionViews();
   };
 
   const goToCreateCharacter = () => {
@@ -854,7 +1036,7 @@ export default function LanSessionScreen() {
         <View style={styles.activeActions}>
           <TouchableOpacity style={styles.dangerButton} onPress={closeActiveSession}>
             <Ionicons name="exit-outline" size={18} color="#ff6666" />
-            <Text style={styles.dangerButtonText}>Sair da mesa</Text>
+            <Text style={styles.dangerButtonText}>Desconectar</Text>
           </TouchableOpacity>
         </View>
       );
@@ -927,9 +1109,9 @@ export default function LanSessionScreen() {
 
         <View style={styles.masterBoardPanel}>
           <View style={styles.sessionBoardHeader}>
-            <View>
-              <Text style={styles.sessionBoardTitle}>{activeSession.name || 'Mesa de D&D'}</Text>
-              <Text style={styles.turnSubValue}>Codigo {activeSession.session_code || '-'}</Text>
+            <View style={styles.sessionBoardTitleBlock}>
+              <Text style={styles.sessionBoardTitle} numberOfLines={1}>{activeSession.name || 'Mesa de D&D'}</Text>
+              <Text style={styles.turnSubValue} numberOfLines={1}>Codigo {activeSession.id || '-'}</Text>
             </View>
             <View style={[styles.statusBadge, styles.statusBadgeReady]}>
               <Text style={styles.statusBadgeTextReady}>{activeSession.status === 'paused' ? 'PAUSADA' : 'ATIVA'}</Text>
@@ -947,7 +1129,8 @@ export default function LanSessionScreen() {
             </View>
             <View style={styles.sessionMetricBox}>
               <Text style={styles.quickMetricLabel}>JOGADORES</Text>
-              <Text style={styles.sessionMetricValue}>{targetPlayers.length}</Text>
+              <Text style={styles.sessionMetricValue}>{players.length}</Text>
+              <Text style={styles.turnSubValue}>{targetPlayers.length} ficha(s)</Text>
             </View>
           </View>
 
@@ -989,6 +1172,7 @@ export default function LanSessionScreen() {
                 style={[styles.input, styles.compactInput]}
                 value={globalXp}
                 onChangeText={value => setGlobalXp(onlyNumberText(value))}
+                onFocus={() => globalXp === '0' && setGlobalXp('')}
                 keyboardType="numeric"
                 placeholder="0"
                 placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1006,6 +1190,34 @@ export default function LanSessionScreen() {
           </View>
 
           <View style={styles.globalRewardBox}>
+            <Text style={styles.coinApplyLabel}>VIDA GLOBAL</Text>
+            <View style={styles.compactInputRow}>
+              <TextInput
+                style={[styles.input, styles.compactInput]}
+                value={globalHp}
+                onChangeText={value => setGlobalHp(onlyNumberText(value))}
+                onFocus={() => globalHp === '0' && setGlobalHp('')}
+                keyboardType="numeric"
+                placeholder="0"
+                placeholderTextColor="rgba(255,255,255,0.35)"
+                selectTextOnFocus
+                textAlign="center"
+              />
+              <TouchableOpacity style={styles.secondaryButton} onPress={() => handleGlobalHp('damage')}>
+                <Ionicons name="flash-outline" size={18} color="#00bfff" />
+                <Text style={styles.secondaryButtonText}>Dano global</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.secondaryButton} onPress={() => handleGlobalHp('heal')}>
+                <Ionicons name="medkit-outline" size={18} color="#00bfff" />
+                <Text style={styles.secondaryButtonText}>Cura global</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.mutedSmallText}>
+              {targetPlayers.length > 0 ? `Aplica em ${targetPlayers.length} ficha(s).` : 'Sem jogadores vinculados.'}
+            </Text>
+          </View>
+
+          <View style={styles.globalRewardBox}>
             <Text style={styles.coinApplyLabel}>MOEDAS GLOBAIS</Text>
             <View style={styles.coinInputGrid}>
               {(['gp', 'sp', 'cp'] as const).map(coin => (
@@ -1015,6 +1227,7 @@ export default function LanSessionScreen() {
                     style={[styles.input, styles.coinInput]}
                     value={globalCoins[coin]}
                     onChangeText={value => setGlobalCoins(prev => ({ ...prev, [coin]: onlyNumberText(value) }))}
+                    onFocus={() => globalCoins[coin] === '0' && setGlobalCoins(prev => ({ ...prev, [coin]: '' }))}
                     keyboardType="numeric"
                     placeholder="0"
                     placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1108,6 +1321,21 @@ export default function LanSessionScreen() {
                         </TouchableOpacity>
                       </View>
 
+                      <View style={styles.quickMetricGrid}>
+                        <View style={styles.quickMetricBox}>
+                          <Text style={styles.quickMetricLabel}>PO</Text>
+                          <Text style={styles.quickMetricValue}>{snapshot.gp}</Text>
+                        </View>
+                        <View style={styles.quickMetricBox}>
+                          <Text style={styles.quickMetricLabel}>PP</Text>
+                          <Text style={styles.quickMetricValue}>{snapshot.sp}</Text>
+                        </View>
+                        <View style={styles.quickMetricBox}>
+                          <Text style={styles.quickMetricLabel}>PC</Text>
+                          <Text style={styles.quickMetricValue}>{snapshot.cp}</Text>
+                        </View>
+                      </View>
+
                       {snapshot.activeEffects.length > 0 && (
                         <TouchableOpacity style={[styles.effectPreviewBox, { borderColor: effectColor(snapshot.activeEffects[0], 'rgba(255,209,102,0.25)') }]} onPress={() => setMasterModal({ kind: 'effects', player })}>
                           <Ionicons name="sparkles-outline" size={14} color={effectColor(snapshot.activeEffects[0])} />
@@ -1184,6 +1412,7 @@ export default function LanSessionScreen() {
                             style={[styles.input, styles.compactInput]}
                             value={amountValue}
                             onChangeText={value => setCardAmount(player, value)}
+                            onFocus={() => amountValue === '1' && setCardAmount(player, '')}
                             keyboardType="numeric"
                             placeholder="Valor"
                             placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1201,7 +1430,7 @@ export default function LanSessionScreen() {
                         </View>
                         {expanded && (
                           <>
-                        <TouchableOpacity style={styles.secondaryWideButton} onPress={() => setMasterModal({ kind: 'xp', player })}>
+                        <TouchableOpacity style={styles.secondaryWideButton} onPress={() => handleMasterXpForPlayer(player)}>
                           <Ionicons name="sparkles-outline" size={18} color="#00bfff" />
                           <Text style={styles.secondaryButtonText}>Aplicar XP pelo valor acima</Text>
                         </TouchableOpacity>
@@ -1216,6 +1445,7 @@ export default function LanSessionScreen() {
                                   style={[styles.input, styles.coinInput]}
                                   value={coinsValue[coin]}
                                   onChangeText={value => setCardCoinValue(player, coin, value)}
+                                  onFocus={() => coinsValue[coin] === '0' && setCardCoinValue(player, coin, '')}
                                   keyboardType="numeric"
                                   placeholder="0"
                                   placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1248,33 +1478,186 @@ export default function LanSessionScreen() {
     if (!activeSession || activeSession.role !== 'player' || !activeSession.linked_character_id) return null;
 
     return (
-      <View style={styles.toolsBox}>
-        <Text style={styles.playersTitle}>Solicitar ao mestre</Text>
-        <View style={styles.compactInputRow}>
-          <TextInput
-            style={[styles.input, styles.compactInput]}
-            value={playerRequestAmount}
-            onChangeText={value => setPlayerRequestAmount(onlyNumberText(value))}
-            keyboardType="numeric"
-            placeholder="Valor"
-            placeholderTextColor="rgba(255,255,255,0.35)"
-            selectTextOnFocus
-            textAlign="center"
-          />
-          <TouchableOpacity style={styles.secondaryButton} onPress={() => handlePlayerRequest('PLAYER_REQUEST_HP')}>
-            <Ionicons name="heart-outline" size={18} color="#00bfff" />
-            <Text style={styles.secondaryButtonText}>PV</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryButton} onPress={() => handlePlayerRequest('PLAYER_REQUEST_XP')}>
-            <Ionicons name="sparkles-outline" size={18} color="#00bfff" />
-            <Text style={styles.secondaryButtonText}>XP</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryButton} onPress={() => handlePlayerRequest('PLAYER_REQUEST_COINS')}>
-            <Ionicons name="cash-outline" size={18} color="#00bfff" />
-            <Text style={styles.secondaryButtonText}>Moedas</Text>
-          </TouchableOpacity>
+      <>
+        {pendingTradeOffers.length > 0 && (
+          <View style={styles.pendingRequestsBox}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.playersTitle}>Trocas pendentes</Text>
+              <Text style={styles.pendingCount}>{pendingTradeOffers.length}</Text>
+            </View>
+            {pendingTradeOffers.map(event => {
+              const payload = (event.payload || {}) as any;
+              const itemName = payload.itemName || payload.item?.name || 'item';
+              const qty = Math.max(1, numericValue(String(payload.quantity || 1), 1));
+              return (
+                <View key={event.commandId || event.eventId} style={styles.pendingRequestCard}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.pendingRequestTitle}>{event.actorName || 'Jogador'}</Text>
+                    <Text style={styles.pendingRequestText}>
+                      Ofereceu {qty}x {itemName}. Voce pode aceitar direto, enviar item/moedas em troca, ou recusar.
+                    </Text>
+                  </View>
+                  <View style={styles.pendingRequestActions}>
+                    <TouchableOpacity style={styles.approveRequestButton} onPress={() => openTradeModal(event)}>
+                      <Ionicons name="swap-horizontal" size={16} color="#02112b" />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.denyRequestButton} onPress={() => handleDeclineTrade(event)}>
+                      <Ionicons name="close" size={16} color="#ff6666" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
+
+        <View style={styles.toolsBox}>
+          <Text style={styles.playersTitle}>Solicitar ao mestre</Text>
+          <View style={styles.compactInputRow}>
+            <TextInput
+              style={[styles.input, styles.compactInput]}
+              value={playerRequestAmount}
+              onChangeText={value => setPlayerRequestAmount(onlyNumberText(value))}
+              onFocus={() => playerRequestAmount === '1' && setPlayerRequestAmount('')}
+              keyboardType="numeric"
+              placeholder="Valor"
+              placeholderTextColor="rgba(255,255,255,0.35)"
+              selectTextOnFocus
+              textAlign="center"
+            />
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => handlePlayerRequest('PLAYER_REQUEST_HP')}>
+              <Ionicons name="heart-outline" size={18} color="#00bfff" />
+              <Text style={styles.secondaryButtonText}>PV</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => handlePlayerRequest('PLAYER_REQUEST_XP')}>
+              <Ionicons name="sparkles-outline" size={18} color="#00bfff" />
+              <Text style={styles.secondaryButtonText}>XP</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => handlePlayerRequest('PLAYER_REQUEST_COINS')}>
+              <Ionicons name="cash-outline" size={18} color="#00bfff" />
+              <Text style={styles.secondaryButtonText}>Moedas</Text>
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
+      </>
+    );
+  };
+
+  const renderTradeModal = () => {
+    if (!tradeModal) return null;
+    const payload = (tradeModal.payload || {}) as any;
+    const offeredItemName = payload.itemName || payload.item?.name || 'item';
+    const offeredQty = Math.max(1, numericValue(String(payload.quantity || 1), 1));
+    const selectedItem = tradeCounterItemIndex !== null ? tradeCounterItems[tradeCounterItemIndex] : null;
+    const selectedMaxQty = Math.max(1, Number(selectedItem?.qty || 1));
+
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={() => setTradeModal(null)}>
+        <Pressable style={styles.modalOverlay} onPress={() => setTradeModal(null)}>
+          <Pressable style={styles.masterModalContent} onPress={event => event.stopPropagation()}>
+            <View style={styles.masterModalHeader}>
+              <Text style={styles.masterModalTitle}>Responder troca</Text>
+              <TouchableOpacity style={styles.modalIconButton} onPress={() => setTradeModal(null)}>
+                <Ionicons name="close" size={20} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <Text style={styles.modalHint}>
+                {tradeModal.actorName || 'Jogador'} ofereceu {offeredQty}x {offeredItemName}.
+              </Text>
+
+              <View style={styles.tradeBoard}>
+                <View style={styles.tradeSidePanel}>
+                  <Text style={styles.tradeSideLabel}>RECEBER</Text>
+                  <View style={styles.tradeSlotFilled}>
+                    <Ionicons name="cube-outline" size={18} color="#00fa9a" />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.tradeItemName}>{offeredItemName}</Text>
+                      <Text style={styles.tradeItemQty}>x{offeredQty}</Text>
+                    </View>
+                  </View>
+                </View>
+
+                <View style={styles.tradeSidePanel}>
+                  <Text style={styles.tradeSideLabel}>ENVIAR</Text>
+                  <TouchableOpacity
+                    style={[styles.tradeItemRow, tradeCounterItemIndex === null && styles.tradeItemRowActive]}
+                    onPress={() => setTradeCounterItemIndex(null)}
+                  >
+                    <Text style={styles.tradeItemName}>Nada</Text>
+                    {tradeCounterItemIndex === null && <Ionicons name="checkmark-circle" size={18} color="#00fa9a" />}
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              <Text style={styles.modalFieldLabel}>SUA MOCHILA</Text>
+              <View style={styles.tradeItemList}>
+                {tradeCounterItems.length === 0 ? (
+                  <Text style={styles.emptyText}>Nenhum item disponivel.</Text>
+                ) : (
+                  tradeCounterItems.map((item, index) => (
+                    <TouchableOpacity
+                      key={`${item?.name || 'item'}-${index}`}
+                      style={[styles.tradeItemRow, tradeCounterItemIndex === index && styles.tradeItemRowActive]}
+                      onPress={() => {
+                        setTradeCounterItemIndex(index);
+                        setTradeCounterQty('1');
+                      }}
+                    >
+                      <Text style={styles.tradeItemName}>{item?.name || 'Item'}</Text>
+                      <Text style={styles.tradeItemQty}>x{Number(item?.qty || 1)}</Text>
+                    </TouchableOpacity>
+                  ))
+                )}
+              </View>
+
+              {selectedItem && (
+                <>
+                  <Text style={styles.modalFieldLabel}>QUANTIDADE</Text>
+                  <TextInput
+                    style={[styles.input, styles.modalNumberInput]}
+                    value={tradeCounterQty}
+                    onChangeText={value => setTradeCounterQty(onlyNumberText(value))}
+                    onFocus={() => tradeCounterQty === '1' && setTradeCounterQty('')}
+                    keyboardType="numeric"
+                    placeholder={`1 a ${selectedMaxQty}`}
+                    placeholderTextColor="rgba(255,255,255,0.35)"
+                    selectTextOnFocus
+                  />
+                </>
+              )}
+
+              <Text style={styles.modalFieldLabel}>MOEDAS EM TROCA</Text>
+              <View style={styles.coinInputGrid}>
+                {(['gp', 'sp', 'cp'] as const).map(type => (
+                  <View key={type} style={styles.coinInputBox}>
+                    <Text style={styles.coinMiniLabel}>{type.toUpperCase()}</Text>
+                    <TextInput
+                      style={[styles.input, styles.coinInput]}
+                      value={tradeCoins[type]}
+                      onChangeText={value => setTradeCoins(prev => ({ ...prev, [type]: onlyNumberText(value) }))}
+                      keyboardType="numeric"
+                      placeholder="0"
+                      placeholderTextColor="rgba(255,255,255,0.35)"
+                      selectTextOnFocus
+                    />
+                  </View>
+                ))}
+              </View>
+
+              <TouchableOpacity style={styles.primaryWideButton} onPress={handleAcceptTrade}>
+                <Ionicons name="checkmark-circle-outline" size={18} color="#02112b" />
+                <Text style={styles.primaryWideButtonText}>Aceitar troca</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.dangerWideButton} onPress={() => handleDeclineTrade(tradeModal)}>
+                <Ionicons name="close-circle-outline" size={18} color="#ff6666" />
+                <Text style={styles.dangerButtonText}>Recusar</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
     );
   };
 
@@ -1285,7 +1668,7 @@ export default function LanSessionScreen() {
     const snapshot = hasPlayer ? playerSnapshot(player) : null;
     const buff = hasPlayer ? getCardBuff(player) : null;
     const tempHp = hasPlayer ? getCardTempHp(player) : null;
-    const amountValue = hasPlayer ? getCardAmount(player) : '0';
+    const amountValue = hasPlayer ? getCardAmount(player) : '';
     const itemSearch = hasPlayer ? cardItemSearch[playerActionKey(player)] || '' : '';
     const itemMatches = itemCatalog
       .filter(item => item.name.toLowerCase().includes(itemSearch.toLowerCase()))
@@ -1323,6 +1706,7 @@ export default function LanSessionScreen() {
                   style={[styles.input, styles.fullInput]}
                   value={buff.amount}
                   onChangeText={value => setCardBuffValue(player, { amount: onlyNumberText(value) })}
+                  onFocus={() => buff.amount === '1' && setCardBuffValue(player, { amount: '' })}
                   keyboardType="numeric"
                   placeholder="+0"
                   placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1351,6 +1735,7 @@ export default function LanSessionScreen() {
                         style={[styles.input, styles.fullInput]}
                         value={buff.durationValue}
                         onChangeText={value => setCardBuffValue(player, { durationValue: onlyNumberText(value) })}
+                        onFocus={() => buff.durationValue === '1' && setCardBuffValue(player, { durationValue: '' })}
                         keyboardType="numeric"
                         placeholder="Duracao"
                         placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1372,11 +1757,11 @@ export default function LanSessionScreen() {
                 <View style={styles.modalInputGrid}>
                   <View style={styles.modalInputBox}>
                     <Text style={styles.modalFieldLabel}>PV temporario</Text>
-                    <TextInput style={[styles.input, styles.modalNumberInput]} value={tempHp.amount} onChangeText={value => setCardTempHpValue(player, { amount: onlyNumberText(value) })} keyboardType="numeric" placeholder="PV" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus textAlign="center" />
+                    <TextInput style={[styles.input, styles.modalNumberInput]} value={tempHp.amount} onChangeText={value => setCardTempHpValue(player, { amount: onlyNumberText(value) })} onFocus={() => tempHp.amount === '1' && setCardTempHpValue(player, { amount: '' })} keyboardType="numeric" placeholder="PV" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus textAlign="center" />
                   </View>
                   <View style={styles.modalInputBox}>
                     <Text style={styles.modalFieldLabel}>Quantidade</Text>
-                    <TextInput style={[styles.input, styles.modalNumberInput]} value={tempHp.durationValue} onChangeText={value => setCardTempHpValue(player, { durationValue: onlyNumberText(value) })} keyboardType="numeric" placeholder="Dur." placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus textAlign="center" />
+                    <TextInput style={[styles.input, styles.modalNumberInput]} value={tempHp.durationValue} onChangeText={value => setCardTempHpValue(player, { durationValue: onlyNumberText(value) })} onFocus={() => tempHp.durationValue === '1' && setCardTempHpValue(player, { durationValue: '' })} keyboardType="numeric" placeholder="Dur." placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus textAlign="center" />
                   </View>
                 </View>
                 <Text style={styles.modalFieldLabel}>Tipo de duracao</Text>
@@ -1398,7 +1783,7 @@ export default function LanSessionScreen() {
               <View>
                 <Text style={styles.modalHint}>XP atual: {snapshot?.xp || 0}</Text>
                 <Text style={styles.modalFieldLabel}>XP a adicionar</Text>
-                <TextInput style={[styles.input, styles.fullInput]} value={amountValue} onChangeText={value => setCardAmount(player, value)} keyboardType="numeric" placeholder="XP" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus />
+                <TextInput style={[styles.input, styles.fullInput]} value={amountValue} onChangeText={value => setCardAmount(player, value)} onFocus={() => amountValue === '1' && setCardAmount(player, '')} keyboardType="numeric" placeholder="XP" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus />
                 <TouchableOpacity style={styles.secondaryWideButton} onPress={() => handleMasterXpForPlayer(player)}>
                   <Ionicons name="sparkles-outline" size={18} color="#00bfff" />
                   <Text style={styles.secondaryButtonText}>Adicionar XP</Text>
@@ -1409,7 +1794,7 @@ export default function LanSessionScreen() {
             {masterModal.kind === 'item' && hasPlayer && (
               <ScrollView showsVerticalScrollIndicator={false}>
                 <Text style={styles.modalFieldLabel}>Quantidade</Text>
-                <TextInput style={[styles.input, styles.fullInput]} value={amountValue} onChangeText={value => setCardAmount(player, value)} keyboardType="numeric" placeholder="1" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus />
+                <TextInput style={[styles.input, styles.fullInput]} value={amountValue} onChangeText={value => setCardAmount(player, value)} onFocus={() => amountValue === '1' && setCardAmount(player, '')} keyboardType="numeric" placeholder="1" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus />
                 <Text style={styles.modalFieldLabel}>Buscar item</Text>
                 <TextInput style={[styles.input, styles.fullInput]} value={itemSearch} onChangeText={value => setCardItemSearch(prev => ({ ...prev, [playerActionKey(player)]: value }))} placeholder="Buscar item" placeholderTextColor="rgba(255,255,255,0.35)" />
                 <View style={styles.itemSendList}>
@@ -1548,7 +1933,7 @@ export default function LanSessionScreen() {
               <View>
                 <Text style={styles.modalHint}>Turno {campaignTurn} / {Math.floor(campaignMinutes / 60)}h {campaignMinutes % 60}min</Text>
                 <Text style={styles.modalFieldLabel}>Quantidade</Text>
-                <TextInput style={[styles.input, styles.fullInput]} value={timeAmount} onChangeText={value => setTimeAmount(onlyNumberText(value))} keyboardType="numeric" placeholder="Quantidade" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus />
+                <TextInput style={[styles.input, styles.fullInput]} value={timeAmount} onChangeText={value => setTimeAmount(onlyNumberText(value))} onFocus={() => timeAmount === '10' && setTimeAmount('')} keyboardType="numeric" placeholder="Quantidade" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus />
                 <Text style={styles.modalFieldLabel}>Tipo de passagem</Text>
                 <View style={styles.durationChipWrap}>
                   {['turn', 'minute', 'hour', 'short_rest', 'long_rest'].map(unit => (
@@ -1603,7 +1988,7 @@ export default function LanSessionScreen() {
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.secondaryButton, history.length < 20 && styles.disabledButton]}
-            disabled={history.length < 20}
+            disabled={history.length < 50}
             onPress={() => loadHistory(historyPage + 1)}
           >
             <Text style={styles.secondaryButtonText}>Próxima</Text>
@@ -1626,7 +2011,7 @@ export default function LanSessionScreen() {
           </View>
           <View style={[styles.statusBadge, isTransportReady && styles.statusBadgeReady]}>
             <Text style={[styles.statusBadgeText, isTransportReady && styles.statusBadgeTextReady]}>
-              {isTransportReady ? 'TCP ON' : 'TCP OFF'}
+              {connectionStatus === 'syncing' ? 'SYNC' : connectionStatus === 'reconnecting' ? 'RECONECTANDO' : isTransportReady ? 'LAN ON' : 'LAN OFF'}
             </Text>
           </View>
         </View>
@@ -1639,7 +2024,7 @@ export default function LanSessionScreen() {
             <View style={{ flex: 1 }}>
               <Text style={styles.codeLabel}>CÓDIGO DA SESSÃO</Text>
               <Text style={styles.codeText} selectable>
-                {activeSession.session_code}
+                {activeSession.id}
               </Text>
               <Text style={styles.networkText}>
                 {activeSession.host_ip}:{activeSession.port}
@@ -1712,6 +2097,42 @@ export default function LanSessionScreen() {
         <Ionicons name="chevron-forward" size={22} color="rgba(255,255,255,0.55)" />
       </TouchableOpacity>
 
+      {savedSessions.length > 0 && (
+        <View style={styles.savedSessionsBox}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.playersTitle}>Mesas salvas</Text>
+            <TouchableOpacity onPress={refreshSavedSessions}>
+              <Text style={styles.refreshText}>Atualizar</Text>
+            </TouchableOpacity>
+          </View>
+          {savedSessions.map(session => {
+            const color = sessionStatusColor(session);
+            const isCurrent = activeSession?.id === session.id;
+            const canResume = !isCurrent || !isTransportReady;
+            return (
+              <View key={session.id} style={styles.savedSessionRow}>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <View style={styles.savedSessionTitleRow}>
+                    <Text style={styles.savedSessionTitle} numberOfLines={1}>{session.name || `Mesa ${session.id}`}</Text>
+                    <Text style={[styles.savedSessionBadge, { color, borderColor: color }]}>{sessionStatusLabel(session)}</Text>
+                  </View>
+                  <Text style={styles.savedSessionSub} numberOfLines={1}>
+                    {session.role === 'master' ? 'Mestre' : 'Jogador'} / {session.id}{session.linked_character_id ? ` / Ficha #${session.linked_character_id}` : ''}
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={[styles.resumeSessionButton, !canResume && styles.disabledButton]}
+                  disabled={!canResume}
+                  onPress={() => handleResumeSavedSession(session)}
+                >
+                  <Ionicons name="play-outline" size={16} color="#02112b" />
+                </TouchableOpacity>
+              </View>
+            );
+          })}
+        </View>
+      )}
+
       <TouchableOpacity style={styles.adminCard} activeOpacity={0.86} onPress={() => navigateOnce('/tracer')}>
         <View style={styles.adminIconBoxYellow}>
           <Ionicons name="bug-outline" size={26} color="#ffd166" />
@@ -1746,10 +2167,11 @@ export default function LanSessionScreen() {
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
           {renderActiveSession()}
-          {(!activeSession || activeSession.status === 'paused') && renderAdminMenu()}
+          {renderAdminMenu()}
         </ScrollView>
       </KeyboardAvoidingView>
       {renderMasterModal()}
+      {renderTradeModal()}
     </LinearGradient>
   );
 }
@@ -1814,6 +2236,28 @@ const styles = StyleSheet.create({
   adminCardTitle: { color: '#fff', fontSize: 15, fontWeight: 'bold', marginBottom: 4 },
   adminCardSub: { color: 'rgba(255,255,255,0.5)', fontSize: 12, lineHeight: 17 },
   adminWarning: { color: '#ffd166', fontSize: 12, lineHeight: 18, marginTop: 2 },
+  savedSessionsBox: {
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 12,
+    backgroundColor: 'rgba(0,0,0,0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  savedSessionRow: {
+    minHeight: 62,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  savedSessionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  savedSessionTitle: { flex: 1, color: '#fff', fontSize: 14, fontWeight: 'bold' },
+  savedSessionBadge: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 3, fontSize: 9, fontWeight: 'bold' },
+  savedSessionSub: { color: 'rgba(255,255,255,0.48)', fontSize: 11, marginTop: 4 },
+  resumeSessionButton: { width: 38, height: 38, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: '#00fa9a' },
   activePanel: {
     backgroundColor: 'rgba(0, 250, 154, 0.08)',
     borderWidth: 1,
@@ -1837,7 +2281,7 @@ const styles = StyleSheet.create({
   activeHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
   activeEyebrow: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold', letterSpacing: 1 },
   activeTitle: { color: '#fff', fontSize: 20, fontWeight: 'bold', marginTop: 3 },
-  statusBadge: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, backgroundColor: 'rgba(255,100,100,0.12)' },
+  statusBadge: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, backgroundColor: 'rgba(255,100,100,0.12)', flexShrink: 0 },
   statusBadgeReady: { backgroundColor: 'rgba(0,250,154,0.16)' },
   statusBadgeText: { color: '#ff6666', fontSize: 10, fontWeight: 'bold' },
   statusBadgeTextReady: { color: '#00fa9a' },
@@ -1867,15 +2311,16 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(0,191,255,0.18)',
   },
   sessionBoardHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 },
-  sessionBoardTitle: { color: '#00bfff', fontSize: 18, fontWeight: 'bold', letterSpacing: 1 },
+  sessionBoardTitleBlock: { flex: 1, minWidth: 0 },
+  sessionBoardTitle: { color: '#00bfff', fontSize: 18, fontWeight: 'bold', letterSpacing: 0 },
   sessionOverviewGrid: { flexDirection: 'row', gap: 8 },
   sessionMetricBox: { flex: 1, minHeight: 72, borderRadius: 12, padding: 10, backgroundColor: 'rgba(0,0,0,0.25)', justifyContent: 'center' },
   sessionMetricValue: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginTop: 5 },
   sessionActionGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginTop: 4 },
   sessionActionButton: {
     minHeight: 48,
-    width: '31.5%',
-    minWidth: 118,
+    width: '47.5%',
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1911,9 +2356,9 @@ const styles = StyleSheet.create({
   playerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 7 },
   playerName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   playerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },
-  compactInputRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 },
-  compactInput: { width: 86, paddingVertical: 10, textAlign: 'center' },
-  coinInput: { width: '100%', minWidth: 0, paddingVertical: 10, textAlign: 'center' },
+  compactInputRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 10 },
+  compactInput: { width: 86, minHeight: 44, paddingVertical: 10, textAlign: 'center' },
+  coinInput: { width: '100%', minWidth: 0, minHeight: 44, paddingVertical: 10, textAlign: 'center' },
   secondaryWideButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1939,6 +2384,20 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   primaryWideButtonText: { color: '#02112b', fontSize: 13, fontWeight: 'bold' },
+  dangerWideButton: {
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: 'rgba(255,100,100,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,100,100,0.25)',
+    marginTop: 10,
+  },
   coinApplyBox: {
     marginTop: 10,
     borderRadius: 12,
@@ -1951,6 +2410,45 @@ const styles = StyleSheet.create({
   coinInputGrid: { flexDirection: 'row', gap: 8 },
   coinInputBox: { flex: 1, minWidth: 0 },
   coinMiniLabel: { color: 'rgba(255,255,255,0.48)', fontSize: 10, fontWeight: 'bold', marginBottom: 5, textAlign: 'center' },
+  tradeItemList: { gap: 8, marginBottom: 10 },
+  tradeBoard: { flexDirection: 'row', gap: 10, marginBottom: 12 },
+  tradeSidePanel: {
+    flex: 1,
+    minWidth: 0,
+    gap: 8,
+    borderRadius: 14,
+    padding: 10,
+    backgroundColor: 'rgba(0,0,0,0.22)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  tradeSideLabel: { color: 'rgba(255,255,255,0.48)', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, textAlign: 'center' },
+  tradeSlotFilled: {
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0,250,154,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,250,154,0.32)',
+  },
+  tradeItemRow: {
+    minHeight: 46,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.09)',
+  },
+  tradeItemRowActive: { backgroundColor: 'rgba(0,250,154,0.12)', borderColor: 'rgba(0,250,154,0.35)' },
+  tradeItemName: { flex: 1, color: '#fff', fontSize: 13, fontWeight: 'bold' },
+  tradeItemQty: { color: 'rgba(255,255,255,0.55)', fontSize: 12, fontWeight: 'bold' },
   historyRow: {
     paddingVertical: 9,
     borderBottomWidth: 1,
@@ -2104,9 +2602,10 @@ const styles = StyleSheet.create({
   equippedChipText: { color: '#dfffe9', fontSize: 11, fontWeight: 'bold' },
   mutedSmallText: { color: 'rgba(255,255,255,0.42)', fontSize: 11, lineHeight: 16 },
   bagPreviewText: { color: 'rgba(255,255,255,0.6)', fontSize: 11, lineHeight: 17 },
-  masterCardActionGrid: { flexDirection: 'row', gap: 8, marginTop: 12 },
+  masterCardActionGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
   masterCardActionButton: {
     flex: 1,
+    minWidth: '47%',
     minHeight: 42,
     flexDirection: 'row',
     alignItems: 'center',
@@ -2275,6 +2774,8 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: '#02112b', fontWeight: 'bold', fontSize: 15, letterSpacing: 1 },
   secondaryButton: {
     flex: 1,
+    minWidth: 96,
+    minHeight: 44,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',

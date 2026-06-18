@@ -1,42 +1,72 @@
-import { LAN_DEFAULT_PORT, LanMessage, ParsedSessionCode } from '../types/lan';
+import { LAN_DEFAULT_PORT, ParsedSessionCode } from '../types/lan';
 
 const CODE_PREFIX = 'DNDLAN';
-const ID_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const SHORT_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
-export function makeSessionId(length = 8) {
-  let result = '';
-  for (let index = 0; index < length; index++) {
-    result += ID_ALPHABET[Math.floor(Math.random() * ID_ALPHABET.length)];
+function uniqueIps(values: Array<string | null | undefined>) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const ip = String(value || '').trim();
+    if (!ip || ip === '0.0.0.0' || seen.has(ip)) continue;
+    seen.add(ip);
+    result.push(ip);
   }
   return result;
 }
 
-export function buildSessionCode(sessionId: string, hostIp: string, port = LAN_DEFAULT_PORT) {
-  const ipPart = hostIp.replace(/\./g, '-');
-  return `${CODE_PREFIX}-${sessionId}-${ipPart}-${port}`;
+export function makeShortSessionCode() {
+  const nextPart = (length: number) => {
+    let result = '';
+    for (let index = 0; index < length; index += 1) {
+      result += SHORT_CODE_ALPHABET[Math.floor(Math.random() * SHORT_CODE_ALPHABET.length)];
+    }
+    return result;
+  };
+  return `${nextPart(4)}-${nextPart(4)}`;
+}
+
+export function buildSessionShareCode(sessionId: string, hostIp: string, port = LAN_DEFAULT_PORT, hostCandidates: string[] = []) {
+  const candidates = uniqueIps([hostIp, ...hostCandidates]);
+  return `${CODE_PREFIX}|${sessionId}|${hostIp}|${port}|${candidates.join(',')}`;
 }
 
 export function parseSessionCode(rawCode: string): ParsedSessionCode | null {
-  const trimmed = rawCode.trim();
+  const trimmed = rawCode.trim().toUpperCase();
   if (!trimmed) return null;
+
+  if (/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(trimmed)) {
+    return {
+      sessionId: trimmed,
+      hostIp: '',
+      hostCandidates: [],
+      port: LAN_DEFAULT_PORT,
+    };
+  }
 
   try {
     const parsed = JSON.parse(trimmed) as Partial<ParsedSessionCode>;
     if (parsed.sessionId && parsed.hostIp) {
+      const hostCandidates = Array.isArray(parsed.hostCandidates)
+        ? uniqueIps(parsed.hostCandidates.map(String))
+        : uniqueIps([String(parsed.hostIp)]);
       return {
         sessionId: String(parsed.sessionId).toUpperCase(),
         hostIp: String(parsed.hostIp),
+        hostCandidates,
         port: Number(parsed.port || LAN_DEFAULT_PORT),
       };
     }
   } catch {}
 
   if (trimmed.includes('|')) {
-    const [prefix, sessionId, hostIp, port] = trimmed.split('|');
+    const [prefix, sessionId, hostIp, port, candidates] = trimmed.split('|');
     if (prefix === CODE_PREFIX && sessionId && hostIp) {
+      const hostCandidates = uniqueIps([hostIp, ...(candidates ? candidates.split(',') : [])]);
       return {
         sessionId: sessionId.toUpperCase(),
         hostIp,
+        hostCandidates,
         port: Number(port || LAN_DEFAULT_PORT),
       };
     }
@@ -52,6 +82,7 @@ export function parseSessionCode(rawCode: string): ParsedSessionCode | null {
       return {
         sessionId,
         hostIp: ipSegments.join('.'),
+        hostCandidates: uniqueIps([ipSegments.join('.')]),
         port,
       };
     }
@@ -59,28 +90,3 @@ export function parseSessionCode(rawCode: string): ParsedSessionCode | null {
 
   return null;
 }
-
-export function encodeLanMessage(message: LanMessage) {
-  return `${JSON.stringify(message)}\n`;
-}
-
-export function readLanFrames(buffer: string, incoming: string) {
-  const combined = buffer + incoming;
-  const parts = combined.split('\n');
-  const nextBuffer = parts.pop() || '';
-  const messages: LanMessage[] = [];
-
-  for (const part of parts) {
-    const line = part.trim();
-    if (!line) continue;
-
-    try {
-      messages.push(JSON.parse(line) as LanMessage);
-    } catch {
-      messages.push({ type: 'ERROR', message: 'Mensagem LAN invalida.' });
-    }
-  }
-
-  return { messages, nextBuffer };
-}
-

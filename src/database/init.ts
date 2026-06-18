@@ -1,3 +1,4 @@
+import Constants from 'expo-constants';
 import { SQLiteDatabase } from 'expo-sqlite';
 import { seedRandomCreatorContent } from './randomContentSeed';
 
@@ -59,6 +60,32 @@ async function ensureTraceTriggers(db: SQLiteDatabase) {
       END;
     `);
   }
+}
+
+function getInstallTraceKey() {
+  const expoConfig = Constants.expoConfig as any;
+  const version = Constants.nativeApplicationVersion || expoConfig?.version || 'dev';
+  const build = Constants.nativeBuildVersion || expoConfig?.android?.versionCode || 'local';
+  return `${version}:${build}`;
+}
+
+async function resetTransientDebugStateOnBuildChange(db: SQLiteDatabase) {
+  const installKey = getInstallTraceKey();
+  const previous = await db.getFirstAsync<{ value?: string }>(
+    `SELECT value FROM app_meta WHERE key = 'install_trace_key' LIMIT 1`
+  );
+
+  if (previous?.value !== installKey) {
+    await db.execAsync(`
+      DELETE FROM app_trace_logs;
+    `);
+    await db.runAsync(
+      `INSERT OR REPLACE INTO app_meta (key, value, updated_at) VALUES ('install_trace_key', ?, CURRENT_TIMESTAMP)`,
+      [installKey]
+    );
+    return true;
+  }
+  return false;
 }
 
 async function seedEffectIfMissing(
@@ -548,6 +575,12 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_lan_event_log_event_id ON lan_event_log(event_id);
     CREATE INDEX IF NOT EXISTS idx_lan_event_log_session_seq ON lan_event_log(session_id, seq DESC);
     CREATE INDEX IF NOT EXISTS idx_app_trace_logs_created_at ON app_trace_logs(created_at DESC);
@@ -587,6 +620,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await ensureColumn(db, 'app_trace_logs', 'request_id', 'TEXT');
   await ensureColumn(db, 'app_trace_logs', 'duration_ms', 'INTEGER');
   await ensureColumn(db, 'app_trace_logs', 'metadata', 'TEXT');
+  const didResetTransientDebugState = await resetTransientDebugStateOnBuildChange(db);
   await ensureTraceTriggers(db);
 
   const checkDb = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM items');
@@ -1155,4 +1189,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await seedRandomCreatorContent(db);
   await seedConditionEffectCatalog(db);
   await seedStructuredBaseEffects(db);
+  if (didResetTransientDebugState) {
+    await db.runAsync(`DELETE FROM app_trace_logs`);
+  }
 }

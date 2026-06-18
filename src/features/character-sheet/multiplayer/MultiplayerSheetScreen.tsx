@@ -14,7 +14,7 @@ export default function MultiplayerSheetScreen({ characterId }: MultiplayerSheet
 
   const syncAdapter = useMemo(
     () => ({
-      enabled: Boolean(activeSession),
+      enabled: Boolean(activeSession && activeSession.status !== 'paused'),
       onCharacterChanged: broadcastCharacter,
     }),
     [activeSession, broadcastCharacter]

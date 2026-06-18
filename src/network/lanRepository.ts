@@ -28,6 +28,8 @@ export const CUSTOM_CONTENT_DEFINITIONS: {
   { type: 'Kit', tableName: 'starting_kits', titleField: 'name', subtitleFields: ['target_name', 'target_type'] },
 ];
 
+export const LAN_ALL_CUSTOM_CONTENT_KEY = '__LAN_ALL_CUSTOM_CONTENT__';
+
 const TABLE_COLUMNS: Record<LanContentTable, string[]> = {
   items: ['name', 'weight', 'damage', 'damage_type', 'category', 'is_consumable', 'properties', 'descricao', 'criador'],
   effects: [
@@ -194,14 +196,14 @@ export async function getLocalPlayerName(db: SQLiteDatabase) {
 export async function closeOpenLanSessions(db: SQLiteDatabase, role?: LanRole) {
   if (role) {
     await db.runAsync(
-      `UPDATE lan_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE role = ? AND status IN ('open', 'connected', 'paused')`,
+      `UPDATE lan_sessions SET status = 'inactive' WHERE role = ? AND status IN ('open', 'connected')`,
       [role]
     );
     return;
   }
 
   await db.runAsync(
-    `UPDATE lan_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE status IN ('open', 'connected', 'paused')`
+    `UPDATE lan_sessions SET status = 'inactive' WHERE status IN ('open', 'connected')`
   );
 }
 
@@ -251,9 +253,32 @@ export async function setLanSessionStatus(db: SQLiteDatabase, sessionId: string,
   );
 }
 
+export async function getLanSessions(db: SQLiteDatabase, includeClosed = false) {
+  return db.getAllAsync<LanSessionRecord>(
+    `SELECT * FROM lan_sessions
+     ${includeClosed ? '' : `WHERE status != 'closed'`}
+     ORDER BY
+       CASE status
+         WHEN 'open' THEN 0
+         WHEN 'connected' THEN 0
+         WHEN 'paused' THEN 1
+         WHEN 'inactive' THEN 2
+         ELSE 3
+       END,
+       COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC`
+  );
+}
+
+export async function getLanSessionById(db: SQLiteDatabase, sessionId: string) {
+  return db.getFirstAsync<LanSessionRecord>(
+    `SELECT * FROM lan_sessions WHERE id = ? LIMIT 1`,
+    [sessionId]
+  );
+}
+
 export async function getActiveLanSession(db: SQLiteDatabase) {
   return db.getFirstAsync<LanSessionRecord>(
-    `SELECT * FROM lan_sessions WHERE status IN ('open', 'connected', 'paused') ORDER BY opened_at DESC LIMIT 1`
+    `SELECT * FROM lan_sessions WHERE status IN ('open', 'connected', 'paused') ORDER BY COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC LIMIT 1`
   );
 }
 
@@ -307,16 +332,17 @@ export async function updateLanSessionState(
 
 export async function getNextLanEventSeq(db: SQLiteDatabase, sessionId: string) {
   await ensureLanSessionState(db, sessionId);
+  await db.runAsync(
+    `UPDATE lan_session_state
+     SET last_event_seq = IFNULL(last_event_seq, 0) + 1, updated_at = CURRENT_TIMESTAMP
+     WHERE session_id = ?`,
+    [sessionId]
+  );
   const row = await db.getFirstAsync<{ last_event_seq: number }>(
     `SELECT last_event_seq FROM lan_session_state WHERE session_id = ?`,
     [sessionId]
   );
-  const nextSeq = Number(row?.last_event_seq || 0) + 1;
-  await db.runAsync(`UPDATE lan_session_state SET last_event_seq = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?`, [
-    nextSeq,
-    sessionId,
-  ]);
-  return nextSeq;
+  return Number(row?.last_event_seq || 0);
 }
 
 export async function appendLanOfficialEvent(
@@ -387,6 +413,12 @@ export async function appendLanOfficialEvent(
 
 export async function saveLanOfficialEvent(db: SQLiteDatabase, event: LanOfficialEventMessage) {
   await ensureLanSessionState(db, event.sessionId);
+  const existing = await db.getFirstAsync<{ id: number }>(
+    `SELECT id FROM lan_event_log WHERE session_id = ? AND event_id = ? LIMIT 1`,
+    [event.sessionId, event.eventId]
+  );
+  if (existing?.id) return false;
+
   await db.runAsync(
     `INSERT OR IGNORE INTO lan_event_log (
       session_id, seq, event_id, command_id, event_type, actor_device_id, actor_name,
@@ -422,6 +454,34 @@ export async function saveLanOfficialEvent(db: SQLiteDatabase, event: LanOfficia
       event.sessionId,
     ]);
   }
+
+  return true;
+}
+
+export async function getLanEventByCommandId(db: SQLiteDatabase, sessionId: string, commandId?: string | null) {
+  if (!commandId) return null;
+  const row = await db.getFirstAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_event_log WHERE session_id = ? AND command_id = ? ORDER BY seq ASC, id ASC LIMIT 1`,
+    [sessionId, commandId]
+  );
+  return row ? rowToOfficialEvent(row) : null;
+}
+
+export async function getLanTradeResolutionEvent(db: SQLiteDatabase, sessionId: string, offerCommandId?: string | null) {
+  if (!offerCommandId) return null;
+  const rows = await db.getAllAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_event_log
+     WHERE session_id = ? AND event_type IN ('TRADE_ACCEPTED', 'TRADE_DECLINED')
+     ORDER BY seq ASC, id ASC`,
+    [sessionId]
+  );
+  for (const row of rows) {
+    const event = rowToOfficialEvent(row);
+    if (String((event.payload as any)?.offerCommandId || '') === offerCommandId) {
+      return event;
+    }
+  }
+  return null;
 }
 
 function rowToOfficialEvent(row: Record<string, unknown>): LanOfficialEventMessage {
@@ -504,6 +564,7 @@ export async function getSelectedCustomContentPayloads(
   selectedKeys: string[]
 ): Promise<LanCustomContentPayload[]> {
   const selected = new Set(selectedKeys);
+  const includeAll = selected.has(LAN_ALL_CUSTOM_CONTENT_KEY);
   const payloads: LanCustomContentPayload[] = [];
   const progressionSourceNames: string[] = [];
 
@@ -514,7 +575,7 @@ export async function getSelectedCustomContentPayloads(
 
     for (const row of rows) {
       const id = Number(row.id);
-      if (!selected.has(makeRefKey(definition.tableName, id))) continue;
+      if (!includeAll && !selected.has(makeRefKey(definition.tableName, id))) continue;
 
       const { id: _id, ...data } = row;
       payloads.push({

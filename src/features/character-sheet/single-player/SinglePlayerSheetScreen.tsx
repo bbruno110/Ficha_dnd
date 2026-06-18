@@ -335,6 +335,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   }
   const isPendingLevelUp = expectedLevel > character.level;
   const isLanPlayerControlledSheet = activeSession?.role === 'player' && Number(activeSession.linked_character_id || 0) === Number(character.id);
+  const isLanPausedReadOnly = isLanPlayerControlledSheet && activeSession?.status === 'paused';
   const isDeadInLan = isLanPlayerControlledSheet && displayHpCurrent <= 0;
 
   const parseLanSnapshot = (player: any) => {
@@ -360,6 +361,9 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const lanPlayersWithCharacters = players.filter((player: any) => player.character_id);
+  const lanTradeTargets = isLanPlayerControlledSheet
+    ? lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) !== Number(character.id))
+    : [];
   const lanPanelPlayers = isLanPlayerControlledSheet
     ? [
         ...lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) === Number(character.id)),
@@ -368,12 +372,75 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     : [];
 
   const requestMasterApproval = async (command: 'PLAYER_REQUEST_HP' | 'PLAYER_REQUEST_XP' | 'PLAYER_REQUEST_COINS' | 'PLAYER_REQUEST_ATTRIBUTE', payload: Record<string, unknown>, notice = 'Solicitacao enviada ao mestre.') => {
+    if (isLanPausedReadOnly) {
+      showCustomAlert('Mesa pausada', 'A ficha fica em modo de leitura ate o mestre retomar a sessao.');
+      return;
+    }
     await sendLanCommand(command, {
       characterName: character.name,
       targetCharacterId: character.id,
       ...payload,
     });
     showCustomAlert('Solicitacao enviada', notice);
+  };
+
+  const lanTargetName = (target: any) => target?.character_name || target?.player_name || 'Jogador';
+
+  const sendItemToLanPlayer = async (target: any, item: any, qty: number) => {
+    if (isLanPausedReadOnly) {
+      showCustomAlert('Mesa pausada', 'A ficha fica em modo de leitura ate o mestre retomar a sessao.');
+      return;
+    }
+    await sendLanCommand('PLAYER_ITEM_DONATE', {
+      sourceCharacterId: character.id,
+      sourceName: character.name,
+      itemName: item?.name || 'Item',
+      item,
+      quantity: qty,
+      targetDeviceId: target.device_id,
+      targetCharacterId: Number(target.character_id || 0),
+      targetName: lanTargetName(target),
+    });
+    showCustomAlert('Envio registrado', `Voce enviou ${qty}x ${item?.name || 'item'} para ${lanTargetName(target)}.`);
+  };
+
+  const offerTradeToLanPlayer = async (target: any, item: any, qty: number) => {
+    if (isLanPausedReadOnly) {
+      showCustomAlert('Mesa pausada', 'A ficha fica em modo de leitura ate o mestre retomar a sessao.');
+      return;
+    }
+    await sendLanCommand('PLAYER_TRADE_OFFER', {
+      sourceCharacterId: character.id,
+      sourceName: character.name,
+      itemName: item?.name || 'Item',
+      item,
+      quantity: qty,
+      targetDeviceId: target.device_id,
+      targetCharacterId: Number(target.character_id || 0),
+      targetName: lanTargetName(target),
+    });
+    showCustomAlert('Troca enviada', `${lanTargetName(target)} recebeu sua proposta de ${qty}x ${item?.name || 'item'}.`);
+  };
+
+  const showLanItemTargetPicker = (mode: 'send' | 'trade', item: any, qty: number) => {
+    if (!lanTradeTargets.length) {
+      showCustomAlert('Sem jogadores', 'Nao ha outro jogador com ficha vinculada nesta mesa.');
+      return;
+    }
+    showCustomAlert(
+      mode === 'send' ? 'Enviar para quem?' : 'Trocar com quem?',
+      `${qty}x ${item?.name || 'item'}`,
+      [
+        ...lanTradeTargets.slice(0, 5).map((target: any) => ({
+          text: lanTargetName(target),
+          color: '#00fa9a',
+          onPress: () => mode === 'send'
+            ? sendItemToLanPlayer(target, item, qty)
+            : offerTradeToLanPlayer(target, item, qty),
+        })),
+        { text: 'Cancelar', color: '#ff6666' },
+      ]
+    );
   };
 
   const checkProficiency = (idx: string, group: any[]) => group.includes(idx);
@@ -387,13 +454,19 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
   const updateDB = async (updates: Partial<any>) => {
     try {
+      if (isLanPausedReadOnly) {
+        showCustomAlert('Mesa pausada', 'A ficha fica em modo de leitura ate o mestre retomar a sessao.');
+        return;
+      }
       const entries = Object.entries(updates);
       const setString = entries.map(([key]) => `${key} = ?`).join(', ');
       const values = entries.map(([_, val]) => (typeof val === 'object' ? JSON.stringify(val) : val));
       await db.runAsync(`UPDATE characters SET ${setString} WHERE id = ?`, [...values, character.id]);
       setCharacter((prev: any) => ({ ...prev, ...updates }));
       if (syncAdapter?.enabled) {
-        await syncAdapter.onCharacterChanged(character.id, 'sheet-update');
+        await syncAdapter.onCharacterChanged(character.id, 'sheet-update').catch(error => {
+          console.warn('Ficha salva localmente, mas a sincronizacao LAN falhou:', error);
+        });
       }
     } catch (e) { console.error(e); }
   };
@@ -510,7 +583,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     const delta = nextValue - currentValue;
 
     if (isLanPlayerControlledSheet) {
-      if (delta !== 0) {
+      if (delta > 0) {
         await requestMasterApproval('PLAYER_REQUEST_COINS', {
           gp: activeCoinType === 'gp' ? delta : 0,
           sp: activeCoinType === 'sp' ? delta : 0,
@@ -518,6 +591,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           coinType: activeCoinType,
           amount: delta,
         }, `Alteracao de moedas (${activeCoinType.toUpperCase()} ${delta >= 0 ? '+' : ''}${delta}) foi solicitada ao mestre.`);
+      } else if (delta < 0) {
+        await updateDB({ [activeCoinType]: nextValue });
       }
       setCoinModalVisible(false);
       setInputValue('');
@@ -529,7 +604,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const updateCoins = async (type: 'gp' | 'sp' | 'cp', delta: number) => {
-    if (isLanPlayerControlledSheet) {
+    if (isLanPlayerControlledSheet && delta > 0) {
       await requestMasterApproval('PLAYER_REQUEST_COINS', {
         gp: type === 'gp' ? delta : 0,
         sp: type === 'sp' ? delta : 0,
@@ -539,17 +614,25 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       }, `Alteracao de moedas (${type.toUpperCase()} ${delta >= 0 ? '+' : ''}${delta}) foi solicitada ao mestre.`);
       return;
     }
-    updateDB({ [type]: Math.max(0, character[type] + delta) });
+    await updateDB({ [type]: Math.max(0, character[type] + delta) });
   };
 
   const executeCoinConversion = async (sourceAmount: number, targetAmount: number) => {
     if (isLanPlayerControlledSheet) {
-      await requestMasterApproval('PLAYER_REQUEST_COINS', {
-        gp: (convertFrom === 'gp' ? -sourceAmount : 0) + (convertTo === 'gp' ? targetAmount : 0),
-        sp: (convertFrom === 'sp' ? -sourceAmount : 0) + (convertTo === 'sp' ? targetAmount : 0),
-        cp: (convertFrom === 'cp' ? -sourceAmount : 0) + (convertTo === 'cp' ? targetAmount : 0),
-        conversion: { from: convertFrom, to: convertTo, sourceAmount, targetAmount },
-      }, 'Conversao de moedas solicitada ao mestre.');
+      if (Number(character[convertFrom] || 0) >= sourceAmount) {
+        await updateDB({
+          [convertFrom]: character[convertFrom] - sourceAmount,
+          [convertTo]: character[convertTo] + targetAmount
+        });
+        showCustomAlert("Cambio Realizado", `Voce converteu ${sourceAmount} ${COIN_NAMES[convertFrom]} em ${targetAmount} ${COIN_NAMES[convertTo]}.`);
+      } else {
+        await requestMasterApproval('PLAYER_REQUEST_COINS', {
+          gp: (convertFrom === 'gp' ? -sourceAmount : 0) + (convertTo === 'gp' ? targetAmount : 0),
+          sp: (convertFrom === 'sp' ? -sourceAmount : 0) + (convertTo === 'sp' ? targetAmount : 0),
+          cp: (convertFrom === 'cp' ? -sourceAmount : 0) + (convertTo === 'cp' ? targetAmount : 0),
+          conversion: { from: convertFrom, to: convertTo, sourceAmount, targetAmount },
+        }, 'Conversao de moedas solicitada ao mestre.');
+      }
       setConvertModalVisible(false);
       setConvertAmount('');
       return;
@@ -704,6 +787,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     const dbUpdates: any = {};
     const msgParts: string[] = [];
     const rolledById = new Map(rolledEffects.map(entry => [entry.effect.id, Math.max(0, parseInt(entry.rolledValue) || 0)]));
+    let workingDisplayHpCurrent = displayHpCurrent;
+    let workingTempHp = tempHpValue;
 
     for (const effect of effects) {
       const chanceText = effect.chance_percent < 100 ? ` (${effect.chance_percent}% de chance)` : '';
@@ -731,14 +816,26 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       if (effect.effect_kind === 'healing') {
         const totalHeal = effect.value_mode === 'dice' ? (rolledById.get(effect.id) || 0) * qty : Math.abs(fixedAmount(effect, qty));
         if (totalHeal > 0) {
-          dbUpdates.hp_current = Math.min(character.hp_max, character.hp_current + totalHeal);
+          workingDisplayHpCurrent = Math.min(displayHpMax, workingDisplayHpCurrent + totalHeal);
+          dbUpdates.hp_current = workingDisplayHpCurrent - hpBonusFromCon;
           msgParts.push(`Cura aplicada: +${totalHeal} PV.`);
         }
       }
 
       if (effect.effect_kind === 'damage') {
         const totalDamage = effect.value_mode === 'dice' ? (rolledById.get(effect.id) || 0) * qty : Math.abs(fixedAmount(effect, qty));
-        msgParts.push(`Dano informado: ${totalDamage} ${effect.effect_type}${chanceText}.`);
+        let remainingDamage = totalDamage;
+        if (workingTempHp > 0 && remainingDamage > 0) {
+          const absorbed = Math.min(workingTempHp, remainingDamage);
+          workingTempHp -= absorbed;
+          remainingDamage -= absorbed;
+        }
+        if (remainingDamage > 0) {
+          workingDisplayHpCurrent = Math.max(0, workingDisplayHpCurrent - remainingDamage);
+          dbUpdates.hp_current = workingDisplayHpCurrent - hpBonusFromCon;
+        }
+        dbUpdates.hp_temp = workingTempHp;
+        msgParts.push(`Dano aplicado: -${totalDamage} ${effect.effect_type}${chanceText}.`);
       }
 
       if (effect.effect_kind === 'condition') {
@@ -1401,13 +1498,20 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarBack} onPress={() => router.back()}><Text style={styles.topBarBackText}>{"<"}</Text></TouchableOpacity>
         <Text style={styles.topBarTitle}>{character.name}</Text>
-        {syncAdapter?.enabled && (
+        {(syncAdapter?.enabled || isLanPausedReadOnly) && (
           <TouchableOpacity style={styles.topBarLanBadge} onPress={onOpenSyncSession}>
-            <Ionicons name="wifi-outline" size={14} color="#00fa9a" />
-            <Text style={styles.topBarLanText}>LAN</Text>
+            <Ionicons name={isLanPausedReadOnly ? 'lock-closed-outline' : 'wifi-outline'} size={14} color="#00fa9a" />
+            <Text style={styles.topBarLanText}>{isLanPausedReadOnly ? 'PAUSADA' : 'LAN'}</Text>
           </TouchableOpacity>
         )}
       </View>
+
+      {isLanPausedReadOnly && (
+        <View style={styles.readOnlyBanner}>
+          <Ionicons name="lock-closed-outline" size={16} color="#ffd166" />
+          <Text style={styles.readOnlyBannerText}>Mesa pausada pelo mestre. Ficha em modo leitura.</Text>
+        </View>
+      )}
 
       <View>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabContainer}>
@@ -2025,6 +2129,30 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                     <Text style={styles.actionBtnThrowText}>Arremessar</Text>
                   </TouchableOpacity>
 
+                  {isLanPlayerControlledSheet && lanTradeTargets.length > 0 && (
+                    <>
+                      <TouchableOpacity style={styles.actionBtnSend} onPress={() => {
+                        const {item} = selectedBagItem;
+                        const qty = actionQty;
+                        setSelectedBagItem(null);
+                        showLanItemTargetPicker('send', item, qty);
+                      }}>
+                        <Ionicons name="arrow-redo-outline" size={20} color="#00bfff" />
+                        <Text style={styles.actionBtnSendText}>Enviar para jogador</Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity style={styles.actionBtnTrade} onPress={() => {
+                        const {item} = selectedBagItem;
+                        const qty = actionQty;
+                        setSelectedBagItem(null);
+                        showLanItemTargetPicker('trade', item, qty);
+                      }}>
+                        <Ionicons name="swap-horizontal" size={20} color="#ffd166" />
+                        <Text style={styles.actionBtnTradeText}>Propor troca</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+
                   <TouchableOpacity style={styles.actionBtnCancel} onPress={() => setSelectedBagItem(null)}>
                     <Text style={styles.actionBtnCancelText}>Voltar</Text>
                   </TouchableOpacity>
@@ -2176,6 +2304,8 @@ const styles = StyleSheet.create({
   topBarLanBadge: { position: 'absolute', right: 20, bottom: 14, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(0,250,154,0.12)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.35)', borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
   topBarLanText: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold' },
   topBarTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  readOnlyBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 9, paddingHorizontal: 14, backgroundColor: 'rgba(255,209,102,0.1)', borderBottomWidth: 1, borderBottomColor: 'rgba(255,209,102,0.22)' },
+  readOnlyBannerText: { color: '#ffd166', fontSize: 12, fontWeight: 'bold', textAlign: 'center' },
   
   tabContainer: { paddingHorizontal: 20, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' },
   tab: { paddingVertical: 12, paddingHorizontal: 15, alignItems: 'center', marginRight: 10 },
@@ -2338,6 +2468,10 @@ const styles = StyleSheet.create({
   actionBtnConsumeText: { color: '#00fa9a', fontWeight: 'bold', fontSize: 16 },
   actionBtnThrow: { flexDirection: 'row', backgroundColor: 'rgba(255,100,100,0.1)', paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,100,100,0.3)', gap: 10 },
   actionBtnThrowText: { color: '#ff6666', fontWeight: 'bold', fontSize: 16 },
+  actionBtnSend: { flexDirection: 'row', backgroundColor: 'rgba(0,191,255,0.1)', paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', gap: 10 },
+  actionBtnSendText: { color: '#00bfff', fontWeight: 'bold', fontSize: 16 },
+  actionBtnTrade: { flexDirection: 'row', backgroundColor: 'rgba(255,209,102,0.1)', paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,209,102,0.35)', gap: 10 },
+  actionBtnTradeText: { color: '#ffd166', fontWeight: 'bold', fontSize: 16 },
   actionBtnCancel: { paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   actionBtnCancelText: { color: 'rgba(255,255,255,0.5)', fontWeight: 'bold', fontSize: 14 },
 

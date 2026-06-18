@@ -839,12 +839,16 @@ export default function CreateCharacterScreen() {
       const newCharacterId = Number((result as any).lastInsertRowId || 0);
       if (activeSession?.role === 'player' && newCharacterId > 0) {
         await linkCharacterToActiveSession(newCharacterId);
-        await broadcastCharacter(newCharacterId, 'character-created');
+        await broadcastCharacter(newCharacterId, 'character-created').catch(error => {
+          console.warn('Ficha salva localmente, mas a sincronizacao LAN falhou:', error);
+        });
         router.replace(`/sheet?id=${newCharacterId}`);
       } else {
         router.back();
       }
-    } catch (error) {}
+    } catch (error) {
+      console.warn('Erro ao salvar ficha:', error);
+    }
   };
 
   // ================= RENDERIZAÇÕES =================
