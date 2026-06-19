@@ -12,6 +12,7 @@ import {
   appendLanOfficialEvent,
   getLanEventsSince,
   getLanEventByCommandId,
+  getLanTradeCounterEvent,
   getLanTradeResolutionEvent,
   getLanHistoryPage,
   getLanSessionById,
@@ -80,6 +81,7 @@ type LanSessionContextValue = {
   lastError: string | null;
   lastNotice: string | null;
   lanRevision: number;
+  localDeviceId: string;
   players: LanPlayerSummary[];
   refreshActiveSession: () => Promise<void>;
   refreshSavedSessions: () => Promise<void>;
@@ -180,6 +182,10 @@ function cloneTransferItem(item: Record<string, unknown>, quantity: number) {
   };
 }
 
+function normalizeItemName(value: unknown) {
+  return String(value || '').trim().toLowerCase();
+}
+
 function normalizeStats(value: unknown): Record<string, any> {
   const stats = parseJsonValue<Record<string, any>>(value, {});
   return {
@@ -212,6 +218,37 @@ function removeTimedEffect(statsValue: unknown, effectId: string, hpTemp = 0) {
 function clearTempHpEffects(statsValue: unknown) {
   const stats = normalizeStats(statsValue);
   stats.timed_effects = stats.timed_effects.filter((entry: any) => entry.kind !== 'temp_hp');
+  return stats;
+}
+
+function consumeTempHpEffects(statsValue: unknown, absorbedDamage: number) {
+  const stats = normalizeStats(statsValue);
+  let remainingDamage = Math.max(0, Number(absorbedDamage || 0));
+  if (remainingDamage <= 0) return stats;
+
+  const remainingEffects: any[] = [];
+  for (const effect of stats.timed_effects) {
+    if (effect?.kind !== 'temp_hp' || remainingDamage <= 0) {
+      remainingEffects.push(effect);
+      continue;
+    }
+
+    const effectAmount = Math.max(0, Number(effect.amount || 0));
+    if (effectAmount <= remainingDamage) {
+      remainingDamage -= effectAmount;
+      continue;
+    }
+
+    const nextAmount = effectAmount - remainingDamage;
+    remainingDamage = 0;
+    remainingEffects.push({
+      ...effect,
+      amount: nextAmount,
+      label: `PV temporario +${nextAmount}`,
+    });
+  }
+
+  stats.timed_effects = remainingEffects;
   return stats;
 }
 
@@ -291,16 +328,22 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastNotice, setLastNotice] = useState<string | null>(null);
   const [lanRevision, setLanRevision] = useState(0);
+  const [localDeviceId, setLocalDeviceId] = useState('');
   const [players, setPlayers] = useState<LanPlayerSummary[]>([]);
 
   const rpcServerRef = useRef<LanRpcServer | null>(null);
   const activeSessionRef = useRef<LanSessionRecord | null>(null);
   const closingSessionRef = useRef<LanSessionRecord | null>(null);
+  const closingSessionPendingDevicesRef = useRef<Record<string, Set<string>>>({});
+  const closingSessionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deviceIdRef = useRef<string>('');
   const customContentCacheRef = useRef<LanCustomContentMessage['records']>([]);
   const reconnectingRef = useRef(false);
   const suppressReconnectRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionGenerationRef = useRef(0);
+  const reconnectFailureCountRef = useRef<Record<string, number>>({});
+  const joinedCharacterEventsRef = useRef<Record<string, boolean>>({});
   const recoverLanSessionRef = useRef<((reason?: string) => Promise<void>) | null>(null);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -408,6 +451,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
   const deactivateCurrentSessionLocally = useCallback(async (reason = 'switch-session') => {
     const current = activeSessionRef.current;
+    sessionGenerationRef.current += 1;
     suppressReconnectRef.current = true;
     rpcServerRef.current?.close();
     rpcServerRef.current = null;
@@ -416,13 +460,22 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    if (closingSessionTimerRef.current) {
+      clearTimeout(closingSessionTimerRef.current);
+      closingSessionTimerRef.current = null;
+    }
+    closingSessionPendingDevicesRef.current = {};
+    closingSessionRef.current = null;
+    reconnectFailureCountRef.current = {};
+    joinedCharacterEventsRef.current = {};
     await LanForegroundService.stop().catch(() => undefined);
     setTransportReadyState(false);
     setLanConnectionStatus('disconnected');
     setPeerCount(0);
     setPlayers([]);
 
-    if (current && current.status !== 'closed' && current.status !== 'paused') {
+    const shouldInactivatePaused = reason === 'join-player-session' || reason === 'start-master-session' || reason === 'resume-other-session';
+    if (current && current.status !== 'closed' && (current.status !== 'paused' || shouldInactivatePaused)) {
       await setLanSessionStatus(db, current.id, 'inactive');
       await traceLan('FUNCTION', 'deactivateCurrentSessionLocally', 'inactive', 'Sessao LAN local ficou inativa para trocar/pausar conexao.', {
         reason,
@@ -439,6 +492,35 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     activeSessionRef.current = null;
     await refreshSavedSessions();
   }, [db, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]);
+
+  const finishClosedSessionHost = useCallback(
+    async (sessionId: string, reason = 'closed-delivered') => {
+      if (closingSessionRef.current?.id !== sessionId) return;
+      if (closingSessionTimerRef.current) {
+        clearTimeout(closingSessionTimerRef.current);
+        closingSessionTimerRef.current = null;
+      }
+      closingSessionPendingDevicesRef.current[sessionId]?.clear();
+      delete closingSessionPendingDevicesRef.current[sessionId];
+      joinedCharacterEventsRef.current = {};
+      rpcServerRef.current?.close();
+      rpcServerRef.current = null;
+      closingSessionRef.current = null;
+      await LanForegroundService.stop().catch(() => undefined);
+      setTransportReadyState(false);
+      setLanConnectionStatus('disconnected');
+      setPeerCount(0);
+      setPlayers([]);
+      setActiveSession(null);
+      activeSessionRef.current = null;
+      await refreshSavedSessions();
+      await traceLan('FUNCTION', 'finishClosedSessionHost', 'done', 'Host da sessao encerrada foi fechado apos entrega do encerramento.', {
+        sessionId,
+        reason,
+      }, 'info');
+    },
+    [refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
+  );
 
   const applyOfficialEventLocally = useCallback(
     async (event: LanOfficialEventMessage) => {
@@ -472,6 +554,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
 
       if (event.eventType === 'SESSION_CLOSED') {
+        sessionGenerationRef.current += 1;
         await setLanSessionStatus(db, event.sessionId, 'closed');
         await linkCharacterToSession(db, event.sessionId, null);
         rpcServerRef.current?.close();
@@ -919,9 +1002,34 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         targetState.cp += cp;
       };
 
+      const hydrateTransferItem = async (item: Record<string, unknown>, itemNameValue?: string) => {
+        const itemName = String(item.name || item.itemName || itemNameValue || 'Item');
+        const embeddedEffects = Array.isArray((item as any).effects)
+          ? (item as any).effects
+          : Array.isArray((item as any).structuredEffects)
+            ? (item as any).structuredEffects
+            : [];
+        if (embeddedEffects.length > 0) return { ...item, name: itemName, effects: embeddedEffects };
+
+        try {
+          const sourceId = Number(item.id || 0);
+          const rows = await db.getAllAsync<any>(
+            `SELECT * FROM effects
+             WHERE source_table = 'items'
+               AND ((? > 0 AND source_id = ?) OR LOWER(TRIM(source_name)) = ?)
+             ORDER BY sort_order ASC, id ASC`,
+            [sourceId, sourceId, normalizeItemName(itemName)]
+          );
+          return rows.length > 0 ? { ...item, name: itemName, effects: rows } : { ...item, name: itemName };
+        } catch {
+          return { ...item, name: itemName };
+        }
+      };
+
       if (command.command === 'PLAYER_ITEM_DONATE') {
         const item = (command.payload?.item || {}) as Record<string, unknown>;
         const itemName = String(item.name || command.payload?.itemName || 'Item');
+        const transferItem = await hydrateTransferItem(item, itemName);
         const quantity = Math.max(1, numberFromPayload(command.payload, 'quantity', 1));
         const sourceCharacterId = Number(command.characterId || command.payload?.sourceCharacterId || 0);
         const targetCharacterId = Number(command.payload?.targetCharacterId || 0);
@@ -934,7 +1042,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
 
         try {
-          moveItemBetweenStates(sourceState, targetState, { ...item, name: itemName }, quantity);
+          moveItemBetweenStates(sourceState, targetState, transferItem, quantity);
         } catch (error) {
           await rejectCommand(session.id, command, error instanceof Error ? error.message : String(error), peerId);
           return;
@@ -953,7 +1061,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           description: `${sourceState.name} enviou ${quantity}x ${itemName} para ${targetState.name}.`,
           payload: {
             mode: 'send',
-            item: { ...item, name: itemName },
+            item: transferItem,
             quantity,
             sourceDeviceId: command.deviceId,
             sourceCharacterId,
@@ -969,6 +1077,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (command.command === 'PLAYER_TRADE_OFFER') {
         const item = (command.payload?.item || {}) as Record<string, unknown>;
         const itemName = String(item.name || command.payload?.itemName || 'Item');
+        const transferItem = await hydrateTransferItem(item, itemName);
         const quantity = Math.max(1, numberFromPayload(command.payload, 'quantity', 1));
         const sourceCharacterId = Number(command.characterId || command.payload?.sourceCharacterId || 0);
         const targetCharacterId = Number(command.payload?.targetCharacterId || 0);
@@ -992,7 +1101,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           description: `${sourceState.name} propos trocar ${quantity}x ${itemName} com ${targetState.name}.`,
           payload: {
             offerCommandId: command.commandId,
-            item: { ...item, name: itemName },
+            item: transferItem,
             itemName,
             quantity,
             sourceDeviceId: command.deviceId,
@@ -1018,23 +1127,127 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           return;
         }
         const offerEvent = await getLanEventByCommandId(db, session.id, offerCommandId);
+        const offerPayload = (offerEvent?.payload || {}) as any;
+        const declinedBySource = command.deviceId && offerPayload.sourceDeviceId === command.deviceId;
+        const otherDeviceId = declinedBySource ? offerPayload.targetDeviceId : offerPayload.sourceDeviceId;
+        const otherCharacterId = declinedBySource ? offerPayload.targetCharacterId : offerPayload.sourceCharacterId;
+        const otherName = declinedBySource ? offerPayload.targetName : offerPayload.sourceName;
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'TRADE_DECLINED',
           commandId: command.commandId,
           actorDeviceId: command.deviceId,
           actorName: command.actorName || 'Jogador',
-          targetDeviceId: offerEvent?.actorDeviceId || null,
-          targetCharacterId: offerEvent?.targetCharacterId || null,
-          targetName: offerEvent?.actorName || null,
+          targetDeviceId: otherDeviceId || offerEvent?.actorDeviceId || null,
+          targetCharacterId: Number(otherCharacterId || 0) || null,
+          targetName: otherName || offerEvent?.actorName || null,
           description: `${command.actorName || 'Jogador'} recusou a proposta de troca.`,
           payload: { offerCommandId },
         });
         return;
       }
 
-      if (command.command === 'PLAYER_TRADE_ACCEPT') {
+      if (command.command === 'PLAYER_TRADE_COUNTER' || command.command === 'PLAYER_TRADE_ACCEPT') {
         const offerCommandId = String(command.payload?.offerCommandId || '');
+        const existingResolution = await getLanTradeResolutionEvent(db, session.id, offerCommandId);
+        if (existingResolution) {
+          await traceLan('LAN_COMMAND', 'handleAuthoritativeCommand', 'trade_resolution_ignored', `Proposta ${offerCommandId} ja foi resolvida.`, {
+            commandId: command.commandId,
+            existingEventId: existingResolution.eventId,
+            existingEventType: existingResolution.eventType,
+          });
+          return;
+        }
+        const existingCounter = await getLanTradeCounterEvent(db, session.id, offerCommandId);
+        if (existingCounter) {
+          await traceLan('LAN_COMMAND', 'handleAuthoritativeCommand', 'trade_counter_ignored', `Proposta ${offerCommandId} ja possui contraproposta.`, {
+            commandId: command.commandId,
+            existingEventId: existingCounter.eventId,
+          });
+          return;
+        }
+        const offerEvent = await getLanEventByCommandId(db, session.id, offerCommandId);
+        if (!offerEvent || offerEvent.eventType !== 'TRADE_OFFERED') {
+          await rejectCommand(session.id, command, 'Proposta de troca nao encontrada.', peerId);
+          return;
+        }
+
+        const offerPayload = (offerEvent.payload || {}) as any;
+        if (offerEvent.targetDeviceId && offerEvent.targetDeviceId !== command.deviceId) {
+          await rejectCommand(session.id, command, 'Apenas o jogador alvo pode responder esta troca.', peerId);
+          return;
+        }
+
+        const sourceState = await loadLanCharacterState(offerPayload.sourceDeviceId, Number(offerPayload.sourceCharacterId || 0));
+        const targetState = await loadLanCharacterState(offerPayload.targetDeviceId, Number(offerPayload.targetCharacterId || 0));
+        if (!sourceState || !targetState) {
+          await rejectCommand(session.id, command, 'Nao foi possivel localizar as fichas da troca.', peerId);
+          return;
+        }
+
+        const counterItemRaw = (command.payload?.counterItem || null) as Record<string, unknown> | null;
+        const counterQuantity = Math.max(0, numberFromPayload(command.payload, 'counterQuantity', 0));
+        const coins = {
+          gp: Math.max(0, numberFromPayload(command.payload, 'gp', 0)),
+          sp: Math.max(0, numberFromPayload(command.payload, 'sp', 0)),
+          cp: Math.max(0, numberFromPayload(command.payload, 'cp', 0)),
+        };
+        const counterItem: Record<string, unknown> | null = counterItemRaw && counterQuantity > 0
+          ? await hydrateTransferItem(counterItemRaw, String(counterItemRaw.name || counterItemRaw.itemName || 'Item'))
+          : null;
+
+        try {
+          if (counterItem && counterQuantity > 0) {
+            const validation = removeItemFromEquipment(targetState.equipment, String(counterItem.name || counterItem.itemName || 'Item'), counterQuantity);
+            if (!validation.ok) throw new Error(`${targetState.name} nao possui ${counterQuantity}x ${String(counterItem.name || counterItem.itemName || 'Item')}.`);
+          }
+          if (coins.gp > 0 || coins.sp > 0 || coins.cp > 0) {
+            if (targetState.gp < coins.gp || targetState.sp < coins.sp || targetState.cp < coins.cp) {
+              throw new Error(`${targetState.name} nao possui moedas suficientes para a troca.`);
+            }
+          }
+        } catch (error) {
+          await rejectCommand(session.id, command, error instanceof Error ? error.message : String(error), peerId);
+          return;
+        }
+
+        const counterParts = [
+          counterItem && counterQuantity > 0 ? `${counterQuantity}x ${String(counterItem.name || counterItem.itemName || 'Item')}` : '',
+          coins.gp > 0 ? `${coins.gp} PO` : '',
+          coins.sp > 0 ? `${coins.sp} PP` : '',
+          coins.cp > 0 ? `${coins.cp} PC` : '',
+        ].filter(Boolean);
+
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'TRADE_COUNTERED',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || targetState.name,
+          targetDeviceId: offerPayload.sourceDeviceId || null,
+          targetCharacterId: Number(offerPayload.sourceCharacterId || 0) || null,
+          targetName: sourceState.name,
+          description: `${targetState.name} respondeu a troca de ${sourceState.name}${counterParts.length ? ` oferecendo ${counterParts.join(' + ')}` : ' sem retorno'}. Aguardando confirmacao.`,
+          payload: {
+            offerCommandId,
+            offeredItem: offerPayload.item || { name: offerPayload.itemName || 'Item' },
+            offeredItemName: offerPayload.itemName || offerPayload.item?.name || 'Item',
+            offeredQuantity: Number(offerPayload.quantity || 1),
+            counterItem,
+            counterQuantity,
+            coins,
+            sourceDeviceId: offerPayload.sourceDeviceId,
+            sourceCharacterId: Number(offerPayload.sourceCharacterId || 0),
+            targetDeviceId: offerPayload.targetDeviceId,
+            targetCharacterId: Number(offerPayload.targetCharacterId || 0),
+          },
+        });
+        return;
+      }
+
+      if (command.command === 'PLAYER_TRADE_CONFIRM') {
+        const offerCommandId = String(command.payload?.offerCommandId || '');
+        const counterCommandId = String(command.payload?.counterCommandId || '');
         const existingResolution = await getLanTradeResolutionEvent(db, session.id, offerCommandId);
         if (existingResolution) {
           await traceLan('LAN_COMMAND', 'handleAuthoritativeCommand', 'trade_resolution_ignored', `Proposta ${offerCommandId} ja foi resolvida.`, {
@@ -1049,10 +1262,18 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           await rejectCommand(session.id, command, 'Proposta de troca nao encontrada.', peerId);
           return;
         }
+        const counterEvent = counterCommandId
+          ? await getLanEventByCommandId(db, session.id, counterCommandId)
+          : await getLanTradeCounterEvent(db, session.id, offerCommandId);
+        if (!counterEvent || counterEvent.eventType !== 'TRADE_COUNTERED') {
+          await rejectCommand(session.id, command, 'Contraproposta de troca nao encontrada.', peerId);
+          return;
+        }
 
         const offerPayload = (offerEvent.payload || {}) as any;
-        if (offerEvent.targetDeviceId && offerEvent.targetDeviceId !== command.deviceId) {
-          await rejectCommand(session.id, command, 'Apenas o jogador alvo pode aceitar esta troca.', peerId);
+        const counterPayload = (counterEvent.payload || {}) as any;
+        if (offerPayload.sourceDeviceId && offerPayload.sourceDeviceId !== command.deviceId) {
+          await rejectCommand(session.id, command, 'Apenas quem iniciou a troca pode confirmar a contraproposta.', peerId);
           return;
         }
 
@@ -1063,16 +1284,18 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           return;
         }
 
-        const counterItem = (command.payload?.counterItem || null) as Record<string, unknown> | null;
-        const counterQuantity = Math.max(0, numberFromPayload(command.payload, 'counterQuantity', 0));
+        const offeredItem = (counterPayload.offeredItem || offerPayload.item || { name: offerPayload.itemName || 'Item' }) as Record<string, unknown>;
+        const offeredQuantity = Math.max(1, Number(counterPayload.offeredQuantity || offerPayload.quantity || 1));
+        const counterItem = (counterPayload.counterItem || null) as Record<string, unknown> | null;
+        const counterQuantity = Math.max(0, Number(counterPayload.counterQuantity || 0));
         const coins = {
-          gp: Math.max(0, numberFromPayload(command.payload, 'gp', 0)),
-          sp: Math.max(0, numberFromPayload(command.payload, 'sp', 0)),
-          cp: Math.max(0, numberFromPayload(command.payload, 'cp', 0)),
+          gp: Math.max(0, Number(counterPayload.coins?.gp || counterPayload.gp || 0)),
+          sp: Math.max(0, Number(counterPayload.coins?.sp || counterPayload.sp || 0)),
+          cp: Math.max(0, Number(counterPayload.coins?.cp || counterPayload.cp || 0)),
         };
 
         try {
-          moveItemBetweenStates(sourceState, targetState, offerPayload.item || { name: offerPayload.itemName || 'Item' }, Number(offerPayload.quantity || 1));
+          moveItemBetweenStates(sourceState, targetState, offeredItem, offeredQuantity);
           if (counterItem && counterQuantity > 0) {
             moveItemBetweenStates(targetState, sourceState, counterItem, counterQuantity);
           }
@@ -1096,16 +1319,17 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           eventType: 'TRADE_ACCEPTED',
           commandId: command.commandId,
           actorDeviceId: command.deviceId,
-          actorName: command.actorName || targetState.name,
-          targetDeviceId: offerPayload.sourceDeviceId || null,
-          targetCharacterId: Number(offerPayload.sourceCharacterId || 0) || null,
-          targetName: sourceState.name,
+          actorName: command.actorName || sourceState.name,
+          targetDeviceId: offerPayload.targetDeviceId || null,
+          targetCharacterId: Number(offerPayload.targetCharacterId || 0) || null,
+          targetName: targetState.name,
           currentValue: { updates: [makeStateUpdate(sourceState), makeStateUpdate(targetState)] },
-          description: `${targetState.name} aceitou a troca com ${sourceState.name}${counterParts.length ? ` oferecendo ${counterParts.join(' + ')}` : ' sem retorno'}.`,
+          description: `${sourceState.name} confirmou a troca com ${targetState.name}${counterParts.length ? ` recebendo ${counterParts.join(' + ')}` : ' sem retorno'}.`,
           payload: {
             offerCommandId,
-            offeredItem: offerPayload.item || { name: offerPayload.itemName || 'Item' },
-            offeredQuantity: Number(offerPayload.quantity || 1),
+            counterCommandId: counterEvent.commandId || counterEvent.eventId,
+            offeredItem,
+            offeredQuantity,
             counterItem,
             counterQuantity,
             coins,
@@ -1170,6 +1394,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (command.command === 'MASTER_PAUSE_SESSION') {
         await setLanSessionStatus(db, session.id, 'paused');
         await updateLanSessionState(db, session.id, { status: 'paused', paused: true });
+        const pausedServer = rpcServerRef.current;
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'SESSION_PAUSED',
@@ -1178,26 +1403,82 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           actorName: command.actorName || 'Mestre',
           description: `Mestre pausou a sessao "${session.name}".`,
         });
-        setActiveSession(prev => (prev ? { ...prev, status: 'paused' } : prev));
+        const pausedSession = { ...session, status: 'paused' as const };
+        setActiveSession(pausedSession);
+        activeSessionRef.current = pausedSession;
+        setLanConnectionStatus('disconnected');
+        setTransportReadyState(false);
+        setTimeout(() => {
+          if (activeSessionRef.current?.id === session.id && activeSessionRef.current.status === 'paused' && rpcServerRef.current === pausedServer) {
+            rpcServerRef.current?.close();
+            rpcServerRef.current = null;
+            void LanForegroundService.stop().catch(() => undefined);
+          }
+        }, 6500);
         return;
       }
 
       if (command.command === 'MASTER_RESUME_SESSION') {
-        await setLanSessionStatus(db, session.id, 'open');
-        await updateLanSessionState(db, session.id, { status: 'open', paused: false });
+        const hostCandidates = await getLanAddressCandidates();
+        let hostIp = session.host_ip || hostCandidates[0] || '0.0.0.0';
+        try {
+          hostIp = hostCandidates[0] || await Network.getIpAddressAsync();
+        } catch {
+          hostIp = hostCandidates[0] || hostIp;
+        }
+        const port = Number(session.port || LAN_DEFAULT_PORT);
+        const resumedSession = {
+          ...session,
+          status: 'open' as const,
+          host_ip: hostIp,
+          port,
+          session_code: buildSessionShareCode(session.id, hostIp, port, hostCandidates),
+          last_connected_at: new Date().toISOString(),
+        };
+        await saveLanSession(db, resumedSession);
+        await setLanSessionStatus(db, resumedSession.id, 'open');
+        await updateLanSessionState(db, resumedSession.id, { status: 'open', paused: false });
+        setActiveSession(resumedSession);
+        activeSessionRef.current = resumedSession;
+
+        if (!rpcServerRef.current) {
+          const rpcServer = new LanRpcServer(handleRpcRequest, {
+            onStatus: status => setLastNotice(status),
+            onError: message => {
+              setLastError(message);
+              void traceLan('LAN_RPC', 'LanRpcServer', 'error', message, { sessionId: resumedSession.id }, 'error');
+            },
+          });
+          await rpcServer.start(port);
+          rpcServerRef.current = rpcServer;
+        }
+        await LanForegroundService.start({
+          sessionId: resumedSession.id,
+          sessionName: resumedSession.name,
+          hostIp: resumedSession.host_ip || null,
+          port,
+          playerCount: players.length,
+        }).catch(error => {
+          void traceLan('FUNCTION', 'LanForegroundService.start', 'native_unavailable', 'Foreground Service nativo indisponivel ou falhou.', {
+            error: error instanceof Error ? error.message : String(error),
+          }, 'warn');
+        });
+        setTransportReadyState(true);
+        setLanConnectionStatus('connected');
         await emitOfficialEvent({
-          sessionId: session.id,
+          sessionId: resumedSession.id,
           eventType: 'SESSION_RESUMED',
           commandId: command.commandId,
           actorDeviceId: command.deviceId,
           actorName: command.actorName || 'Mestre',
-          description: `Mestre retomou a sessao "${session.name}".`,
+          description: `Mestre retomou a sessao "${resumedSession.name}".`,
         });
-        setActiveSession(prev => (prev ? { ...prev, status: 'open' } : prev));
+        await refreshSavedSessions();
         return;
       }
 
       if (command.command === 'MASTER_END_SESSION') {
+        sessionGenerationRef.current += 1;
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'SESSION_CLOSED',
@@ -1209,28 +1490,35 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         await setLanSessionStatus(db, session.id, 'closed');
         await linkCharacterToSession(db, session.id, null);
         const closedSession = { ...session, status: 'closed' as const, linked_character_id: null };
-        const closingServer = rpcServerRef.current;
+        const playerRows = await getLanPlayers(db, session.id);
+        const pendingDevices = new Set(
+          playerRows
+            .filter(player => player.connected && player.device_id && player.device_id !== command.deviceId)
+            .map(player => player.device_id)
+        );
+        closingSessionPendingDevicesRef.current[session.id] = pendingDevices;
         closingSessionRef.current = closedSession;
-        setTimeout(() => {
-          if (rpcServerRef.current === closingServer) {
-            rpcServerRef.current?.close();
-            rpcServerRef.current = null;
-          }
-          if (closingSessionRef.current?.id === session.id) {
-            closingSessionRef.current = null;
-          }
-        }, 6500);
+        if (closingSessionTimerRef.current) {
+          clearTimeout(closingSessionTimerRef.current);
+          closingSessionTimerRef.current = null;
+        }
+        closingSessionTimerRef.current = setTimeout(() => {
+          void finishClosedSessionHost(session.id, 'timeout-waiting-player-unlink').catch(() => undefined);
+        }, pendingDevices.size > 0 ? 25000 : 900);
         if (reconnectTimerRef.current) {
           clearTimeout(reconnectTimerRef.current);
           reconnectTimerRef.current = null;
         }
-        await LanForegroundService.stop().catch(() => undefined);
-        setTransportReadyState(false);
-        setLanConnectionStatus('disconnected');
-        setPeerCount(0);
-        setPlayers([]);
-        setActiveSession(null);
+        setTransportReadyState(true);
+        setLanConnectionStatus('connected');
+        setPeerCount(pendingDevices.size);
+        setActiveSession(closedSession);
         activeSessionRef.current = null;
+        setLastNotice(
+          pendingDevices.size > 0
+            ? `Sessao encerrada. Aguardando ${pendingDevices.size} jogador(es) desvincular(em).`
+            : 'Sessao encerrada. Fechando host LAN.'
+        );
         await refreshSavedSessions();
         return;
       }
@@ -1418,8 +1706,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           nextTempHp = Math.max(0, previous.hp_temp - absorbedByTemp);
           remainingDamage = Math.max(0, remainingDamage - absorbedByTemp);
           nextHp = Math.max(0, previous.hp_current - remainingDamage);
-          if (previous.hp_temp > 0 && nextTempHp === 0) {
+          if (previous.hp_temp > 0 && absorbedByTemp > 0 && nextTempHp === 0) {
             nextStats = clearTempHpEffects(previousStats);
+          } else if (absorbedByTemp > 0) {
+            nextStats = consumeTempHpEffects(previousStats, absorbedByTemp);
           }
         }
 
@@ -1455,9 +1745,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         const durationValue = numberFromPayload(command.payload, 'durationValue', 1);
         const previousStats = normalizeStats(target?.stats);
         const previous = { hp_temp: Number(target?.hp_temp || 0), stats: previousStats };
+        const baseStats = mode === 'set' ? clearTempHpEffects(previousStats) : previousStats;
         const current = {
           hp_temp: mode === 'set' ? Math.max(0, amount) : Math.max(0, previous.hp_temp + amount),
-          stats: previousStats,
+          stats: baseStats,
         };
         if (amount > 0) {
           current.stats.timed_effects.push({
@@ -1679,8 +1970,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         const item = (command.payload?.item || {}) as Record<string, unknown>;
         const quantity = numberFromPayload(command.payload, 'quantity', 1);
         const itemName = String(item.name || command.payload?.itemName || 'Item');
+        const transferItem = await hydrateTransferItem(item, itemName);
         const previousEquipment = normalizeEquipment(target?.equipment);
-        const currentEquipment = addItemToEquipment(previousEquipment, { ...item, name: itemName }, quantity);
+        const currentEquipment = addItemToEquipment(previousEquipment, transferItem, quantity);
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'ITEM_ADDED',
@@ -1694,14 +1986,14 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           currentValue: { equipment: currentEquipment },
           description: `Mestre enviou ${quantity}x ${itemName} para ${targetName}.`,
           payload: {
-            item: { ...item, name: itemName },
+            item: transferItem,
             quantity,
             requestCommandId: command.payload?.requestCommandId || null,
           },
         });
       }
     },
-    [db, emitOfficialEvent, refreshSavedSessions, rejectCommand, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [db, emitOfficialEvent, finishClosedSessionHost, refreshSavedSessions, rejectCommand, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   const runAuthoritativeCommandQueued = useCallback(
@@ -1752,17 +2044,32 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       await refreshPlayers();
       setLanRevision(prev => prev + 1);
 
+      const joinedEventKey = snapshotCharacterId ? `${session.id}:${characterMessage.deviceId}:${snapshotCharacterId}` : '';
+      const joinedEventExists = snapshotCharacterId
+        ? await db.getFirstAsync<{ id: number }>(
+            `SELECT id FROM lan_event_log
+             WHERE session_id = ?
+               AND event_type = 'PLAYER_JOINED'
+               AND actor_device_id = ?
+               AND target_character_id = ?
+             LIMIT 1`,
+            [session.id, characterMessage.deviceId, snapshotCharacterId]
+          )
+        : null;
       if (snapshotCharacterId && previousCharacterId !== snapshotCharacterId) {
-        await emitOfficialEvent({
-          sessionId: session.id,
-          eventType: 'PLAYER_JOINED',
-          actorDeviceId: characterMessage.deviceId,
-          actorName: existingPlayer?.player_name || 'Jogador',
-          targetDeviceId: characterMessage.deviceId,
-          targetCharacterId: snapshotCharacterId,
-          targetName: characterMessage.snapshot.name,
-          description: `${existingPlayer?.player_name || 'Jogador'} vinculou a ficha ${characterMessage.snapshot.name}.`,
-        });
+        if (!joinedEventExists && !joinedCharacterEventsRef.current[joinedEventKey]) {
+          joinedCharacterEventsRef.current[joinedEventKey] = true;
+          await emitOfficialEvent({
+            sessionId: session.id,
+            eventType: 'PLAYER_JOINED',
+            actorDeviceId: characterMessage.deviceId,
+            actorName: existingPlayer?.player_name || 'Jogador',
+            targetDeviceId: characterMessage.deviceId,
+            targetCharacterId: snapshotCharacterId,
+            targetName: characterMessage.snapshot.name,
+            description: `${existingPlayer?.player_name || 'Jogador'} vinculou a ficha ${characterMessage.snapshot.name}.`,
+          });
+        }
       }
 
       setLastNotice(`Ficha recebida: ${characterMessage.snapshot.name}.`);
@@ -1833,6 +2140,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         const current = activeSessionRef.current;
         if (current?.id === state.sessionId && current.status !== state.status) {
           if (state.status === 'closed') {
+            sessionGenerationRef.current += 1;
             await setLanSessionStatus(db, state.sessionId, 'closed');
             await linkCharacterToSession(db, state.sessionId, null);
             setActiveSession(null);
@@ -1852,13 +2160,24 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       for (const rawPlayer of playerRows) {
         const player = rawPlayer as any;
         if (!player.device_id) continue;
+        let snapshot: LanCharacterMessage['snapshot'] | null = null;
+        if (player.snapshot_payload) {
+          try {
+            snapshot = typeof player.snapshot_payload === 'string' ? JSON.parse(player.snapshot_payload) : player.snapshot_payload;
+          } catch {
+            snapshot = null;
+          }
+        }
+        if (snapshot?.localId) {
+          await saveCharacterSnapshot(db, state?.sessionId || activeSessionRef.current?.id || '', String(player.device_id), snapshot);
+        }
         await upsertLanPlayer(
           db,
           state?.sessionId || activeSessionRef.current?.id || '',
           String(player.device_id),
           String(player.player_name || 'Jogador'),
-          player.character_id ? Number(player.character_id) : null,
-          player.character_name ? String(player.character_name) : null,
+          player.character_id ? Number(player.character_id) : snapshot?.localId ? Number(snapshot.localId) : null,
+          player.character_name ? String(player.character_name) : snapshot?.name ? String(snapshot.name) : null,
           Number(player.connected || 0) === 1
         );
       }
@@ -1936,7 +2255,28 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             await saveCharacterSnapshot(db, session.id, deviceId, snapshot);
           }
 
-          if (!existingPlayer || previousCharacterId !== characterId) {
+          const joinedEventKey = `${session.id}:${deviceId}:${characterId || 'no-character'}`;
+          const joinedEventExists = characterId
+            ? await db.getFirstAsync<{ id: number }>(
+                `SELECT id FROM lan_event_log
+                 WHERE session_id = ?
+                   AND event_type = 'PLAYER_JOINED'
+                   AND actor_device_id = ?
+                   AND target_character_id = ?
+                 LIMIT 1`,
+                [session.id, deviceId, characterId]
+              )
+            : await db.getFirstAsync<{ id: number }>(
+                `SELECT id FROM lan_event_log
+                 WHERE session_id = ?
+                   AND event_type = 'PLAYER_JOINED'
+                   AND actor_device_id = ?
+                   AND target_character_id IS NULL
+                 LIMIT 1`,
+                [session.id, deviceId]
+              );
+          if ((!existingPlayer || previousCharacterId !== characterId) && !joinedEventExists && !joinedCharacterEventsRef.current[joinedEventKey]) {
+            joinedCharacterEventsRef.current[joinedEventKey] = true;
             await emitOfficialEvent({
               sessionId: session.id,
               eventType: 'PLAYER_JOINED',
@@ -1962,7 +2302,30 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             const playerName = String(payload.playerName || 'Jogador');
             await upsertLanPlayer(db, session.id, deviceId, playerName, payload.characterId ? Number(payload.characterId) : null, payload.characterName ? String(payload.characterName) : null, true);
           }
-          return makeRpcResponse(request, true, await buildRpcSyncPayload(session, Number(payload.sinceSeq || 0)));
+          const responsePayload = await buildRpcSyncPayload(session, Number(payload.sinceSeq || 0));
+          if (session.status === 'closed' && deviceId) {
+            const pending = closingSessionPendingDevicesRef.current[session.id];
+            if (pending?.has(deviceId)) {
+              pending.delete(deviceId);
+              setPeerCount(pending.size);
+              setLastNotice(
+                pending.size > 0
+                  ? `Sessao encerrada. Aguardando ${pending.size} jogador(es) desvincular(em).`
+                  : 'Todos os jogadores receberam o encerramento. Fechando host LAN.'
+              );
+              await traceLan('LAN_RPC', 'handleRpcRequest', 'closed_ack', 'Jogador recebeu estado de sessao encerrada.', {
+                sessionId: session.id,
+                deviceId,
+                pendingDevices: pending.size,
+              }, 'info', request.id);
+              if (pending.size === 0) {
+                setTimeout(() => {
+                  void finishClosedSessionHost(session.id, 'all-players-polled-closed').catch(() => undefined);
+                }, 350);
+              }
+            }
+          }
+          return makeRpcResponse(request, true, responsePayload);
         }
 
         if (request.method === 'COMMAND') {
@@ -2000,12 +2363,14 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }, 'debug', request.id);
       }
     },
-    [buildRpcSyncPayload, db, emitOfficialEvent, handleCharacterUpsert, makeRpcResponse, refreshPlayers, runAuthoritativeCommandQueued, traceLan]
+    [buildRpcSyncPayload, db, emitOfficialEvent, finishClosedSessionHost, handleCharacterUpsert, makeRpcResponse, refreshPlayers, runAuthoritativeCommandQueued, traceLan]
   );
 
   const recoverLanSession = useCallback(
     async (reason = 'app-active') => {
       if (reconnectingRef.current) return;
+      const generationAtStart = sessionGenerationRef.current;
+      const isStaleRecovery = () => generationAtStart !== sessionGenerationRef.current;
       reconnectingRef.current = true;
       setLanConnectionStatus('reconnecting');
 
@@ -2013,6 +2378,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         let session = activeSessionRef.current;
         if (!session || session.status === 'closed') {
           session = await getActiveLanSession(db);
+          if (isStaleRecovery()) return;
           if (session) {
             setActiveSession(session);
             activeSessionRef.current = session;
@@ -2025,7 +2391,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
 
         const deviceId = deviceIdRef.current || (await getOrCreateDeviceId(db));
+        if (isStaleRecovery()) return;
         deviceIdRef.current = deviceId;
+        setLocalDeviceId(deviceId);
         await traceLan('FUNCTION', 'recoverLanSession', 'start', 'Retomando RPC LAN apos background/bloqueio.', {
           used: ['AppState', 'LanRpcServer', 'POLL', 'LanForegroundService'],
           reason,
@@ -2093,6 +2461,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             const parsedCode = parseSessionCode(nextSession.session_code || nextSession.id);
             if (!parsedCode) throw new Error('Sessao do jogador sem codigo para redescobrir mestre.');
             const discovery = await discoverLanMaster(parsedCode);
+            if (isStaleRecovery()) return;
             nextSession = { ...nextSession, host_ip: discovery.host, port: discovery.port };
             await saveLanSession(db, nextSession);
             setActiveSession(nextSession);
@@ -2134,6 +2503,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
                 ...metadata,
               }, step === 'discovered' ? 'info' : step === 'priority_failed' ? 'warn' : 'debug');
             });
+            if (isStaleRecovery()) return;
             nextSession = { ...nextSession, host_ip: discovery.host, port: discovery.port };
             await saveLanSession(db, nextSession);
             setActiveSession(nextSession);
@@ -2141,6 +2511,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             session = nextSession;
             response = await pollMaster(discovery.host, discovery.port, 2400);
           }
+          if (isStaleRecovery()) return;
           if (!response.ok) throw new Error(response.error || 'Falha ao retomar polling LAN.');
           await applyRpcSyncPayload(response.payload);
           if (nextSession.status === 'inactive') {
@@ -2157,6 +2528,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
 
         setLanRevision(prev => prev + 1);
+        delete reconnectFailureCountRef.current[(session as LanSessionRecord).id];
         await traceLan('FUNCTION', 'recoverLanSession', 'success', 'Retomada LAN concluida.', {
           sessionId: (session as LanSessionRecord).id,
           role: (session as LanSessionRecord).role,
@@ -2164,6 +2536,45 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }, 'info');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const currentSession = activeSessionRef.current;
+        const masterClosedExplicitly = /encerrada|encerrado|closed/i.test(message);
+        const masterNotFound = /nao encontrada|não encontrada|not found/i.test(message);
+        const shouldCloseAfterMissingMaster =
+          currentSession?.role === 'player' &&
+          currentSession.status !== 'paused' &&
+          masterNotFound &&
+          ((reconnectFailureCountRef.current[currentSession.id] || 0) + 1 >= 2);
+        if (currentSession?.role === 'player' && masterNotFound) {
+          reconnectFailureCountRef.current[currentSession.id] = (reconnectFailureCountRef.current[currentSession.id] || 0) + 1;
+        }
+        if (currentSession?.role === 'player' && (masterClosedExplicitly || shouldCloseAfterMissingMaster)) {
+          sessionGenerationRef.current += 1;
+          if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+          }
+          delete reconnectFailureCountRef.current[currentSession.id];
+          await setLanSessionStatus(db, currentSession.id, 'closed');
+          await linkCharacterToSession(db, currentSession.id, null);
+          await updateLanSessionState(db, currentSession.id, { status: 'closed', paused: false });
+          await LanForegroundService.stop().catch(() => undefined);
+          setTransportReadyState(false);
+          setLanConnectionStatus('disconnected');
+          setPeerCount(0);
+          setPlayers([]);
+          setActiveSession(null);
+          activeSessionRef.current = null;
+          await refreshSavedSessions();
+          setLastNotice('Mesa LAN encerrada ou indisponivel. Ficha desvinculada da sessao.');
+          await traceLan('FUNCTION', 'recoverLanSession', masterClosedExplicitly ? 'closed_after_master_closed' : 'closed_after_master_missing', 'Sessao local do jogador foi finalizada e ficha desvinculada.', {
+            sessionId: currentSession.id,
+            error: message,
+            reason,
+            masterClosedExplicitly,
+            masterNotFound,
+          }, 'info');
+          return;
+        }
         setTransportReadyState(false);
         setLanConnectionStatus('disconnected');
         setLastError(`Falha ao retomar sessao LAN: ${message}`);
@@ -2217,8 +2628,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         },
       }, 'info');
       setLastError(null);
+      sessionGenerationRef.current += 1;
       const deviceId = await getOrCreateDeviceId(db);
       deviceIdRef.current = deviceId;
+      setLocalDeviceId(deviceId);
       await deactivateCurrentSessionLocally('start-master-session');
 
       const sessionId = makeShortSessionCode();
@@ -2313,6 +2726,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (!parsedCode) {
         throw new Error('Codigo de sessao invalido.');
       }
+      sessionGenerationRef.current += 1;
 
       let discovery: Awaited<ReturnType<typeof discoverLanMaster>> | null = null;
 
@@ -2321,6 +2735,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         await updateLocalPlayerName(db, playerName);
         const deviceId = await getOrCreateDeviceId(db);
         deviceIdRef.current = deviceId;
+        setLocalDeviceId(deviceId);
         await deactivateCurrentSessionLocally('join-player-session');
 
         let characterName: string | null = null;
@@ -2545,6 +2960,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
       const deviceId = deviceIdRef.current || (await getOrCreateDeviceId(db));
       deviceIdRef.current = deviceId;
+      setLocalDeviceId(deviceId);
       const snapshot = await getCharacterSnapshot(db, characterId);
       if (!snapshot) return;
 
@@ -2648,8 +3064,17 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
       const deviceId = deviceIdRef.current || (await getOrCreateDeviceId(db));
       deviceIdRef.current = deviceId;
+      setLocalDeviceId(deviceId);
 
-      const actorName = session.role === 'master' ? 'Mestre' : await getLocalPlayerName(db);
+      let actorName = session.role === 'master' ? 'Mestre' : String(payload.characterName || payload.sourceName || '');
+      if (!actorName && session.role === 'player' && session.linked_character_id) {
+        const character = await db.getFirstAsync<{ name?: string }>(
+          `SELECT name FROM characters WHERE id = ? LIMIT 1`,
+          [session.linked_character_id]
+        );
+        actorName = String(character?.name || '');
+      }
+      if (!actorName) actorName = await getLocalPlayerName(db);
       const message: LanCommandMessage = {
         type: 'LAN_COMMAND',
         sessionId: session.id,
@@ -2770,7 +3195,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     let mounted = true;
 
     getOrCreateDeviceId(db).then(deviceId => {
-      if (mounted) deviceIdRef.current = deviceId;
+      if (mounted) {
+        deviceIdRef.current = deviceId;
+        setLocalDeviceId(deviceId);
+      }
     });
     refreshActiveSession().then(() => {
       if (mounted) void recoverLanSession('provider-mounted');
@@ -2781,6 +3209,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
+      }
+      if (closingSessionTimerRef.current) {
+        clearTimeout(closingSessionTimerRef.current);
+        closingSessionTimerRef.current = null;
       }
       suppressReconnectRef.current = true;
       rpcServerRef.current?.close();
@@ -2867,6 +3299,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       lastError,
       lastNotice,
       lanRevision,
+      localDeviceId,
       players,
       refreshActiveSession,
       refreshSavedSessions,
@@ -2892,6 +3325,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       lastError,
       lastNotice,
       lanRevision,
+      localDeviceId,
       players,
       refreshActiveSession,
       refreshSavedSessions,

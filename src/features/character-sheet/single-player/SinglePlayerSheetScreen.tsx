@@ -9,6 +9,7 @@ import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, St
 import { useLanSession } from '@/contexts/LanSessionContext';
 import { addTraceLog } from '@/network/traceRepository';
 import { EffectDraft, formatEffectSummary } from '@/types/effects';
+import { LanOfficialEventMessage } from '@/types/lan';
 
 const XP_TABLE = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000, 85000, 100000, 120000, 140000, 165000, 195000, 225000, 265000, 305000, 355000];
 
@@ -63,7 +64,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const id = Array.isArray(characterId) ? characterId[0] : characterId;
   const router = useRouter();
   const db = useSQLiteContext();
-  const { activeSession, sendLanCommand, players } = useLanSession();
+  const { activeSession, sendLanCommand, players, getHistoryPage, localDeviceId } = useLanSession();
 
   const [activeTab, setActiveTab] = useState<'stats' | 'profs' | 'inv' | 'spells'>('stats');
   const [character, setCharacter] = useState<any>(null);
@@ -100,8 +101,11 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
   // Estados do Menu de Ação
   const [selectedBagItem, setSelectedBagItem] = useState<{item: any, index: number} | null>(null);
+  const [lanTargetPicker, setLanTargetPicker] = useState<{ mode: 'send' | 'trade'; item: any; qty: number } | null>(null);
   const [actionQty, setActionQty] = useState(1);
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
+  const [sheetTradeOffers, setSheetTradeOffers] = useState<LanOfficialEventMessage[]>([]);
+  const alertedTradeIdsRef = useRef<Record<string, boolean>>({});
   const [rollEffectsModalVisible, setRollEffectsModalVisible] = useState(false);
   const [pendingRollEffects, setPendingRollEffects] = useState<PendingRollEffect[]>([]);
   const [pendingRollSummary, setPendingRollSummary] = useState('');
@@ -176,6 +180,108 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string}[]) => {
     setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: '#00bfff' }] });
   };
+
+  const respondToSheetTradeOffer = async (event: LanOfficialEventMessage, action: 'accept' | 'decline') => {
+    const payload = (event.payload || {}) as any;
+    const offerCommandId = payload.offerCommandId || event.commandId || event.eventId;
+    if (!offerCommandId) return;
+    if (action === 'accept') {
+      if (onOpenSyncSession) onOpenSyncSession();
+      else router.navigate('/lan-session' as any);
+      return;
+    }
+    await sendLanCommand('PLAYER_TRADE_DECLINE', {
+      offerCommandId,
+    });
+    setSheetTradeOffers(prev => prev.filter(offer => (((offer.payload || {}) as any).offerCommandId || offer.commandId || offer.eventId) !== offerCommandId));
+    showCustomAlert('Troca recusada', 'A proposta foi recusada.');
+  };
+
+  useEffect(() => {
+    if (!activeSession || activeSession.role !== 'player' || !activeSession.linked_character_id || !character?.id) {
+      setSheetTradeOffers([]);
+      return;
+    }
+
+    let cancelled = false;
+    const loadTradeOffers = async () => {
+      const rows = await getHistoryPage(0, 50);
+      const resolvedTradeOfferIds = new Set<string>();
+      const counteredTradeOfferIds = new Set<string>();
+      for (const event of rows) {
+        const offerCommandId = String((event.payload as any)?.offerCommandId || '');
+        if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED')) {
+          resolvedTradeOfferIds.add(offerCommandId);
+        }
+        if (offerCommandId && event.eventType === 'TRADE_COUNTERED') {
+          counteredTradeOfferIds.add(offerCommandId);
+        }
+      }
+
+      const pending = rows.filter(event => {
+        const offerCommandId = event.commandId || event.eventId;
+        const payload = (event.payload || {}) as any;
+        const targetDeviceId = String(event.targetDeviceId || payload.targetDeviceId || '');
+        const belongsToThisDevice = localDeviceId ? targetDeviceId === localDeviceId : !targetDeviceId;
+        const pendingOffer = (
+          event.eventType === 'TRADE_OFFERED' &&
+          Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
+          belongsToThisDevice &&
+          !resolvedTradeOfferIds.has(offerCommandId) &&
+          !counteredTradeOfferIds.has(offerCommandId)
+        );
+        const counterOfferCommandId = String(payload.offerCommandId || '');
+        const pendingCounter = (
+          event.eventType === 'TRADE_COUNTERED' &&
+          Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
+          belongsToThisDevice &&
+          !!counterOfferCommandId &&
+          !resolvedTradeOfferIds.has(counterOfferCommandId)
+        );
+        return pendingOffer || pendingCounter;
+      });
+
+      if (cancelled) return;
+      setSheetTradeOffers(pending);
+
+      const unseen = pending.find(event => {
+        const key = event.commandId || event.eventId;
+        return key && !alertedTradeIdsRef.current[key];
+      });
+      if (!unseen) return;
+
+      const key = unseen.commandId || unseen.eventId;
+      alertedTradeIdsRef.current[key] = true;
+      const payload = (unseen.payload || {}) as any;
+      const isCounter = unseen.eventType === 'TRADE_COUNTERED';
+      const itemName = isCounter ? payload.offeredItemName || payload.offeredItem?.name || 'item' : payload.itemName || payload.item?.name || 'item';
+      const qty = Math.max(1, Number(isCounter ? payload.offeredQuantity || 1 : payload.quantity || 1));
+      const sourceName = isCounter ? payload.targetName || unseen.actorName || 'Personagem' : payload.sourceName || unseen.actorName || 'Personagem';
+      showCustomAlert(isCounter ? 'Contraproposta de troca' : 'Proposta de troca', isCounter ? `${sourceName} respondeu sua troca de ${qty}x ${itemName}.` : `${sourceName} ofereceu ${qty}x ${itemName}.`, [
+        {
+          text: 'Aceitar',
+          color: '#00fa9a',
+          onPress: () => void respondToSheetTradeOffer(unseen, 'accept'),
+        },
+        {
+          text: 'Recusar',
+          color: '#ff6666',
+          onPress: () => void respondToSheetTradeOffer(unseen, 'decline'),
+        },
+        {
+          text: 'Ignorar',
+          color: '#00bfff',
+        },
+      ]);
+    };
+
+    void loadTradeOffers();
+    const timer = setInterval(() => void loadTradeOffers(), 2500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeSession?.id, activeSession?.role, activeSession?.linked_character_id, character?.id, externalRevision, getHistoryPage, localDeviceId, onOpenSyncSession, router]);
 
   const onlySignedIntegerText = (value: string) => value.replace(/[^\d-]/g, '').replace(/(?!^)-/g, '');
   const onlyPositiveIntegerText = (value: string) => value.replace(/[^\d]/g, '');
@@ -310,6 +416,42 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     return String(base);
   };
 
+  const consumeVisualTempHpEffects = (statsValue: any, absorbedDamage: number) => {
+    const nextStats = {
+      ...statsValue,
+      temp_mods: { ...(statsValue?.temp_mods || {}) },
+      equip_mods: { ...(statsValue?.equip_mods || {}) },
+      timed_effects: Array.isArray(statsValue?.timed_effects) ? [...statsValue.timed_effects] : [],
+    };
+    let remainingDamage = Math.max(0, Number(absorbedDamage || 0));
+    if (remainingDamage <= 0) return nextStats;
+
+    const remainingEffects: any[] = [];
+    for (const effect of nextStats.timed_effects) {
+      if (effect?.kind !== 'temp_hp' || remainingDamage <= 0) {
+        remainingEffects.push(effect);
+        continue;
+      }
+
+      const effectAmount = Math.max(0, Number(effect.amount || 0));
+      if (effectAmount <= remainingDamage) {
+        remainingDamage -= effectAmount;
+        continue;
+      }
+
+      const nextAmount = effectAmount - remainingDamage;
+      remainingDamage = 0;
+      remainingEffects.push({
+        ...effect,
+        amount: nextAmount,
+        label: `PV temporario +${nextAmount}`,
+      });
+    }
+
+    nextStats.timed_effects = remainingEffects;
+    return nextStats;
+  };
+
   const bagWeight = character.equipment.bag.reduce((acc: number, item: any) => acc + (item.weight * item.qty), 0);
   const slotsWeight = Object.values(character.equipment.slots).reduce((acc: number, item: any) => acc + (item ? item.weight : 0), 0);
   const totalWeight = bagWeight + slotsWeight + ((character.gp + character.sp + character.cp) * 0.01);
@@ -341,33 +483,50 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const parseLanSnapshot = (player: any) => {
     try {
       const snapshot = typeof player?.snapshot_payload === 'string' ? JSON.parse(player.snapshot_payload) : player?.snapshot_payload;
+      if (!snapshot?.data) {
+        return {
+          name: player?.character_name || player?.player_name || 'Personagem',
+          level: 1,
+          hpCurrent: 0,
+          hpMax: 1,
+          hpTemp: 0,
+          hpUnknown: true,
+        };
+      }
       const data = snapshot?.data || {};
       return {
-        name: snapshot?.name || player?.character_name || player?.player_name || 'Jogador',
+        name: snapshot?.name || data.name || player?.character_name || player?.player_name || 'Personagem',
         level: Number(data.level ?? snapshot?.level ?? 1),
         hpCurrent: Math.max(0, Number(data.hp_current ?? 0)),
         hpMax: Math.max(1, Number(data.hp_max ?? 1)),
         hpTemp: Math.max(0, Number(data.hp_temp ?? 0)),
+        hpUnknown: false,
       };
     } catch {
       return {
-        name: player?.character_name || player?.player_name || 'Jogador',
+        name: player?.character_name || player?.player_name || 'Personagem',
         level: 1,
         hpCurrent: 0,
         hpMax: 1,
         hpTemp: 0,
+        hpUnknown: true,
       };
     }
   };
 
   const lanPlayersWithCharacters = players.filter((player: any) => player.character_id);
+  const isOwnLanPlayer = (player: any) => {
+    const playerDeviceId = String(player?.device_id || '');
+    const ownDeviceMatches = localDeviceId ? playerDeviceId === localDeviceId : playerDeviceId === 'local';
+    return ownDeviceMatches && Number(player?.character_id || 0) === Number(character.id);
+  };
   const lanTradeTargets = isLanPlayerControlledSheet
-    ? lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) !== Number(character.id))
+    ? lanPlayersWithCharacters.filter((player: any) => !isOwnLanPlayer(player))
     : [];
   const lanPanelPlayers = isLanPlayerControlledSheet
     ? [
-        ...lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) === Number(character.id)),
-        ...lanPlayersWithCharacters.filter((player: any) => Number(player.character_id) !== Number(character.id)),
+        ...lanPlayersWithCharacters.filter((player: any) => isOwnLanPlayer(player)),
+        ...lanPlayersWithCharacters.filter((player: any) => !isOwnLanPlayer(player)),
       ]
     : [];
 
@@ -379,6 +538,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     await sendLanCommand(command, {
       characterName: character.name,
       targetCharacterId: character.id,
+      targetDeviceId: localDeviceId || undefined,
       ...payload,
     });
     showCustomAlert('Solicitacao enviada', notice);
@@ -427,19 +587,23 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       showCustomAlert('Sem jogadores', 'Nao ha outro jogador com ficha vinculada nesta mesa.');
       return;
     }
-    showCustomAlert(
-      mode === 'send' ? 'Enviar para quem?' : 'Trocar com quem?',
-      `${qty}x ${item?.name || 'item'}`,
-      [
-        ...lanTradeTargets.slice(0, 5).map((target: any) => ({
-          text: lanTargetName(target),
-          color: '#00fa9a',
-          onPress: () => mode === 'send'
-            ? sendItemToLanPlayer(target, item, qty)
-            : offerTradeToLanPlayer(target, item, qty),
-        })),
-        { text: 'Cancelar', color: '#ff6666' },
-      ]
+    setLanTargetPicker({ mode, item, qty });
+  };
+
+  const isConsumableItem = (item: any, catalogItem?: any) => {
+    const p = String(item?.properties || catalogItem?.properties || '').toLowerCase();
+    const d = String(item?.damage || catalogItem?.damage || '').toLowerCase();
+    const dt = String(item?.damage_type || catalogItem?.damage_type || '').toLowerCase();
+    const n = String(item?.name || catalogItem?.name || '').toLowerCase();
+    return (
+      Number(item?.is_consumable ?? catalogItem?.is_consumable ?? 0) === 1 ||
+      p.includes('consumivel') ||
+      p.includes('consumível') ||
+      d.includes('cura') ||
+      dt.includes('cura') ||
+      d.includes('escolher') ||
+      n.includes('pocao') ||
+      n.includes('poção')
     );
   };
 
@@ -744,12 +908,19 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     const catalogItem = getCatalogItem(item);
     const rows = await db.getAllAsync<any>(
       `SELECT * FROM effects
-       WHERE source_table = 'items' AND (source_id = ? OR source_name = ?)
+       WHERE source_table = 'items'
+         AND ((? > 0 AND source_id = ?) OR LOWER(TRIM(source_name)) = ?)
        ORDER BY sort_order ASC, id ASC`,
-      [catalogItem?.id || 0, item.name]
+      [catalogItem?.id || Number(item?.id || 0) || 0, catalogItem?.id || Number(item?.id || 0) || 0, String(item?.name || '').trim().toLowerCase()]
     );
+    const embeddedRows = Array.isArray(item?.effects)
+      ? item.effects
+      : Array.isArray(item?.structuredEffects)
+        ? item.structuredEffects
+        : [];
+    const sourceRows = rows.length > 0 ? rows : embeddedRows;
 
-    return rows.map(row => ({
+    return sourceRows.map((row: any) => ({
       ...row,
       effect_kind: row.effect_kind,
       effect_type: row.effect_type,
@@ -764,7 +935,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       condition_name: row.condition_name || null,
       target: row.target || null,
       notes: row.notes || null,
-      metadata: row.metadata ? JSON.parse(row.metadata) : {},
+      metadata: typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata || {},
     })) as ItemEffect[];
   };
 
@@ -829,6 +1000,9 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           const absorbed = Math.min(workingTempHp, remainingDamage);
           workingTempHp -= absorbed;
           remainingDamage -= absorbed;
+          newStats.timed_effects = workingTempHp <= 0
+            ? newStats.timed_effects.filter((entry: any) => entry?.kind !== 'temp_hp')
+            : consumeVisualTempHpEffects(newStats, absorbed).timed_effects;
         }
         if (remainingDamage > 0) {
           workingDisplayHpCurrent = Math.max(0, workingDisplayHpCurrent - remainingDamage);
@@ -942,7 +1116,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     if (hasEscolher) {
       const escolherMatch = effect.match(/escolher\s*([+-]?\d+)/i);
       escolherVal = escolherMatch ? parseInt(escolherMatch[1]) : 1;
-      escolherIsPerm = effect.toLowerCase().includes('perm');
+      escolherIsPerm = !/temp|tempor/i.test(effect) || effect.toLowerCase().includes('perm');
     }
 
     // Função interna que processa TUDO: O status escolhido (se tiver), as penalidades e curas.
@@ -1328,7 +1502,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     const rows = lanPanelPlayers.length > 0
       ? lanPanelPlayers
       : [{
-          device_id: 'local',
+          device_id: localDeviceId || 'local',
           player_name: character.name,
           character_id: character.id,
           character_name: character.name,
@@ -1351,13 +1525,14 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           <Ionicons name="people-outline" size={22} color="#00bfff" />
         </View>
 
+        <ScrollView style={styles.lanPlayersList} nestedScrollEnabled showsVerticalScrollIndicator={rows.length > 4}>
         {rows.map((player: any) => {
-          const snapshot = Number(player.character_id) === Number(character.id)
-            ? { name: character.name, level: character.level, hpCurrent: displayHpCurrent, hpMax: displayHpMax, hpTemp: tempHpValue }
+          const isSelf = isOwnLanPlayer(player);
+          const snapshot = isSelf
+            ? { name: character.name, level: character.level, hpCurrent: displayHpCurrent, hpMax: displayHpMax, hpTemp: tempHpValue, hpUnknown: false }
             : parseLanSnapshot(player);
-          const isSelf = Number(player.character_id) === Number(character.id);
-          const percent = snapshot.hpMax > 0 ? Math.max(0, Math.min(100, (snapshot.hpCurrent / snapshot.hpMax) * 100)) : 0;
-          const dead = snapshot.hpCurrent <= 0;
+          const percent = !snapshot.hpUnknown && snapshot.hpMax > 0 ? Math.max(0, Math.min(100, (snapshot.hpCurrent / snapshot.hpMax) * 100)) : 0;
+          const dead = !snapshot.hpUnknown && snapshot.hpCurrent <= 0;
           return (
             <View key={`${player.device_id}-${player.character_id}`} style={styles.lanPlayerRow}>
               <View style={{ flex: 1 }}>
@@ -1365,12 +1540,12 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                   {snapshot.name}{isSelf ? ' (você)' : ''}
                 </Text>
                 <Text style={styles.lanPlayerSub}>
-                  {player.connected ? 'Ativo' : 'Offline'} • Nível {snapshot.level}
+                  {player.connected ? 'Ativo' : 'Offline'} • {snapshot.hpUnknown ? 'Sincronizando ficha' : `Nível ${snapshot.level}`}
                 </Text>
               </View>
               <View style={styles.lanHpSide}>
                 <Text style={[styles.lanHpText, dead && styles.lanHpDeadText]}>
-                  {dead ? '☠️' : `${snapshot.hpCurrent}/${snapshot.hpMax}${snapshot.hpTemp > 0 ? ` +${snapshot.hpTemp}` : ''}`}
+                  {snapshot.hpUnknown ? '--/--' : dead ? '☠️' : `${snapshot.hpCurrent}/${snapshot.hpMax}${snapshot.hpTemp > 0 ? ` +${snapshot.hpTemp}` : ''}`}
                 </Text>
                 <View style={styles.lanHpTrack}>
                   <View style={[styles.lanHpFill, dead ? styles.lanHpFillDead : null, { width: `${dead ? 100 : percent}%` }]} />
@@ -1379,6 +1554,38 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
             </View>
           );
         })}
+        </ScrollView>
+
+        {sheetTradeOffers.length > 0 && (
+          <View style={styles.lanTradePendingList}>
+            <Text style={styles.lanEffectsTitle}>TROCAS PENDENTES</Text>
+            {sheetTradeOffers.map((event) => {
+              const payload = (event.payload || {}) as any;
+              const isCounter = event.eventType === 'TRADE_COUNTERED';
+              const itemName = isCounter ? payload.offeredItemName || payload.offeredItem?.name || 'item' : payload.itemName || payload.item?.name || 'item';
+              const qty = Math.max(1, Number(isCounter ? payload.offeredQuantity || 1 : payload.quantity || 1));
+              const sourceName = isCounter ? payload.targetName || event.actorName || 'Personagem' : payload.sourceName || event.actorName || 'Personagem';
+              return (
+                <View key={event.commandId || event.eventId} style={styles.lanTradePendingCard}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.lanTradePendingName} numberOfLines={1}>{sourceName}</Text>
+                    <Text style={styles.lanEffectText} numberOfLines={2}>
+                      {isCounter ? `Respondeu sua troca de ${qty}x ${itemName}.` : `Ofereceu ${qty}x ${itemName}.`}
+                    </Text>
+                  </View>
+                  <View style={styles.lanTradeIconActions}>
+                    <TouchableOpacity style={[styles.lanTradeIconButton, styles.lanTradeDeclineButton]} onPress={() => void respondToSheetTradeOffer(event, 'decline')}>
+                      <Ionicons name="close" size={18} color="#ff6666" />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.lanTradeIconButton, styles.lanTradeAcceptButton]} onPress={() => void respondToSheetTradeOffer(event, 'accept')}>
+                      <Ionicons name="checkmark" size={18} color="#02112b" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
 
         <View style={styles.lanEffectsBox}>
           <Text style={styles.lanEffectsTitle}>SEUS EFEITOS</Text>
@@ -1559,7 +1766,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
               </Text>
             </TouchableOpacity>
 
-            {activeEffects.length > 0 && (
+            {!isLanPlayerControlledSheet && activeEffects.length > 0 && (
               <View style={styles.activeEffectsBox}>
                 <Text style={styles.activeEffectsTitle}>EFEITOS ATIVOS</Text>
                 <View style={styles.activeEffectsWrap}>
@@ -1716,11 +1923,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
             
             <View style={styles.cardBlock}>
               {character.equipment.bag.length > 0 ? character.equipment.bag.map((item: any, i: number) => {
-                  const p = (item.properties || '').toLowerCase();
-                  const d = (item.damage || '').toLowerCase();
-                  const dt = (item.damage_type || '').toLowerCase();
-                  const n = (item.name || '').toLowerCase();
-                  const isConsumable = p.includes('consumível') || d.includes('cura') || dt.includes('cura') || d.includes('escolher') || n.includes('poção') || n.includes('pocao');
+                  const catItem = dbItemsCatalog.find(cat => cat.name === item.name);
+                  const isConsumable = isConsumableItem(item, catItem);
 
                   return (
                     <View key={i} style={styles.itemRow}>
@@ -2066,14 +2270,11 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
             {selectedBagItem && (() => {
               const catItem = dbItemsCatalog.find(i => i.name === selectedBagItem.item.name);
               const itemLore = catItem?.descricao || '';
-              const p = (selectedBagItem.item.properties || '').toLowerCase();
-              const d = (selectedBagItem.item.damage || '').toLowerCase();
-              const dt = (selectedBagItem.item.damage_type || '').toLowerCase();
-              const n = (selectedBagItem.item.name || '').toLowerCase();
-              const isConsumable = p.includes('consumível') || d.includes('cura') || dt.includes('cura') || d.includes('escolher') || n.includes('poção') || n.includes('pocao');
+              const isConsumable = isConsumableItem(selectedBagItem.item, catItem);
 
               return (
               <>
+                <ScrollView style={styles.actionModalScroll} contentContainerStyle={styles.actionModalContent} showsVerticalScrollIndicator={false}>
                 <Text style={styles.modalTitle}>{selectedBagItem.item.name}</Text>
                 
                 {/* LORE DO ITEM */}
@@ -2129,7 +2330,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                     <Text style={styles.actionBtnThrowText}>Arremessar</Text>
                   </TouchableOpacity>
 
-                  {isLanPlayerControlledSheet && lanTradeTargets.length > 0 && (
+                  {isLanPlayerControlledSheet && (
                     <>
                       <TouchableOpacity style={styles.actionBtnSend} onPress={() => {
                         const {item} = selectedBagItem;
@@ -2157,8 +2358,52 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                     <Text style={styles.actionBtnCancelText}>Voltar</Text>
                   </TouchableOpacity>
                 </View>
+                </ScrollView>
               </>
             )})()}
+          </View>
+        </Pressable>
+      </Modal>
+
+      <Modal visible={!!lanTargetPicker} transparent animationType="fade">
+        <Pressable style={styles.modalOverlay} onPress={() => setLanTargetPicker(null)}>
+          <View style={styles.lanTargetPickerBox}>
+            <Text style={styles.modalTitle}>{lanTargetPicker?.mode === 'send' ? 'Enviar para quem?' : 'Trocar com quem?'}</Text>
+            <Text style={styles.lanTargetPickerSub}>{lanTargetPicker?.qty || 1}x {lanTargetPicker?.item?.name || 'item'}</Text>
+            <ScrollView style={styles.lanTargetPickerList} showsVerticalScrollIndicator={false}>
+              {lanTradeTargets.map((target: any) => {
+                const snapshot = parseLanSnapshot(target);
+                const targetName = snapshot.name || lanTargetName(target);
+                return (
+                  <TouchableOpacity
+                    key={`${target.device_id}-${target.character_id}`}
+                    style={styles.lanTargetRow}
+                    onPress={() => {
+                      const current = lanTargetPicker;
+                      setLanTargetPicker(null);
+                      if (!current) return;
+                      void (current.mode === 'send'
+                        ? sendItemToLanPlayer(target, current.item, current.qty)
+                        : offerTradeToLanPlayer(target, current.item, current.qty));
+                    }}
+                  >
+                    <View style={styles.lanTargetAvatar}>
+                      <Ionicons name="person-circle-outline" size={30} color="#00fa9a" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.lanTargetName} numberOfLines={1}>{targetName}</Text>
+                      <Text style={styles.lanTargetSub} numberOfLines={1}>
+                        Nv. {snapshot.hpUnknown ? '?' : snapshot.level} / {target.connected ? 'Ativo' : 'Offline'}
+                      </Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={18} color="rgba(255,255,255,0.45)" />
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+            <TouchableOpacity style={styles.actionBtnCancel} onPress={() => setLanTargetPicker(null)}>
+              <Text style={styles.actionBtnCancelText}>Cancelar</Text>
+            </TouchableOpacity>
           </View>
         </Pressable>
       </Modal>
@@ -2259,12 +2504,12 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
       {/* ================= MODAL DE ALERTAS CUSTOMIZADOS (AÇÕES) ================= */}
       <Modal visible={customAlert.visible} transparent animationType="fade">
-        <View style={styles.modalOverlay}>
-          <View style={styles.customAlertBox}>
+        <Pressable style={styles.modalOverlay} onPress={() => setCustomAlert(prev => ({ ...prev, visible: false }))}>
+          <Pressable style={styles.customAlertBox} onPress={event => event.stopPropagation()}>
             <Text style={styles.customAlertTitle}>{customAlert.title}</Text>
             <Text style={styles.customAlertMessage}>{customAlert.message}</Text>
             
-            <View style={styles.customAlertBtnRow}>
+            <ScrollView style={styles.customAlertScroll} contentContainerStyle={styles.customAlertBtnRow} showsVerticalScrollIndicator={false}>
               {customAlert.buttons.map((btn, index) => (
                 <TouchableOpacity 
                   key={index} 
@@ -2280,9 +2525,9 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                   </Text>
                 </TouchableOpacity>
               ))}
-            </View>
-          </View>
-        </View>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
       </Modal>
         <DiceRoller3D/>
     </LinearGradient>
@@ -2458,7 +2703,9 @@ const styles = StyleSheet.create({
   unequipBtn: { backgroundColor: 'rgba(255,50,50,0.1)', padding: 10, borderRadius: 10, alignItems: 'center', marginBottom: 15, borderWidth: 1, borderColor: 'rgba(255,50,50,0.3)' },
   unequipBtnText: { color: '#ff6666', fontWeight: 'bold', fontSize: 12 },
 
-  actionModalBox: { backgroundColor: '#02112b', width: '85%', borderRadius: 25, padding: 25, borderWidth: 1, borderColor: '#00bfff' },
+  actionModalBox: { backgroundColor: '#02112b', width: '85%', maxHeight: '86%', borderRadius: 25, padding: 0, borderWidth: 1, borderColor: '#00bfff', overflow: 'hidden' },
+  actionModalScroll: { width: '100%' },
+  actionModalContent: { padding: 25 },
   actionQtyRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, marginVertical: 10 },
   actionQtyBtn: { backgroundColor: 'rgba(255,255,255,0.1)', width: 45, height: 45, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   actionQtyBtnText: { color: '#00bfff', fontSize: 26, fontWeight: 'bold' },
@@ -2475,9 +2722,10 @@ const styles = StyleSheet.create({
   actionBtnCancel: { paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   actionBtnCancelText: { color: 'rgba(255,255,255,0.5)', fontWeight: 'bold', fontSize: 14 },
 
-  customAlertBox: { backgroundColor: '#102b56', width: '90%', borderRadius: 20, padding: 25, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', alignItems: 'center' },
+  customAlertBox: { backgroundColor: '#102b56', width: '90%', maxHeight: '86%', borderRadius: 20, padding: 25, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', alignItems: 'center' },
   customAlertTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },
   customAlertMessage: { color: 'rgba(255,255,255,0.8)', fontSize: 14, textAlign: 'center', lineHeight: 22, marginBottom: 25 },
+  customAlertScroll: { width: '100%' },
   customAlertBtnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, width: '100%', justifyContent: 'center' },
   customAlertBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 10, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)', minWidth: '30%' },
   customAlertBtnText: { fontWeight: 'bold', fontSize: 14 },
@@ -2495,6 +2743,7 @@ const styles = StyleSheet.create({
   lanSessionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.08)', marginBottom: 10 },
   lanSessionTitle: { color: '#00bfff', fontSize: 15, fontWeight: 'bold', letterSpacing: 1.5 },
   lanSessionHint: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4 },
+  lanPlayersList: { maxHeight: 248 },
   lanPlayerRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
   lanPlayerName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   lanPlayerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },
@@ -2508,6 +2757,20 @@ const styles = StyleSheet.create({
   lanEffectsTitle: { color: '#00bfff', fontSize: 11, fontWeight: 'bold', letterSpacing: 1, marginBottom: 6 },
   lanEffectText: { color: 'rgba(255,255,255,0.82)', fontSize: 12, lineHeight: 18 },
   lanEffectMuted: { color: 'rgba(255,255,255,0.45)', fontSize: 12 },
+  lanTradePendingList: { marginTop: 12, gap: 8, backgroundColor: 'rgba(255,209,102,0.08)', borderRadius: 14, padding: 12, borderWidth: 1, borderColor: 'rgba(255,209,102,0.25)' },
+  lanTradePendingCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: 'rgba(0,0,0,0.18)', borderRadius: 12, padding: 10 },
+  lanTradePendingName: { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 3 },
+  lanTradeIconActions: { flexDirection: 'row', gap: 8 },
+  lanTradeIconButton: { width: 38, height: 38, borderRadius: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1 },
+  lanTradeDeclineButton: { backgroundColor: 'rgba(255,102,102,0.1)', borderColor: 'rgba(255,102,102,0.35)' },
+  lanTradeAcceptButton: { backgroundColor: '#00fa9a', borderColor: '#00fa9a' },
+  lanTargetPickerBox: { backgroundColor: '#102b56', width: '90%', maxHeight: '78%', borderRadius: 22, padding: 18, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)' },
+  lanTargetPickerSub: { color: 'rgba(255,255,255,0.65)', fontSize: 16, textAlign: 'center', marginTop: 8, marginBottom: 16 },
+  lanTargetPickerList: { maxHeight: 360, width: '100%' },
+  lanTargetRow: { flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 16, padding: 12, marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.22)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.22)' },
+  lanTargetAvatar: { width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,250,154,0.08)' },
+  lanTargetName: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
+  lanTargetSub: { color: 'rgba(255,255,255,0.45)', fontSize: 11, marginTop: 3 },
   deathOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.52)', alignItems: 'center', justifyContent: 'center', zIndex: 20 },
   deathSkull: { fontSize: 76, marginBottom: 10 },
   deathText: { color: '#fff', fontSize: 24, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 1 },

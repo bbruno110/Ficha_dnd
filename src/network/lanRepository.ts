@@ -484,6 +484,23 @@ export async function getLanTradeResolutionEvent(db: SQLiteDatabase, sessionId: 
   return null;
 }
 
+export async function getLanTradeCounterEvent(db: SQLiteDatabase, sessionId: string, offerCommandId?: string | null) {
+  if (!offerCommandId) return null;
+  const rows = await db.getAllAsync<Record<string, unknown>>(
+    `SELECT * FROM lan_event_log
+     WHERE session_id = ? AND event_type = 'TRADE_COUNTERED'
+     ORDER BY seq DESC, id DESC`,
+    [sessionId]
+  );
+  for (const row of rows) {
+    const event = rowToOfficialEvent(row);
+    if (String((event.payload as any)?.offerCommandId || '') === offerCommandId) {
+      return event;
+    }
+  }
+  return null;
+}
+
 function rowToOfficialEvent(row: Record<string, unknown>): LanOfficialEventMessage {
   return {
     type: 'LAN_EVENT',
@@ -728,7 +745,7 @@ export async function upsertLanPlayer(
     ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(session_id, device_id)
     DO UPDATE SET player_name = excluded.player_name, character_id = excluded.character_id,
-      character_name = excluded.character_name, connected = excluded.connected, last_seen_at = CURRENT_TIMESTAMP`,
+      character_name = COALESCE(excluded.character_name, character_name), connected = excluded.connected, last_seen_at = CURRENT_TIMESTAMP`,
     [sessionId, deviceId, playerName, characterId || null, characterName || null, connected ? 1 : 0]
   );
 }

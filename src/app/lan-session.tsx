@@ -68,6 +68,7 @@ export default function LanSessionScreen() {
     lastError,
     lastNotice,
     players,
+    localDeviceId,
     closeActiveSession,
     endActiveSession,
     linkCharacterToActiveSession,
@@ -87,6 +88,7 @@ export default function LanSessionScreen() {
   const [history, setHistory] = useState<LanOfficialEventMessage[]>([]);
   const [historyPage, setHistoryPage] = useState(0);
   const [selectedTargetCharacterId, setSelectedTargetCharacterId] = useState<number | null>(null);
+  const [selectedTargetDeviceId, setSelectedTargetDeviceId] = useState<string | null>(null);
   const [masterAmount, setMasterAmount] = useState('');
   const [coinGp, setCoinGp] = useState('');
   const [coinSp, setCoinSp] = useState('');
@@ -104,8 +106,8 @@ export default function LanSessionScreen() {
   const [selectedEffectIds, setSelectedEffectIds] = useState<number[]>([]);
   const [effectDurationValue, setEffectDurationValue] = useState('3');
   const [effectDurationUnit, setEffectDurationUnit] = useState<'turn' | 'minute' | 'hour' | 'short_rest' | 'long_rest'>('turn');
-  const [globalXp, setGlobalXp] = useState('');
-  const [globalHp, setGlobalHp] = useState('');
+  const [globalXp, setGlobalXp] = useState('100');
+  const [globalHp, setGlobalHp] = useState('1');
   const [globalCoins, setGlobalCoins] = useState({ gp: '', sp: '', cp: '' });
   const [campaignTurn, setCampaignTurn] = useState(1);
   const [campaignMinutes, setCampaignMinutes] = useState(0);
@@ -177,6 +179,7 @@ export default function LanSessionScreen() {
       setHistoryPage(0);
       setSelectedCharacterId(null);
       setSelectedTargetCharacterId(null);
+      setSelectedTargetDeviceId(null);
     }
   }, [activeSession, loadHistory, refreshPlayers]);
 
@@ -196,15 +199,31 @@ export default function LanSessionScreen() {
   }, [activeSession, lanRevision, refreshPlayers, loadHistory, loadSessionState]);
 
   useEffect(() => {
+    const targetStillPresent = selectedTargetCharacterId
+      ? players.some(player =>
+          player.character_id &&
+          Number(player.character_id) === selectedTargetCharacterId &&
+          (!selectedTargetDeviceId || player.device_id === selectedTargetDeviceId)
+        )
+      : false;
+    if (targetStillPresent) return;
+
     const firstTarget = players.find(player => player.character_id);
-    if (!selectedTargetCharacterId && firstTarget?.character_id) {
+    if (firstTarget?.character_id) {
       setSelectedTargetCharacterId(Number(firstTarget.character_id));
+      setSelectedTargetDeviceId(firstTarget.device_id);
+    } else {
+      setSelectedTargetCharacterId(null);
+      setSelectedTargetDeviceId(null);
     }
-  }, [players, selectedTargetCharacterId]);
+  }, [players, selectedTargetCharacterId, selectedTargetDeviceId]);
 
   const selectedCharacter = characters.find(character => character.id === selectedCharacterId);
   const targetPlayers = players.filter(player => player.character_id);
-  const selectedTargetPlayer = players.find(player => Number(player.character_id) === selectedTargetCharacterId);
+  const selectedTargetPlayer = players.find(player =>
+    Number(player.character_id) === selectedTargetCharacterId &&
+    (!selectedTargetDeviceId || player.device_id === selectedTargetDeviceId)
+  );
 
   const safeJson = (value: unknown, fallback: any = null) => {
     if (value === null || value === undefined || value === '') return fallback;
@@ -375,7 +394,7 @@ export default function LanSessionScreen() {
   };
 
   const handleMasterHp = async (mode: 'damage' | 'heal') => {
-    if (!selectedTargetCharacterId) {
+    if (!selectedTargetPlayer?.character_id) {
       Alert.alert('Escolha um alvo', 'Selecione um jogador com ficha vinculada.');
       return;
     }
@@ -383,8 +402,8 @@ export default function LanSessionScreen() {
     if (amount <= 0) return;
 
     await sendLanCommand('MASTER_APPLY_HP', {
-      targetCharacterId: selectedTargetCharacterId,
-      targetDeviceId: selectedTargetPlayer?.device_id || null,
+      targetCharacterId: Number(selectedTargetPlayer.character_id),
+      targetDeviceId: selectedTargetPlayer.device_id,
       targetName: selectedTargetPlayer?.character_name || 'Personagem',
       mode,
       amount,
@@ -394,7 +413,7 @@ export default function LanSessionScreen() {
   };
 
   const handleMasterXp = async () => {
-    if (!selectedTargetCharacterId) {
+    if (!selectedTargetPlayer?.character_id) {
       Alert.alert('Escolha um alvo', 'Selecione um jogador com ficha vinculada.');
       return;
     }
@@ -402,8 +421,8 @@ export default function LanSessionScreen() {
     if (amount === 0) return;
 
     await sendLanCommand('MASTER_APPLY_XP', {
-      targetCharacterId: selectedTargetCharacterId,
-      targetDeviceId: selectedTargetPlayer?.device_id || null,
+      targetCharacterId: Number(selectedTargetPlayer.character_id),
+      targetDeviceId: selectedTargetPlayer.device_id,
       targetName: selectedTargetPlayer?.character_name || 'Personagem',
       amount,
     });
@@ -412,7 +431,7 @@ export default function LanSessionScreen() {
   };
 
   const handleMasterCoins = async () => {
-    if (!selectedTargetCharacterId) {
+    if (!selectedTargetPlayer?.character_id) {
       Alert.alert('Escolha um alvo', 'Selecione um jogador com ficha vinculada.');
       return;
     }
@@ -424,8 +443,8 @@ export default function LanSessionScreen() {
     if (coins.gp === 0 && coins.sp === 0 && coins.cp === 0) return;
 
     await sendLanCommand('MASTER_APPLY_COINS', {
-      targetCharacterId: selectedTargetCharacterId,
-      targetDeviceId: selectedTargetPlayer?.device_id || null,
+      targetCharacterId: Number(selectedTargetPlayer.character_id),
+      targetDeviceId: selectedTargetPlayer.device_id,
       targetName: selectedTargetPlayer?.character_name || 'Personagem',
       ...coins,
     });
@@ -446,7 +465,7 @@ export default function LanSessionScreen() {
       mode,
       amount,
     });
-    setCardAmount(player, '');
+    setCardAmount(player, '1');
     await refreshSessionViews();
   };
 
@@ -596,7 +615,7 @@ export default function LanSessionScreen() {
         amount: share,
       });
     }
-    setGlobalXp('');
+    setGlobalXp('100');
     await refreshSessionViews();
   };
 
@@ -613,7 +632,7 @@ export default function LanSessionScreen() {
         amount,
       });
     }
-    setGlobalHp('');
+    setGlobalHp('1');
     await refreshSessionViews();
   };
 
@@ -711,21 +730,54 @@ export default function LanSessionScreen() {
   });
 
   const resolvedTradeOfferIds = new Set<string>();
+  const counteredTradeOfferIds = new Set<string>();
   for (const event of history) {
     const offerCommandId = String((event.payload as any)?.offerCommandId || '');
     if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED')) {
       resolvedTradeOfferIds.add(offerCommandId);
     }
+    if (offerCommandId && event.eventType === 'TRADE_COUNTERED') {
+      counteredTradeOfferIds.add(offerCommandId);
+    }
   }
   const pendingTradeOffers = history.filter(event => {
     const offerCommandId = event.commandId || event.eventId;
+    const payload = (event.payload || {}) as any;
+    const targetDeviceId = String(event.targetDeviceId || payload.targetDeviceId || '');
+    const belongsToThisDevice = localDeviceId ? targetDeviceId === localDeviceId : !targetDeviceId;
     return (
       activeSession?.role === 'player' &&
       event.eventType === 'TRADE_OFFERED' &&
       Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
+      belongsToThisDevice &&
+      !resolvedTradeOfferIds.has(offerCommandId) &&
+      !counteredTradeOfferIds.has(offerCommandId)
+    );
+  });
+  const pendingTradeCounters = history.filter(event => {
+    const offerCommandId = String((event.payload as any)?.offerCommandId || '');
+    const payload = (event.payload || {}) as any;
+    const targetDeviceId = String(event.targetDeviceId || payload.sourceDeviceId || '');
+    const belongsToThisDevice = localDeviceId ? targetDeviceId === localDeviceId : !targetDeviceId;
+    return (
+      activeSession?.role === 'player' &&
+      event.eventType === 'TRADE_COUNTERED' &&
+      Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
+      belongsToThisDevice &&
+      !!offerCommandId &&
       !resolvedTradeOfferIds.has(offerCommandId)
     );
   });
+
+  const tradePartsLabel = (item: any, quantity: number, coins?: { gp?: number; sp?: number; cp?: number }) => {
+    const parts = [
+      item && quantity > 0 ? `${quantity}x ${String(item.name || item.itemName || 'Item')}` : '',
+      Number(coins?.gp || 0) > 0 ? `${Number(coins?.gp || 0)} PO` : '',
+      Number(coins?.sp || 0) > 0 ? `${Number(coins?.sp || 0)} PP` : '',
+      Number(coins?.cp || 0) > 0 ? `${Number(coins?.cp || 0)} PC` : '',
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(' + ') : 'Nada';
+  };
 
   const openTradeModal = async (event: LanOfficialEventMessage) => {
     if (!activeSession?.linked_character_id) return;
@@ -742,9 +794,18 @@ export default function LanSessionScreen() {
     setTradeModal(event);
   };
 
+  const openTradeConfirmModal = (event: LanOfficialEventMessage) => {
+    setTradeCounterItems([]);
+    setTradeCounterItemIndex(null);
+    setTradeCounterQty('1');
+    setTradeCoins({ gp: '', sp: '', cp: '' });
+    setTradeModal(event);
+  };
+
   const handleDeclineTrade = async (event: LanOfficialEventMessage) => {
+    const payload = (event.payload || {}) as any;
     await sendLanCommand('PLAYER_TRADE_DECLINE', {
-      offerCommandId: event.commandId || event.eventId,
+      offerCommandId: payload.offerCommandId || event.commandId || event.eventId,
     });
     setTradeModal(current => ((current?.commandId || current?.eventId) === (event.commandId || event.eventId) ? null : current));
     await refreshSessionViews();
@@ -752,15 +813,28 @@ export default function LanSessionScreen() {
 
   const handleAcceptTrade = async () => {
     if (!tradeModal) return;
+    if (tradeModal.eventType === 'TRADE_COUNTERED') {
+      await sendLanCommand('PLAYER_TRADE_CONFIRM', {
+        offerCommandId: String((tradeModal.payload as any)?.offerCommandId || ''),
+        counterCommandId: tradeModal.commandId || tradeModal.eventId,
+      });
+      setTradeModal(null);
+      await refreshSessionViews();
+      return;
+    }
+
     const selectedItem = tradeCounterItemIndex !== null ? tradeCounterItems[tradeCounterItemIndex] : null;
     const qty = selectedItem ? Math.max(1, Math.min(Number(selectedItem.qty || 1), numericValue(tradeCounterQty, 1))) : 0;
-    await sendLanCommand('PLAYER_TRADE_ACCEPT', {
-      offerCommandId: tradeModal.commandId || tradeModal.eventId,
-      counterItem: selectedItem || null,
-      counterQuantity: selectedItem ? qty : 0,
+    const coins = {
       gp: Math.max(0, numericValue(tradeCoins.gp, 0)),
       sp: Math.max(0, numericValue(tradeCoins.sp, 0)),
       cp: Math.max(0, numericValue(tradeCoins.cp, 0)),
+    };
+    await sendLanCommand('PLAYER_TRADE_COUNTER', {
+      offerCommandId: tradeModal.commandId || tradeModal.eventId,
+      counterItem: selectedItem || null,
+      counterQuantity: selectedItem ? qty : 0,
+      ...coins,
     });
     setTradeModal(null);
     setTradeCounterItems([]);
@@ -991,20 +1065,6 @@ export default function LanSessionScreen() {
       return renderPlayerLinkedCharacterCard();
     }
 
-    if (false) {
-      return (
-        <View style={styles.section}>
-          <Text style={styles.label}>FICHA DA MESA</Text>
-          <View style={styles.createRequiredBox}>
-            <Ionicons name="hourglass-outline" size={24} color="#00bfff" />
-            <View style={{ flex: 1 }}>
-              <Text style={styles.createRequiredTitle}>Aguardando regras da mesa</Text>
-              <Text style={styles.createRequiredSub}>A escolha/criação da ficha aparece depois da resposta do mestre.</Text>
-            </View>
-          </View>
-        </View>
-      );
-    }
 
     if (activeSession.allow_existing_character) {
       return renderCharacterLinkPicker();
@@ -1038,6 +1098,14 @@ export default function LanSessionScreen() {
             <Ionicons name="exit-outline" size={18} color="#ff6666" />
             <Text style={styles.dangerButtonText}>Desconectar</Text>
           </TouchableOpacity>
+        </View>
+      );
+    }
+
+    if (activeSession.status === 'closed') {
+      return (
+        <View style={styles.activeActions}>
+          <Text style={styles.mutedSmallText}>Encerrando sessao e aguardando jogadores desvincularem.</Text>
         </View>
       );
     }
@@ -1095,6 +1163,7 @@ export default function LanSessionScreen() {
 
   const renderMasterTools = () => {
     if (!activeSession || activeSession.role !== 'master') return null;
+    if (activeSession.status === 'closed') return null;
 
     return (
       <View style={styles.toolsBox}>
@@ -1173,6 +1242,7 @@ export default function LanSessionScreen() {
                 value={globalXp}
                 onChangeText={value => setGlobalXp(onlyNumberText(value))}
                 onFocus={() => globalXp === '0' && setGlobalXp('')}
+                onBlur={() => !globalXp && setGlobalXp('100')}
                 keyboardType="numeric"
                 placeholder="0"
                 placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1197,6 +1267,7 @@ export default function LanSessionScreen() {
                 value={globalHp}
                 onChangeText={value => setGlobalHp(onlyNumberText(value))}
                 onFocus={() => globalHp === '0' && setGlobalHp('')}
+                onBlur={() => !globalHp && setGlobalHp('1')}
                 keyboardType="numeric"
                 placeholder="0"
                 placeholderTextColor="rgba(255,255,255,0.35)"
@@ -1263,18 +1334,20 @@ export default function LanSessionScreen() {
                 .slice(0, 8);
               const equippedPreview = snapshot.equipped.map(itemLabel).filter(Boolean);
               const bagPreview = snapshot.equipment.bag.map(itemLabel).filter(Boolean);
+              const displayName = snapshot.raw?.name || snapshot.data?.name || player.character_name || (hasCharacter ? 'Personagem sem nome' : player.player_name || 'Jogador');
+              const playerLabel = player.player_name && player.player_name !== displayName ? player.player_name : 'Jogador';
 
               return (
-                <View key={player.device_id} style={[styles.playerSheetCard, !hasCharacter && styles.playerSheetCardDisabled]}>
+                <View key={playerActionKey(player)} style={[styles.playerSheetCard, !hasCharacter && styles.playerSheetCardDisabled]}>
                   <View style={styles.playerSheetHeader}>
                     <View style={{ flex: 1 }}>
                       <View style={styles.playerIdentityRow}>
-                        <Text style={styles.playerSheetName} numberOfLines={1}>{player.character_name || player.player_name || 'Jogador'}</Text>
+                        <Text style={styles.playerSheetName} numberOfLines={1}>{displayName}</Text>
                         <View style={[styles.dot, player.connected ? styles.dotOn : styles.dotOff]} />
                       </View>
                       <Text style={styles.playerSheetSub} numberOfLines={1}>
                         {hasCharacter
-                          ? `${player.player_name || 'Jogador'} / Nv. ${snapshot.level} / ${snapshot.race || 'Raça'} / ${snapshot.className || 'Classe'}`
+                          ? `${playerLabel} / Nv. ${snapshot.level} / ${snapshot.race || 'Raça'} / ${snapshot.className || 'Classe'}`
                           : 'Aguardando vínculo/criação da ficha'}
                       </Text>
                     </View>
@@ -1321,6 +1394,7 @@ export default function LanSessionScreen() {
                         </TouchableOpacity>
                       </View>
 
+                      {expanded && (
                       <View style={styles.quickMetricGrid}>
                         <View style={styles.quickMetricBox}>
                           <Text style={styles.quickMetricLabel}>PO</Text>
@@ -1335,8 +1409,9 @@ export default function LanSessionScreen() {
                           <Text style={styles.quickMetricValue}>{snapshot.cp}</Text>
                         </View>
                       </View>
+                      )}
 
-                      {snapshot.activeEffects.length > 0 && (
+                      {expanded && snapshot.activeEffects.length > 0 && (
                         <TouchableOpacity style={[styles.effectPreviewBox, { borderColor: effectColor(snapshot.activeEffects[0], 'rgba(255,209,102,0.25)') }]} onPress={() => setMasterModal({ kind: 'effects', player })}>
                           <Ionicons name="sparkles-outline" size={14} color={effectColor(snapshot.activeEffects[0])} />
                           <Text style={styles.effectPreviewText} numberOfLines={1}>
@@ -1482,24 +1557,59 @@ export default function LanSessionScreen() {
         {pendingTradeOffers.length > 0 && (
           <View style={styles.pendingRequestsBox}>
             <View style={styles.sectionHeader}>
-              <Text style={styles.playersTitle}>Trocas pendentes</Text>
+              <Text style={styles.playersTitle}>Propostas recebidas</Text>
               <Text style={styles.pendingCount}>{pendingTradeOffers.length}</Text>
             </View>
             {pendingTradeOffers.map(event => {
               const payload = (event.payload || {}) as any;
               const itemName = payload.itemName || payload.item?.name || 'item';
               const qty = Math.max(1, numericValue(String(payload.quantity || 1), 1));
+              const sourceName = payload.sourceName || event.actorName || 'Personagem';
               return (
                 <View key={event.commandId || event.eventId} style={styles.pendingRequestCard}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.pendingRequestTitle}>{event.actorName || 'Jogador'}</Text>
+                    <Text style={styles.pendingRequestTitle}>{sourceName}</Text>
                     <Text style={styles.pendingRequestText}>
-                      Ofereceu {qty}x {itemName}. Voce pode aceitar direto, enviar item/moedas em troca, ou recusar.
+                      Ofereceu {qty}x {itemName}. Responda com item, moedas ou nada.
                     </Text>
                   </View>
                   <View style={styles.pendingRequestActions}>
                     <TouchableOpacity style={styles.approveRequestButton} onPress={() => openTradeModal(event)}>
                       <Ionicons name="swap-horizontal" size={16} color="#02112b" />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.denyRequestButton} onPress={() => handleDeclineTrade(event)}>
+                      <Ionicons name="close" size={16} color="#ff6666" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
+
+        {pendingTradeCounters.length > 0 && (
+          <View style={styles.pendingRequestsBox}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.playersTitle}>Contrapropostas</Text>
+              <Text style={styles.pendingCount}>{pendingTradeCounters.length}</Text>
+            </View>
+            {pendingTradeCounters.map(event => {
+              const payload = (event.payload || {}) as any;
+              const targetName = payload.targetName || event.actorName || 'Personagem';
+              const offeredName = payload.offeredItemName || payload.offeredItem?.name || 'item';
+              const offeredQty = Math.max(1, numericValue(String(payload.offeredQuantity || 1), 1));
+              const counterLabel = tradePartsLabel(payload.counterItem, Number(payload.counterQuantity || 0), payload.coins);
+              return (
+                <View key={event.commandId || event.eventId} style={styles.pendingRequestCard}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.pendingRequestTitle}>{targetName}</Text>
+                    <Text style={styles.pendingRequestText}>
+                      Aceitou receber {offeredQty}x {offeredName} e oferecer {counterLabel}. Confirme para executar.
+                    </Text>
+                  </View>
+                  <View style={styles.pendingRequestActions}>
+                    <TouchableOpacity style={styles.approveRequestButton} onPress={() => openTradeConfirmModal(event)}>
+                      <Ionicons name="checkmark" size={16} color="#02112b" />
                     </TouchableOpacity>
                     <TouchableOpacity style={styles.denyRequestButton} onPress={() => handleDeclineTrade(event)}>
                       <Ionicons name="close" size={16} color="#ff6666" />
@@ -1546,17 +1656,28 @@ export default function LanSessionScreen() {
   const renderTradeModal = () => {
     if (!tradeModal) return null;
     const payload = (tradeModal.payload || {}) as any;
-    const offeredItemName = payload.itemName || payload.item?.name || 'item';
-    const offeredQty = Math.max(1, numericValue(String(payload.quantity || 1), 1));
+    const isConfirmingCounter = tradeModal.eventType === 'TRADE_COUNTERED';
+    const offeredItemName = isConfirmingCounter
+      ? payload.offeredItemName || payload.offeredItem?.name || 'item'
+      : payload.itemName || payload.item?.name || 'item';
+    const offeredQty = Math.max(1, numericValue(String(isConfirmingCounter ? payload.offeredQuantity || 1 : payload.quantity || 1), 1));
+    const sourceName = payload.sourceName || tradeModal.actorName || 'Personagem';
+    const counterName = payload.targetName || tradeModal.actorName || 'Personagem';
+    const counterLabel = tradePartsLabel(payload.counterItem, Number(payload.counterQuantity || 0), payload.coins);
     const selectedItem = tradeCounterItemIndex !== null ? tradeCounterItems[tradeCounterItemIndex] : null;
     const selectedMaxQty = Math.max(1, Number(selectedItem?.qty || 1));
+    const selectedCounterLabel = tradePartsLabel(selectedItem, selectedItem ? Math.max(1, Math.min(Number(selectedItem.qty || 1), numericValue(tradeCounterQty, 1))) : 0, {
+      gp: numericValue(tradeCoins.gp, 0),
+      sp: numericValue(tradeCoins.sp, 0),
+      cp: numericValue(tradeCoins.cp, 0),
+    });
 
     return (
       <Modal visible transparent animationType="fade" onRequestClose={() => setTradeModal(null)}>
         <Pressable style={styles.modalOverlay} onPress={() => setTradeModal(null)}>
           <Pressable style={styles.masterModalContent} onPress={event => event.stopPropagation()}>
             <View style={styles.masterModalHeader}>
-              <Text style={styles.masterModalTitle}>Responder troca</Text>
+              <Text style={styles.masterModalTitle}>{isConfirmingCounter ? 'Confirmar troca' : 'Responder troca'}</Text>
               <TouchableOpacity style={styles.modalIconButton} onPress={() => setTradeModal(null)}>
                 <Ionicons name="close" size={20} color="#fff" />
               </TouchableOpacity>
@@ -1564,12 +1685,14 @@ export default function LanSessionScreen() {
 
             <ScrollView showsVerticalScrollIndicator={false}>
               <Text style={styles.modalHint}>
-                {tradeModal.actorName || 'Jogador'} ofereceu {offeredQty}x {offeredItemName}.
+                {isConfirmingCounter
+                  ? `${counterName} respondeu oferecendo ${counterLabel}. Confirme para executar a troca.`
+                  : `${sourceName} ofereceu ${offeredQty}x ${offeredItemName}.`}
               </Text>
 
               <View style={styles.tradeBoard}>
                 <View style={styles.tradeSidePanel}>
-                  <Text style={styles.tradeSideLabel}>RECEBER</Text>
+                  <Text style={styles.tradeSideLabel}>{isConfirmingCounter ? 'ENVIAR' : 'RECEBER'}</Text>
                   <View style={styles.tradeSlotFilled}>
                     <Ionicons name="cube-outline" size={18} color="#00fa9a" />
                     <View style={{ flex: 1 }}>
@@ -1580,79 +1703,94 @@ export default function LanSessionScreen() {
                 </View>
 
                 <View style={styles.tradeSidePanel}>
-                  <Text style={styles.tradeSideLabel}>ENVIAR</Text>
-                  <TouchableOpacity
-                    style={[styles.tradeItemRow, tradeCounterItemIndex === null && styles.tradeItemRowActive]}
-                    onPress={() => setTradeCounterItemIndex(null)}
-                  >
-                    <Text style={styles.tradeItemName}>Nada</Text>
-                    {tradeCounterItemIndex === null && <Ionicons name="checkmark-circle" size={18} color="#00fa9a" />}
-                  </TouchableOpacity>
+                  <Text style={styles.tradeSideLabel}>{isConfirmingCounter ? 'RECEBER' : 'ENVIAR'}</Text>
+                  <View style={isConfirmingCounter && counterLabel !== 'Nada' ? styles.tradeSlotFilled : styles.tradeSlotEmpty}>
+                    <Ionicons name={isConfirmingCounter && counterLabel !== 'Nada' ? 'cube-outline' : 'swap-horizontal-outline'} size={18} color={isConfirmingCounter && counterLabel !== 'Nada' ? '#00fa9a' : 'rgba(255,255,255,0.5)'} />
+                    <Text style={styles.tradeItemQty}>{isConfirmingCounter ? counterLabel : selectedCounterLabel}</Text>
+                  </View>
                 </View>
               </View>
 
-              <Text style={styles.modalFieldLabel}>SUA MOCHILA</Text>
-              <View style={styles.tradeItemList}>
-                {tradeCounterItems.length === 0 ? (
-                  <Text style={styles.emptyText}>Nenhum item disponivel.</Text>
-                ) : (
-                  tradeCounterItems.map((item, index) => (
+              {!isConfirmingCounter && (
+                <>
+                  <Text style={styles.modalFieldLabel}>SUA MOCHILA</Text>
+                  <View style={styles.tradeItemList}>
                     <TouchableOpacity
-                      key={`${item?.name || 'item'}-${index}`}
-                      style={[styles.tradeItemRow, tradeCounterItemIndex === index && styles.tradeItemRowActive]}
+                      style={[styles.tradeItemRow, tradeCounterItemIndex === null && styles.tradeItemRowActive]}
                       onPress={() => {
-                        setTradeCounterItemIndex(index);
+                        setTradeCounterItemIndex(null);
                         setTradeCounterQty('1');
                       }}
                     >
-                      <Text style={styles.tradeItemName}>{item?.name || 'Item'}</Text>
-                      <Text style={styles.tradeItemQty}>x{Number(item?.qty || 1)}</Text>
+                      <Text style={styles.tradeItemName}>Nada</Text>
+                      <Text style={styles.tradeItemQty}>sem item</Text>
                     </TouchableOpacity>
-                  ))
-                )}
-              </View>
+                    {tradeCounterItems.length === 0 ? (
+                      <Text style={styles.emptyText}>Nenhum item disponivel.</Text>
+                    ) : (
+                      tradeCounterItems.map((item, index) => (
+                        <TouchableOpacity
+                          key={`${item?.name || 'item'}-${index}`}
+                          style={[styles.tradeItemRow, tradeCounterItemIndex === index && styles.tradeItemRowActive]}
+                          onPress={() => {
+                            setTradeCounterItemIndex(index);
+                            setTradeCounterQty('1');
+                          }}
+                        >
+                          <Text style={styles.tradeItemName}>{item?.name || 'Item'}</Text>
+                          <Text style={styles.tradeItemQty}>x{Number(item?.qty || 1)}</Text>
+                        </TouchableOpacity>
+                      ))
+                    )}
+                  </View>
 
-              {selectedItem && (
-                <>
-                  <Text style={styles.modalFieldLabel}>QUANTIDADE</Text>
-                  <TextInput
-                    style={[styles.input, styles.modalNumberInput]}
-                    value={tradeCounterQty}
-                    onChangeText={value => setTradeCounterQty(onlyNumberText(value))}
-                    onFocus={() => tradeCounterQty === '1' && setTradeCounterQty('')}
-                    keyboardType="numeric"
-                    placeholder={`1 a ${selectedMaxQty}`}
-                    placeholderTextColor="rgba(255,255,255,0.35)"
-                    selectTextOnFocus
-                  />
+                  {selectedItem && (
+                    <>
+                      <Text style={styles.modalFieldLabel}>QUANTIDADE</Text>
+                      <TextInput
+                        style={[styles.input, styles.modalNumberInput]}
+                        value={tradeCounterQty}
+                        onChangeText={value => setTradeCounterQty(onlyNumberText(value))}
+                        onFocus={() => tradeCounterQty === '1' && setTradeCounterQty('')}
+                        keyboardType="numeric"
+                        placeholder={`1 a ${selectedMaxQty}`}
+                        placeholderTextColor="rgba(255,255,255,0.35)"
+                        selectTextOnFocus
+                      />
+                    </>
+                  )}
+
+                  <Text style={styles.modalFieldLabel}>MOEDAS EM TROCA</Text>
+                  <View style={styles.coinInputGrid}>
+                    {(['gp', 'sp', 'cp'] as const).map(type => (
+                      <View key={type} style={styles.coinInputBox}>
+                        <Text style={styles.coinMiniLabel}>{type.toUpperCase()}</Text>
+                        <TextInput
+                          style={[styles.input, styles.coinInput]}
+                          value={tradeCoins[type]}
+                          onChangeText={value => setTradeCoins(prev => ({ ...prev, [type]: onlyNumberText(value) }))}
+                          keyboardType="numeric"
+                          placeholder="0"
+                          placeholderTextColor="rgba(255,255,255,0.35)"
+                          selectTextOnFocus
+                        />
+                      </View>
+                    ))}
+                  </View>
                 </>
               )}
 
-              <Text style={styles.modalFieldLabel}>MOEDAS EM TROCA</Text>
-              <View style={styles.coinInputGrid}>
-                {(['gp', 'sp', 'cp'] as const).map(type => (
-                  <View key={type} style={styles.coinInputBox}>
-                    <Text style={styles.coinMiniLabel}>{type.toUpperCase()}</Text>
-                    <TextInput
-                      style={[styles.input, styles.coinInput]}
-                      value={tradeCoins[type]}
-                      onChangeText={value => setTradeCoins(prev => ({ ...prev, [type]: onlyNumberText(value) }))}
-                      keyboardType="numeric"
-                      placeholder="0"
-                      placeholderTextColor="rgba(255,255,255,0.35)"
-                      selectTextOnFocus
-                    />
-                  </View>
-                ))}
-              </View>
-
               <TouchableOpacity style={styles.primaryWideButton} onPress={handleAcceptTrade}>
                 <Ionicons name="checkmark-circle-outline" size={18} color="#02112b" />
-                <Text style={styles.primaryWideButtonText}>Aceitar troca</Text>
+                <Text style={styles.primaryWideButtonText}>{isConfirmingCounter ? 'Confirmar e trocar' : 'Enviar resposta'}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.dangerWideButton} onPress={() => handleDeclineTrade(tradeModal)}>
                 <Ionicons name="close-circle-outline" size={18} color="#ff6666" />
                 <Text style={styles.dangerButtonText}>Recusar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.secondaryWideButton} onPress={() => setTradeModal(null)}>
+                <Ionicons name="time-outline" size={18} color="#00bfff" />
+                <Text style={styles.secondaryButtonText}>Ignorar por enquanto</Text>
               </TouchableOpacity>
             </ScrollView>
           </Pressable>
@@ -2002,6 +2140,67 @@ export default function LanSessionScreen() {
   const renderActiveSession = () => {
     if (!activeSession) return null;
 
+    if (activeSession.role === 'player') {
+      return (
+        <View style={styles.activePanel}>
+          <View style={styles.activeHeader}>
+            <View>
+              <Text style={styles.activeEyebrow}>SESSAO LAN / JOGADOR</Text>
+              <Text style={styles.activeTitle}>{activeSession.name}</Text>
+            </View>
+            <View style={[styles.statusBadge, isTransportReady && styles.statusBadgeReady]}>
+              <Text style={[styles.statusBadgeText, isTransportReady && styles.statusBadgeTextReady]}>
+                {connectionStatus === 'syncing' ? 'SYNC' : connectionStatus === 'reconnecting' ? 'RECONECTANDO' : isTransportReady ? 'LAN ON' : 'LAN OFF'}
+              </Text>
+            </View>
+          </View>
+
+          {activeSession.linked_character_id && (
+            <TouchableOpacity style={styles.primaryButton} onPress={() => router.replace(`/sheet?id=${activeSession.linked_character_id}`)}>
+              <Ionicons name="document-text-outline" size={20} color="#02112b" />
+              <Text style={styles.primaryButtonText}>ABRIR MINHA FICHA</Text>
+            </TouchableOpacity>
+          )}
+          {!activeSession.linked_character_id && renderPlayerCharacterGate()}
+
+          {renderHistory()}
+          {lastNotice && <Text style={styles.noticeText}>{lastNotice}</Text>}
+          {lastError && <Text style={styles.errorText}>{lastError}</Text>}
+          {renderSessionControls()}
+        </View>
+      );
+    }
+
+    if (activeSession.status === 'closed') {
+      return (
+        <View style={styles.activePanel}>
+          <View style={styles.activeHeader}>
+            <View>
+              <Text style={styles.activeEyebrow}>SESSAO ENCERRADA / MESTRE</Text>
+              <Text style={styles.activeTitle}>{activeSession.name}</Text>
+            </View>
+            <View style={styles.statusBadge}>
+              <Text style={styles.statusBadgeText}>FECHANDO</Text>
+            </View>
+          </View>
+
+          <View style={styles.closedSessionBox}>
+            <Ionicons name="close-circle-outline" size={34} color="#ff6666" />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.closedSessionTitle}>Mesa encerrada</Text>
+              <Text style={styles.closedSessionText}>
+                O host fica aberto apenas por alguns instantes para avisar os jogadores e desvincular as fichas.
+              </Text>
+            </View>
+          </View>
+
+          {lastNotice && <Text style={styles.noticeText}>{lastNotice}</Text>}
+          {lastError && <Text style={styles.errorText}>{lastError}</Text>}
+          {renderSessionControls()}
+        </View>
+      );
+    }
+
     return (
       <View style={[styles.activePanel, activeSession.role === 'master' && styles.activePanelFull]}>
         <View style={styles.activeHeader}>
@@ -2068,7 +2267,11 @@ export default function LanSessionScreen() {
     );
   };
 
-  const renderAdminMenu = () => (
+  const renderAdminMenu = () => {
+    const hasRunningSession = activeSession && activeSession.status !== 'paused' && activeSession.status !== 'inactive' && activeSession.status !== 'closed';
+    if (hasRunningSession) return null;
+
+    return (
     <View style={styles.adminPanel}>
       <Text style={styles.adminTitle}>Sessão LAN</Text>
       <Text style={styles.adminDescription}>
@@ -2150,7 +2353,8 @@ export default function LanSessionScreen() {
         </Text>
       )}
     </View>
-  );
+    );
+  };
 
   return (
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
@@ -2297,6 +2501,18 @@ const styles = StyleSheet.create({
   linkedText: { color: '#fff', fontSize: 12, marginBottom: 8 },
   noticeText: { color: '#00fa9a', fontSize: 12, marginTop: 4 },
   errorText: { color: '#ff6666', fontSize: 12, marginTop: 4 },
+  closedSessionBox: {
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'center',
+    borderRadius: 16,
+    padding: 14,
+    backgroundColor: 'rgba(255,102,102,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,102,102,0.24)',
+  },
+  closedSessionTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 4 },
+  closedSessionText: { color: 'rgba(255,255,255,0.62)', fontSize: 12, lineHeight: 18 },
   playersBox: { marginTop: 12, backgroundColor: 'rgba(0,0,0,0.22)', borderRadius: 12, padding: 12 },
   toolsBox: { marginTop: 12, backgroundColor: 'rgba(0,0,0,0.22)', borderRadius: 12, padding: 12 },
   historyBox: { marginTop: 12, backgroundColor: 'rgba(0,0,0,0.18)', borderRadius: 12, padding: 12 },
@@ -2434,6 +2650,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(0,250,154,0.32)',
   },
+  tradeSlotEmpty: {
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
   tradeItemRow: {
     minHeight: 46,
     flexDirection: 'row',
@@ -2506,24 +2733,27 @@ const styles = StyleSheet.create({
   playerToolHint: { color: '#00bfff', fontSize: 10, fontWeight: 'bold', marginTop: 10 },
   playerToolWarning: { color: '#ffd166', fontSize: 10, fontWeight: 'bold', marginTop: 10 },
   refreshText: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold' },
-  playerCardsList: { gap: 14 },
+  playerCardsList: { gap: 10 },
   playerSheetCard: {
-    borderRadius: 18,
-    padding: 14,
+    borderRadius: 14,
+    padding: 11,
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.22)',
     backgroundColor: 'rgba(0,0,0,0.28)',
   },
   playerSheetCardDisabled: { opacity: 0.72, borderColor: 'rgba(255,209,102,0.22)' },
-  playerSheetHeader: { gap: 10, marginBottom: 12 },
+  playerSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 },
   playerIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   playerSheetName: { color: '#fff', fontSize: 17, fontWeight: 'bold', flex: 1, minWidth: 0 },
   playerSheetSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 4 },
-  cardHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 8, width: '100%' },
+  cardHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 7, flexShrink: 0 },
   viewSheetButton: {
-    flex: 1,
+    flex: 0,
+    minWidth: 70,
+    minHeight: 38,
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     gap: 5,
     borderRadius: 10,
     paddingHorizontal: 10,
@@ -2534,8 +2764,9 @@ const styles = StyleSheet.create({
   },
   viewSheetText: { color: '#00bfff', fontSize: 11, fontWeight: 'bold' },
   expandToggleButton: {
-    minHeight: 42,
-    flex: 1,
+    minHeight: 38,
+    flex: 0,
+    minWidth: 96,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -2548,14 +2779,14 @@ const styles = StyleSheet.create({
     borderColor: '#89ffd0',
   },
   expandToggleText: { color: '#02112b', fontSize: 11, fontWeight: 'bold' },
-  hpBlock: { marginTop: 2, marginBottom: 12 },
+  hpBlock: { marginTop: 0, marginBottom: 9 },
   metricHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   metricLabel: { color: 'rgba(255,255,255,0.45)', fontSize: 10, fontWeight: 'bold', letterSpacing: 1 },
   metricValue: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
   hpTrack: { height: 9, borderRadius: 999, overflow: 'hidden', backgroundColor: 'rgba(255,255,255,0.12)' },
   hpFill: { height: '100%', borderRadius: 999, backgroundColor: '#00fa9a' },
-  quickMetricGrid: { flexDirection: 'row', gap: 8, marginBottom: 12 },
-  quickMetricBox: { flex: 1, borderRadius: 12, padding: 9, backgroundColor: 'rgba(255,255,255,0.05)', alignItems: 'center' },
+  quickMetricGrid: { flexDirection: 'row', gap: 7, marginBottom: 9 },
+  quickMetricBox: { flex: 1, borderRadius: 10, padding: 8, backgroundColor: 'rgba(255,255,255,0.05)', alignItems: 'center' },
   quickMetricLabel: { color: 'rgba(255,255,255,0.44)', fontSize: 9, fontWeight: 'bold' },
   quickMetricValue: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginTop: 3 },
   effectPreviewBox: {
