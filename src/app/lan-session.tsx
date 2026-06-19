@@ -224,6 +224,7 @@ export default function LanSessionScreen() {
     Number(player.character_id) === selectedTargetCharacterId &&
     (!selectedTargetDeviceId || player.device_id === selectedTargetDeviceId)
   );
+  const visibleSavedSessions = savedSessions.filter(session => session.status !== 'inactive' && session.status !== 'closed');
 
   const safeJson = (value: unknown, fallback: any = null) => {
     if (value === null || value === undefined || value === '') return fallback;
@@ -2202,7 +2203,7 @@ export default function LanSessionScreen() {
     }
 
     return (
-      <View style={[styles.activePanel, activeSession.role === 'master' && styles.activePanelFull]}>
+      <View style={[styles.activePanel, activeSession.role === 'master' && activeSession.status !== 'paused' && styles.activePanelFull]}>
         <View style={styles.activeHeader}>
           <View>
             <Text style={styles.activeEyebrow}>SESSÃO ATIVA / {activeSession.role === 'master' ? 'MESTRE' : 'JOGADOR'}</Text>
@@ -2300,7 +2301,7 @@ export default function LanSessionScreen() {
         <Ionicons name="chevron-forward" size={22} color="rgba(255,255,255,0.55)" />
       </TouchableOpacity>
 
-      {savedSessions.length > 0 && (
+      {visibleSavedSessions.length > 0 && (
         <View style={styles.savedSessionsBox}>
           <View style={styles.sectionHeader}>
             <Text style={styles.playersTitle}>Mesas salvas</Text>
@@ -2308,7 +2309,7 @@ export default function LanSessionScreen() {
               <Text style={styles.refreshText}>Atualizar</Text>
             </TouchableOpacity>
           </View>
-          {savedSessions.map(session => {
+          {visibleSavedSessions.map(session => {
             const color = sessionStatusColor(session);
             const isCurrent = activeSession?.id === session.id;
             const canResume = !isCurrent || !isTransportReady;
@@ -2392,7 +2393,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.3)',
   },
   topBarTitle: { color: '#00fa9a', fontSize: 16, fontWeight: 'bold', letterSpacing: 1 },
-  scrollContent: { padding: 20, paddingBottom: 60 },
+  scrollContent: { flexGrow: 1, justifyContent: 'flex-start', padding: 20, paddingBottom: 60 },
   adminPanel: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 18, padding: 16 },
   adminTitle: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginBottom: 8 },
   adminDescription: { color: 'rgba(255,255,255,0.58)', fontSize: 13, lineHeight: 19, marginBottom: 16 },

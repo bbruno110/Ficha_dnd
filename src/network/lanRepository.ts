@@ -196,14 +196,14 @@ export async function getLocalPlayerName(db: SQLiteDatabase) {
 export async function closeOpenLanSessions(db: SQLiteDatabase, role?: LanRole) {
   if (role) {
     await db.runAsync(
-      `UPDATE lan_sessions SET status = 'inactive' WHERE role = ? AND status IN ('open', 'connected')`,
+      `UPDATE lan_sessions SET status = 'inactive', linked_character_id = NULL WHERE role = ? AND status IN ('open', 'connected')`,
       [role]
     );
     return;
   }
 
   await db.runAsync(
-    `UPDATE lan_sessions SET status = 'inactive' WHERE status IN ('open', 'connected')`
+    `UPDATE lan_sessions SET status = 'inactive', linked_character_id = NULL WHERE status IN ('open', 'connected')`
   );
 }
 
@@ -240,9 +240,10 @@ export async function setLanSessionStatus(db: SQLiteDatabase, sessionId: string,
      SET status = ?, closed_at = CASE WHEN ? = 'closed' THEN CURRENT_TIMESTAMP ELSE closed_at END,
          paused_at = CASE WHEN ? = 'paused' THEN CURRENT_TIMESTAMP ELSE paused_at END,
          resumed_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE resumed_at END,
-         last_connected_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE last_connected_at END
+         last_connected_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE last_connected_at END,
+         linked_character_id = CASE WHEN ? IN ('closed', 'inactive') THEN NULL ELSE linked_character_id END
      WHERE id = ?`,
-    [status, status, status, status, status, sessionId]
+    [status, status, status, status, status, status, sessionId]
   );
 
   await db.runAsync(
@@ -256,7 +257,7 @@ export async function setLanSessionStatus(db: SQLiteDatabase, sessionId: string,
 export async function getLanSessions(db: SQLiteDatabase, includeClosed = false) {
   return db.getAllAsync<LanSessionRecord>(
     `SELECT * FROM lan_sessions
-     ${includeClosed ? '' : `WHERE status != 'closed'`}
+     ${includeClosed ? '' : `WHERE status NOT IN ('closed', 'inactive')`}
      ORDER BY
        CASE status
          WHEN 'open' THEN 0
@@ -278,7 +279,16 @@ export async function getLanSessionById(db: SQLiteDatabase, sessionId: string) {
 
 export async function getActiveLanSession(db: SQLiteDatabase) {
   return db.getFirstAsync<LanSessionRecord>(
-    `SELECT * FROM lan_sessions WHERE status IN ('open', 'connected', 'paused') ORDER BY COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC LIMIT 1`
+    `SELECT * FROM lan_sessions
+     WHERE status IN ('open', 'connected')
+     ORDER BY
+       CASE status
+         WHEN 'open' THEN 0
+         WHEN 'connected' THEN 0
+         ELSE 2
+       END,
+       COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC
+     LIMIT 1`
   );
 }
 
