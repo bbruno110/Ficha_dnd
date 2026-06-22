@@ -224,6 +224,13 @@ async function seedConditionEffectCatalog(db: SQLiteDatabase) {
     { name: 'Inconsciente', description: 'Nao age normalmente ate acordar, estabilizar ou ser removido do estado.', color: '#64748B' },
     { name: 'Queimadura', description: 'Chamas, calor ou acido deixam um efeito persistente.', color: '#F4A84D' },
     { name: 'Amaldicoado', description: 'Uma maldicao ativa altera sorte, corpo, mente ou destino do alvo.', color: '#8B5CF6' },
+    { name: 'Invisivel', description: 'Nao pode ser visto normalmente. Ataques contra a criatura podem sofrer desvantagem, e ataques dela podem ter vantagem conforme regra da mesa.', color: '#94A3B8' },
+    { name: 'Voando', description: 'Pode se mover pelo ar durante a duracao do efeito.', color: '#38BDF8' },
+    { name: 'Aumentado', description: 'Tamanho ou massa aumentados por magia, podendo alterar dano, alcance, peso carregado ou testes de Forca.', color: '#F59E0B' },
+    { name: 'Heroismo', description: 'Coragem sobrenatural, resistencia a medo e vigor temporario.', color: '#FACC15' },
+    { name: 'Velocidade', description: 'Movimento acelerado e reflexos ampliados durante a duracao.', color: '#22C55E' },
+    { name: 'Resistencia Elemental', description: 'Reduz dano de um tipo elemental definido pelo efeito.', color: '#60A5FA' },
+    { name: 'Obscurecido', description: 'Fumaca, neblina, sombra ou cobertura visual dificulta enxergar ou mirar dentro da area.', color: '#64748B' },
   ];
 
   for (const effect of baseEffects) {
@@ -366,6 +373,15 @@ type ExpandedSpellSeed = {
   classLevelRequired: number;
 };
 
+type SpellcastingProgressionSeed = {
+  sourceType: 'class' | 'subclass' | 'race';
+  sourceName: string;
+  level: number;
+  cantripsKnown: number;
+  spellsKnown: number;
+  slots: number[];
+};
+
 const EXPANDED_RACES = [
   { name: 'Aasimar', statBonuses: '{"CAR": 2, "SAB": 1}', speed: '9m', features: ['Visao no Escuro', 'Resistencia Celestial', 'Maos Curativas'] },
   { name: 'Genasi do Fogo', statBonuses: '{"CON": 2, "INT": 1}', speed: '9m', features: ['Visao no Escuro', 'Resistencia a Fogo', 'Chama Inata'] },
@@ -433,8 +449,23 @@ const EXPANDED_ITEMS: ExpandedItemSeed[] = [
   { name: 'Tonica de Foco', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Concentração', descricao: 'Mistura amarga que ajuda a manter a mente firme por alguns minutos.' },
   { name: 'Pocao de Escalada', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Movimento', descricao: 'Liquido viscoso que facilita escalar paredes e rochas.' },
   { name: 'Pocao de Respiracao Aquatica', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Aquatico', descricao: 'Permite respirar embaixo da agua por tempo limitado.' },
+  { name: 'Poção de Invisibilidade', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Furtividade', descricao: 'Torna quem bebe invisivel por ate 1 hora, ou ate atacar/conjurar conforme regra da mesa.' },
+  { name: 'Poção de Força do Gigante da Colina', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Forca', descricao: 'Define a Forca de quem bebe como 21 por 1 hora.' },
+  { name: 'Poção de Velocidade', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Movimento', descricao: 'Acelera quem bebe por 1 minuto, aumentando defesa, movimento e ritmo de acoes conforme regra da mesa.' },
+  { name: 'Poção de Voo', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Movimento', descricao: 'Concede deslocamento de voo por 1 hora.' },
+  { name: 'Poção de Heroísmo', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Coragem', descricao: 'Concede heroismo por 1 hora: vigor temporario e resistencia a medo conforme regra da mesa.' },
+  { name: 'Poção de Resistência ao Fogo', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Resistencia', descricao: 'Concede resistencia contra dano de fogo por 1 hora.' },
+  { name: 'Poção de Resistência ao Frio', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Resistencia', descricao: 'Concede resistencia contra dano de frio por 1 hora.' },
+  { name: 'Poção de Crescimento', weight: 0.25, damage: '+1d4', damageType: 'Extra', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magico, Tamanho', descricao: 'Aumenta o tamanho por 1 hora e adiciona 1d4 ao dano com arma enquanto durar.' },
   { name: 'Pergaminho de Reparar', weight: 0.0, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho', descricao: 'Pergaminho simples que repara um objeto pequeno danificado.' },
   { name: 'Pergaminho de Sono', weight: 0.0, damage: '5d8', damageType: 'Outro', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho', descricao: 'Pergaminho que libera uma onda sonolenta sobre criaturas proximas.' },
+  { name: 'Pergaminho de Misseis Magicos', weight: 0.0, damage: '3d4+3', damageType: 'Forca', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, Nivel 1', descricao: 'Permite conjurar Misseis Magicos uma vez, consumindo o pergaminho.' },
+  { name: 'Pergaminho de Bola de Fogo', weight: 0.0, damage: '8d6', damageType: 'Fogo', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, Nivel 3, Area', descricao: 'Permite conjurar Bola de Fogo uma vez, consumindo o pergaminho.' },
+  { name: 'Pergaminho de Curar Ferimentos', weight: 0.0, damage: 'Cura 1d8', damageType: 'Cura', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, Cura, Nivel 1', descricao: 'Permite conjurar Curar Ferimentos uma vez, consumindo o pergaminho.' },
+  { name: 'Pergaminho de Armadura Arcana', weight: 0.0, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, CA, Nivel 1', descricao: 'Permite conjurar Armadura Arcana uma vez, consumindo o pergaminho.' },
+  { name: 'Pergaminho de Invisibilidade', weight: 0.0, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, Invisibilidade, Nivel 2', descricao: 'Permite conjurar Invisibilidade uma vez, consumindo o pergaminho.' },
+  { name: 'Pergaminho de Escudo Arcano', weight: 0.0, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, Reacao, CA, Nivel 1', descricao: 'Permite conjurar Escudo Arcano uma vez, consumindo o pergaminho.' },
+  { name: 'Pergaminho de Relampago', weight: 0.0, damage: '8d6', damageType: 'Eletrico', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho, Linha, Nivel 3', descricao: 'Permite conjurar Relampago uma vez, consumindo o pergaminho.' },
   { name: 'Talismã Celestial', weight: 0.1, damage: '-', damageType: '-', category: 'Foco', isConsumable: 0, properties: 'Amuleto, Foco Divino', descricao: 'Pequeno simbolo banhado em prata usado por devotos celestiais.' },
   { name: 'Manto Umbral', weight: 1.0, damage: '-', damageType: '-', category: 'Vestuario', isConsumable: 0, properties: 'Capa, Furtividade, Sombras', descricao: 'Manto escuro que parece absorver parte da luz ao redor.' },
   { name: 'Anzol de Adamante', weight: 0.2, damage: '-', damageType: '-', category: 'Ferramenta', isConsumable: 0, properties: 'Ferramenta, Escalada, Pesca', descricao: 'Anzol robusto usado tanto para pesca perigosa quanto para escalada improvisada.' },
@@ -487,11 +518,50 @@ const EXPANDED_SPELLS: ExpandedSpellSeed[] = [
   { name: 'Poder dos Gigantes', level: 'Nível 3', category: 'Habilidade', classes: 'Guerreiro', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '+1d6', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Aumenta tamanho, forca e dano enquanto runas brilham.', classLevelRequired: 3 },
   { name: 'Manto de Inspiracao', level: 'Nível 3', category: 'Habilidade', classes: 'Bardo', castingTime: '1 Acao Bonus', range: '18m', components: '-', duration: 'Instantanea', damageDice: 'PV Temp', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Aliados recebem pontos temporarios e podem se mover sem provocar ataques.', classLevelRequired: 3 },
   { name: 'Emboscador Sombrio', level: 'Nível 3', category: 'Passiva', classes: 'Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+1d8', damageType: 'Extra', savingThrow: 'Nenhum', description: 'No inicio do combate, move-se mais e causa dano extra.', classLevelRequired: 3 },
+  { name: 'Palavra Radiante', level: 'Truque', category: 'Magia', classes: 'Clérigo', castingTime: '1 Acao', range: '1,5m', components: 'V, M', duration: 'Instantanea', damageDice: '1d6', damageType: 'Radiante', savingThrow: 'CON', description: 'Luz divina fere inimigos proximos que falham no teste.', classLevelRequired: 1 },
+  { name: 'Lufada', level: 'Truque', category: 'Magia', classes: 'Druida,Feiticeiro,Mago', castingTime: '1 Acao', range: '9m', components: 'V, S', duration: 'Instantanea', damageDice: '-', damageType: 'Outro', savingThrow: 'FOR', description: 'Empurra uma criatura ou objeto leve com uma lufada de vento.', classLevelRequired: 1 },
+  { name: 'Moldar Agua', level: 'Truque', category: 'Magia', classes: 'Druida,Feiticeiro,Mago', castingTime: '1 Acao', range: '9m', components: 'S', duration: '1 Hora', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Move, congela ou colore uma pequena porcao de agua.', classLevelRequired: 1 },
+  { name: 'Toque Gelido', level: 'Truque', category: 'Magia', classes: 'Bruxo,Feiticeiro,Mago', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: '1 Rodada', damageDice: '1d8', damageType: 'Frio', savingThrow: 'CON', description: 'Frio necromantico reduz vigor e dificulta recuperacao.', classLevelRequired: 1 },
+  { name: 'Badalar dos Mortos', level: 'Truque', category: 'Magia', classes: 'Bruxo,Clérigo,Mago', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Instantanea', damageDice: '1d8/1d12', damageType: 'Necrótico', savingThrow: 'SAB', description: 'Sino funebre causa mais dano em alvo ja ferido.', classLevelRequired: 1 },
+  { name: 'Rajada de Ar', level: 'Truque', category: 'Magia', classes: 'Druida,Mistico,Feiticeiro', castingTime: '1 Acao', range: '9m', components: 'S', duration: 'Instantanea', damageDice: '1d6', damageType: 'Concussao', savingThrow: 'FOR', description: 'Compressao de ar golpeia e desloca o alvo.', classLevelRequired: 1 },
+  { name: 'Raio Guia', level: 'Nível 1', category: 'Magia', classes: 'Clérigo', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: '1 Rodada', damageDice: '4d6', damageType: 'Radiante', savingThrow: 'Nenhum', description: 'Raio luminoso causa dano e concede vantagem ao proximo ataque contra o alvo.', classLevelRequired: 1 },
+  { name: 'Heroismo', level: 'Nível 1', category: 'Magia', classes: 'Bardo,Paladino', castingTime: '1 Acao', range: 'Toque', components: 'V, S', duration: 'Concentracao', damageDice: 'PV Temp', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Alvo fica imune a medo e recebe pontos temporarios a cada turno.', classLevelRequired: 1 },
+  { name: 'Santuário', level: 'Nível 1', category: 'Magia', classes: 'Clérigo,Paladino', castingTime: '1 Acao Bonus', range: '9m', components: 'V, S, M', duration: '1 Minuto', damageDice: '-', damageType: 'Outro', savingThrow: 'SAB', description: 'Inimigos precisam vencer teste para atacar o alvo protegido.', classLevelRequired: 1 },
+  { name: 'Orbe Cromatico', level: 'Nível 1', category: 'Magia', classes: 'Feiticeiro,Mago', castingTime: '1 Acao', range: '27m', components: 'V, S, M', duration: 'Instantanea', damageDice: '3d8', damageType: 'Variavel', savingThrow: 'Nenhum', description: 'Arremessa esfera elemental de tipo escolhido.', classLevelRequired: 1 },
+  { name: 'Faca de Gelo', level: 'Nível 1', category: 'Magia', classes: 'Druida,Feiticeiro,Mago', castingTime: '1 Acao', range: '18m', components: 'S, M', duration: 'Instantanea', damageDice: '1d10+2d6', damageType: 'Perfurante, Frio', savingThrow: 'DES', description: 'Estilhaço de gelo perfura e explode em frio.', classLevelRequired: 1 },
+  { name: 'Queda Suave', level: 'Nível 1', category: 'Magia', classes: 'Bardo,Feiticeiro,Mago,Artifice', castingTime: 'Reacao', range: '18m', components: 'V, M', duration: '1 Minuto', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Reduz dano de queda de criaturas escolhidas.', classLevelRequired: 1 },
+  { name: 'Aprimorar Salto', level: 'Nível 1', category: 'Magia', classes: 'Druida,Feiticeiro,Mago,Patrulheiro,Artifice', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: '1 Minuto', damageDice: 'Movimento', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Triplica a distancia de salto do alvo.', classLevelRequired: 1 },
+  { name: 'Ajuda', level: 'Nível 2', category: 'Magia', classes: 'Clérigo,Paladino,Artifice', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: '8 Horas', damageDice: '+5 PV Max', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Aumenta pontos de vida maximos e atuais de aliados.', classLevelRequired: 3 },
+  { name: 'Restauracao Menor', level: 'Nível 2', category: 'Magia', classes: 'Bardo,Clérigo,Druida,Paladino,Patrulheiro,Artifice', castingTime: '1 Acao', range: 'Toque', components: 'V, S', duration: 'Instantanea', damageDice: '-', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Remove uma condicao simples como cego, surdo, paralisado ou envenenado.', classLevelRequired: 3 },
+  { name: 'Silencio', level: 'Nível 2', category: 'Magia', classes: 'Bardo,Clérigo,Patrulheiro', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: 'Concentracao', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Cria area onde nenhum som existe ou atravessa.', classLevelRequired: 3 },
+  { name: 'Ver Invisibilidade', level: 'Nível 2', category: 'Magia', classes: 'Bardo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S, M', duration: '1 Hora', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Permite enxergar criaturas e objetos invisiveis.', classLevelRequired: 3 },
+  { name: 'Escalada de Aranha', level: 'Nível 2', category: 'Magia', classes: 'Bruxo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Movimento', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Alvo escala paredes e tetos como uma aranha.', classLevelRequired: 3 },
+  { name: 'Forca Fantasmagorica', level: 'Nível 2', category: 'Magia', classes: 'Bardo,Feiticeiro,Mago,Mistico', castingTime: '1 Acao', range: '18m', components: 'V, S, M', duration: 'Concentracao', damageDice: '1d6', damageType: 'Psiquico', savingThrow: 'INT', description: 'Cria ilusao mental que o alvo racionaliza como real.', classLevelRequired: 3 },
+  { name: 'Medo', level: 'Nível 3', category: 'Magia', classes: 'Bardo,Bruxo,Feiticeiro,Mago', castingTime: '1 Acao', range: 'Cone', components: 'V, S, M', duration: 'Concentracao', damageDice: '-', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Projeta imagem aterradora que amedronta criaturas.', classLevelRequired: 5 },
+  { name: 'Lentidao', level: 'Nível 3', category: 'Magia', classes: 'Feiticeiro,Mago,Mistico', castingTime: '1 Acao', range: '36m', components: 'V, S, M', duration: 'Concentracao', damageDice: '-', damageType: 'Outro', savingThrow: 'SAB', description: 'Distorce o tempo e reduz acoes, velocidade e defesa de alvos.', classLevelRequired: 5 },
+  { name: 'Protecao contra Energia', level: 'Nível 3', category: 'Magia', classes: 'Clérigo,Druida,Feiticeiro,Mago,Patrulheiro,Artifice', castingTime: '1 Acao', range: 'Toque', components: 'V, S', duration: 'Concentracao', damageDice: 'Resistencia', damageType: 'Variavel', savingThrow: 'Nenhum', description: 'Concede resistencia a um tipo de dano elemental.', classLevelRequired: 5 },
+  { name: 'Toque Vampirico', level: 'Nível 3', category: 'Magia', classes: 'Bruxo,Mago', castingTime: '1 Acao', range: 'Toque', components: 'V, S', duration: 'Concentracao', damageDice: '3d6', damageType: 'Necrótico', savingThrow: 'Nenhum', description: 'Drena vida do alvo e cura metade do dano causado.', classLevelRequired: 5 },
+  { name: 'Crescimento de Plantas', level: 'Nível 3', category: 'Magia', classes: 'Bardo,Druida,Patrulheiro', castingTime: '1 Acao', range: '45m', components: 'V, S', duration: 'Instantanea', damageDice: 'Terreno', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Vegetacao cresce e transforma area em terreno dificil extremo.', classLevelRequired: 5 },
+  { name: 'Confusao', level: 'Nível 4', category: 'Magia', classes: 'Bardo,Druida,Feiticeiro,Mago', castingTime: '1 Acao', range: '27m', components: 'V, S, M', duration: 'Concentracao', damageDice: '-', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Embaralha a mente de criaturas em area.', classLevelRequired: 7 },
+  { name: 'Tentaculos Negros', level: 'Nível 4', category: 'Magia', classes: 'Mago,Bruxo', castingTime: '1 Acao', range: '27m', components: 'V, S, M', duration: 'Concentracao', damageDice: '3d6', damageType: 'Concussao', savingThrow: 'DES', description: 'Tentaculos sombrios agarram e esmagam criaturas na area.', classLevelRequired: 7 },
+  { name: 'Localizar Criatura', level: 'Nível 4', category: 'Magia', classes: 'Bardo,Clérigo,Druida,Mago,Paladino,Patrulheiro', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S, M', duration: 'Concentracao', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Sente a direcao de uma criatura conhecida dentro do alcance narrativo.', classLevelRequired: 7 },
+  { name: 'Animar Objetos', level: 'Nível 5', category: 'Magia', classes: 'Bardo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: 'Concentracao', damageDice: 'Variavel', damageType: 'Concussao', savingThrow: 'Nenhum', description: 'Objetos proximos ganham vida e atacam sob comando.', classLevelRequired: 9 },
+  { name: 'Telecinese', level: 'Nível 5', category: 'Magia', classes: 'Feiticeiro,Mago,Mistico', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Concentracao', damageDice: 'Controle', damageType: 'Outro', savingThrow: 'FOR', description: 'Move criaturas ou objetos com forca mental sustentada.', classLevelRequired: 9 },
+  { name: 'Restauracao Maior', level: 'Nível 5', category: 'Magia', classes: 'Bardo,Clérigo,Druida,Artifice', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Instantanea', damageDice: '-', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Remove efeitos severos como maldicao, reducao de atributo ou exaustao.', classLevelRequired: 9 },
+  { name: 'Missao', level: 'Nível 5', category: 'Magia', classes: 'Bardo,Clérigo,Paladino', castingTime: '1 Minuto', range: '18m', components: 'V', duration: '30 Dias', damageDice: '5d10', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Impõe uma ordem magica prolongada a uma criatura.', classLevelRequired: 9 },
+  { name: 'Estilo de Luta: Arquearia', level: 'Nível 1', category: 'Passiva', classes: 'Guerreiro,Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+2 Ataque', damageType: 'Outro', savingThrow: 'Nenhum', description: '+2 em jogadas de ataque com armas a distancia.', classLevelRequired: 1 },
+  { name: 'Estilo de Luta: Duas Armas', level: 'Nível 1', category: 'Passiva', classes: 'Guerreiro,Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+Mod Dano', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Adiciona modificador de atributo ao dano da segunda arma.', classLevelRequired: 1 },
+  { name: 'Estilo de Luta: Protecao', level: 'Nível 1', category: 'Habilidade', classes: 'Guerreiro,Paladino', castingTime: 'Reacao', range: '1,5m', components: '-', duration: 'Instantanea', damageDice: 'Desvantagem', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Impõe desvantagem em ataque contra aliado proximo enquanto usa escudo.', classLevelRequired: 1 },
+  { name: 'Ataque Extra', level: 'Nível 5', category: 'Passiva', classes: 'Guerreiro,Paladino,Patrulheiro,Monge,Artifice', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+1 Ataque', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Pode atacar duas vezes ao usar a acao Atacar.', classLevelRequired: 5 },
+  { name: 'Evasao', level: 'Nível 7', category: 'Passiva', classes: 'Ladino,Monge', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: 'Reducao', damageType: 'Outro', savingThrow: 'DES', description: 'Sofre menos dano em efeitos de Destreza bem-sucedidos.', classLevelRequired: 7 },
+  { name: 'Esquiva Sobrenatural', level: 'Nível 5', category: 'Habilidade', classes: 'Ladino', castingTime: 'Reacao', range: 'Pessoal', components: '-', duration: 'Instantanea', damageDice: 'Metade', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Reduz pela metade o dano de um ataque que o acertou.', classLevelRequired: 5 },
+  { name: 'Aura de Protecao', level: 'Nível 6', category: 'Passiva', classes: 'Paladino', castingTime: 'Passiva', range: '3m', components: '-', duration: 'Permanente', damageDice: '+CAR', damageType: 'Outro', savingThrow: 'Todos', description: 'Aliados proximos somam seu Carisma em testes de resistencia.', classLevelRequired: 6 },
+  { name: 'Canalizar Divindade: Expulsar Mortos-Vivos', level: 'Nível 2', category: 'Habilidade', classes: 'Clérigo,Paladino', castingTime: '1 Acao', range: '9m', components: '-', duration: '1 Minuto', damageDice: 'Amedrontado', damageType: 'Radiante', savingThrow: 'SAB', description: 'Mortos-vivos falham e precisam se afastar da fonte divina.', classLevelRequired: 2 },
 ];
 
 const EXPANDED_STARTING_KITS = [
   { name: 'Kit Artifice de Campo', targetName: 'Artifice', targetType: 'class', items: [{ name: 'Repetidor Leve', qty: 1 }, { name: 'Aljava com 20 Virotes', qty: 1 }, { name: 'Ferramentas de Inventor', qty: 1 }, { name: 'Granada de Fumaca', qty: 2 }] },
-  { name: 'Kit Artifice Alquimico', targetName: 'Artifice', targetType: 'class', items: [{ name: 'Adaga', qty: 1 }, { name: 'Kit de Alquimia', qty: 1 }, { name: 'Tonica de Foco', qty: 1 }, { name: 'Pocao de Cura', qty: 1 }] },
+  { name: 'Kit Artifice Alquimico', targetName: 'Artifice', targetType: 'class', items: [{ name: 'Adaga', qty: 1 }, { name: 'Kit de Alquimia', qty: 1 }, { name: 'Tonica de Foco', qty: 1 }, { name: 'Poção de Cura', qty: 1 }] },
   { name: 'Kit Mistico Errante', targetName: 'Mistico', targetType: 'class', items: [{ name: 'Cristal Psiquico', qty: 1 }, { name: 'Lamina Psiquica', qty: 1 }, { name: 'Roupas de Viagem', qty: 1 }, { name: 'Livro', qty: 1 }] },
   { name: 'Kit Mistico Umbral', targetName: 'Mistico', targetType: 'class', items: [{ name: 'Cristal Psiquico', qty: 1 }, { name: 'Manto Umbral', qty: 1 }, { name: 'Adaga', qty: 2 }, { name: 'Tonica de Foco', qty: 1 }] },
 ];
@@ -512,6 +582,178 @@ const EXPANDED_SPELLCASTING_PROGRESSIONS = [
   ['race', 'Tritao', 1, 0, 1, 0, 0, 0],
   ['race', 'Firbolg', 1, 0, 1, 0, 0, 0],
 ];
+
+const FULL_CASTER_SLOTS = [
+  [2, 0, 0, 0, 0, 0, 0, 0, 0],
+  [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 1, 0, 0, 0, 0, 0],
+  [4, 3, 3, 2, 0, 0, 0, 0, 0],
+  [4, 3, 3, 3, 1, 0, 0, 0, 0],
+  [4, 3, 3, 3, 2, 0, 0, 0, 0],
+  [4, 3, 3, 3, 2, 1, 0, 0, 0],
+  [4, 3, 3, 3, 2, 1, 0, 0, 0],
+  [4, 3, 3, 3, 2, 1, 1, 0, 0],
+  [4, 3, 3, 3, 2, 1, 1, 0, 0],
+  [4, 3, 3, 3, 2, 1, 1, 1, 0],
+  [4, 3, 3, 3, 2, 1, 1, 1, 0],
+  [4, 3, 3, 3, 2, 1, 1, 1, 1],
+  [4, 3, 3, 3, 3, 1, 1, 1, 1],
+  [4, 3, 3, 3, 3, 2, 1, 1, 1],
+  [4, 3, 3, 3, 3, 2, 2, 1, 1],
+];
+
+const HALF_CASTER_SLOTS = [
+  [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  [2, 0, 0, 0, 0, 0, 0, 0, 0],
+  [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 1, 0, 0, 0, 0, 0],
+  [4, 3, 3, 1, 0, 0, 0, 0, 0],
+  [4, 3, 3, 2, 0, 0, 0, 0, 0],
+  [4, 3, 3, 2, 0, 0, 0, 0, 0],
+  [4, 3, 3, 3, 1, 0, 0, 0, 0],
+  [4, 3, 3, 3, 1, 0, 0, 0, 0],
+  [4, 3, 3, 3, 2, 0, 0, 0, 0],
+  [4, 3, 3, 3, 2, 0, 0, 0, 0],
+];
+
+const ARTIFICE_SLOTS = [
+  [2, 0, 0, 0, 0, 0, 0, 0, 0],
+  ...HALF_CASTER_SLOTS.slice(1),
+];
+
+const THIRD_CASTER_SLOTS = [
+  [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  [2, 0, 0, 0, 0, 0, 0, 0, 0],
+  [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 1, 0, 0, 0, 0, 0],
+  [4, 3, 3, 1, 0, 0, 0, 0, 0],
+];
+
+const WARLOCK_SLOTS = Array.from({ length: 20 }, (_, index) => {
+  const level = index + 1;
+  const slots = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  const pactLevel = level >= 9 ? 5 : level >= 7 ? 4 : level >= 5 ? 3 : level >= 3 ? 2 : 1;
+  slots[pactLevel - 1] = level >= 11 ? 3 : level >= 2 ? 2 : 1;
+  return slots;
+});
+
+const spellsKnownByClass: Record<string, number[]> = {
+  Bardo: [4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 15, 16, 18, 19, 19, 20, 22, 22, 22],
+  Bruxo: [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15],
+  Feiticeiro: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 13, 13, 14, 14, 15, 15, 15, 15],
+  Patrulheiro: [0, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11],
+  Mistico: [2, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12],
+  'Cavaleiro Arcano': [0, 0, 3, 4, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 11, 11, 12, 13],
+  'Trapaceiro Arcano': [0, 0, 3, 4, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 11, 11, 12, 13],
+};
+
+function fullCasterCantrips(sourceName: string, level: number) {
+  if (sourceName === 'Bardo') return level >= 10 ? 4 : level >= 4 ? 3 : 2;
+  if (sourceName === 'Feiticeiro') return level >= 10 ? 6 : level >= 4 ? 5 : 4;
+  if (sourceName === 'Clérigo' || sourceName === 'Druida' || sourceName === 'Mago') return level >= 10 ? 5 : level >= 4 ? 4 : 3;
+  return 0;
+}
+
+function halfCasterCantrips(sourceName: string, level: number) {
+  if (sourceName !== 'Artifice') return 0;
+  if (level >= 14) return 4;
+  if (level >= 10) return 3;
+  return 2;
+}
+
+function buildClassProgressions(): SpellcastingProgressionSeed[] {
+  const seeds: SpellcastingProgressionSeed[] = [];
+  const fullCasters = ['Bardo', 'Clérigo', 'Druida', 'Feiticeiro', 'Mago'];
+  const halfCasters = ['Paladino', 'Patrulheiro', 'Artifice'];
+
+  for (const sourceName of fullCasters) {
+    for (let level = 1; level <= 20; level++) {
+      seeds.push({
+        sourceType: 'class',
+        sourceName,
+        level,
+        cantripsKnown: fullCasterCantrips(sourceName, level),
+        spellsKnown: spellsKnownByClass[sourceName]?.[level - 1] || 0,
+        slots: FULL_CASTER_SLOTS[level - 1],
+      });
+    }
+  }
+
+  for (const sourceName of halfCasters) {
+    for (let level = 1; level <= 20; level++) {
+      seeds.push({
+        sourceType: 'class',
+        sourceName,
+        level,
+        cantripsKnown: halfCasterCantrips(sourceName, level),
+        spellsKnown: spellsKnownByClass[sourceName]?.[level - 1] || 0,
+        slots: sourceName === 'Artifice' ? ARTIFICE_SLOTS[level - 1] : HALF_CASTER_SLOTS[level - 1],
+      });
+    }
+  }
+
+  for (let level = 1; level <= 20; level++) {
+    seeds.push({
+      sourceType: 'class',
+      sourceName: 'Bruxo',
+      level,
+      cantripsKnown: level >= 10 ? 4 : level >= 4 ? 3 : 2,
+      spellsKnown: spellsKnownByClass.Bruxo[level - 1],
+      slots: WARLOCK_SLOTS[level - 1],
+    });
+    seeds.push({
+      sourceType: 'class',
+      sourceName: 'Mistico',
+      level,
+      cantripsKnown: level >= 10 ? 4 : level >= 4 ? 3 : 2,
+      spellsKnown: spellsKnownByClass.Mistico[level - 1],
+      slots: [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    });
+  }
+
+  for (const sourceName of ['Cavaleiro Arcano', 'Trapaceiro Arcano']) {
+    for (let level = 1; level <= 20; level++) {
+      seeds.push({
+        sourceType: 'subclass',
+        sourceName,
+        level,
+        cantripsKnown: level >= 10 ? 3 : level >= 3 ? 2 : 0,
+        spellsKnown: spellsKnownByClass[sourceName][level - 1],
+        slots: THIRD_CASTER_SLOTS[level - 1],
+      });
+    }
+  }
+
+  return seeds;
+}
 
 async function seedExpandedBaseCatalog(db: SQLiteDatabase) {
   for (const race of EXPANDED_RACES) {
@@ -605,6 +847,509 @@ async function seedExpandedBaseCatalog(db: SQLiteDatabase) {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
       progression
     );
+  }
+}
+
+async function seedFullSpellcastingProgression(db: SQLiteDatabase) {
+  for (const progression of buildClassProgressions()) {
+    const [slot1 = 0, slot2 = 0, slot3 = 0, slot4 = 0, slot5 = 0, slot6 = 0, slot7 = 0, slot8 = 0, slot9 = 0] = progression.slots;
+    await db.runAsync(
+      `INSERT OR REPLACE INTO spellcasting_progression (
+        source_type, source_name, level, cantrips_known, spells_known,
+        slot_1, slot_2, slot_3, slot_4, slot_5, slot_6, slot_7, slot_8, slot_9, criador
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+      [
+        progression.sourceType,
+        progression.sourceName,
+        progression.level,
+        progression.cantripsKnown,
+        progression.spellsKnown,
+        slot1,
+        slot2,
+        slot3,
+        slot4,
+        slot5,
+        slot6,
+        slot7,
+        slot8,
+        slot9,
+      ]
+    );
+  }
+}
+
+async function seedStructuredItemEffects(db: SQLiteDatabase) {
+  await seedEffectIfMissing(db, 'items', 'Poção de Invisibilidade', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Invisivel',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      condition_color: '#94A3B8',
+      condition_description: 'Torna-se invisivel ate a duracao acabar ou ate atacar/conjurar, conforme regra da mesa.',
+      ends_on_attack_or_spell: true,
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Força do Gigante da Colina', {
+    effect_kind: 'stat_modifier',
+    effect_type: 'FOR',
+    value_mode: 'fixed',
+    fixed_value: 21,
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      modifier_mode: 'set_minimum',
+      description: 'FOR vira 21 enquanto durar, a menos que ja seja maior.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Velocidade', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Velocidade',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'minute',
+    sort_order: 0,
+    metadata: {
+      condition_color: '#22C55E',
+      condition_description: 'Movimento acelerado: bonus defensivo, deslocamento ampliado e acao extra conforme regra da mesa.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Velocidade', {
+    effect_kind: 'stat_modifier',
+    effect_type: 'CA',
+    value_mode: 'fixed',
+    fixed_value: 2,
+    duration_value: 1,
+    duration_unit: 'minute',
+    sort_order: 1,
+    metadata: {
+      modifier_mode: 'bonus',
+      description: '+2 CA enquanto durar.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Voo', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Voando',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      condition_color: '#38BDF8',
+      condition_description: 'Recebe deslocamento de voo enquanto durar.',
+      fly_speed: 'igual ao deslocamento ou 18m, conforme regra da mesa',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Heroísmo', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Heroismo',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    sort_order: 0,
+    metadata: {
+      condition_color: '#FACC15',
+      condition_description: 'Nao pode ser amedrontado enquanto durar.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Heroísmo', {
+    effect_kind: 'stat_modifier',
+    effect_type: 'PV Temp',
+    value_mode: 'fixed',
+    fixed_value: 10,
+    duration_value: 1,
+    duration_unit: 'hour',
+    sort_order: 1,
+    metadata: {
+      modifier_mode: 'temporary_hp',
+      description: 'Ganha 10 PV temporarios ao beber.',
+    },
+  });
+
+  for (const resistance of [
+    { item: 'Poção de Resistência ao Fogo', damageType: 'Fogo', color: '#F97316' },
+    { item: 'Poção de Resistência ao Frio', damageType: 'Frio', color: '#38BDF8' },
+  ]) {
+    await seedEffectIfMissing(db, 'items', resistance.item, {
+      effect_kind: 'condition',
+      effect_type: 'Condicao',
+      condition_name: 'Resistencia Elemental',
+      value_mode: 'none',
+      duration_value: 1,
+      duration_unit: 'hour',
+      metadata: {
+        condition_color: resistance.color,
+        condition_description: `Resistencia contra dano de ${resistance.damageType}.`,
+        resistance_type: resistance.damageType,
+      },
+    });
+  }
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Crescimento', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Aumentado',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    sort_order: 0,
+    metadata: {
+      condition_color: '#F59E0B',
+      condition_description: 'Tamanho aumentado enquanto durar.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Poção de Crescimento', {
+    effect_kind: 'damage',
+    effect_type: 'Extra',
+    value_mode: 'dice',
+    dice_count: 1,
+    dice_sides: 4,
+    duration_value: 1,
+    duration_unit: 'hour',
+    sort_order: 1,
+    metadata: {
+      applies_to: 'weapon_damage',
+      description: '+1d4 de dano com arma enquanto durar.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Água Benta (Frasco)', {
+    effect_kind: 'damage',
+    effect_type: 'Radiante',
+    value_mode: 'dice',
+    dice_count: 2,
+    dice_sides: 6,
+    duration_unit: 'instant',
+    metadata: {
+      applies_to: 'fiend_or_undead',
+      description: 'Causa dano radiante contra mortos-vivos e demonios conforme regra da mesa.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Ácido (Frasco)', {
+    effect_kind: 'damage',
+    effect_type: 'Acido',
+    value_mode: 'dice',
+    dice_count: 2,
+    dice_sides: 6,
+    duration_unit: 'instant',
+    metadata: {
+      delivery: 'arremesso',
+      description: 'Frasco arremessado que causa dano acido no impacto.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Veneno Básico (Frasco)', {
+    effect_kind: 'damage',
+    effect_type: 'Veneno',
+    value_mode: 'dice',
+    dice_count: 1,
+    dice_sides: 4,
+    duration_value: 1,
+    duration_unit: 'minute',
+    metadata: {
+      applies_to: 'weapon_coating',
+      description: 'Aplica veneno em arma por 1 minuto; o proximo alvo atingido sofre dano extra conforme regra da mesa.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Antitoxina', {
+    effect_kind: 'utility',
+    effect_type: 'Vantagem contra Veneno',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      applies_to: 'saving_throw_poison',
+      description: 'Concede vantagem contra venenos por 1 hora.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Kit de Primeiros Socorros', {
+    effect_kind: 'utility',
+    effect_type: 'Estabilizar',
+    value_mode: 'none',
+    duration_unit: 'instant',
+    metadata: {
+      consumes_charge: true,
+      description: 'Estabiliza uma criatura a 0 PV sem teste, consumindo um uso do kit.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Granada de Fumaca', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Obscurecido',
+    value_mode: 'none',
+    duration_value: 3,
+    duration_unit: 'turn',
+    metadata: {
+      condition_color: '#64748B',
+      condition_description: 'Area fica obscurecida por fumaca densa.',
+      area_shape: 'nuvem',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Bomba de Trovao', {
+    effect_kind: 'damage',
+    effect_type: 'Trovejante',
+    value_mode: 'dice',
+    dice_count: 2,
+    dice_sides: 6,
+    duration_unit: 'instant',
+    sort_order: 0,
+    metadata: {
+      area_shape: 'explosao',
+      description: 'Explosao sonora em area pequena.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Bomba de Trovao', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Surdo',
+    value_mode: 'none',
+    chance_percent: 50,
+    duration_value: 1,
+    duration_unit: 'turn',
+    sort_order: 1,
+    metadata: {
+      condition_color: '#38BDF8',
+      condition_description: 'Pode deixar o alvo surdo por 1 turno.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Tonica de Foco', {
+    effect_kind: 'utility',
+    effect_type: 'Vantagem',
+    value_mode: 'none',
+    duration_value: 10,
+    duration_unit: 'minute',
+    metadata: {
+      applies_to: 'concentration_or_mental_focus',
+      description: 'Ajuda em testes de concentracao ou foco mental por 10 minutos.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pocao de Escalada', {
+    effect_kind: 'utility',
+    effect_type: 'Escalada',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      climb_speed: 'igual ao deslocamento',
+      description: 'Concede deslocamento de escalada por 1 hora.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pocao de Respiracao Aquatica', {
+    effect_kind: 'utility',
+    effect_type: 'Respiracao Aquatica',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      description: 'Permite respirar embaixo da agua por 1 hora.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Reparar', {
+    effect_kind: 'utility',
+    effect_type: 'Reparar Objeto',
+    value_mode: 'none',
+    duration_unit: 'instant',
+    metadata: {
+      spell_name: 'Consertar',
+      spell_level: 'Truque',
+      consumes_item: true,
+      description: 'Repara um objeto pequeno danificado, reproduzindo a magia Consertar.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Sono', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Inconsciente',
+    value_mode: 'dice',
+    dice_count: 5,
+    dice_sides: 8,
+    duration_value: 1,
+    duration_unit: 'minute',
+    metadata: {
+      spell_name: 'Sono',
+      spell_level: 'Nivel 1',
+      consumes_item: true,
+      condition_color: '#64748B',
+      condition_description: 'Criaturas afetadas caem em sono magico por ate 1 minuto ou ate acordarem.',
+      hp_pool: '5d8',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Misseis Magicos', {
+    effect_kind: 'damage',
+    effect_type: 'Forca',
+    value_mode: 'dice',
+    dice_count: 3,
+    dice_sides: 4,
+    dice_bonus: 3,
+    duration_unit: 'instant',
+    metadata: {
+      spell_name: 'Misseis Magicos',
+      spell_level: 'Nivel 1',
+      consumes_item: true,
+      auto_hit: true,
+      projectile_count: 3,
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Bola de Fogo', {
+    effect_kind: 'damage',
+    effect_type: 'Fogo',
+    value_mode: 'dice',
+    dice_count: 8,
+    dice_sides: 6,
+    duration_unit: 'instant',
+    metadata: {
+      spell_name: 'Bola de Fogo',
+      spell_level: 'Nivel 3',
+      consumes_item: true,
+      saving_throw: 'DES',
+      area: 'esfera',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Curar Ferimentos', {
+    effect_kind: 'healing',
+    effect_type: 'Cura',
+    value_mode: 'dice',
+    dice_count: 1,
+    dice_sides: 8,
+    duration_unit: 'instant',
+    metadata: {
+      spell_name: 'Curar Ferimentos',
+      spell_level: 'Nivel 1',
+      consumes_item: true,
+      range: 'Toque',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Armadura Arcana', {
+    effect_kind: 'stat_modifier',
+    effect_type: 'CA',
+    value_mode: 'fixed',
+    fixed_value: 13,
+    duration_value: 8,
+    duration_unit: 'hour',
+    metadata: {
+      spell_name: 'Armadura Arcana',
+      spell_level: 'Nivel 1',
+      consumes_item: true,
+      modifier_mode: 'base_ac_plus_dex',
+      description: 'CA base vira 13 + modificador de DES por 8 horas.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Invisibilidade', {
+    effect_kind: 'condition',
+    effect_type: 'Condicao',
+    condition_name: 'Invisivel',
+    value_mode: 'none',
+    duration_value: 1,
+    duration_unit: 'hour',
+    metadata: {
+      spell_name: 'Invisibilidade',
+      spell_level: 'Nivel 2',
+      consumes_item: true,
+      condition_color: '#94A3B8',
+      condition_description: 'Torna-se invisivel ate atacar, conjurar ou a duracao acabar.',
+      ends_on_attack_or_spell: true,
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Escudo Arcano', {
+    effect_kind: 'stat_modifier',
+    effect_type: 'CA',
+    value_mode: 'fixed',
+    fixed_value: 5,
+    duration_value: 1,
+    duration_unit: 'round',
+    metadata: {
+      spell_name: 'Escudo Arcano',
+      spell_level: 'Nivel 1',
+      consumes_item: true,
+      modifier_mode: 'bonus',
+      trigger: 'reaction',
+      description: '+5 CA ate o inicio do proximo turno.',
+    },
+  });
+
+  await seedEffectIfMissing(db, 'items', 'Pergaminho de Relampago', {
+    effect_kind: 'damage',
+    effect_type: 'Eletrico',
+    value_mode: 'dice',
+    dice_count: 8,
+    dice_sides: 6,
+    duration_unit: 'instant',
+    metadata: {
+      spell_name: 'Relampago',
+      spell_level: 'Nivel 3',
+      consumes_item: true,
+      saving_throw: 'DES',
+      area: 'linha',
+    },
+  });
+}
+
+async function repairStartingKitsAgainstCatalog(db: SQLiteDatabase) {
+  const catalogItems = await db.getAllAsync<{ name: string }>(`SELECT name FROM items`);
+  const itemNames = new Set(catalogItems.map(item => item.name));
+  const aliases: Record<string, string> = {
+    'Pocao de Cura': 'Poção de Cura',
+    'Poção Cura': 'Poção de Cura',
+    'Kit Alquimia': 'Kit de Alquimia',
+    'Ferramentas Inventor': 'Ferramentas de Inventor',
+  };
+
+  const kits = await db.getAllAsync<{ id: number; items: string }>(`SELECT id, items FROM starting_kits`);
+  for (const kit of kits) {
+    let parsed: { name: string; qty: number }[];
+    try {
+      parsed = JSON.parse(kit.items);
+    } catch {
+      continue;
+    }
+
+    let changed = false;
+    const repaired = parsed
+      .map(item => {
+        const alias = aliases[item.name];
+        if (alias && itemNames.has(alias)) {
+          changed = true;
+          return { ...item, name: alias };
+        }
+        return item;
+      })
+      .filter(item => {
+        const exists = itemNames.has(item.name);
+        if (!exists) changed = true;
+        return exists;
+      });
+
+    if (changed) {
+      await db.runAsync(`UPDATE starting_kits SET items = ? WHERE id = ?`, [JSON.stringify(repaired), kit.id]);
+    }
   }
 }
 
@@ -977,6 +1722,12 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await ensureColumn(db, 'spells', 'range_shape', 'TEXT');
   await ensureColumn(db, 'spells', 'duration_value', 'INTEGER');
   await ensureColumn(db, 'spells', 'duration_unit', 'TEXT');
+  await ensureColumn(db, 'spellcasting_progression', 'slot_4', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'spellcasting_progression', 'slot_5', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'spellcasting_progression', 'slot_6', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'spellcasting_progression', 'slot_7', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'spellcasting_progression', 'slot_8', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'spellcasting_progression', 'slot_9', 'INTEGER DEFAULT 0');
   await ensureColumn(db, 'lan_sessions', 'paused_at', 'DATETIME');
   await ensureColumn(db, 'lan_sessions', 'resumed_at', 'DATETIME');
   await ensureColumn(db, 'lan_event_log', 'seq', 'INTEGER');
@@ -1566,6 +2317,9 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await seedConditionEffectCatalog(db);
   await seedStructuredBaseEffects(db);
   await seedExpandedBaseCatalog(db);
+  await seedStructuredItemEffects(db);
+  await seedFullSpellcastingProgression(db);
+  await repairStartingKitsAgainstCatalog(db);
   await organizeBaseCatalog(db);
   if (didResetTransientDebugState) {
     await db.runAsync(`DELETE FROM app_trace_logs`);
