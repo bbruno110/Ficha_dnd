@@ -447,6 +447,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       backstory TEXT,
       allies_organizations TEXT,
       languages TEXT,
+      avatar_uri TEXT,
       spells TEXT,
       spell_slots_used TEXT DEFAULT '{}',
       equipment TEXT,
@@ -591,6 +592,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await ensureColumn(db, 'bg3_companions', 'languages', 'TEXT');
   await ensureColumn(db, 'bg3_companions', 'origin_traits', 'TEXT');
   await ensureColumn(db, 'characters', 'hp_temp', 'INTEGER DEFAULT 0');
+  await ensureColumn(db, 'characters', 'avatar_uri', 'TEXT');
   await ensureColumn(db, 'items', 'category', 'TEXT');
   await ensureColumn(db, 'items', 'is_consumable', 'INTEGER DEFAULT 0');
   await ensureColumn(db, 'effects', 'source_name', 'TEXT');

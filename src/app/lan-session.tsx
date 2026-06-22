@@ -5,6 +5,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
+  Image,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -18,6 +19,7 @@ import {
 } from 'react-native';
 import QRCode from 'react-native-qrcode-svg';
 import { useLanSession } from '../contexts/LanSessionContext';
+import { isTradeEventExpired } from '../contexts/lan/lanSessionHelpers';
 import { getLanSessionState } from '../network/lanRepository';
 import { LanOfficialEventMessage, LanSessionRecord } from '../types/lan';
 
@@ -264,6 +266,12 @@ export default function LanSessionScreen() {
       className: String(data.class ?? parsed?.class ?? ''),
     };
   };
+
+  const avatarSourceForName = (name: string, size = 120) =>
+    `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Jogador')}&background=102b56&color=00bfff&size=${size}&bold=true`;
+
+  const playerAvatarSource = (snapshot: ReturnType<typeof playerSnapshot>, fallbackName: string) =>
+    String(snapshot.data?.avatar_data_uri || snapshot.data?.avatar_uri || snapshot.raw?.avatar_data_uri || snapshot.raw?.avatar_uri || '') || avatarSourceForName(fallbackName);
 
   const playerActionKey = (player: typeof players[number]) => `${player.device_id}_${player.character_id || 'none'}`;
 
@@ -734,7 +742,7 @@ export default function LanSessionScreen() {
   const counteredTradeOfferIds = new Set<string>();
   for (const event of history) {
     const offerCommandId = String((event.payload as any)?.offerCommandId || '');
-    if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED')) {
+    if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED' || event.eventType === 'TRADE_EXPIRED')) {
       resolvedTradeOfferIds.add(offerCommandId);
     }
     if (offerCommandId && event.eventType === 'TRADE_COUNTERED') {
@@ -752,7 +760,8 @@ export default function LanSessionScreen() {
       Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
       belongsToThisDevice &&
       !resolvedTradeOfferIds.has(offerCommandId) &&
-      !counteredTradeOfferIds.has(offerCommandId)
+      !counteredTradeOfferIds.has(offerCommandId) &&
+      !isTradeEventExpired(event)
     );
   });
   const pendingTradeCounters = history.filter(event => {
@@ -766,7 +775,8 @@ export default function LanSessionScreen() {
       Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
       belongsToThisDevice &&
       !!offerCommandId &&
-      !resolvedTradeOfferIds.has(offerCommandId)
+      !resolvedTradeOfferIds.has(offerCommandId) &&
+      !isTradeEventExpired(event)
     );
   });
 
@@ -1337,11 +1347,14 @@ export default function LanSessionScreen() {
               const bagPreview = snapshot.equipment.bag.map(itemLabel).filter(Boolean);
               const displayName = snapshot.raw?.name || snapshot.data?.name || player.character_name || (hasCharacter ? 'Personagem sem nome' : player.player_name || 'Jogador');
               const playerLabel = player.player_name && player.player_name !== displayName ? player.player_name : 'Jogador';
+              const avatarUri = playerAvatarSource(snapshot, displayName);
 
               return (
                 <View key={playerActionKey(player)} style={[styles.playerSheetCard, !hasCharacter && styles.playerSheetCardDisabled]}>
                   <View style={styles.playerSheetHeader}>
-                    <View style={{ flex: 1 }}>
+                    <View style={styles.playerSheetIdentityBlock}>
+                      <Image source={{ uri: avatarUri }} style={[styles.playerSheetAvatar, !hasCharacter && styles.playerSheetAvatarMuted]} />
+                      <View style={{ flex: 1, minWidth: 0 }}>
                       <View style={styles.playerIdentityRow}>
                         <Text style={styles.playerSheetName} numberOfLines={1}>{displayName}</Text>
                         <View style={[styles.dot, player.connected ? styles.dotOn : styles.dotOff]} />
@@ -1351,6 +1364,7 @@ export default function LanSessionScreen() {
                           ? `${playerLabel} / Nv. ${snapshot.level} / ${snapshot.race || 'Raça'} / ${snapshot.className || 'Classe'}`
                           : 'Aguardando vínculo/criação da ficha'}
                       </Text>
+                      </View>
                     </View>
                     {hasCharacter && (
                       <View style={styles.cardHeaderActions}>
@@ -2269,7 +2283,7 @@ export default function LanSessionScreen() {
   };
 
   const renderAdminMenu = () => {
-    const hasRunningSession = activeSession && activeSession.status !== 'paused' && activeSession.status !== 'inactive' && activeSession.status !== 'closed';
+    const hasRunningSession = activeSession && activeSession.status !== 'inactive' && activeSession.status !== 'closed';
     if (hasRunningSession) return null;
 
     return (
@@ -2737,13 +2751,16 @@ const styles = StyleSheet.create({
   playerCardsList: { gap: 10 },
   playerSheetCard: {
     borderRadius: 14,
-    padding: 11,
+    padding: 12,
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.22)',
     backgroundColor: 'rgba(0,0,0,0.28)',
   },
   playerSheetCardDisabled: { opacity: 0.72, borderColor: 'rgba(255,209,102,0.22)' },
   playerSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 },
+  playerSheetIdentityBlock: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 11 },
+  playerSheetAvatar: { width: 54, height: 54, borderRadius: 14, borderWidth: 2, borderColor: 'rgba(0,191,255,0.42)', backgroundColor: 'rgba(255,255,255,0.06)' },
+  playerSheetAvatarMuted: { opacity: 0.58, borderColor: 'rgba(255,209,102,0.25)' },
   playerIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   playerSheetName: { color: '#fff', fontSize: 17, fontWeight: 'bold', flex: 1, minWidth: 0 },
   playerSheetSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 4 },

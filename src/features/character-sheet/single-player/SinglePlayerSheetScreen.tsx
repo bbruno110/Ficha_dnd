@@ -5,8 +5,9 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Animated, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Animated, FlatList, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useLanSession } from '@/contexts/LanSessionContext';
+import { isTradeEventExpired } from '@/contexts/lan/lanSessionHelpers';
 import { addTraceLog } from '@/network/traceRepository';
 import { EffectDraft, formatEffectSummary } from '@/types/effects';
 import { LanOfficialEventMessage } from '@/types/lan';
@@ -210,7 +211,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       const counteredTradeOfferIds = new Set<string>();
       for (const event of rows) {
         const offerCommandId = String((event.payload as any)?.offerCommandId || '');
-        if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED')) {
+        if (offerCommandId && (event.eventType === 'TRADE_ACCEPTED' || event.eventType === 'TRADE_DECLINED' || event.eventType === 'TRADE_EXPIRED')) {
           resolvedTradeOfferIds.add(offerCommandId);
         }
         if (offerCommandId && event.eventType === 'TRADE_COUNTERED') {
@@ -228,7 +229,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
           belongsToThisDevice &&
           !resolvedTradeOfferIds.has(offerCommandId) &&
-          !counteredTradeOfferIds.has(offerCommandId)
+          !counteredTradeOfferIds.has(offerCommandId) &&
+          !isTradeEventExpired(event)
         );
         const counterOfferCommandId = String(payload.offerCommandId || '');
         const pendingCounter = (
@@ -236,7 +238,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           Number(event.targetCharacterId || 0) === Number(activeSession.linked_character_id || 0) &&
           belongsToThisDevice &&
           !!counterOfferCommandId &&
-          !resolvedTradeOfferIds.has(counterOfferCommandId)
+          !resolvedTradeOfferIds.has(counterOfferCommandId) &&
+          !isTradeEventExpired(event)
         );
         return pendingOffer || pendingCounter;
       });
@@ -480,6 +483,9 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const isLanPausedReadOnly = isLanPlayerControlledSheet && activeSession?.status === 'paused';
   const isDeadInLan = isLanPlayerControlledSheet && displayHpCurrent <= 0;
 
+  const avatarSourceForName = (name: string, size = 120) =>
+    `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Jogador')}&background=102b56&color=00bfff&size=${size}&bold=true`;
+
   const parseLanSnapshot = (player: any) => {
     try {
       const snapshot = typeof player?.snapshot_payload === 'string' ? JSON.parse(player.snapshot_payload) : player?.snapshot_payload;
@@ -491,25 +497,30 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           hpMax: 1,
           hpTemp: 0,
           hpUnknown: true,
+          avatarUri: avatarSourceForName(player?.character_name || player?.player_name || 'Jogador'),
         };
       }
       const data = snapshot?.data || {};
+      const name = snapshot?.name || data.name || player?.character_name || player?.player_name || 'Personagem';
       return {
-        name: snapshot?.name || data.name || player?.character_name || player?.player_name || 'Personagem',
+        name,
         level: Number(data.level ?? snapshot?.level ?? 1),
         hpCurrent: Math.max(0, Number(data.hp_current ?? 0)),
         hpMax: Math.max(1, Number(data.hp_max ?? 1)),
         hpTemp: Math.max(0, Number(data.hp_temp ?? 0)),
         hpUnknown: false,
+        avatarUri: String(data.avatar_data_uri || data.avatar_uri || snapshot?.avatar_data_uri || snapshot?.avatar_uri || '') || avatarSourceForName(name),
       };
     } catch {
+      const name = player?.character_name || player?.player_name || 'Personagem';
       return {
-        name: player?.character_name || player?.player_name || 'Personagem',
+        name,
         level: 1,
         hpCurrent: 0,
         hpMax: 1,
         hpTemp: 0,
         hpUnknown: true,
+        avatarUri: avatarSourceForName(name),
       };
     }
   };
@@ -1511,7 +1522,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
             localId: character.id,
             name: character.name,
             level: character.level,
-            data: { hp_current: character.hp_current, hp_max: character.hp_max, hp_temp: character.hp_temp, level: character.level },
+            data: { hp_current: character.hp_current, hp_max: character.hp_max, hp_temp: character.hp_temp, level: character.level, avatar_uri: character.avatar_uri },
           }),
         }];
 
@@ -1529,13 +1540,14 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         {rows.map((player: any) => {
           const isSelf = isOwnLanPlayer(player);
           const snapshot = isSelf
-            ? { name: character.name, level: character.level, hpCurrent: displayHpCurrent, hpMax: displayHpMax, hpTemp: tempHpValue, hpUnknown: false }
+            ? { name: character.name, level: character.level, hpCurrent: displayHpCurrent, hpMax: displayHpMax, hpTemp: tempHpValue, hpUnknown: false, avatarUri: String(character.avatar_uri || '') || avatarSourceForName(character.name) }
             : parseLanSnapshot(player);
           const percent = !snapshot.hpUnknown && snapshot.hpMax > 0 ? Math.max(0, Math.min(100, (snapshot.hpCurrent / snapshot.hpMax) * 100)) : 0;
           const dead = !snapshot.hpUnknown && snapshot.hpCurrent <= 0;
           return (
             <View key={`${player.device_id}-${player.character_id}`} style={styles.lanPlayerRow}>
-              <View style={{ flex: 1 }}>
+              <Image source={{ uri: snapshot.avatarUri }} style={[styles.lanPlayerAvatar, !player.connected && styles.lanPlayerAvatarOffline]} />
+              <View style={{ flex: 1, minWidth: 0 }}>
                 <Text style={styles.lanPlayerName} numberOfLines={1}>
                   {snapshot.name}{isSelf ? ' (você)' : ''}
                 </Text>
@@ -2387,9 +2399,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                         : offerTradeToLanPlayer(target, current.item, current.qty));
                     }}
                   >
-                    <View style={styles.lanTargetAvatar}>
-                      <Ionicons name="person-circle-outline" size={30} color="#00fa9a" />
-                    </View>
+                    <Image source={{ uri: snapshot.avatarUri }} style={[styles.lanTargetAvatar, !target.connected && styles.lanPlayerAvatarOffline]} />
                     <View style={{ flex: 1 }}>
                       <Text style={styles.lanTargetName} numberOfLines={1}>{targetName}</Text>
                       <Text style={styles.lanTargetSub} numberOfLines={1}>
@@ -2745,6 +2755,8 @@ const styles = StyleSheet.create({
   lanSessionHint: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4 },
   lanPlayersList: { maxHeight: 248 },
   lanPlayerRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
+  lanPlayerAvatar: { width: 42, height: 42, borderRadius: 13, borderWidth: 2, borderColor: 'rgba(0,191,255,0.38)', backgroundColor: 'rgba(255,255,255,0.06)' },
+  lanPlayerAvatarOffline: { opacity: 0.48 },
   lanPlayerName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   lanPlayerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },
   lanHpSide: { width: 122, alignItems: 'flex-end' },
@@ -2768,7 +2780,7 @@ const styles = StyleSheet.create({
   lanTargetPickerSub: { color: 'rgba(255,255,255,0.65)', fontSize: 16, textAlign: 'center', marginTop: 8, marginBottom: 16 },
   lanTargetPickerList: { maxHeight: 360, width: '100%' },
   lanTargetRow: { flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 16, padding: 12, marginBottom: 10, backgroundColor: 'rgba(0,0,0,0.22)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.22)' },
-  lanTargetAvatar: { width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,250,154,0.08)' },
+  lanTargetAvatar: { width: 48, height: 48, borderRadius: 15, borderWidth: 2, borderColor: 'rgba(0,250,154,0.35)', backgroundColor: 'rgba(0,250,154,0.08)' },
   lanTargetName: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
   lanTargetSub: { color: 'rgba(255,255,255,0.45)', fontSize: 11, marginTop: 3 },
   deathOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.52)', alignItems: 'center', justifyContent: 'center', zIndex: 20 },

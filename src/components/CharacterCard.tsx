@@ -7,6 +7,7 @@ export type Character = {
   level: number;
   class: string;
   race: string;
+  avatar_uri?: string | null;
 };
 
 type Props = {
@@ -65,9 +66,9 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, on
         onLongPress={handleLongPress}
         delayLongPress={400} // Segurar por 400ms ativa o menu
       >
-        <Image 
-          source={{ uri: `https://ui-avatars.com/api/?name=${encodeURIComponent(character.name)}&background=102b56&color=00bfff&size=100&bold=true` }} 
-          style={styles.avatar} 
+        <Image
+          source={{ uri: character.avatar_uri || `https://ui-avatars.com/api/?name=${encodeURIComponent(character.name)}&background=102b56&color=00bfff&size=100&bold=true` }}
+          style={styles.avatar}
         />
         
         <View style={styles.cardInfo}>

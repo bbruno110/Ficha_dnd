@@ -1,4 +1,5 @@
 import { SQLiteDatabase } from 'expo-sqlite';
+import { File } from 'expo-file-system';
 import {
   LanCharacterSnapshot,
   LanContentTable,
@@ -185,6 +186,28 @@ function makeEventId(sessionId: string, seq: number) {
   return `evt_${sessionId}_${seq}_${Date.now().toString(36)}`;
 }
 
+function avatarMimeFromUri(uri: string) {
+  const clean = uri.split('?')[0].split('#')[0].toLowerCase();
+  if (clean.endsWith('.png')) return 'image/png';
+  if (clean.endsWith('.webp')) return 'image/webp';
+  if (clean.endsWith('.gif')) return 'image/gif';
+  return 'image/jpeg';
+}
+
+async function readAvatarDataUri(uri?: unknown) {
+  const avatarUri = typeof uri === 'string' ? uri : '';
+  if (!avatarUri || avatarUri.startsWith('data:') || avatarUri.startsWith('http')) return null;
+
+  try {
+    const file = new File(avatarUri);
+    if (!file.exists) return null;
+    const base64 = await file.base64();
+    return `data:${avatarMimeFromUri(avatarUri)};base64,${base64}`;
+  } catch {
+    return null;
+  }
+}
+
 export async function getLocalPlayerName(db: SQLiteDatabase) {
   const row = await db.getFirstAsync<{ player_name?: string | null }>(
     `SELECT player_name FROM lan_device_identity WHERE id = 'local'`
@@ -280,11 +303,12 @@ export async function getLanSessionById(db: SQLiteDatabase, sessionId: string) {
 export async function getActiveLanSession(db: SQLiteDatabase) {
   return db.getFirstAsync<LanSessionRecord>(
     `SELECT * FROM lan_sessions
-     WHERE status IN ('open', 'connected')
+     WHERE status IN ('open', 'connected', 'paused')
      ORDER BY
        CASE status
          WHEN 'open' THEN 0
          WHEN 'connected' THEN 0
+         WHEN 'paused' THEN 1
          ELSE 2
        END,
        COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC
@@ -481,7 +505,7 @@ export async function getLanTradeResolutionEvent(db: SQLiteDatabase, sessionId: 
   if (!offerCommandId) return null;
   const rows = await db.getAllAsync<Record<string, unknown>>(
     `SELECT * FROM lan_event_log
-     WHERE session_id = ? AND event_type IN ('TRADE_ACCEPTED', 'TRADE_DECLINED')
+     WHERE session_id = ? AND event_type IN ('TRADE_ACCEPTED', 'TRADE_DECLINED', 'TRADE_EXPIRED')
      ORDER BY seq ASC, id ASC`,
     [sessionId]
   );
@@ -709,9 +733,15 @@ export async function upsertCustomContentPayloads(db: SQLiteDatabase, records: L
   }
 }
 
-export async function getCharacterSnapshot(db: SQLiteDatabase, characterId: number): Promise<LanCharacterSnapshot | null> {
+export async function getCharacterSnapshot(
+  db: SQLiteDatabase,
+  characterId: number,
+  options: { includeAvatarDataUri?: boolean } = {}
+): Promise<LanCharacterSnapshot | null> {
   const row = await db.getFirstAsync<Record<string, unknown>>(`SELECT * FROM characters WHERE id = ?`, [characterId]);
   if (!row) return null;
+  const avatarDataUri = options.includeAvatarDataUri ? await readAvatarDataUri(row.avatar_uri) : null;
+  const data = avatarDataUri ? { ...row, avatar_data_uri: avatarDataUri } : row;
 
   return {
     localId: Number(row.id),
@@ -720,7 +750,7 @@ export async function getCharacterSnapshot(db: SQLiteDatabase, characterId: numb
     class: String(row.class || ''),
     level: Number(row.level || 1),
     updatedAt: new Date().toISOString(),
-    data: row,
+    data,
   };
 }
 
@@ -730,13 +760,35 @@ export async function saveCharacterSnapshot(
   ownerDeviceId: string,
   snapshot: LanCharacterSnapshot
 ) {
+  const existing = await db.getFirstAsync<{ payload?: string | null }>(
+    `SELECT payload FROM lan_character_snapshots
+     WHERE session_id = ? AND owner_device_id = ? AND remote_character_id = ?
+     LIMIT 1`,
+    [sessionId, ownerDeviceId, String(snapshot.localId)]
+  );
+  let snapshotToSave = snapshot;
+  if (!snapshot.data?.avatar_data_uri && existing?.payload) {
+    try {
+      const previous = JSON.parse(existing.payload) as LanCharacterSnapshot;
+      const previousAvatar = previous?.data?.avatar_data_uri;
+      if (previousAvatar) {
+        snapshotToSave = {
+          ...snapshot,
+          data: { ...(snapshot.data || {}), avatar_data_uri: previousAvatar },
+        };
+      }
+    } catch {
+      // Snapshot antigo corrompido nao deve impedir salvar o snapshot novo.
+    }
+  }
+
   await db.runAsync(
     `INSERT INTO lan_character_snapshots (
       session_id, owner_device_id, remote_character_id, character_name, payload, updated_at
     ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(session_id, owner_device_id, remote_character_id)
     DO UPDATE SET character_name = excluded.character_name, payload = excluded.payload, updated_at = CURRENT_TIMESTAMP`,
-    [sessionId, ownerDeviceId, String(snapshot.localId), snapshot.name, JSON.stringify(snapshot)]
+    [sessionId, ownerDeviceId, String(snapshotToSave.localId), snapshotToSave.name, JSON.stringify(snapshotToSave)]
   );
 }
 

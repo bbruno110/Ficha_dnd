@@ -5,12 +5,13 @@ import { Stack, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  FlatList, KeyboardAvoidingView, Modal, Platform,
+  FlatList, Image, KeyboardAvoidingView, Modal, Platform,
   Pressable,
   ScrollView,
   StyleSheet, Text, TextInput, TouchableOpacity, View
 } from 'react-native';
 import { useLanSession } from '../contexts/LanSessionContext';
+import { pickAndStoreCharacterAvatar } from '../utils/characterAvatar';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE
 import SpellSelector, { SpellItem } from '../components/SpellSelector';
@@ -91,6 +92,7 @@ export default function CreateCharacterScreen() {
   // ----- ESTADOS BÁSICOS -----
   const [step, setStep] = useState(1);
   const [name, setName] = useState('');
+  const [avatarUri, setAvatarUri] = useState<string | null>(null);
   const [race, setRace] = useState('Selecione uma raça');
   const [charClass, setCharClass] = useState('Selecione uma classe');
   const [stats, setStats] = useState({ FOR: '10', DES: '10', CON: '10', INT: '10', SAB: '10', CAR: '10' });
@@ -138,6 +140,16 @@ export default function CreateCharacterScreen() {
 
   const showCustomAlert = (title: string, message: string, buttons?: {text: string, onPress?: () => void, color?: string, style?: string}[]) => {
     setCustomAlert({ visible: true, title, message, buttons: buttons || [{ text: 'OK', color: '#00bfff' }] });
+  };
+
+  const handlePickAvatar = async () => {
+    try {
+      const uri = await pickAndStoreCharacterAvatar();
+      if (uri) setAvatarUri(uri);
+    } catch (error) {
+      console.warn('Erro ao escolher imagem da ficha:', error);
+      showCustomAlert('Imagem nao carregada', 'Nao foi possivel usar esta imagem. Tente outro arquivo.');
+    }
   };
 
   // ================= CÁLCULOS TÉCNICOS =================
@@ -825,14 +837,14 @@ export default function CreateCharacterScreen() {
         `INSERT INTO characters (
           name, race, class, stats, prof_bonus, inspiration, proficiencies, 
           save_values, skill_values, personality_traits, ideals, bonds, flaws, 
-          features_traits, backstory, allies_organizations, languages,
+          features_traits, backstory, allies_organizations, languages, avatar_uri,
           spells, spell_slots_used, equipment, gp, sp, cp,
           hp_max, hp_current, level, xp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           name, race, charClass, JSON.stringify(stats), profBonus, inspiration || '0', 
           JSON.stringify(proficiencies), JSON.stringify(activeSavesToSave), JSON.stringify(activeSkillsToSave), 
-          personalityTraits, ideals, bonds, flaws, featuresTraits, backstory, alliesOrganizations, languages, 
+          personalityTraits, ideals, bonds, flaws, featuresTraits, backstory, alliesOrganizations, languages, avatarUri,
           JSON.stringify(selectedSpells), '{}', JSON.stringify(cleanInventory), gp, sp, cp, hpMax, hpMax, 1, 0 
         ]
       );
@@ -879,6 +891,24 @@ export default function CreateCharacterScreen() {
     const totalStats = Object.values(stats).reduce((acc, val) => acc + (parseInt(val) || 0), 0);
     return (
       <View style={styles.stepContainer}>
+        <View style={styles.avatarPickerBox}>
+          <Image
+            source={{ uri: avatarUri || `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Heroi')}&background=102b56&color=00bfff&size=160&bold=true` }}
+            style={styles.avatarPreview}
+          />
+          <View style={styles.avatarActions}>
+            <Text style={styles.label}>IMAGEM DO PERSONAGEM</Text>
+            <TouchableOpacity style={styles.avatarButton} onPress={handlePickAvatar}>
+              <Ionicons name="image-outline" size={18} color="#00bfff" />
+              <Text style={styles.avatarButtonText}>{avatarUri ? 'Trocar imagem' : 'Escolher imagem'}</Text>
+            </TouchableOpacity>
+            {avatarUri && (
+              <TouchableOpacity style={styles.avatarRemoveButton} onPress={() => setAvatarUri(null)}>
+                <Text style={styles.avatarRemoveText}>Remover imagem</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
         <View style={styles.formGroup}><Text style={styles.label}>NOME DO PERSONAGEM</Text><TextInput style={styles.input} placeholder="Ex: Kaelen" placeholderTextColor="rgba(255, 255, 255, 0.3)" value={name} onChangeText={setName} /></View>
         <View style={styles.formGroup}><Text style={styles.label}>RAÇA</Text><TouchableOpacity style={styles.selectButton} onPress={() => openSelectionModal('race')}><Text style={[styles.selectButtonText, race.includes('Selecione') && {color:'rgba(255,255,255,0.3)'}]}>{race}</Text><Text style={styles.selectIcon}>▼</Text></TouchableOpacity></View>
         <View style={styles.formGroup}><Text style={styles.label}>CLASSE</Text><TouchableOpacity style={styles.selectButton} onPress={() => openSelectionModal('class')}><Text style={[styles.selectButtonText, charClass.includes('Selecione') && {color:'rgba(255,255,255,0.3)'}]}>{charClass}</Text><Text style={styles.selectIcon}>▼</Text></TouchableOpacity></View>
@@ -1134,6 +1164,13 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 32, fontWeight: 'bold', color: '#ffffff' },
   headerSubtitle: { fontSize: 16, color: '#00bfff', marginTop: 5, fontWeight: 'bold' },
   randomDiceBtn: { backgroundColor: 'rgba(255,255,255,0.1)', padding: 12, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)', alignItems: 'center', justifyContent: 'center' },
+  avatarPickerBox: { flexDirection: 'row', alignItems: 'center', gap: 15, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', borderRadius: 16, padding: 15, marginBottom: 20 },
+  avatarPreview: { width: 82, height: 82, borderRadius: 41, borderWidth: 2, borderColor: 'rgba(0,191,255,0.5)', backgroundColor: 'rgba(0,0,0,0.25)' },
+  avatarActions: { flex: 1, minWidth: 0 },
+  avatarButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1, borderColor: '#00bfff', backgroundColor: 'rgba(0,191,255,0.1)', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 12 },
+  avatarButtonText: { color: '#00bfff', fontSize: 13, fontWeight: 'bold' },
+  avatarRemoveButton: { alignItems: 'center', marginTop: 8, paddingVertical: 8 },
+  avatarRemoveText: { color: '#ff6666', fontSize: 12, fontWeight: 'bold' },
   formGroup: { marginBottom: 20 },
   row: { flexDirection: 'row', justifyContent: 'space-between' },
   label: { fontSize: 12, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.7)', marginBottom: 8, letterSpacing: 1 },

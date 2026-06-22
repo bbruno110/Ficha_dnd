@@ -170,6 +170,7 @@ export type LanOfficialEventType =
   | 'TRADE_COUNTERED'
   | 'TRADE_ACCEPTED'
   | 'TRADE_DECLINED'
+  | 'TRADE_EXPIRED'
   | 'EFFECT_APPLIED'
   | 'EFFECT_EXPIRED'
   | 'PLAYER_REQUESTED'

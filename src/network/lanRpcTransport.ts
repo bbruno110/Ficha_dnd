@@ -4,6 +4,7 @@ export type LanRpcMethod =
   | 'DISCOVER'
   | 'JOIN'
   | 'POLL'
+  | 'SESSION_CLOSED_ACK'
   | 'COMMAND'
   | 'CHARACTER_UPSERT'
   | 'LEAVE';

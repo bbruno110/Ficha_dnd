@@ -21,7 +21,7 @@ export default function HomeScreen() {
   const loadCharacters = async () => {
     try {
       const result = await db.getAllAsync<Character>(
-        `SELECT id, name, level, class, race FROM characters ORDER BY created_at DESC`
+        `SELECT id, name, level, class, race, avatar_uri FROM characters ORDER BY created_at DESC`
       );
       setCharactersList(result);
     } catch (error) {

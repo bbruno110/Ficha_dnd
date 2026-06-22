@@ -4,8 +4,9 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Image, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useLanSession } from '../contexts/LanSessionContext';
+import { pickAndStoreCharacterAvatar } from '../utils/characterAvatar';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
 import SpellSelector from '../components/SpellSelector';
@@ -82,6 +83,7 @@ export default function EditCharacterScreen() {
 
   const [loading, setLoading] = useState(true);
   const [character, setCharacter] = useState<any>(null);
+  const [avatarUri, setAvatarUri] = useState<string | null>(null);
   const [currentStep, setCurrentStep] = useState(0);
   
   const [dbSkills, setDbSkills] = useState<any[]>([]);
@@ -160,6 +162,7 @@ export default function EditCharacterScreen() {
 
         if (char) {
           setCharacter(char);
+          setAvatarUri((char as any).avatar_uri || null);
           const tLevel = levelUpTo ? Number(levelUpTo) : (char as any).level;
           setTargetLevel(tLevel);
           
@@ -517,6 +520,16 @@ export default function EditCharacterScreen() {
     setCurrentStep(prev => prev + 1);
   };
 
+  const handlePickAvatar = async () => {
+    try {
+      const uri = await pickAndStoreCharacterAvatar(character?.id);
+      if (uri) setAvatarUri(uri);
+    } catch (error) {
+      console.warn('Erro ao escolher imagem da ficha:', error);
+      Alert.alert('Imagem nao carregada', 'Nao foi possivel usar esta imagem. Tente outro arquivo.');
+    }
+  };
+
   const saveChanges = async () => {
     const finalClassStr = classesData
       .filter(c => c.level > 0)
@@ -528,8 +541,8 @@ export default function EditCharacterScreen() {
 
     try {
       await db.runAsync(
-        `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=? WHERE id=?`,
-        [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), character.id]
+        `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=?, avatar_uri=? WHERE id=?`,
+        [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), avatarUri, character.id]
       );
       
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!
@@ -553,6 +566,27 @@ export default function EditCharacterScreen() {
   const isLevelUp = character && targetLevel > character.level;
 
   // ================= RENDER PASSOS =================
+  const renderAvatarPicker = () => (
+    <View style={styles.avatarPickerBox}>
+      <Image
+        source={{ uri: avatarUri || `https://ui-avatars.com/api/?name=${encodeURIComponent(character?.name || 'Heroi')}&background=102b56&color=00bfff&size=160&bold=true` }}
+        style={styles.avatarPreview}
+      />
+      <View style={styles.avatarActions}>
+        <Text style={styles.avatarTitle}>IMAGEM DO PERSONAGEM</Text>
+        <TouchableOpacity style={styles.avatarButton} onPress={handlePickAvatar}>
+          <Ionicons name="image-outline" size={18} color="#00bfff" />
+          <Text style={styles.avatarButtonText}>{avatarUri ? 'Trocar imagem' : 'Escolher imagem'}</Text>
+        </TouchableOpacity>
+        {avatarUri && (
+          <TouchableOpacity style={styles.avatarRemoveButton} onPress={() => setAvatarUri(null)}>
+            <Text style={styles.avatarRemoveText}>Remover imagem</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+
   const renderStep0 = () => (
     <View>
       <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'}}>
@@ -902,6 +936,7 @@ export default function EditCharacterScreen() {
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContent}>
+        {renderAvatarPicker()}
         {currentStep === 0 && renderStep0()}
         {currentStep === 1 && renderStep1()}
         {currentStep === 2 && renderStep2()}
@@ -1014,6 +1049,14 @@ const styles = StyleSheet.create({
   scrollContent: { padding: 20 },
   sectionTitle: { color: '#00bfff', fontWeight: 'bold', marginBottom: 15, fontSize: 12, textTransform: 'uppercase' },
   cardBlock: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 20, padding: 20, marginBottom: 20 },
+  avatarPickerBox: { flexDirection: 'row', alignItems: 'center', gap: 15, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', borderRadius: 16, padding: 15, marginBottom: 20 },
+  avatarPreview: { width: 82, height: 82, borderRadius: 41, borderWidth: 2, borderColor: 'rgba(0,191,255,0.5)', backgroundColor: 'rgba(0,0,0,0.25)' },
+  avatarActions: { flex: 1, minWidth: 0 },
+  avatarTitle: { color: 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: 'bold', marginBottom: 8, letterSpacing: 1 },
+  avatarButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1, borderColor: '#00bfff', backgroundColor: 'rgba(0,191,255,0.1)', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 12 },
+  avatarButtonText: { color: '#00bfff', fontSize: 13, fontWeight: 'bold' },
+  avatarRemoveButton: { alignItems: 'center', marginTop: 8, paddingVertical: 8 },
+  avatarRemoveText: { color: '#ff6666', fontSize: 12, fontWeight: 'bold' },
   
   classManagerBox: { marginBottom: 20, backgroundColor: 'rgba(0,0,0,0.2)', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' },
   classHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
