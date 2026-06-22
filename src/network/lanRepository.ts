@@ -1,5 +1,6 @@
 import { SQLiteDatabase } from 'expo-sqlite';
 import { File } from 'expo-file-system';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import {
   LanCharacterSnapshot,
   LanContentTable,
@@ -186,6 +187,15 @@ function makeEventId(sessionId: string, seq: number) {
   return `evt_${sessionId}_${seq}_${Date.now().toString(36)}`;
 }
 
+const LAN_AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+const LAN_AVATAR_COMPRESSION_STEPS = [
+  { width: 1024, compress: 0.82 },
+  { width: 768, compress: 0.72 },
+  { width: 512, compress: 0.62 },
+  { width: 384, compress: 0.55 },
+];
+const avatarDataUriCache = new Map<string, string | null>();
+
 function avatarMimeFromUri(uri: string) {
   const clean = uri.split('?')[0].split('#')[0].toLowerCase();
   if (clean.endsWith('.png')) return 'image/png';
@@ -197,13 +207,42 @@ function avatarMimeFromUri(uri: string) {
 async function readAvatarDataUri(uri?: unknown) {
   const avatarUri = typeof uri === 'string' ? uri : '';
   if (!avatarUri || avatarUri.startsWith('data:') || avatarUri.startsWith('http')) return null;
+  if (avatarDataUriCache.has(avatarUri)) return avatarDataUriCache.get(avatarUri) || null;
 
   try {
-    const file = new File(avatarUri);
-    if (!file.exists) return null;
+    let file = new File(avatarUri);
+    if (!file.exists) {
+      avatarDataUriCache.set(avatarUri, null);
+      return null;
+    }
+    const fileSize = Number((file as any).size || 0);
+    if (fileSize > LAN_AVATAR_MAX_BYTES) {
+      let compressedUri = '';
+      for (const step of LAN_AVATAR_COMPRESSION_STEPS) {
+        const result = await manipulateAsync(
+          avatarUri,
+          [{ resize: { width: step.width } }],
+          { compress: step.compress, format: SaveFormat.JPEG }
+        );
+        const compressedFile = new File(result.uri);
+        const compressedSize = Number((compressedFile as any).size || 0);
+        if (compressedFile.exists && compressedSize > 0 && compressedSize <= LAN_AVATAR_MAX_BYTES) {
+          compressedUri = result.uri;
+          file = compressedFile;
+          break;
+        }
+      }
+      if (!compressedUri) {
+        avatarDataUriCache.set(avatarUri, null);
+        return null;
+      }
+    }
     const base64 = await file.base64();
-    return `data:${avatarMimeFromUri(avatarUri)};base64,${base64}`;
+    const dataUri = `data:${avatarMimeFromUri(file.uri)};base64,${base64}`;
+    avatarDataUriCache.set(avatarUri, dataUri);
+    return dataUri;
   } catch {
+    avatarDataUriCache.set(avatarUri, null);
     return null;
   }
 }

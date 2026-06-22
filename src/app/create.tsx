@@ -10,8 +10,9 @@ import {
   ScrollView,
   StyleSheet, Text, TextInput, TouchableOpacity, View
 } from 'react-native';
+import AvatarAdjustModal from '../components/AvatarAdjustModal';
 import { useLanSession } from '../contexts/LanSessionContext';
-import { pickAndStoreCharacterAvatar } from '../utils/characterAvatar';
+import { AvatarAdjustment, AvatarDraft, deleteStoredCharacterAvatar, finalizeDraftCharacterAvatar, pickCharacterAvatarDraft, storeAdjustedCharacterAvatar } from '../utils/characterAvatar';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE
 import SpellSelector, { SpellItem } from '../components/SpellSelector';
@@ -93,6 +94,8 @@ export default function CreateCharacterScreen() {
   const [step, setStep] = useState(1);
   const [name, setName] = useState('');
   const [avatarUri, setAvatarUri] = useState<string | null>(null);
+  const [pendingAvatarDraft, setPendingAvatarDraft] = useState<AvatarDraft | null>(null);
+  const [avatarAdjustment, setAvatarAdjustment] = useState<AvatarAdjustment>({ zoom: 1, offsetX: 0, offsetY: 0 });
   const [race, setRace] = useState('Selecione uma raça');
   const [charClass, setCharClass] = useState('Selecione uma classe');
   const [stats, setStats] = useState({ FOR: '10', DES: '10', CON: '10', INT: '10', SAB: '10', CAR: '10' });
@@ -144,11 +147,29 @@ export default function CreateCharacterScreen() {
 
   const handlePickAvatar = async () => {
     try {
-      const uri = await pickAndStoreCharacterAvatar();
-      if (uri) setAvatarUri(uri);
+      const draft = await pickCharacterAvatarDraft();
+      if (draft) {
+        setPendingAvatarDraft(draft);
+        setAvatarAdjustment({ zoom: 1, offsetX: 0, offsetY: 0 });
+      }
     } catch (error) {
       console.warn('Erro ao escolher imagem da ficha:', error);
       showCustomAlert('Imagem nao carregada', 'Nao foi possivel usar esta imagem. Tente outro arquivo.');
+    }
+  };
+
+  const confirmAvatarAdjustment = async () => {
+    if (!pendingAvatarDraft) return;
+    try {
+      const uri = await storeAdjustedCharacterAvatar(null, pendingAvatarDraft, avatarAdjustment);
+      if (uri) {
+        if (avatarUri) deleteStoredCharacterAvatar(avatarUri);
+        setAvatarUri(uri);
+      }
+      setPendingAvatarDraft(null);
+    } catch (error) {
+      console.warn('Erro ao ajustar imagem da ficha:', error);
+      showCustomAlert('Imagem nao carregada', 'Nao foi possivel ajustar esta imagem. Tente outro arquivo.');
     }
   };
 
@@ -849,6 +870,11 @@ export default function CreateCharacterScreen() {
         ]
       );
       const newCharacterId = Number((result as any).lastInsertRowId || 0);
+      const finalAvatarUri = finalizeDraftCharacterAvatar(avatarUri, newCharacterId);
+      if (newCharacterId > 0 && finalAvatarUri !== avatarUri) {
+        await db.runAsync(`UPDATE characters SET avatar_uri = ? WHERE id = ?`, [finalAvatarUri, newCharacterId]);
+        setAvatarUri(finalAvatarUri);
+      }
       if (activeSession?.role === 'player' && newCharacterId > 0) {
         await linkCharacterToActiveSession(newCharacterId);
         await broadcastCharacter(newCharacterId, 'character-created').catch(error => {
@@ -903,7 +929,10 @@ export default function CreateCharacterScreen() {
               <Text style={styles.avatarButtonText}>{avatarUri ? 'Trocar imagem' : 'Escolher imagem'}</Text>
             </TouchableOpacity>
             {avatarUri && (
-              <TouchableOpacity style={styles.avatarRemoveButton} onPress={() => setAvatarUri(null)}>
+              <TouchableOpacity style={styles.avatarRemoveButton} onPress={() => {
+                deleteStoredCharacterAvatar(avatarUri);
+                setAvatarUri(null);
+              }}>
                 <Text style={styles.avatarRemoveText}>Remover imagem</Text>
               </TouchableOpacity>
             )}
@@ -1085,6 +1114,13 @@ export default function CreateCharacterScreen() {
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
       {renderSearchModal()}
+      <AvatarAdjustModal
+        draft={pendingAvatarDraft}
+        adjustment={avatarAdjustment}
+        onChange={setAvatarAdjustment}
+        onCancel={() => setPendingAvatarDraft(null)}
+        onConfirm={confirmAvatarAdjustment}
+      />
 
       {/* MODAL DE ALERTA CUSTOMIZADO */}
       <Modal visible={customAlert.visible} transparent animationType="fade">

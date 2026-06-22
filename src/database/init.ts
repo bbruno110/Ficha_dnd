@@ -234,6 +234,380 @@ async function seedConditionEffectCatalog(db: SQLiteDatabase) {
   }
 }
 
+async function organizeBaseCatalog(db: SQLiteDatabase) {
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_items_catalog_name
+      ON items (name COLLATE NOCASE);
+    CREATE INDEX IF NOT EXISTS idx_items_catalog_category_name
+      ON items (category COLLATE NOCASE, name COLLATE NOCASE);
+    CREATE INDEX IF NOT EXISTS idx_spells_catalog_name
+      ON spells (name COLLATE NOCASE);
+    CREATE INDEX IF NOT EXISTS idx_spells_catalog_category_level_name
+      ON spells (category COLLATE NOCASE, level COLLATE NOCASE, name COLLATE NOCASE);
+    CREATE INDEX IF NOT EXISTS idx_spells_catalog_classes_name
+      ON spells (classes COLLATE NOCASE, name COLLATE NOCASE);
+  `);
+
+  await db.runAsync(`
+    UPDATE items
+    SET
+      category = CASE
+        WHEN LOWER(properties) LIKE '%consum%' THEN 'Consumivel'
+        WHEN LOWER(properties) LIKE '%armadura%' THEN 'Armadura'
+        WHEN LOWER(properties) LIKE '%escudo%' THEN 'Escudo'
+        WHEN LOWER(properties) LIKE '%muni%' THEN 'Municao'
+        WHEN LOWER(properties) LIKE '%ferramenta%' THEN 'Ferramenta'
+        WHEN LOWER(properties) LIKE '%instrumento%' THEN 'Ferramenta'
+        WHEN LOWER(properties) LIKE '%arma%' THEN 'Arma'
+        WHEN LOWER(properties) LIKE '%mochila%' OR LOWER(properties) LIKE '%saco%' THEN 'Carga'
+        WHEN LOWER(properties) LIKE '%capa%' OR LOWER(properties) LIKE '%roupa%' OR LOWER(properties) LIKE '%veste%' THEN 'Vestuario'
+        ELSE 'Outro'
+      END,
+      is_consumable = CASE
+        WHEN LOWER(properties) LIKE '%consum%' THEN 1
+        ELSE COALESCE(is_consumable, 0)
+      END
+    WHERE criador = 'base'
+      AND (category IS NULL OR TRIM(category) = '' OR LOWER(category) = 'outro')
+  `);
+
+  await db.runAsync(`
+    UPDATE items
+    SET is_consumable = 1
+    WHERE criador = 'base'
+      AND is_consumable <> 1
+      AND LOWER(properties) LIKE '%consum%'
+  `);
+
+  await db.runAsync(`
+    UPDATE spells
+    SET category = CASE
+      WHEN LOWER(level) = 'passiva' OR LOWER(casting_time) = 'passiva' THEN 'Passiva'
+      WHEN components = '-' AND LOWER(category) <> 'passiva' THEN 'Habilidade'
+      WHEN LOWER(category) IN ('magia', 'habilidade', 'passiva') THEN category
+      ELSE 'Magia'
+    END
+    WHERE criador = 'base'
+      AND (
+        category IS NULL
+        OR TRIM(category) = ''
+        OR LOWER(category) NOT IN ('magia', 'habilidade', 'passiva')
+        OR LOWER(level) = 'passiva'
+        OR LOWER(casting_time) = 'passiva'
+        OR (components = '-' AND LOWER(category) <> 'passiva')
+      )
+  `);
+
+  await db.runAsync(`
+    UPDATE spells
+    SET class_level_required = CASE
+      WHEN LOWER(level) = 'truque' THEN 1
+      WHEN LOWER(level) = 'passiva' THEN 1
+      WHEN LOWER(category) = 'magia' AND level LIKE '%1' THEN 1
+      WHEN LOWER(category) = 'magia' AND level LIKE '%2' THEN 3
+      WHEN LOWER(category) = 'magia' AND level LIKE '%3' THEN 5
+      WHEN LOWER(category) = 'magia' AND level LIKE '%4' THEN 7
+      WHEN LOWER(category) = 'magia' AND level LIKE '%5' THEN 9
+      WHEN LOWER(category) = 'magia' AND level LIKE '%6' THEN 11
+      WHEN LOWER(category) = 'magia' AND level LIKE '%7' THEN 13
+      WHEN LOWER(category) = 'magia' AND level LIKE '%8' THEN 15
+      WHEN LOWER(category) = 'magia' AND level LIKE '%9' THEN 17
+      WHEN level LIKE '%20' THEN 20
+      WHEN level LIKE '%19' THEN 19
+      WHEN level LIKE '%18' THEN 18
+      WHEN level LIKE '%17' THEN 17
+      WHEN level LIKE '%16' THEN 16
+      WHEN level LIKE '%15' THEN 15
+      WHEN level LIKE '%14' THEN 14
+      WHEN level LIKE '%13' THEN 13
+      WHEN level LIKE '%12' THEN 12
+      WHEN level LIKE '%11' THEN 11
+      WHEN level LIKE '%10' THEN 10
+      WHEN level LIKE '%9' THEN 9
+      WHEN level LIKE '%8' THEN 8
+      WHEN level LIKE '%7' THEN 7
+      WHEN level LIKE '%6' THEN 6
+      WHEN level LIKE '%5' THEN 5
+      WHEN level LIKE '%4' THEN 4
+      WHEN level LIKE '%3' THEN 3
+      WHEN level LIKE '%2' THEN 2
+      WHEN level LIKE '%1' THEN 1
+      ELSE 1
+    END
+    WHERE criador = 'base'
+      AND (class_level_required IS NULL OR TRIM(CAST(class_level_required AS TEXT)) = '' OR CAST(class_level_required AS INTEGER) <= 0)
+  `);
+}
+
+type ExpandedItemSeed = {
+  name: string;
+  weight: number;
+  damage: string;
+  damageType: string;
+  category: string;
+  isConsumable: number;
+  properties: string;
+  descricao: string;
+};
+
+type ExpandedSpellSeed = {
+  name: string;
+  level: string;
+  category: string;
+  classes: string;
+  castingTime: string;
+  range: string;
+  components: string;
+  duration: string;
+  damageDice: string;
+  damageType: string;
+  savingThrow: string;
+  description: string;
+  classLevelRequired: number;
+};
+
+const EXPANDED_RACES = [
+  { name: 'Aasimar', statBonuses: '{"CAR": 2, "SAB": 1}', speed: '9m', features: ['Visao no Escuro', 'Resistencia Celestial', 'Maos Curativas'] },
+  { name: 'Genasi do Fogo', statBonuses: '{"CON": 2, "INT": 1}', speed: '9m', features: ['Visao no Escuro', 'Resistencia a Fogo', 'Chama Inata'] },
+  { name: 'Tabaxi', statBonuses: '{"DES": 2, "CAR": 1}', speed: '9m', features: ['Agilidade Felina', 'Garras', 'Talento Felino'] },
+  { name: 'Firbolg', statBonuses: '{"SAB": 2, "FOR": 1}', speed: '9m', features: ['Magia Firbolg', 'Passo Oculto', 'Fala com Feras e Plantas'] },
+  { name: 'Kenku', statBonuses: '{"DES": 2, "SAB": 1}', speed: '9m', features: ['Mimetismo', 'Treinamento Kenku', 'Memoria de Perito'] },
+  { name: 'Kobold', statBonuses: '{"DES": 2}', speed: '9m', features: ['Tatica de Matilha', 'Grito Draconico', 'Visao no Escuro'] },
+  { name: 'Tritao', statBonuses: '{"FOR": 1, "CON": 1, "CAR": 1}', speed: '9m / nado 9m', features: ['Anfibio', 'Controle do Ar e Agua', 'Guardiao das Profundezas'] },
+  { name: 'Shadar-kai', statBonuses: '{"DES": 2, "CON": 1}', speed: '9m', features: ['Resistencia Necrotica', 'Bencao da Rainha Corvo', 'Visao no Escuro'] },
+];
+
+const EXPANDED_CLASSES = [
+  {
+    name: 'Artifice',
+    recommendedStats: '{"INT": 15, "CON": 14, "DES": 13, "SAB": 12, "FOR": 10, "CAR": 8}',
+    startingEquipment: '[{"name":"Besta Leve","qty":1},{"name":"Aljava com 20 Virotes","qty":1},{"name":"Ferramentas de Ferreiro","qty":1},{"name":"Foco Arcano","qty":1},{"name":"Armadura de Couro","qty":1}]',
+    startingGold: 15,
+    hitDice: 8,
+    saves: '["save_con", "save_int"]',
+    subclassLevel: 3,
+    isCaster: 1,
+    features: ['Infusoes Magicas', 'Conjuracao por Ferramentas'],
+  },
+  {
+    name: 'Mistico',
+    recommendedStats: '{"INT": 15, "DES": 14, "CON": 13, "SAB": 12, "CAR": 10, "FOR": 8}',
+    startingEquipment: '[{"name":"Adaga","qty":2},{"name":"Cristal Psiquico","qty":1},{"name":"Roupas de Viagem","qty":1},{"name":"Livro","qty":1}]',
+    startingGold: 10,
+    hitDice: 8,
+    saves: '["save_int", "save_sab"]',
+    subclassLevel: 3,
+    isCaster: 1,
+    features: ['Talento Psionico', 'Disciplina Mental'],
+  },
+];
+
+const EXPANDED_SUBCLASSES = [
+  { name: 'Alquimista', className: 'Artifice', levelRequired: 3, features: ['Elixir Experimental', 'Savant Alquimico'] },
+  { name: 'Armeiro', className: 'Artifice', levelRequired: 3, features: ['Armadura Arcana', 'Modelo Guardiao'] },
+  { name: 'Artilheiro', className: 'Artifice', levelRequired: 3, features: ['Canhao Eldritch', 'Arma de Fogo Arcana'] },
+  { name: 'Ferreiro de Batalha', className: 'Artifice', levelRequired: 3, features: ['Defensor de Aco', 'Pronto para Batalha'] },
+  { name: 'Ordem do Despertar', className: 'Mistico', levelRequired: 3, features: ['Olho Psiquico', 'Mente Expandida'] },
+  { name: 'Lamina Psiquica', className: 'Mistico', levelRequired: 3, features: ['Lamina Mental', 'Passo Imaterial'] },
+  { name: 'Nomade Astral', className: 'Mistico', levelRequired: 3, features: ['Salto Nomade', 'Memoria de Mil Caminhos'] },
+  { name: 'Cavaleiro Runico', className: 'Guerreiro', levelRequired: 3, features: ['Runas de Gigante', 'Poder dos Gigantes'] },
+  { name: 'Colegio do Glamour', className: 'Bardo', levelRequired: 3, features: ['Manto de Inspiracao', 'Performance Encantadora'] },
+  { name: 'Batedor', className: 'Ladino', levelRequired: 3, features: ['Escaramuca', 'Sobrevivente Nato'] },
+  { name: 'Alma Solar', className: 'Monge', levelRequired: 3, features: ['Raio Solar Radiante', 'Arcos Solares'] },
+  { name: 'Perseguidor Sombrio', className: 'Patrulheiro', levelRequired: 3, features: ['Emboscador Sombrio', 'Visao Umbral'] },
+  { name: 'Juramento da Redencao', className: 'Paladino', levelRequired: 3, features: ['Emissario da Paz', 'Repreender Violento'] },
+];
+
+const EXPANDED_ITEMS: ExpandedItemSeed[] = [
+  { name: 'Cristal Psiquico', weight: 0.1, damage: '-', damageType: '-', category: 'Foco', isConsumable: 0, properties: 'Foco Psiquico', descricao: 'Cristal que vibra com pensamentos intensos e serve como foco para disciplinas mentais.' },
+  { name: 'Ferramentas de Inventor', weight: 2.0, damage: '-', damageType: '-', category: 'Ferramenta', isConsumable: 0, properties: 'Ferramenta, Prototipos', descricao: 'Pequeno estojo com molas, lentes, pincoes, fios e chaves finas.' },
+  { name: 'Kit de Alquimia', weight: 4.0, damage: '-', damageType: '-', category: 'Ferramenta', isConsumable: 0, properties: 'Ferramenta, Alquimia', descricao: 'Conjunto de frascos, queimadores e reagentes para preparar misturas instaveis.' },
+  { name: 'Repetidor Leve', weight: 2.5, damage: '1d8', damageType: 'Perfurante', category: 'Arma', isConsumable: 0, properties: 'Arma, Municao (24/96m), Recarga, Duas maos', descricao: 'Besta refinada com mecanismo de recarga rapida.' },
+  { name: 'Martelo Runico', weight: 2.0, damage: '1d8', damageType: 'Concussao', category: 'Arma', isConsumable: 0, properties: 'Arma, Versatil (1d10), Runico', descricao: 'Martelo gravado com runas antigas, comum entre ferreiros arcanos.' },
+  { name: 'Lamina Psiquica', weight: 0.0, damage: '1d6', damageType: 'Psiquico', category: 'Arma', isConsumable: 0, properties: 'Arma, Acuidade, Manifestada', descricao: 'Arma mental que surge na mao do usuario e some apos o golpe.' },
+  { name: 'Escudo Dobraveloz', weight: 2.5, damage: '-', damageType: '-', category: 'Escudo', isConsumable: 0, properties: 'Escudo, CA +2, Dobraveloz', descricao: 'Escudo articulado que se prende ao antebraco e abre com um estalo.' },
+  { name: 'Armadura de Malha Reforcada', weight: 18.0, damage: '-', damageType: '-', category: 'Armadura', isConsumable: 0, properties: 'Armadura, CA 15, Desv. Furtividade', descricao: 'Malha reforcada com placas pequenas, criada para exploradores resistentes.' },
+  { name: 'Oculos de Precisao', weight: 0.1, damage: '-', damageType: '-', category: 'Ferramenta', isConsumable: 0, properties: 'Ferramenta, Investigacao, Percepcao', descricao: 'Lentes ajustaveis que ajudam a examinar detalhes minusculos.' },
+  { name: 'Granada de Fumaca', weight: 0.5, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Arremesso, Nuvem', descricao: 'Capsula que cria uma nuvem densa de fumaca por alguns turnos.' },
+  { name: 'Bomba de Trovao', weight: 0.5, damage: '2d6', damageType: 'Trovejante', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Arremesso, Area', descricao: 'Explosivo pequeno que estoura com som ensurdecedor.' },
+  { name: 'Tonica de Foco', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Concentração', descricao: 'Mistura amarga que ajuda a manter a mente firme por alguns minutos.' },
+  { name: 'Pocao de Escalada', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Movimento', descricao: 'Liquido viscoso que facilita escalar paredes e rochas.' },
+  { name: 'Pocao de Respiracao Aquatica', weight: 0.25, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Aquatico', descricao: 'Permite respirar embaixo da agua por tempo limitado.' },
+  { name: 'Pergaminho de Reparar', weight: 0.0, damage: '-', damageType: '-', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho', descricao: 'Pergaminho simples que repara um objeto pequeno danificado.' },
+  { name: 'Pergaminho de Sono', weight: 0.0, damage: '5d8', damageType: 'Outro', category: 'Consumivel', isConsumable: 1, properties: 'Consumivel, Magia, Pergaminho', descricao: 'Pergaminho que libera uma onda sonolenta sobre criaturas proximas.' },
+  { name: 'Talismã Celestial', weight: 0.1, damage: '-', damageType: '-', category: 'Foco', isConsumable: 0, properties: 'Amuleto, Foco Divino', descricao: 'Pequeno simbolo banhado em prata usado por devotos celestiais.' },
+  { name: 'Manto Umbral', weight: 1.0, damage: '-', damageType: '-', category: 'Vestuario', isConsumable: 0, properties: 'Capa, Furtividade, Sombras', descricao: 'Manto escuro que parece absorver parte da luz ao redor.' },
+  { name: 'Anzol de Adamante', weight: 0.2, damage: '-', damageType: '-', category: 'Ferramenta', isConsumable: 0, properties: 'Ferramenta, Escalada, Pesca', descricao: 'Anzol robusto usado tanto para pesca perigosa quanto para escalada improvisada.' },
+  { name: 'Bolsa Dimensional Pequena', weight: 0.5, damage: '-', damageType: '-', category: 'Carga', isConsumable: 0, properties: 'Mochila/Saco, Magico, Capacidade extra', descricao: 'Bolsa modesta com interior maior do que aparenta.' },
+];
+
+const EXPANDED_SPELLS: ExpandedSpellSeed[] = [
+  { name: 'Lamina Estrondosa', level: 'Truque', category: 'Magia', classes: 'Artifice,Bruxo,Feiticeiro,Mago', castingTime: '1 Acao', range: 'Arma', components: 'S, M', duration: '1 Rodada', damageDice: '1d8', damageType: 'Trovejante', savingThrow: 'Nenhum', description: 'Ataque com arma envolto em energia sonora; se o alvo se mover, sofre dano.', classLevelRequired: 1 },
+  { name: 'Lamina de Chamas Verdes', level: 'Truque', category: 'Magia', classes: 'Artifice,Bruxo,Feiticeiro,Mago', castingTime: '1 Acao', range: 'Arma', components: 'S, M', duration: 'Instantanea', damageDice: '1d8', damageType: 'Fogo', savingThrow: 'Nenhum', description: 'Ataque com arma espalha chama para um inimigo proximo.', classLevelRequired: 1 },
+  { name: 'Moldar Terra', level: 'Truque', category: 'Magia', classes: 'Druida,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: '9m', components: 'S', duration: 'Instantanea', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Move ou molda terra solta em uma area pequena.', classLevelRequired: 1 },
+  { name: 'Controlar Chamas', level: 'Truque', category: 'Magia', classes: 'Druida,Feiticeiro,Mago,Genasi do Fogo', castingTime: '1 Acao', range: '18m', components: 'S', duration: '1 Hora', damageDice: '-', damageType: 'Fogo', savingThrow: 'Nenhum', description: 'Expande, apaga ou altera chamas pequenas.', classLevelRequired: 1 },
+  { name: 'Criar Fogueira', level: 'Truque', category: 'Magia', classes: 'Druida,Bruxo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Concentracao', damageDice: '1d8', damageType: 'Fogo', savingThrow: 'DES', description: 'Cria uma fogueira magica que queima quem ocupa o espaco.', classLevelRequired: 1 },
+  { name: 'Fragmento Mental', level: 'Truque', category: 'Magia', classes: 'Bruxo,Feiticeiro,Mago,Mistico', castingTime: '1 Acao', range: '18m', components: 'V', duration: '1 Rodada', damageDice: '1d6', damageType: 'Psiquico', savingThrow: 'INT', description: 'Estilhaço psiquico causa dano e atrapalha o proximo teste do alvo.', classLevelRequired: 1 },
+  { name: 'Pulso Magnetico', level: 'Truque', category: 'Magia', classes: 'Artifice,Mago', castingTime: '1 Acao', range: '9m', components: 'S, M', duration: 'Instantanea', damageDice: '1d6', damageType: 'Forca', savingThrow: 'FOR', description: 'Empurra ou puxa um objeto metalico leve ou criatura pequena.', classLevelRequired: 1 },
+  { name: 'Visao no Escuro', level: 'Passiva', category: 'Passiva', classes: 'Raça', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Enxerga melhor em penumbra e escuridao conforme regra da mesa.', classLevelRequired: 1 },
+  { name: 'Resistencia Celestial', level: 'Passiva', category: 'Passiva', classes: 'Aasimar', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Resistencia a dano radiante e necrotico.', classLevelRequired: 1 },
+  { name: 'Maos Curativas', level: 'Nível 1', category: 'Habilidade', classes: 'Aasimar', castingTime: '1 Acao', range: 'Toque', components: '-', duration: 'Instantanea', damageDice: 'Nivel', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Toca uma criatura e cura uma pequena quantidade baseada no nivel.', classLevelRequired: 1 },
+  { name: 'Chama Inata', level: 'Truque', category: 'Magia', classes: 'Genasi do Fogo', castingTime: '1 Acao', range: '18m', components: 'S', duration: 'Instantanea', damageDice: '1d8', damageType: 'Fogo', savingThrow: 'DES', description: 'Manipula chama elemental herdada da linhagem genasi.', classLevelRequired: 1 },
+  { name: 'Agilidade Felina', level: 'Passiva', category: 'Passiva', classes: 'Tabaxi', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: 'Movimento', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Pode dobrar deslocamento por um turno antes de precisar recuperar o folego.', classLevelRequired: 1 },
+  { name: 'Mimetismo', level: 'Passiva', category: 'Passiva', classes: 'Kenku', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Imita sons e vozes que ja ouviu.', classLevelRequired: 1 },
+  { name: 'Tatica de Matilha', level: 'Passiva', category: 'Passiva', classes: 'Kobold', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: 'Vantagem', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Recebe vantagem quando um aliado ameaca o mesmo alvo.', classLevelRequired: 1 },
+  { name: 'Passo Oculto', level: 'Nível 1', category: 'Habilidade', classes: 'Firbolg', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Turno', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Fica invisivel brevemente ate atacar, conjurar ou forcar um teste.', classLevelRequired: 1 },
+  { name: 'Controle do Ar e Agua', level: 'Nível 1', category: 'Magia', classes: 'Tritao', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Instantanea', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Manifesta magia menor ligada ao mar, vento e correntes.', classLevelRequired: 1 },
+  { name: 'Bencao da Rainha Corvo', level: 'Nível 1', category: 'Habilidade', classes: 'Shadar-kai', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: 'Instantanea', damageDice: 'Teleporte', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Teleporta-se por uma curta distancia envolto em sombras.', classLevelRequired: 1 },
+  { name: 'Impulso Telecinetico', level: 'Nível 1', category: 'Magia', classes: 'Mistico,Feiticeiro,Mago', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Instantanea', damageDice: '2d6', damageType: 'Forca', savingThrow: 'FOR', description: 'Uma forca invisivel arremessa ou empurra uma criatura ou objeto.', classLevelRequired: 1 },
+  { name: 'Leitura de Aura', level: 'Nível 1', category: 'Magia', classes: 'Mistico,Bardo,Clérigo', castingTime: '1 Acao', range: '9m', components: 'V, S', duration: 'Concentracao', damageDice: '-', damageType: 'Outro', savingThrow: 'SAB', description: 'Percebe ecos emocionais e rastros magicos superficiais de uma criatura.', classLevelRequired: 1 },
+  { name: 'Absorver Elementos', level: 'Nível 1', category: 'Magia', classes: 'Artifice,Druida,Feiticeiro,Mago,Patrulheiro', castingTime: 'Reacao', range: 'Pessoal', components: 'S', duration: '1 Rodada', damageDice: '+1d6', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Reduz dano elemental recebido e carrega o proximo ataque.', classLevelRequired: 1 },
+  { name: 'Catapulta', level: 'Nível 1', category: 'Magia', classes: 'Artifice,Feiticeiro,Mago', castingTime: '1 Acao', range: '18m', components: 'S', duration: 'Instantanea', damageDice: '3d8', damageType: 'Concussao', savingThrow: 'DES', description: 'Arremessa um objeto solto contra uma criatura.', classLevelRequired: 1 },
+  { name: 'Graxa', level: 'Nível 1', category: 'Magia', classes: 'Artifice,Mago', castingTime: '1 Acao', range: '18m', components: 'V, S, M', duration: '1 Minuto', damageDice: '-', damageType: 'Outro', savingThrow: 'DES', description: 'Cobre o chao com gordura escorregadia.', classLevelRequired: 1 },
+  { name: 'Disfarcar-se', level: 'Nível 1', category: 'Magia', classes: 'Bardo,Bruxo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S', duration: '1 Hora', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Altera sua aparencia com ilusao.', classLevelRequired: 1 },
+  { name: 'Recuo Acelerado', level: 'Nível 1', category: 'Magia', classes: 'Bruxo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V, S', duration: 'Concentracao', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Permite disparar como acao bonus durante a duracao.', classLevelRequired: 1 },
+  { name: 'Sinalizador de Alvo', level: 'Nível 1', category: 'Magia', classes: 'Artifice,Patrulheiro', castingTime: '1 Acao Bonus', range: '27m', components: 'V, S, M', duration: 'Concentracao', damageDice: '+1d4', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Marca um alvo para facilitar ataques coordenados.', classLevelRequired: 1 },
+  { name: 'Passo Trovejante', level: 'Nível 3', category: 'Magia', classes: 'Bruxo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: '27m', components: 'V', duration: 'Instantanea', damageDice: '3d10', damageType: 'Trovejante', savingThrow: 'CON', description: 'Teletransporta em um estouro que fere criaturas adjacentes.', classLevelRequired: 5 },
+  { name: 'Servo Mecanico', level: 'Nível 2', category: 'Magia', classes: 'Artifice,Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: '1 Hora', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Anima um pequeno construto simples para tarefas basicas.', classLevelRequired: 3 },
+  { name: 'Vortice Temporal', level: 'Nível 2', category: 'Magia', classes: 'Mago,Mistico', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Instantanea', damageDice: '2d8', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Desorienta o alvo com ecos de futuros possiveis.', classLevelRequired: 3 },
+  { name: 'Infusao: Arma Aprimorada', level: 'Nível 2', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Arma', components: '-', duration: 'Permanente', damageDice: '+1', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Arma infundida recebe bonus magico de ataque e dano.', classLevelRequired: 2 },
+  { name: 'Infusao: Defesa Aprimorada', level: 'Nível 2', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Armadura', components: '-', duration: 'Permanente', damageDice: '+1 CA', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Armadura ou escudo infundido recebe bonus defensivo.', classLevelRequired: 2 },
+  { name: 'Infusoes Magicas', level: 'Nível 1', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Aprende a imbuir objetos comuns com propriedades arcanas temporarias.', classLevelRequired: 1 },
+  { name: 'Conjuracao por Ferramentas', level: 'Nível 1', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Pode usar ferramentas como foco para canalizar magias de artifice.', classLevelRequired: 1 },
+  { name: 'Ferramenta Certa', level: 'Nível 3', category: 'Habilidade', classes: 'Artifice', castingTime: '1 Hora', range: 'Pessoal', components: '-', duration: 'Ate descanso', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Cria ou adapta ferramentas comuns com sucata e magia.', classLevelRequired: 3 },
+  { name: 'Elixir Experimental', level: 'Nível 3', category: 'Habilidade', classes: 'Artifice', castingTime: '1 Acao', range: 'Toque', components: '-', duration: 'Variavel', damageDice: '1d6', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Prepara um elixir de cura, velocidade, voo curto ou resistencia.', classLevelRequired: 3 },
+  { name: 'Canhao Eldritch', level: 'Nível 3', category: 'Habilidade', classes: 'Artifice', castingTime: '1 Acao', range: '18m', components: '-', duration: '1 Hora', damageDice: '2d8', damageType: 'Forca', savingThrow: 'DES', description: 'Invoca um pequeno canhao arcano portatil.', classLevelRequired: 3 },
+  { name: 'Defensor de Aco', level: 'Nível 3', category: 'Habilidade', classes: 'Artifice', castingTime: '1 Acao Bonus', range: '9m', components: '-', duration: 'Permanente', damageDice: '1d8', damageType: 'Forca', savingThrow: 'Nenhum', description: 'Construto aliado protege e ataca sob comando.', classLevelRequired: 3 },
+  { name: 'Talento Psionico', level: 'Nível 1', category: 'Passiva', classes: 'Mistico', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '1d6', damageType: 'Psiquico', savingThrow: 'Nenhum', description: 'Recebe um dado psionico para ampliar poderes mentais.', classLevelRequired: 1 },
+  { name: 'Disciplina Mental', level: 'Nível 1', category: 'Passiva', classes: 'Mistico', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Treinamento para manter foco psionico e resistir a intrusoes mentais.', classLevelRequired: 1 },
+  { name: 'Pulso Psiquico', level: 'Nível 1', category: 'Habilidade', classes: 'Mistico', castingTime: '1 Acao', range: '18m', components: '-', duration: 'Instantanea', damageDice: '1d8', damageType: 'Psiquico', savingThrow: 'INT', description: 'Onda mental fere e empurra a consciencia do alvo.', classLevelRequired: 1 },
+  { name: 'Escudo Mental', level: 'Nível 2', category: 'Habilidade', classes: 'Mistico', castingTime: 'Reacao', range: 'Pessoal', components: '-', duration: '1 Turno', damageDice: '+2 CA', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Barreira psiquica protege contra ataque ou magia mental.', classLevelRequired: 2 },
+  { name: 'Mente Telepatica', level: 'Nível 3', category: 'Passiva', classes: 'Mistico', castingTime: 'Passiva', range: '18m', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Comunica ideias simples diretamente na mente de criaturas conhecidas.', classLevelRequired: 3 },
+  { name: 'Lamina Mental', level: 'Nível 3', category: 'Habilidade', classes: 'Mistico', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '1d8', damageType: 'Psiquico', savingThrow: 'Nenhum', description: 'Forma uma lamina de energia mental para ataques rapidos.', classLevelRequired: 3 },
+  { name: 'Poder dos Gigantes', level: 'Nível 3', category: 'Habilidade', classes: 'Guerreiro', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '+1d6', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Aumenta tamanho, forca e dano enquanto runas brilham.', classLevelRequired: 3 },
+  { name: 'Manto de Inspiracao', level: 'Nível 3', category: 'Habilidade', classes: 'Bardo', castingTime: '1 Acao Bonus', range: '18m', components: '-', duration: 'Instantanea', damageDice: 'PV Temp', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Aliados recebem pontos temporarios e podem se mover sem provocar ataques.', classLevelRequired: 3 },
+  { name: 'Emboscador Sombrio', level: 'Nível 3', category: 'Passiva', classes: 'Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+1d8', damageType: 'Extra', savingThrow: 'Nenhum', description: 'No inicio do combate, move-se mais e causa dano extra.', classLevelRequired: 3 },
+];
+
+const EXPANDED_STARTING_KITS = [
+  { name: 'Kit Artifice de Campo', targetName: 'Artifice', targetType: 'class', items: [{ name: 'Repetidor Leve', qty: 1 }, { name: 'Aljava com 20 Virotes', qty: 1 }, { name: 'Ferramentas de Inventor', qty: 1 }, { name: 'Granada de Fumaca', qty: 2 }] },
+  { name: 'Kit Artifice Alquimico', targetName: 'Artifice', targetType: 'class', items: [{ name: 'Adaga', qty: 1 }, { name: 'Kit de Alquimia', qty: 1 }, { name: 'Tonica de Foco', qty: 1 }, { name: 'Pocao de Cura', qty: 1 }] },
+  { name: 'Kit Mistico Errante', targetName: 'Mistico', targetType: 'class', items: [{ name: 'Cristal Psiquico', qty: 1 }, { name: 'Lamina Psiquica', qty: 1 }, { name: 'Roupas de Viagem', qty: 1 }, { name: 'Livro', qty: 1 }] },
+  { name: 'Kit Mistico Umbral', targetName: 'Mistico', targetType: 'class', items: [{ name: 'Cristal Psiquico', qty: 1 }, { name: 'Manto Umbral', qty: 1 }, { name: 'Adaga', qty: 2 }, { name: 'Tonica de Foco', qty: 1 }] },
+];
+
+const EXPANDED_SPELLCASTING_PROGRESSIONS = [
+  ['class', 'Artifice', 1, 2, 0, 2, 0, 0],
+  ['class', 'Artifice', 2, 2, 0, 2, 0, 0],
+  ['class', 'Artifice', 3, 2, 0, 3, 0, 0],
+  ['class', 'Artifice', 4, 2, 0, 3, 0, 0],
+  ['class', 'Artifice', 5, 2, 0, 4, 2, 0],
+  ['class', 'Mistico', 1, 2, 2, 0, 0, 0],
+  ['class', 'Mistico', 2, 2, 3, 0, 0, 0],
+  ['class', 'Mistico', 3, 2, 4, 0, 0, 0],
+  ['class', 'Mistico', 4, 3, 4, 0, 0, 0],
+  ['class', 'Mistico', 5, 3, 5, 0, 0, 0],
+  ['race', 'Aasimar', 1, 0, 1, 0, 0, 0],
+  ['race', 'Genasi do Fogo', 1, 1, 0, 0, 0, 0],
+  ['race', 'Tritao', 1, 0, 1, 0, 0, 0],
+  ['race', 'Firbolg', 1, 0, 1, 0, 0, 0],
+];
+
+async function seedExpandedBaseCatalog(db: SQLiteDatabase) {
+  for (const race of EXPANDED_RACES) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO races (name, stat_bonuses, speed, features, criador) VALUES (?, ?, ?, ?, 'base')`,
+      [race.name, race.statBonuses, race.speed, JSON.stringify(race.features)]
+    );
+  }
+
+  for (const item of EXPANDED_ITEMS) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO items (name, weight, damage, damage_type, category, is_consumable, properties, descricao, criador)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+      [item.name, item.weight, item.damage, item.damageType, item.category, item.isConsumable, item.properties, item.descricao]
+    );
+  }
+
+  for (const charClass of EXPANDED_CLASSES) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO classes (name, recommended_stats, starting_equipment, starting_gold, hit_dice, saves, subclass_level, is_caster, features, criador)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+      [
+        charClass.name,
+        charClass.recommendedStats,
+        charClass.startingEquipment,
+        charClass.startingGold,
+        charClass.hitDice,
+        charClass.saves,
+        charClass.subclassLevel,
+        charClass.isCaster,
+        JSON.stringify(charClass.features),
+      ]
+    );
+  }
+
+  for (const subclass of EXPANDED_SUBCLASSES) {
+    const existing = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM subclasses WHERE name = ? AND class_name = ? LIMIT 1`,
+      [subclass.name, subclass.className]
+    );
+    if (existing?.id) continue;
+    await db.runAsync(
+      `INSERT INTO subclasses (name, class_name, level_required, features, criador) VALUES (?, ?, ?, ?, 'base')`,
+      [subclass.name, subclass.className, subclass.levelRequired, JSON.stringify(subclass.features)]
+    );
+  }
+
+  for (const spell of EXPANDED_SPELLS) {
+    const existing = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM spells WHERE name = ? AND classes = ? LIMIT 1`,
+      [spell.name, spell.classes]
+    );
+    if (existing?.id) continue;
+    await db.runAsync(
+      `INSERT INTO spells (name, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type, saving_throw, description, class_level_required, criador)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+      [
+        spell.name,
+        spell.level,
+        spell.category,
+        spell.classes,
+        spell.castingTime,
+        spell.range,
+        spell.components,
+        spell.duration,
+        spell.damageDice,
+        spell.damageType,
+        spell.savingThrow,
+        spell.description,
+        spell.classLevelRequired,
+      ]
+    );
+  }
+
+  for (const kit of EXPANDED_STARTING_KITS) {
+    const existing = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM starting_kits WHERE name = ? LIMIT 1`,
+      [kit.name]
+    );
+    if (existing?.id) continue;
+    await db.runAsync(
+      `INSERT INTO starting_kits (name, target_name, target_type, items, criador) VALUES (?, ?, ?, ?, 'base')`,
+      [kit.name, kit.targetName, kit.targetType, JSON.stringify(kit.items)]
+    );
+  }
+
+  for (const progression of EXPANDED_SPELLCASTING_PROGRESSIONS) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO spellcasting_progression
+       (source_type, source_name, level, cantrips_known, spells_known, slot_1, slot_2, slot_3, criador)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+      progression
+    );
+  }
+}
+
 export async function initializeDatabase(db: SQLiteDatabase) {
   await db.execAsync(`PRAGMA journal_mode = WAL;`);
 
@@ -1191,6 +1565,8 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await seedRandomCreatorContent(db);
   await seedConditionEffectCatalog(db);
   await seedStructuredBaseEffects(db);
+  await seedExpandedBaseCatalog(db);
+  await organizeBaseCatalog(db);
   if (didResetTransientDebugState) {
     await db.runAsync(`DELETE FROM app_trace_logs`);
   }

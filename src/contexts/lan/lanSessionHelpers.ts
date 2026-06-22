@@ -98,8 +98,9 @@ export function removeItemFromEquipment(equipmentValue: unknown, itemNameValue: 
 }
 
 export function cloneTransferItem(item: Record<string, unknown>, quantity: number) {
+  const { qty: _qty, quantity: _quantity, ...itemWithoutQuantity } = item as Record<string, unknown>;
   return {
-    ...item,
+    ...itemWithoutQuantity,
     name: String(item.name || item.itemName || 'Item'),
     qty: Math.max(1, quantity),
   };

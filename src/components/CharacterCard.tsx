@@ -8,6 +8,9 @@ export type Character = {
   class: string;
   race: string;
   avatar_uri?: string | null;
+  linked_session_name?: string | null;
+  linked_session_status?: string | null;
+  linked_session_role?: string | null;
 };
 
 type Props = {
@@ -73,6 +76,11 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, on
         
         <View style={styles.cardInfo}>
           <Text style={styles.characterName} numberOfLines={1}>{character.name}</Text>
+          {character.linked_session_name && (
+            <Text style={styles.sessionDetails} numberOfLines={1}>
+              LAN: {character.linked_session_name} ({character.linked_session_role === 'master' ? 'Mestre' : 'Jogador'})
+            </Text>
+          )}
           <Text style={styles.characterDetails}>{character.race} • {character.class}</Text>
         </View>
 
@@ -168,6 +176,12 @@ const styles = StyleSheet.create({
   characterDetails: {
     fontSize: 14,
     color: 'rgba(255, 255, 255, 0.6)',
+  },
+  sessionDetails: {
+    fontSize: 11,
+    color: '#00fa9a',
+    fontWeight: 'bold',
+    marginBottom: 3,
   },
   levelBadge: {
     backgroundColor: 'rgba(0, 191, 255, 0.15)',

@@ -5,8 +5,9 @@ import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import AvatarAdjustModal from '../components/AvatarAdjustModal';
 import { useLanSession } from '../contexts/LanSessionContext';
-import { pickAndStoreCharacterAvatar } from '../utils/characterAvatar';
+import { AvatarAdjustment, AvatarDraft, deleteStoredCharacterAvatar, pickCharacterAvatarDraft, storeAdjustedCharacterAvatar } from '../utils/characterAvatar';
 
 // IMPORTAÇÃO DO NOVO COMPONENTE (Ajuste o caminho se necessário)
 import SpellSelector from '../components/SpellSelector';
@@ -80,10 +81,15 @@ export default function EditCharacterScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const { activeSession, broadcastCharacter } = useLanSession();
+  const isLevelUpFlow = Boolean(levelUpTo);
 
   const [loading, setLoading] = useState(true);
   const [character, setCharacter] = useState<any>(null);
+  const [linkedLanSession, setLinkedLanSession] = useState<{ id: string; name: string; status: string } | null>(null);
   const [avatarUri, setAvatarUri] = useState<string | null>(null);
+  const [originalAvatarUri, setOriginalAvatarUri] = useState<string | null>(null);
+  const [pendingAvatarDraft, setPendingAvatarDraft] = useState<AvatarDraft | null>(null);
+  const [avatarAdjustment, setAvatarAdjustment] = useState<AvatarAdjustment>({ zoom: 1, offsetX: 0, offsetY: 0 });
   const [currentStep, setCurrentStep] = useState(0);
   
   const [dbSkills, setDbSkills] = useState<any[]>([]);
@@ -163,6 +169,17 @@ export default function EditCharacterScreen() {
         if (char) {
           setCharacter(char);
           setAvatarUri((char as any).avatar_uri || null);
+          setOriginalAvatarUri((char as any).avatar_uri || null);
+          const linkedSession = await db.getFirstAsync<{ id: string; name: string; status: string }>(
+            `SELECT id, name, status
+             FROM lan_sessions
+             WHERE linked_character_id = ?
+               AND status IN ('open', 'connected', 'paused')
+             ORDER BY COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC
+             LIMIT 1`,
+            [Number(id)]
+          );
+          setLinkedLanSession(linkedSession || null);
           const tLevel = levelUpTo ? Number(levelUpTo) : (char as any).level;
           setTargetLevel(tLevel);
           
@@ -522,15 +539,48 @@ export default function EditCharacterScreen() {
 
   const handlePickAvatar = async () => {
     try {
-      const uri = await pickAndStoreCharacterAvatar(character?.id);
-      if (uri) setAvatarUri(uri);
+      const draft = await pickCharacterAvatarDraft();
+      if (draft) {
+        setPendingAvatarDraft(draft);
+        setAvatarAdjustment({ zoom: 1, offsetX: 0, offsetY: 0 });
+      }
     } catch (error) {
       console.warn('Erro ao escolher imagem da ficha:', error);
       Alert.alert('Imagem nao carregada', 'Nao foi possivel usar esta imagem. Tente outro arquivo.');
     }
   };
 
+  const confirmAvatarAdjustment = async () => {
+    if (!pendingAvatarDraft) return;
+    try {
+      const uri = await storeAdjustedCharacterAvatar(character?.id, pendingAvatarDraft, avatarAdjustment);
+      if (uri) {
+        if (avatarUri && avatarUri !== originalAvatarUri) deleteStoredCharacterAvatar(avatarUri);
+        setAvatarUri(uri);
+      }
+      setPendingAvatarDraft(null);
+    } catch (error) {
+      console.warn('Erro ao ajustar imagem da ficha:', error);
+      Alert.alert('Imagem nao carregada', 'Nao foi possivel ajustar esta imagem. Tente outro arquivo.');
+    }
+  };
+
   const saveChanges = async () => {
+    if (linkedLanSession && !isLevelUpFlow) {
+      try {
+        await db.runAsync(`UPDATE characters SET avatar_uri=? WHERE id=?`, [avatarUri, character.id]);
+        if (originalAvatarUri && originalAvatarUri !== avatarUri) deleteStoredCharacterAvatar(originalAvatarUri);
+        await broadcastCharacter(character.id, 'avatar-updated').catch(error => {
+          console.warn('Avatar salvo localmente, mas a sincronizacao LAN falhou:', error);
+        });
+        if (router.canGoBack()) router.back();
+        else router.replace('/');
+      } catch (e) {
+        console.error('Erro ao salvar avatar:', e);
+      }
+      return;
+    }
+
     const finalClassStr = classesData
       .filter(c => c.level > 0)
       .map(c => `${c.name}${c.subclass ? ` (${c.subclass})` : ''} ${c.level}`)
@@ -544,6 +594,7 @@ export default function EditCharacterScreen() {
         `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=?, avatar_uri=? WHERE id=?`,
         [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), avatarUri, character.id]
       );
+      if (originalAvatarUri && originalAvatarUri !== avatarUri) deleteStoredCharacterAvatar(originalAvatarUri);
       
       // CORREÇÃO: Em vez de criar uma Ficha nova e empilhar, apenas voltamos (pop) a tela atual!
       if (activeSession) {
@@ -579,13 +630,46 @@ export default function EditCharacterScreen() {
           <Text style={styles.avatarButtonText}>{avatarUri ? 'Trocar imagem' : 'Escolher imagem'}</Text>
         </TouchableOpacity>
         {avatarUri && (
-          <TouchableOpacity style={styles.avatarRemoveButton} onPress={() => setAvatarUri(null)}>
+          <TouchableOpacity style={styles.avatarRemoveButton} onPress={() => {
+            if (avatarUri && avatarUri !== originalAvatarUri) deleteStoredCharacterAvatar(avatarUri);
+            setAvatarUri(null);
+          }}>
             <Text style={styles.avatarRemoveText}>Remover imagem</Text>
           </TouchableOpacity>
         )}
       </View>
     </View>
   );
+
+  if (linkedLanSession && !isLevelUpFlow) {
+    return (
+      <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
+        <Stack.Screen options={{ headerShown: false }} />
+        <AvatarAdjustModal
+          draft={pendingAvatarDraft}
+          adjustment={avatarAdjustment}
+          onChange={setAvatarAdjustment}
+          onCancel={() => setPendingAvatarDraft(null)}
+          onConfirm={confirmAvatarAdjustment}
+        />
+        <View style={styles.topBar}>
+          <TouchableOpacity onPress={() => router.back()}><Ionicons name="arrow-back" size={28} color="#fff" /></TouchableOpacity>
+          <Text style={styles.topBarTitle}>AVATAR DA FICHA</Text>
+          <View style={{ width: 28 }} />
+        </View>
+        <View style={styles.lockedEditContainer}>
+          <Text style={styles.lockedEditTitle}>{character?.name}</Text>
+          <Text style={styles.lockedEditText}>
+            Esta ficha esta vinculada a sessao LAN {linkedLanSession.name}. Enquanto estiver vinculada, apenas a foto do avatar pode ser alterada.
+          </Text>
+          {renderAvatarPicker()}
+          <TouchableOpacity style={[styles.navBtn, styles.navBtnFinish, styles.lockedSaveButton]} onPress={saveChanges}>
+            <Text style={styles.navBtnFinishText}>Salvar Avatar</Text>
+          </TouchableOpacity>
+        </View>
+      </LinearGradient>
+    );
+  }
 
   const renderStep0 = () => (
     <View>
@@ -919,6 +1003,13 @@ export default function EditCharacterScreen() {
   return (
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
+      <AvatarAdjustModal
+        draft={pendingAvatarDraft}
+        adjustment={avatarAdjustment}
+        onChange={setAvatarAdjustment}
+        onCancel={() => setPendingAvatarDraft(null)}
+        onConfirm={confirmAvatarAdjustment}
+      />
       
       <View style={styles.topBar}>
         <TouchableOpacity onPress={() => router.back()}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
@@ -1123,6 +1214,10 @@ const styles = StyleSheet.create({
   navBtnText: { color: '#fff', fontWeight: 'bold' },
   navBtnPrimaryText: { color: '#02112b', fontWeight: 'bold' },
   navBtnFinishText: { color: '#02112b', fontWeight: 'bold', fontSize: 16 },
+  lockedEditContainer: { flex: 1, padding: 20, justifyContent: 'center' },
+  lockedEditTitle: { color: '#fff', fontSize: 24, fontWeight: 'bold', textAlign: 'center', marginBottom: 10 },
+  lockedEditText: { color: 'rgba(255,255,255,0.68)', fontSize: 14, lineHeight: 20, textAlign: 'center', marginBottom: 20 },
+  lockedSaveButton: { flex: 0, marginTop: 10, minHeight: 54, justifyContent: 'center' },
 
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'flex-end' },
   modalContentFullScreen: { backgroundColor: '#102b56', borderTopLeftRadius: 30, borderTopRightRadius: 30, padding: 20, maxHeight: '90%', borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)' },

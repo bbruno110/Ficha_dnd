@@ -2,9 +2,11 @@ import * as Network from 'expo-network';
 import { useSQLiteContext } from 'expo-sqlite';
 import { AppState, AppStateStatus } from 'react-native';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { LanTcpClient } from '../network/LanTcpClient';
+import { LanTcpServer, LanTcpStreamMessage } from '../network/LanTcpServer';
 import { getLanAddressCandidates } from '../network/lanAddresses';
 import { discoverLanMaster } from '../network/lanDiscovery';
-import { LanRpcRequest, LanRpcResponse, LanRpcServer, makeRpcId, sendLanRpc } from '../network/lanRpcTransport';
+import { LanRpcRequest, LanRpcResponse, makeRpcId, sendLanRpc } from '../network/lanRpcTransport';
 import { buildSessionShareCode, makeShortSessionCode, parseSessionCode } from '../network/lanProtocol';
 import { addFunctionTraceLog } from '../network/traceRepository';
 import { LanForegroundService } from '../services/lan/LanForegroundService';
@@ -91,7 +93,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const [players, setPlayers] = useState<LanPlayerSummary[]>([]);
   const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
 
-  const rpcServerRef = useRef<LanRpcServer | null>(null);
+  const rpcServerRef = useRef<LanTcpServer | null>(null);
+  const tcpClientRef = useRef<LanTcpClient | null>(null);
+  const tcpClientKeyRef = useRef('');
+  const tcpClientConnectedRef = useRef(false);
   const activeSessionRef = useRef<LanSessionRecord | null>(null);
   const closingSessionRef = useRef<LanSessionRecord | null>(null);
   const closingSessionPendingDevicesRef = useRef<Record<string, Set<string>>>({});
@@ -109,6 +114,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
   const playerPollInFlightRef = useRef(false);
+  const pushTcpSyncRef = useRef<((session: LanSessionRecord, reason?: string) => Promise<void>) | null>(null);
 
   const setTransportReadyState = useCallback((ready: boolean) => {
     setIsTransportReady(ready);
@@ -215,6 +221,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     const current = activeSessionRef.current;
     sessionGenerationRef.current += 1;
     suppressReconnectRef.current = true;
+    tcpClientRef.current?.close();
+    tcpClientRef.current = null;
+    tcpClientKeyRef.current = '';
+    tcpClientConnectedRef.current = false;
     rpcServerRef.current?.close();
     rpcServerRef.current = null;
     suppressReconnectRef.current = false;
@@ -362,6 +372,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           await refreshSavedSessions();
           return;
         }
+        tcpClientRef.current?.close();
+        tcpClientRef.current = null;
+        tcpClientKeyRef.current = '';
+        tcpClientConnectedRef.current = false;
         rpcServerRef.current?.close();
         rpcServerRef.current = null;
         if (reconnectTimerRef.current) {
@@ -1332,13 +1346,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         activeSessionRef.current = resumedSession;
 
         if (!rpcServerRef.current) {
-          const rpcServer = new LanRpcServer(handleRpcRequest, {
-            onStatus: status => setLastNotice(status),
-            onError: message => {
-              setLastError(message);
-              void traceLan('LAN_RPC', 'LanRpcServer', 'error', message, { sessionId: resumedSession.id }, 'error');
-            },
-          });
+          const rpcServer = makeLanTcpServer(resumedSession.id);
           await rpcServer.start(port);
           rpcServerRef.current = rpcServer;
         }
@@ -1392,13 +1400,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         const port = Number(session.port || LAN_DEFAULT_PORT);
         if (!rpcServerRef.current) {
           try {
-            const rpcServer = new LanRpcServer(handleRpcRequest, {
-              onStatus: status => setLastNotice(status),
-              onError: message => {
-                setLastError(message);
-                void traceLan('LAN_RPC', 'LanRpcServer', 'error', message, { sessionId: session.id, mode: 'closed-announcement' }, 'error');
-              },
-            });
+            const rpcServer = makeLanTcpServer(session.id, { mode: 'closed-announcement' });
             await rpcServer.start(port);
             rpcServerRef.current = rpcServer;
             await traceLan('LAN_RPC', 'MASTER_END_SESSION', 'closed_host_started', 'Host temporario iniciado para avisar encerramento da sessao.', {
@@ -1929,6 +1931,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       const run = commandQueueRef.current.then(() => handleAuthoritativeCommand(command, peerId));
       commandQueueRef.current = run.catch(() => undefined);
       await run;
+      const session = activeSessionRef.current || closingSessionRef.current;
+      if (session?.role === 'master') {
+        await pushTcpSyncRef.current?.(session, `command:${command.command}`);
+      }
     },
     [handleAuthoritativeCommand]
   );
@@ -2001,6 +2007,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
 
       setLastNotice(`Ficha recebida: ${characterMessage.snapshot.name}.`);
+      await pushTcpSyncRef.current?.(session, 'character-upsert');
     },
     [db, emitOfficialEvent, refreshPlayers, traceLan]
   );
@@ -2051,6 +2058,33 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     [db, expireStaleTrades, traceLan]
   );
 
+  const pushTcpSync = useCallback(
+    async (session: LanSessionRecord, reason = 'sync') => {
+      const server = rpcServerRef.current;
+      if (!server || session.role !== 'master') return;
+
+      const payload = await buildRpcSyncPayload(session, 0);
+      const sent = server.broadcast({
+        method: 'SYNC',
+        sessionId: session.id,
+        payload,
+      });
+      if (sent > 0) {
+        setPeerCount(server.connectedDeviceIds().length);
+        await traceLan('LAN_TCP', 'pushTcpSync', 'sent', 'Sync LAN enviado por push TCP.', {
+          sessionId: session.id,
+          reason,
+          sent,
+        }, 'debug');
+      }
+    },
+    [buildRpcSyncPayload, traceLan]
+  );
+
+  useEffect(() => {
+    pushTcpSyncRef.current = pushTcpSync;
+  }, [pushTcpSync]);
+
   const applyRpcSyncPayload = useCallback(
     async (payload: Record<string, unknown> | undefined) => {
       if (!payload) return;
@@ -2075,6 +2109,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             await sendClosedSessionAck(current, 'sync-state');
             await setLanSessionStatus(db, state.sessionId, 'closed');
             await linkCharacterToSession(db, state.sessionId, null);
+            tcpClientRef.current?.close();
+            tcpClientRef.current = null;
+            tcpClientKeyRef.current = '';
+            tcpClientConnectedRef.current = false;
             setActiveSession(null);
             activeSessionRef.current = null;
             setTransportReadyState(false);
@@ -2310,7 +2348,11 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           const deviceId = String(request.deviceId || request.payload?.deviceId || '');
           if (deviceId) {
             await db.runAsync(
-              `UPDATE lan_session_players SET connected = 0, last_seen_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ?`,
+              `DELETE FROM lan_session_players WHERE session_id = ? AND device_id = ?`,
+              [session.id, deviceId]
+            );
+            await db.runAsync(
+              `DELETE FROM lan_character_snapshots WHERE session_id = ? AND owner_device_id = ?`,
               [session.id, deviceId]
             );
             await refreshPlayers();
@@ -2328,6 +2370,122 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
     },
     [acknowledgeClosedSessionDelivery, buildRpcSyncPayload, db, emitOfficialEvent, handleCharacterUpsert, makeRpcResponse, refreshPlayers, runAuthoritativeCommandQueued, traceLan]
+  );
+
+  const makeLanTcpServer = useCallback(
+    (sessionId: string, errorMetadata: Record<string, unknown> = {}) => new LanTcpServer(handleRpcRequest, {
+      heartbeatMs: 10000,
+      onStatus: status => setLastNotice(status),
+      onError: message => {
+        setLastError(message);
+        void traceLan('LAN_TCP', 'LanTcpServer', 'error', message, { sessionId, ...errorMetadata }, 'error');
+      },
+      onClientHello: async (message: LanTcpStreamMessage) => {
+        const response = await handleRpcRequest({
+          type: 'LAN_RPC',
+          id: message.id || makeRpcId(),
+          method: 'POLL',
+          sessionId: message.sessionId || sessionId,
+          deviceId: message.deviceId || null,
+          payload: message.payload || {},
+          at: message.at || new Date().toISOString(),
+        });
+        if (!response.ok) {
+          return { error: response.error || 'Falha ao entrar na sessao LAN.' };
+        }
+        setPeerCount(rpcServerRef.current?.connectedDeviceIds().length || 0);
+        return response.payload;
+      },
+      onClosedAck: async (message: LanTcpStreamMessage) => {
+        const session = closingSessionRef.current || activeSessionRef.current;
+        const deviceId = String(message.deviceId || message.payload?.deviceId || '');
+        if (session && deviceId) {
+          await acknowledgeClosedSessionDelivery(session, deviceId, message.id, 'explicit');
+        }
+      },
+      onClientDisconnected: async (deviceId, disconnectedSessionId) => {
+        await db.runAsync(
+          `UPDATE lan_session_players SET connected = 0, last_seen_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ?`,
+          [disconnectedSessionId, deviceId]
+        );
+        setPeerCount(rpcServerRef.current?.connectedDeviceIds().length || 0);
+        await refreshPlayers();
+        await traceLan('LAN_TCP', 'LanTcpServer', 'client_disconnected', 'Jogador desconectado do socket persistente.', {
+          sessionId: disconnectedSessionId,
+          deviceId,
+        }, 'warn');
+      },
+    }),
+    [acknowledgeClosedSessionDelivery, db, handleRpcRequest, refreshPlayers, traceLan]
+  );
+
+  const ensureTcpClient = useCallback(
+    async (session: LanSessionRecord, reason = 'active-session') => {
+      if (session.role !== 'player' || session.status === 'closed' || session.status === 'inactive' || !session.host_ip || !session.port) return;
+
+      const deviceId = deviceIdRef.current || (await getOrCreateDeviceId(db));
+      deviceIdRef.current = deviceId;
+      setLocalDeviceId(deviceId);
+
+      const characterId = session.linked_character_id || null;
+      const clientKey = `${session.id}:${session.host_ip}:${Number(session.port || LAN_DEFAULT_PORT)}:${deviceId}:${characterId || 'no-character'}`;
+      if (tcpClientRef.current && tcpClientKeyRef.current === clientKey) return;
+
+      const characterRow = characterId
+        ? await db.getFirstAsync<{ name?: string | null }>(`SELECT name FROM characters WHERE id = ? LIMIT 1`, [characterId])
+        : null;
+      const sinceSeq = await getLocalLastEventSeq(session.id);
+      const payload = {
+        deviceId,
+        sinceSeq,
+        playerName: await getLocalPlayerName(db),
+        characterId,
+        characterName: characterRow?.name || null,
+      };
+
+      tcpClientRef.current?.close();
+      tcpClientConnectedRef.current = false;
+      tcpClientKeyRef.current = clientKey;
+      const client = new LanTcpClient({
+        host: session.host_ip,
+        port: Number(session.port || LAN_DEFAULT_PORT),
+        sessionId: session.id,
+        deviceId,
+        payload,
+        reconnectMs: 3000,
+        onStatus: status => {
+          tcpClientConnectedRef.current = status === 'connected';
+          setTransportReadyState(status === 'connected');
+          setLanConnectionStatus(status === 'connected' ? 'connected' : status);
+        },
+        onMessage: async message => {
+          if (message.method === 'SYNC') {
+            await applyRpcSyncPayload(message.payload);
+            setTransportReadyState(true);
+            setLanConnectionStatus('connected');
+          }
+          if (message.method === 'NOTICE' && message.payload?.error) {
+            setLastError(String(message.payload.error));
+          }
+        },
+        onError: message => {
+          void traceLan('LAN_TCP', 'LanTcpClient', 'error', message, {
+            sessionId: session.id,
+            reason,
+          }, 'warn');
+        },
+      });
+      tcpClientRef.current = client;
+      client.start();
+      await traceLan('LAN_TCP', 'ensureTcpClient', 'started', 'Cliente TCP persistente iniciado para jogador.', {
+        sessionId: session.id,
+        hostIp: session.host_ip,
+        port: session.port,
+        characterId,
+        reason,
+      }, 'info');
+    },
+    [applyRpcSyncPayload, db, getLocalLastEventSeq, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   const recoverLanSession = useCallback(
@@ -2415,13 +2573,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
           if (!rpcServerRef.current) {
             const sessionId = session.id;
-            const rpcServer = new LanRpcServer(handleRpcRequest, {
-              onStatus: status => setLastNotice(status),
-              onError: message => {
-                setLastError(message);
-                void traceLan('LAN_RPC', 'LanRpcServer', 'error', message, { sessionId }, 'error');
-              },
-            });
+            const rpcServer = makeLanTcpServer(sessionId);
             await rpcServer.start(Number(session.port || LAN_DEFAULT_PORT));
             rpcServerRef.current = rpcServer;
           }
@@ -2499,6 +2651,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           }
           setTransportReadyState(true);
           setLanConnectionStatus('connected');
+          await ensureTcpClient(nextSession, 'recover-success');
           setLastNotice('Sincronizando com o mestre.');
         }
 
@@ -2561,7 +2714,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         reconnectingRef.current = false;
       }
     },
-    [applyRpcSyncPayload, db, getLocalLastEventSeq, handleRpcRequest, players.length, refreshPlayers, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [applyRpcSyncPayload, db, ensureTcpClient, getLocalLastEventSeq, handleRpcRequest, makeLanTcpServer, players.length, refreshPlayers, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   useEffect(() => {
@@ -2639,13 +2792,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         : [];
 
       rpcServerRef.current?.close();
-      const rpcServer = new LanRpcServer(handleRpcRequest, {
-        onStatus: status => setLastNotice(status),
-        onError: message => {
-          setLastError(message);
-          void traceLan('LAN_RPC', 'LanRpcServer', 'error', message, { sessionId }, 'error');
-        },
-      });
+      const rpcServer = makeLanTcpServer(sessionId);
       await rpcServer.start(LAN_DEFAULT_PORT);
       rpcServerRef.current = rpcServer;
       await LanForegroundService.start({
@@ -2684,7 +2831,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
       return session;
     },
-    [db, deactivateCurrentSessionLocally, handleRpcRequest, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [db, deactivateCurrentSessionLocally, handleRpcRequest, makeLanTcpServer, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   const joinPlayerSession = useCallback(
@@ -2831,6 +2978,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         setLanConnectionStatus('connected');
         setPeerCount(1);
         await applyRpcSyncPayload(joinResponse.payload);
+        await ensureTcpClient(session, 'join-success');
         setLastNotice('Entrada LAN confirmada pelo mestre.');
 
         await traceLan('LAN_RPC', 'joinPlayerSession', 'success', 'Jogador entrou via RPC LAN.', {
@@ -2859,7 +3007,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         throw error;
       }
     },
-    [applyRpcSyncPayload, db, deactivateCurrentSessionLocally, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [applyRpcSyncPayload, db, deactivateCurrentSessionLocally, ensureTcpClient, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   const closeActiveSession = useCallback(async () => {
@@ -2869,7 +3017,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       sessionId: session?.id || null,
     }, 'info');
 
-    if (session?.role === 'player' && session.host_ip && session.port && session.status !== 'paused') {
+    if (session?.role === 'player' && session.host_ip && session.port) {
       try {
         const deviceId = deviceIdRef.current || (await getOrCreateDeviceId(db));
         await sendLanRpc(session.host_ip, Number(session.port || LAN_DEFAULT_PORT), {
@@ -3213,6 +3361,29 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   }, [recoverLanSession]);
 
   useEffect(() => {
+    if (!activeSession || activeSession.role !== 'player' || activeSession.status === 'closed' || activeSession.status === 'inactive') {
+      tcpClientRef.current?.close();
+      tcpClientRef.current = null;
+      tcpClientKeyRef.current = '';
+      tcpClientConnectedRef.current = false;
+      return undefined;
+    }
+    if (appState !== 'active' || !activeSession.host_ip || !activeSession.port) return undefined;
+
+    void ensureTcpClient(activeSession, 'active-session-effect');
+    return undefined;
+  }, [
+    activeSession?.id,
+    activeSession?.role,
+    activeSession?.status,
+    activeSession?.host_ip,
+    activeSession?.port,
+    activeSession?.linked_character_id,
+    appState,
+    ensureTcpClient,
+  ]);
+
+  useEffect(() => {
     if (!activeSession || activeSession.status === 'closed' || activeSession.status === 'inactive' || activeSession.role !== 'player') return undefined;
     if (appState !== 'active') return undefined;
 
@@ -3226,7 +3397,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     const interval = setInterval(() => {
       const session = activeSessionRef.current;
       if (!session || session.role !== 'player' || session.status === 'closed' || session.status === 'inactive' || !session.host_ip || !session.port) return;
-      if (appStateRef.current !== 'active' || playerPollInFlightRef.current) return;
+      if (appStateRef.current !== 'active' || playerPollInFlightRef.current || tcpClientConnectedRef.current) return;
       playerPollInFlightRef.current = true;
 
       void (async () => {

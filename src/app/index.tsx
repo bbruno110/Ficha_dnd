@@ -21,7 +21,16 @@ export default function HomeScreen() {
   const loadCharacters = async () => {
     try {
       const result = await db.getAllAsync<Character>(
-        `SELECT id, name, level, class, race, avatar_uri FROM characters ORDER BY created_at DESC`
+        `SELECT
+           c.id, c.name, c.level, c.class, c.race, c.avatar_uri,
+           s.name AS linked_session_name,
+           s.status AS linked_session_status,
+           s.role AS linked_session_role
+         FROM characters c
+         LEFT JOIN lan_sessions s
+           ON s.linked_character_id = c.id
+          AND s.status IN ('open', 'connected', 'paused')
+         ORDER BY c.created_at DESC`
       );
       setCharactersList(result);
     } catch (error) {
@@ -96,7 +105,7 @@ export default function HomeScreen() {
               onDelete={handleDeleteCharacter}
               onEdit={handleEditCharacter}
               onUnlinkSession={handleUnlinkSession}
-              isLinkedToSession={activeSession?.linked_character_id === item.id}
+              isLinkedToSession={Boolean(item.linked_session_name) || activeSession?.linked_character_id === item.id}
             />
           )}
           contentContainerStyle={styles.listContent}

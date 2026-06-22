@@ -53,6 +53,17 @@ const DURATION_UNITS: { value: EffectDurationUnit; label: string }[] = [
 const MASTER_TOOL_CATEGORIES = [...CATEGORIES.slice(0, -1), 'Efeitos', 'Acervo'];
 const IMPORT_VALID_TABLES = [...VALID_TABLES, 'condition_effects'];
 const CONDITION_COLOR_PALETTE = ['#7ED957', '#F4A84D', '#8B5CF6', '#EF4444', '#38BDF8', '#FACC15', '#EC4899', '#64748B'];
+const CONDITION_EFFECT_PAGE_SIZE = 20;
+const CONDITION_GRADIENT_PALETTE = [
+  { name: 'Veneno', color: '#7ED957', colors: ['#163B22', '#7ED957', '#D4FF77'] },
+  { name: 'Fogo', color: '#F97316', colors: ['#4A1208', '#F97316', '#FACC15'] },
+  { name: 'Arcano', color: '#8B5CF6', colors: ['#20134A', '#8B5CF6', '#38BDF8'] },
+  { name: 'Sangue', color: '#EF4444', colors: ['#3F0D12', '#EF4444', '#FB7185'] },
+  { name: 'Gelo', color: '#38BDF8', colors: ['#082F49', '#38BDF8', '#DDFBFF'] },
+  { name: 'Luz', color: '#FACC15', colors: ['#4A3904', '#FACC15', '#FFFFFF'] },
+  { name: 'Psiquico', color: '#EC4899', colors: ['#3D0D2B', '#EC4899', '#F0ABFC'] },
+  { name: 'Sombra', color: '#64748B', colors: ['#020617', '#475569', '#94A3B8'] },
+];
 const isValidHexColor = (value: string) => /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value.trim());
 const normalizeHexColorInput = (value: string) => {
   const cleaned = value.replace(/[^0-9a-fA-F#]/g, '');
@@ -149,6 +160,8 @@ export default function AdvancedCreatorScreen() {
   const [conditionCatalog, setConditionCatalog] = useState<ConditionCatalogItem[]>([]);
   const [conditionDescription, setConditionDescription] = useState('');
   const [conditionColor, setConditionColor] = useState('#F4A84D');
+  const [conditionSearch, setConditionSearch] = useState('');
+  const [conditionPage, setConditionPage] = useState(0);
 
   const loadConditionCatalog = async () => {
     try {
@@ -878,7 +891,7 @@ export default function AdvancedCreatorScreen() {
                   </TouchableOpacity>
                 )
               }}
-              ListEmptyComponent={<Text style={styles.emptyText}>Nenhuma passiva encontrada. Crie uma na aba Magia/Skill marcando o nível ou tempo como "Passiva".</Text>}
+              ListEmptyComponent={<Text style={styles.emptyText}>{'Nenhuma passiva encontrada. Crie uma na aba Magia/Skill marcando o nivel ou tempo como "Passiva".'}</Text>}
             />
             <TouchableOpacity style={styles.modalCloseButton} onPress={() => setFeatureModalVisible(false)}>
               <Text style={styles.modalCloseText}>FECHAR</Text>
@@ -891,6 +904,21 @@ export default function AdvancedCreatorScreen() {
 
   const renderConditionEffectForm = () => {
     const safeColor = isValidHexColor(conditionColor) ? conditionColor : '#2A3654';
+    const selectedGradient = CONDITION_GRADIENT_PALETTE.find(preset => preset.color.toUpperCase() === safeColor.toUpperCase()) || CONDITION_GRADIENT_PALETTE[0];
+    const normalizedSearch = conditionSearch.trim().toLowerCase();
+    const filteredEffects = conditionCatalog.filter(effect => {
+      if (!normalizedSearch) return true;
+      return (
+        effect.name.toLowerCase().includes(normalizedSearch) ||
+        String(effect.description || '').toLowerCase().includes(normalizedSearch)
+      );
+    });
+    const totalPages = Math.max(1, Math.ceil(filteredEffects.length / CONDITION_EFFECT_PAGE_SIZE));
+    const currentPage = Math.min(conditionPage, totalPages - 1);
+    const pagedEffects = filteredEffects.slice(
+      currentPage * CONDITION_EFFECT_PAGE_SIZE,
+      currentPage * CONDITION_EFFECT_PAGE_SIZE + CONDITION_EFFECT_PAGE_SIZE
+    );
     return (
       <View>
         <View style={styles.formGroup}>
@@ -906,7 +934,26 @@ export default function AdvancedCreatorScreen() {
         </View>
 
         <View style={styles.formGroup}>
-          <Text style={styles.label}>COR HEXADECIMAL</Text>
+          <Text style={styles.label}>GRADIENTE DO EFEITO</Text>
+          <View style={styles.gradientPalette}>
+            {CONDITION_GRADIENT_PALETTE.map(preset => {
+              const active = safeColor.toUpperCase() === preset.color.toUpperCase();
+              return (
+                <TouchableOpacity
+                  key={preset.name}
+                  style={[styles.gradientOption, active && styles.gradientOptionActive]}
+                  onPress={() => setConditionColor(preset.color)}
+                >
+                  <LinearGradient colors={preset.colors as any} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.gradientSwatch}>
+                    {active && <Ionicons name="checkmark" size={18} color="#02112b" />}
+                  </LinearGradient>
+                  <Text style={[styles.gradientOptionText, active && styles.gradientOptionTextActive]}>{preset.name}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+
+          <Text style={[styles.label, { marginTop: 14 }]}>COR HEXADECIMAL</Text>
           <View style={styles.colorInputRow}>
             <View style={[styles.colorPreview, { backgroundColor: safeColor }]} />
             <TextInput
@@ -930,19 +977,33 @@ export default function AdvancedCreatorScreen() {
         </View>
 
         <Text style={styles.label}>PREVIEW</Text>
-        <View style={[styles.conditionPreviewCard, { borderColor: safeColor }]}>
+        <LinearGradient colors={selectedGradient.colors as any} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[styles.conditionPreviewCard, { borderColor: safeColor }]}>
           <View style={[styles.effectColorDot, { backgroundColor: safeColor }]} />
           <View style={{ flex: 1 }}>
             <Text style={styles.conditionPreviewTitle}>{name.trim() || 'Nome do efeito'}</Text>
             <Text style={styles.conditionPreviewSub}>{conditionDescription.trim() || 'Descricao amigavel do efeito.'}</Text>
           </View>
-        </View>
+        </LinearGradient>
 
         <Text style={[styles.label, { marginTop: 20 }]}>EFEITOS CADASTRADOS</Text>
-        {conditionCatalog.length === 0 ? (
+        <TextInput
+          style={styles.searchInput}
+          value={conditionSearch}
+          onChangeText={value => {
+            setConditionSearch(value);
+            setConditionPage(0);
+          }}
+          placeholder="Pesquisar por nome ou descricao..."
+          placeholderTextColor="#666"
+        />
+        <View style={styles.conditionListHeader}>
+          <Text style={styles.conditionListMeta}>{filteredEffects.length} efeito(s) / pag. {currentPage + 1} de {totalPages}</Text>
+          <Text style={styles.conditionListMeta}>{CONDITION_EFFECT_PAGE_SIZE} por pagina</Text>
+        </View>
+        {filteredEffects.length === 0 ? (
           <Text style={styles.emptyText}>Nenhum efeito cadastrado ainda.</Text>
         ) : (
-          conditionCatalog.map(effect => (
+          pagedEffects.map(effect => (
             <View key={effect.id} style={styles.conditionListItem}>
               <View style={[styles.effectColorDot, { backgroundColor: effect.color }]} />
               <View style={{ flex: 1 }}>
@@ -952,6 +1013,24 @@ export default function AdvancedCreatorScreen() {
             </View>
           ))
         )}
+        <View style={styles.conditionPager}>
+          <TouchableOpacity
+            style={[styles.pagerButton, currentPage === 0 && styles.pagerButtonDisabled]}
+            disabled={currentPage === 0}
+            onPress={() => setConditionPage(page => Math.max(0, page - 1))}
+          >
+            <Ionicons name="chevron-back" size={16} color="#00bfff" />
+            <Text style={styles.pagerButtonText}>Anterior</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.pagerButton, currentPage >= totalPages - 1 && styles.pagerButtonDisabled]}
+            disabled={currentPage >= totalPages - 1}
+            onPress={() => setConditionPage(page => Math.min(totalPages - 1, page + 1))}
+          >
+            <Text style={styles.pagerButtonText}>Proxima</Text>
+            <Ionicons name="chevron-forward" size={16} color="#00bfff" />
+          </TouchableOpacity>
+        </View>
       </View>
     );
   };
@@ -1636,10 +1715,22 @@ const styles = StyleSheet.create({
   colorPalette: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 12 },
   colorSwatch: { width: 34, height: 34, borderRadius: 17, borderWidth: 2, borderColor: 'rgba(255,255,255,0.18)' },
   colorSwatchActive: { borderColor: '#fff' },
+  gradientPalette: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  gradientOption: { width: '47.5%', minWidth: 132, borderRadius: 14, padding: 8, backgroundColor: 'rgba(0,0,0,0.22)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.09)' },
+  gradientOptionActive: { borderColor: '#00fa9a', backgroundColor: 'rgba(0,250,154,0.08)' },
+  gradientSwatch: { height: 48, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
+  gradientOptionText: { color: 'rgba(255,255,255,0.62)', fontSize: 11, fontWeight: 'bold', textAlign: 'center', marginTop: 6 },
+  gradientOptionTextActive: { color: '#00fa9a' },
   conditionPreviewCard: { minHeight: 74, flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 14, padding: 14, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, marginBottom: 8 },
   conditionPreviewTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
   conditionPreviewSub: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4, lineHeight: 17 },
+  conditionListHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 8 },
+  conditionListMeta: { color: 'rgba(255,255,255,0.46)', fontSize: 11, fontWeight: 'bold' },
   conditionListItem: { minHeight: 62, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
+  conditionPager: { flexDirection: 'row', gap: 10, marginTop: 12 },
+  pagerButton: { flex: 1, minHeight: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, borderRadius: 12, backgroundColor: 'rgba(0,191,255,0.08)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.28)' },
+  pagerButtonDisabled: { opacity: 0.42 },
+  pagerButtonText: { color: '#00bfff', fontSize: 12, fontWeight: 'bold' },
   saveBtn: { backgroundColor: '#00fa9a', padding: 18, borderRadius: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
   saveBtnText: { color: '#02112b', fontSize: 16, fontWeight: 'bold', letterSpacing: 1 },
   acervoTabs: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 15, justifyContent: 'center' },

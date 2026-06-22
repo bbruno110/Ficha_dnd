@@ -50,6 +50,8 @@ type ConditionEffectOption = {
   color: string;
 };
 
+const HISTORY_PAGE_SIZES = [10, 30, 50, 100];
+
 type MasterModalKind = 'attribute' | 'tempHp' | 'xp' | 'item' | 'sheet' | 'time' | 'effects' | 'applyEffect';
 type MasterModalState = {
   kind: MasterModalKind;
@@ -89,6 +91,7 @@ export default function LanSessionScreen() {
   const [selectedCharacterId, setSelectedCharacterId] = useState<number | null>(null);
   const [history, setHistory] = useState<LanOfficialEventMessage[]>([]);
   const [historyPage, setHistoryPage] = useState(0);
+  const [historyPageSize, setHistoryPageSize] = useState(10);
   const [selectedTargetCharacterId, setSelectedTargetCharacterId] = useState<number | null>(null);
   const [selectedTargetDeviceId, setSelectedTargetDeviceId] = useState<string | null>(null);
   const [masterAmount, setMasterAmount] = useState('');
@@ -139,12 +142,12 @@ export default function LanSessionScreen() {
   }, [db]);
 
   const loadHistory = useCallback(
-    async (page = 0) => {
-      const rows = await getHistoryPage(page, 50);
+    async (page = 0, pageSize = historyPageSize) => {
+      const rows = await getHistoryPage(page, pageSize);
       setHistory(rows);
       setHistoryPage(page);
     },
-    [getHistoryPage]
+    [getHistoryPage, historyPageSize]
   );
 
   const loadSessionState = useCallback(async () => {
@@ -271,7 +274,7 @@ export default function LanSessionScreen() {
     `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Jogador')}&background=102b56&color=00bfff&size=${size}&bold=true`;
 
   const playerAvatarSource = (snapshot: ReturnType<typeof playerSnapshot>, fallbackName: string) =>
-    String(snapshot.data?.avatar_data_uri || snapshot.data?.avatar_uri || snapshot.raw?.avatar_data_uri || snapshot.raw?.avatar_uri || '') || avatarSourceForName(fallbackName);
+    String(snapshot.data?.avatar_data_uri || snapshot.raw?.avatar_data_uri || '') || avatarSourceForName(fallbackName);
 
   const playerActionKey = (player: typeof players[number]) => `${player.device_id}_${player.character_id || 'none'}`;
 
@@ -1359,6 +1362,7 @@ export default function LanSessionScreen() {
                         <Text style={styles.playerSheetName} numberOfLines={1}>{displayName}</Text>
                         <View style={[styles.dot, player.connected ? styles.dotOn : styles.dotOff]} />
                       </View>
+                      <Text style={styles.playerSheetPlayerName} numberOfLines={1}>{playerLabel}</Text>
                       <Text style={styles.playerSheetSub} numberOfLines={1}>
                         {hasCharacter
                           ? `${playerLabel} / Nv. ${snapshot.level} / ${snapshot.race || 'Raça'} / ${snapshot.className || 'Classe'}`
@@ -2114,7 +2118,22 @@ export default function LanSessionScreen() {
       <View style={styles.historyBox}>
         <View style={styles.sectionHeader}>
           <Text style={styles.playersTitle}>Histórico da sessão</Text>
-          <Text style={styles.historyPageText}>Pag. {historyPage + 1}</Text>
+          <Text style={styles.historyPageText}>Pag. {historyPage + 1} / {historyPageSize} itens</Text>
+        </View>
+
+        <View style={styles.historyPageSizeRow}>
+          {HISTORY_PAGE_SIZES.map(size => (
+            <TouchableOpacity
+              key={size}
+              style={[styles.historyPageSizeChip, historyPageSize === size && styles.historyPageSizeChipActive]}
+              onPress={() => {
+                setHistoryPageSize(size);
+                void loadHistory(0, size);
+              }}
+            >
+              <Text style={[styles.historyPageSizeText, historyPageSize === size && styles.historyPageSizeTextActive]}>{size}</Text>
+            </TouchableOpacity>
+          ))}
         </View>
 
         {history.length === 0 ? (
@@ -2140,8 +2159,8 @@ export default function LanSessionScreen() {
             <Text style={styles.secondaryButtonText}>Anterior</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.secondaryButton, history.length < 20 && styles.disabledButton]}
-            disabled={history.length < 50}
+            style={[styles.secondaryButton, history.length < historyPageSize && styles.disabledButton]}
+            disabled={history.length < historyPageSize}
             onPress={() => loadHistory(historyPage + 1)}
           >
             <Text style={styles.secondaryButtonText}>Próxima</Text>
@@ -2587,8 +2606,8 @@ const styles = StyleSheet.create({
   playerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 7 },
   playerName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   playerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },
-  compactInputRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 10 },
-  compactInput: { width: 86, minHeight: 44, paddingVertical: 10, textAlign: 'center' },
+  compactInputRow: { flexDirection: 'row', flexWrap: 'nowrap', alignItems: 'center', gap: 6, marginTop: 6 },
+  compactInput: { width: 72, minHeight: 38, paddingVertical: 8, textAlign: 'center' },
   coinInput: { width: '100%', minWidth: 0, minHeight: 44, paddingVertical: 10, textAlign: 'center' },
   secondaryWideButton: {
     flexDirection: 'row',
@@ -2699,6 +2718,23 @@ const styles = StyleSheet.create({
   historyTitle: { color: '#fff', fontSize: 12, lineHeight: 17 },
   historyMeta: { color: 'rgba(255,255,255,0.42)', fontSize: 10, marginTop: 4 },
   historyPageText: { color: 'rgba(255,255,255,0.5)', fontSize: 11, fontWeight: 'bold' },
+  historyPageSizeRow: { flexDirection: 'row', gap: 8, marginBottom: 8 },
+  historyPageSizeChip: {
+    minWidth: 42,
+    minHeight: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 9,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  historyPageSizeChipActive: {
+    backgroundColor: 'rgba(0,250,154,0.14)',
+    borderColor: 'rgba(0,250,154,0.35)',
+  },
+  historyPageSizeText: { color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: 'bold' },
+  historyPageSizeTextActive: { color: '#00fa9a' },
   dot: { width: 10, height: 10, borderRadius: 5 },
   dotOn: { backgroundColor: '#00fa9a' },
   dotOff: { backgroundColor: '#ff6666' },
@@ -2750,61 +2786,61 @@ const styles = StyleSheet.create({
   refreshText: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold' },
   playerCardsList: { gap: 10 },
   playerSheetCard: {
-    borderRadius: 14,
-    padding: 12,
+    borderRadius: 12,
+    padding: 10,
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.22)',
     backgroundColor: 'rgba(0,0,0,0.28)',
   },
   playerSheetCardDisabled: { opacity: 0.72, borderColor: 'rgba(255,209,102,0.22)' },
-  playerSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 },
-  playerSheetIdentityBlock: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 11 },
-  playerSheetAvatar: { width: 54, height: 54, borderRadius: 14, borderWidth: 2, borderColor: 'rgba(0,191,255,0.42)', backgroundColor: 'rgba(255,255,255,0.06)' },
+  playerSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 },
+  playerSheetIdentityBlock: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 9 },
+  playerSheetAvatar: { width: 48, height: 48, borderRadius: 12, borderWidth: 2, borderColor: 'rgba(0,191,255,0.42)', backgroundColor: 'rgba(255,255,255,0.06)' },
   playerSheetAvatarMuted: { opacity: 0.58, borderColor: 'rgba(255,209,102,0.25)' },
   playerIdentityRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  playerSheetName: { color: '#fff', fontSize: 17, fontWeight: 'bold', flex: 1, minWidth: 0 },
-  playerSheetSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 4 },
-  cardHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 7, flexShrink: 0 },
+  playerSheetName: { color: '#fff', fontSize: 15, fontWeight: 'bold', flex: 1, minWidth: 0 },
+  playerSheetPlayerName: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold', marginTop: 1 },
+  playerSheetSub: { color: 'rgba(255,255,255,0.5)', fontSize: 10, marginTop: 2 },
+  cardHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 },
   viewSheetButton: {
     flex: 0,
-    minWidth: 70,
-    minHeight: 38,
+    width: 38,
+    minHeight: 36,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
     borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingHorizontal: 0,
+    paddingVertical: 0,
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.3)',
     backgroundColor: 'rgba(0,191,255,0.08)',
   },
-  viewSheetText: { color: '#00bfff', fontSize: 11, fontWeight: 'bold' },
+  viewSheetText: { display: 'none', color: '#00bfff', fontSize: 11, fontWeight: 'bold' },
   expandToggleButton: {
-    minHeight: 38,
+    width: 38,
+    minHeight: 36,
     flex: 0,
-    minWidth: 96,
+    minWidth: 38,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 6,
     borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    paddingHorizontal: 0,
+    paddingVertical: 0,
     backgroundColor: '#00fa9a',
     borderWidth: 1,
     borderColor: '#89ffd0',
   },
-  expandToggleText: { color: '#02112b', fontSize: 11, fontWeight: 'bold' },
-  hpBlock: { marginTop: 0, marginBottom: 9 },
+  expandToggleText: { display: 'none', color: '#02112b', fontSize: 11, fontWeight: 'bold' },
+  hpBlock: { marginTop: 0, marginBottom: 7 },
   metricHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   metricLabel: { color: 'rgba(255,255,255,0.45)', fontSize: 10, fontWeight: 'bold', letterSpacing: 1 },
   metricValue: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
   hpTrack: { height: 9, borderRadius: 999, overflow: 'hidden', backgroundColor: 'rgba(255,255,255,0.12)' },
   hpFill: { height: '100%', borderRadius: 999, backgroundColor: '#00fa9a' },
-  quickMetricGrid: { flexDirection: 'row', gap: 7, marginBottom: 9 },
-  quickMetricBox: { flex: 1, borderRadius: 10, padding: 8, backgroundColor: 'rgba(255,255,255,0.05)', alignItems: 'center' },
+  quickMetricGrid: { flexDirection: 'row', gap: 6, marginBottom: 7 },
+  quickMetricBox: { flex: 1, borderRadius: 9, padding: 7, backgroundColor: 'rgba(255,255,255,0.05)', alignItems: 'center' },
   quickMetricLabel: { color: 'rgba(255,255,255,0.44)', fontSize: 9, fontWeight: 'bold' },
   quickMetricValue: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginTop: 3 },
   effectPreviewBox: {
@@ -2980,10 +3016,10 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,100,100,0.28)',
   },
   cardActionBlock: {
-    marginTop: 12,
+    marginTop: 7,
     borderTopWidth: 1,
     borderTopColor: 'rgba(255,255,255,0.08)',
-    paddingTop: 2,
+    paddingTop: 0,
   },
   emptyAction: {
     flexDirection: 'row',
@@ -3023,19 +3059,19 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: '#02112b', fontWeight: 'bold', fontSize: 15, letterSpacing: 1 },
   secondaryButton: {
     flex: 1,
-    minWidth: 96,
-    minHeight: 44,
+    minWidth: 0,
+    minHeight: 38,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
-    borderRadius: 12,
-    paddingVertical: 12,
+    gap: 6,
+    borderRadius: 10,
+    paddingVertical: 8,
     backgroundColor: 'rgba(0,191,255,0.08)',
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.25)',
   },
-  secondaryButtonText: { color: '#00bfff', fontWeight: 'bold', fontSize: 12 },
+  secondaryButtonText: { color: '#00bfff', fontWeight: 'bold', fontSize: 11 },
   disabledButton: { opacity: 0.4 },
   dangerButton: {
     flex: 1,

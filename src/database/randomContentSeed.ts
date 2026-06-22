@@ -491,6 +491,147 @@ const RANDOM_LORE_ARCHETYPES: RandomLoreArchetypeSeed[] = [
   }
 ];
 
+const EXTRA_RANDOM_LORE_ARCHETYPES: RandomLoreArchetypeSeed[] = [
+  {
+    name: 'O Inventor de Campo',
+    allowedClasses: ['Artifice', 'Mago', 'Guerreiro', 'Ladino'],
+    traits: [
+      'Examino trancas, armas e portas antes de olhar para as pessoas.',
+      'Sempre carrego pecas sobressalentes, mesmo quando nao sei para que servem.',
+      'Fico desconfortavel quando nao tenho uma ferramenta nas maos.',
+      'Transformo qualquer problema em um projeto, mesmo quando so precisavam de uma resposta simples.',
+    ],
+    ideals: [
+      'Progresso. Todo problema pode ser melhorado com engenho e paciencia.',
+      'Utilidade. Uma ideia so vale algo quando ajuda alguem a sobreviver.',
+      'Controle. Se eu entender cada peca, nada me pega desprevenido.',
+    ],
+    bonds: [
+      'Meu primeiro prototipo feriu alguem importante, e ainda tento consertar esse erro.',
+      'Protejo um caderno de projetos herdado de um mestre desaparecido.',
+      'Quero provar que minha arte vale tanto quanto a magia tradicional.',
+    ],
+    flaws: [
+      'Confio demais em mecanismos recem-criados.',
+      'Sou teimoso quando alguem chama minha invencao de gambiarra.',
+      'Tenho dificuldade em abandonar uma ideia ruim depois de investir tempo nela.',
+    ],
+    backstory: [
+      'Aprendi a reparar armas no meio de uma guerra, cercado por soldados feridos e metal quebrado.',
+      'Fui expulso de uma guilda por misturar magia, sucata e metodos nada autorizados.',
+      'Meu laboratorio queimou durante um teste publico, mas o publico sobreviveu e a fama ficou.',
+    ],
+    allies: [
+      'Um ferreiro velho guarda minhas pecas mais perigosas em troca de favores.',
+      'Tenho uma fornecedora de cristais instaveis que nunca revela a origem do estoque.',
+      'Um aprendiz curioso insiste em me seguir de cidade em cidade.',
+    ],
+    features: [
+      'Minhas roupas tem bolsos demais e todos fazem barulho.',
+      'Consigo estimar a funcao de um mecanismo so pelo som.',
+      'Tenho pequenas cicatrizes de queimaduras nas maos.',
+    ],
+    extraLanguages: [
+      'Proficiência com Ferramentas de Inventor',
+      'Proficiência com Kit de Alquimia',
+      'Gnomico',
+      'Draconico',
+    ],
+  },
+  {
+    name: 'O Desperto Psiquico',
+    allowedClasses: ['Mistico', 'Bruxo', 'Monge', 'Feiticeiro'],
+    traits: [
+      'Respondo a pensamentos antes que as pessoas terminem de falar.',
+      'Evito multidoes porque muitas emocoes misturadas me deixam exausto.',
+      'Quando me concentro, objetos leves vibram ao meu redor.',
+      'Tenho o costume de encarar o vazio como se alguem estivesse la.',
+    ],
+    ideals: [
+      'Autodomínio. A mente sem disciplina vira uma porta aberta para horrores.',
+      'Empatia. Entender a dor alheia e uma responsabilidade, nao um truque.',
+      'Liberdade. Ninguem deve controlar o pensamento de outro ser.',
+    ],
+    bonds: [
+      'Ouco em sonhos a voz de alguem preso em outro plano.',
+      'Fui treinado por uma ordem que apagou parte das minhas memorias.',
+      'Minha familia teme meus dons, mas ainda tento protege-la de longe.',
+    ],
+    flaws: [
+      'Invado pensamentos sem querer quando estou sob pressao.',
+      'Tenho medo de dormir e perder o controle dos meus poderes.',
+      'As vezes trato intuicoes como verdades absolutas.',
+    ],
+    backstory: [
+      'Meus poderes despertaram durante uma febre, quando ouvi a vila inteira pensando ao mesmo tempo.',
+      'Passei anos em silencio num mosteiro dedicado a fechar as portas da propria mente.',
+      'Sobrevivi ao toque de uma entidade astral e nunca mais sonhei sozinho.',
+    ],
+    allies: [
+      'Uma bibliotecaria guarda relatos sobre fenomenos mentais raros.',
+      'Um velho monge me ensinou tecnicas para nao ferir aliados por acidente.',
+      'Uma crianca com o mesmo dom aparece nos meus sonhos pedindo ajuda.',
+    ],
+    features: [
+      'Meus olhos mudam de foco quando sinto magia mental por perto.',
+      'Minha sombra parece hesitar antes de acompanhar meus passos.',
+      'Consigo reconhecer mentiras pela tensao emocional, mas nem sempre sei explicar como.',
+    ],
+    extraLanguages: [
+      'Telepatia simples',
+      'Subcomum',
+      'Proficiência com Jogos de Estrategia',
+      'Celestial',
+    ],
+  },
+  {
+    name: 'O Exilado Celestial',
+    allowedClasses: ['Paladino', 'Clérigo', 'Clerigo', 'Bruxo', 'Bardo'],
+    traits: [
+      'Falo de pressagios com naturalidade, como se todos tambem os vissem.',
+      'Tenho paciencia com pecadores, mas pouca com hipocritas.',
+      'A luz forte me acalma e a escuridao silenciosa me deixa alerta.',
+      'Carrego culpa por uma promessa sagrada que nao consegui cumprir.',
+    ],
+    ideals: [
+      'Redencao. A queda nao e o fim se ainda houver escolha.',
+      'Misericordia. Forca sem compaixao vira tirania.',
+      'Destino. Algumas almas carregam sinais que nao podem ignorar.',
+    ],
+    bonds: [
+      'Um anjo caido me salvou e desapareceu antes de explicar por que.',
+      'Minha linhagem celestial atrai cultistas que querem me usar como chave ritual.',
+      'Guardo uma pena dourada que esquenta perto de mentiras profundas.',
+    ],
+    flaws: [
+      'Assumo responsabilidades que nao sao minhas.',
+      'Tenho medo de falhar e confirmar as duvidas de todos sobre mim.',
+      'Perdoo inimigos perigosos quando deveria agir com firmeza.',
+    ],
+    backstory: [
+      'Nasci durante uma chuva de estrelas e fui tratado como pressagio desde pequeno.',
+      'Fui criado por uma ordem que esperava perfeicao, mas encontrei humanidade na falha.',
+      'Recusei uma missao divina porque custaria vidas inocentes, e desde entao vivo em exilio.',
+    ],
+    allies: [
+      'Um sacerdote rural me abriga quando a estrada fica pesada.',
+      'Uma ordem de vigilantes celestiais acompanha meus passos a distancia.',
+      'Um inimigo redimido me deve a propria vida.',
+    ],
+    features: [
+      'Minha voz fica mais clara quando digo a verdade com conviccao.',
+      'Pequenas marcas luminosas aparecem na pele durante curas ou juramentos.',
+      'Animais assustados costumam se acalmar perto de mim.',
+    ],
+    extraLanguages: [
+      'Celestial',
+      'Infernal',
+      'Proficiência com Kit de Caligrafia',
+      'Proficiência em Religiao',
+    ],
+  },
+];
+
 const RANDOM_NAME_SEED = {
   "maleNames": [
     "Bruno",
@@ -816,6 +957,97 @@ const RANDOM_RACE_LANGUAGE_RULES = [
   { raceContains: '*', baseLanguages: 'Comum e mais um idioma racial à escolha', priority: 0 },
 ];
 
+const EXTRA_RANDOM_NAME_SEED = {
+  maleNames: [
+    'Aurel',
+    'Bastian',
+    'Corvin',
+    'Damaris',
+    'Eldric',
+    'Icaro',
+    'Jarek',
+    'Kairon',
+    'Lucien',
+    'Marek',
+    'Nairon',
+    'Orestes',
+    'Pavel',
+    'Quiron',
+    'Ravik',
+    'Samael',
+    'Tavian',
+    'Uriel',
+    'Varric',
+    'Zephor',
+  ],
+  femaleNames: [
+    'Aurelia',
+    'Briseis',
+    'Calina',
+    'Daphne',
+    'Elaris',
+    'Fiora',
+    'Irielle',
+    'Jasmina',
+    'Kaia',
+    'Liora',
+    'Mirela',
+    'Nerissa',
+    'Oriana',
+    'Prisma',
+    'Ravena',
+    'Samira',
+    'Tessara',
+    'Uriela',
+    'Virelle',
+    'Zafira',
+  ],
+  genericTitlesMale: [
+    'Mente-de-Vidro',
+    'o Forjado',
+    'o Sem-Porto',
+    'Olho-de-Cobre',
+    'o Exilado',
+    'Chama-Branda',
+    'o Tocado-pelas-Estrelas',
+  ],
+  genericTitlesFemale: [
+    'Mente-de-Vidro',
+    'a Forjada',
+    'a Sem-Porto',
+    'Olho-de-Cobre',
+    'a Exilada',
+    'Chama-Branda',
+    'a Tocada-pelas-Estrelas',
+  ],
+  classTitlesMale: {
+    Artifice: ['o Artifice', 'Mao-de-Engrenagem', 'o Inventor', 'Chave-de-Cobre'],
+    Mistico: ['o Mistico', 'Mente-Aberta', 'o Desperto', 'Eco-Astral'],
+  },
+  classTitlesFemale: {
+    Artifice: ['a Artifice', 'Mao-de-Engrenagem', 'a Inventora', 'Chave-de-Cobre'],
+    Mistico: ['a Mistica', 'Mente-Aberta', 'a Desperta', 'Eco-Astral'],
+  },
+};
+
+const EXTRA_RANDOM_LORE_CONNECTORS = [
+  'Foi nesse passado que aprendi a transformar medo em tecnica como {classe}.',
+  'A estrada me empurrou para o caminho de {classe}, e agora nao sei ser outra coisa.',
+  'Cada cicatriz desse passado virou uma ferramenta no meu oficio de {classe}.',
+  'Minha origem nao explica tudo, mas revela por que escolhi viver como {classe}.',
+];
+
+const EXTRA_RANDOM_RACE_LANGUAGE_RULES = [
+  { raceContains: 'Aasimar', baseLanguages: 'Comum, Celestial', priority: 120 },
+  { raceContains: 'Genasi', baseLanguages: 'Comum, Primordial', priority: 115 },
+  { raceContains: 'Tabaxi', baseLanguages: 'Comum, um idioma a escolha, Proficiência em Percepcao ou Furtividade', priority: 110 },
+  { raceContains: 'Firbolg', baseLanguages: 'Comum, Gigante, Silvestre', priority: 108 },
+  { raceContains: 'Kenku', baseLanguages: 'Comum, Auran, Mimetismo vocal', priority: 106 },
+  { raceContains: 'Kobold', baseLanguages: 'Comum, Draconico', priority: 104 },
+  { raceContains: 'Tritao', baseLanguages: 'Comum, Primordial', priority: 102 },
+  { raceContains: 'Shadar-kai', baseLanguages: 'Comum, Elfico, Subcomum', priority: 101 },
+];
+
 const BG3_EXTRAS = {
   "Astarion": {
     "langs": "Comum, Élfico, Subcomum.\nProficiência: Ferramentas de Ladrão, Kit de Disfarce.",
@@ -878,7 +1110,7 @@ async function insertRandomNamePart(
 }
 
 export async function seedRandomCreatorContent(db: SQLiteDatabase) {
-  for (const archetype of RANDOM_LORE_ARCHETYPES) {
+  for (const archetype of [...RANDOM_LORE_ARCHETYPES, ...EXTRA_RANDOM_LORE_ARCHETYPES]) {
     await db.runAsync(
       `INSERT OR IGNORE INTO random_lore_archetypes (name, allowed_classes, criador) VALUES (?, ?, 'base')`,
       [archetype.name, JSON.stringify(archetype.allowedClasses)],
@@ -890,7 +1122,7 @@ export async function seedRandomCreatorContent(db: SQLiteDatabase) {
     );
     if (!row?.id) continue;
 
-    const fields: Array<keyof Pick<RandomLoreArchetypeSeed, 'traits' | 'ideals' | 'bonds' | 'flaws' | 'backstory' | 'allies' | 'features' | 'extraLanguages'>> = [
+    const fields: (keyof Pick<RandomLoreArchetypeSeed, 'traits' | 'ideals' | 'bonds' | 'flaws' | 'backstory' | 'allies' | 'features' | 'extraLanguages'>)[] = [
       'traits', 'ideals', 'bonds', 'flaws', 'backstory', 'allies', 'features', 'extraLanguages',
     ];
 
@@ -908,6 +1140,10 @@ export async function seedRandomCreatorContent(db: SQLiteDatabase) {
   for (const name of RANDOM_NAME_SEED.femaleNames) await insertRandomNamePart(db, 'female', 'first_name', name);
   for (const title of RANDOM_NAME_SEED.genericTitlesMale) await insertRandomNamePart(db, 'male', 'title', title);
   for (const title of RANDOM_NAME_SEED.genericTitlesFemale) await insertRandomNamePart(db, 'female', 'title', title);
+  for (const name of EXTRA_RANDOM_NAME_SEED.maleNames) await insertRandomNamePart(db, 'male', 'first_name', name);
+  for (const name of EXTRA_RANDOM_NAME_SEED.femaleNames) await insertRandomNamePart(db, 'female', 'first_name', name);
+  for (const title of EXTRA_RANDOM_NAME_SEED.genericTitlesMale) await insertRandomNamePart(db, 'male', 'title', title);
+  for (const title of EXTRA_RANDOM_NAME_SEED.genericTitlesFemale) await insertRandomNamePart(db, 'female', 'title', title);
 
   for (const [className, titles] of Object.entries(RANDOM_NAME_SEED.classTitlesMale)) {
     for (const title of titles as string[]) await insertRandomNamePart(db, 'male', 'title', title, className);
@@ -915,15 +1151,21 @@ export async function seedRandomCreatorContent(db: SQLiteDatabase) {
   for (const [className, titles] of Object.entries(RANDOM_NAME_SEED.classTitlesFemale)) {
     for (const title of titles as string[]) await insertRandomNamePart(db, 'female', 'title', title, className);
   }
+  for (const [className, titles] of Object.entries(EXTRA_RANDOM_NAME_SEED.classTitlesMale)) {
+    for (const title of titles as string[]) await insertRandomNamePart(db, 'male', 'title', title, className);
+  }
+  for (const [className, titles] of Object.entries(EXTRA_RANDOM_NAME_SEED.classTitlesFemale)) {
+    for (const title of titles as string[]) await insertRandomNamePart(db, 'female', 'title', title, className);
+  }
 
-  for (const connector of RANDOM_LORE_CONNECTORS) {
+  for (const connector of [...RANDOM_LORE_CONNECTORS, ...EXTRA_RANDOM_LORE_CONNECTORS]) {
     await db.runAsync(
       `INSERT OR IGNORE INTO random_lore_connectors (class_name, value, criador) VALUES ('', ?, 'base')`,
       [connector],
     );
   }
 
-  for (const rule of RANDOM_RACE_LANGUAGE_RULES) {
+  for (const rule of [...RANDOM_RACE_LANGUAGE_RULES, ...EXTRA_RANDOM_RACE_LANGUAGE_RULES]) {
     await db.runAsync(
       `INSERT OR IGNORE INTO random_race_language_rules (race_contains, base_languages, priority, criador) VALUES (?, ?, ?, 'base')`,
       [rule.raceContains, rule.baseLanguages, rule.priority],

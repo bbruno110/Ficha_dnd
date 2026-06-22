@@ -1,4 +1,4 @@
-declare const require: (moduleName: string) => any;
+import { dataToString, encodeFrame, getTcpSocketModule, readFrames } from './lanTcpFraming';
 
 export type LanRpcMethod =
   | 'DISCOVER'
@@ -28,50 +28,10 @@ export type LanRpcResponse = {
   at: string;
 };
 
-type LanRpcServerCallbacks = {
+export type LanRpcServerCallbacks = {
   onStatus?: (status: string) => void;
   onError?: (message: string) => void;
 };
-
-function getTcpSocketModule() {
-  try {
-    const module = require('react-native-tcp-socket');
-    return module.default || module;
-  } catch {
-    throw new Error('Modulo TCP nativo indisponivel. Gere um dev build/APK com react-native-tcp-socket.');
-  }
-}
-
-function dataToString(data: unknown) {
-  if (typeof data === 'string') return data;
-  if (data && typeof (data as { toString?: () => string }).toString === 'function') {
-    return (data as { toString: () => string }).toString();
-  }
-  return String(data || '');
-}
-
-function encodeFrame(value: unknown) {
-  return `${JSON.stringify(value)}\n`;
-}
-
-function readFrames(buffer: string, incoming: string) {
-  const combined = buffer + incoming;
-  const parts = combined.split('\n');
-  const nextBuffer = parts.pop() || '';
-  const frames: unknown[] = [];
-
-  for (const part of parts) {
-    const line = part.trim();
-    if (!line) continue;
-    try {
-      frames.push(JSON.parse(line));
-    } catch {
-      frames.push(null);
-    }
-  }
-
-  return { frames, nextBuffer };
-}
 
 export function makeRpcId() {
   return `rpc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
