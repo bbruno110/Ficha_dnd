@@ -125,17 +125,17 @@ export default function HomeScreen() {
           <Text style={styles.advancedButtonText}>FERRAMENTAS DO MESTRE</Text>
         </TouchableOpacity>
 
+        <TouchableOpacity style={styles.grimoireButton} activeOpacity={0.8} onPress={() => router.push('/grimorio' as any)}>
+          <Ionicons name="book-outline" size={20} color="#ffd166" style={{ marginRight: 10 }} />
+          <Text style={styles.grimoireButtonText}>GRIMÓRIO</Text>
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.lanButton} activeOpacity={0.8} onPress={handleOpenLanSession}>
           <Ionicons name="wifi-outline" size={20} color="#00fa9a" style={{ marginRight: 10 }} />
           <View style={{ alignItems: 'center' }}>
             <Text style={styles.lanButtonText}>SESSÃO LAN</Text>
             {activeSession && <Text style={styles.lanButtonSub}>{activeSession.role === 'master' ? 'Mestre' : 'Jogador'} / {activeSession.name}</Text>}
           </View>
-        </TouchableOpacity>
-
-        <TouchableOpacity style={styles.tracerButton} activeOpacity={0.8} onPress={() => router.push('/tracer' as any)}>
-          <Ionicons name="bug-outline" size={20} color="#ffd166" style={{ marginRight: 10 }} />
-          <Text style={styles.tracerButtonText}>TRACER / DEBUG</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.createButton} activeOpacity={0.8} onPress={() => router.push('/create')}>
@@ -168,13 +168,13 @@ const styles = StyleSheet.create({
   advancedButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0, 191, 255, 0.1)', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
   advancedButtonText: { fontSize: 14, fontWeight: 'bold', color: '#00bfff', letterSpacing: 1 },
 
+  grimoireButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255, 209, 102, 0.1)', borderWidth: 1, borderColor: '#ffd166', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
+  grimoireButtonText: { fontSize: 14, fontWeight: 'bold', color: '#ffd166', letterSpacing: 1 },
+
   lanButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0, 250, 154, 0.1)', borderWidth: 1, borderColor: '#00fa9a', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
   lanButtonText: { fontSize: 14, fontWeight: 'bold', color: '#00fa9a', letterSpacing: 1 },
   lanButtonSub: { color: 'rgba(255,255,255,0.6)', fontSize: 10, marginTop: 3, fontWeight: 'bold' },
 
-  tracerButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255, 209, 102, 0.1)', borderWidth: 1, borderColor: '#ffd166', borderRadius: 16, paddingVertical: 14, marginBottom: 15 },
-  tracerButtonText: { fontSize: 14, fontWeight: 'bold', color: '#ffd166', letterSpacing: 1 },
-  
   createButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#102b56', borderWidth: 1, borderColor: '#00bfff', borderRadius: 16, paddingVertical: 16, shadowColor: '#00bfff', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 5, elevation: 5 },
   createButtonIcon: { fontSize: 24, color: '#00bfff', marginRight: 10, fontWeight: '300' },
   createButtonText: { fontSize: 16, fontWeight: 'bold', color: '#ffffff', letterSpacing: 1 },

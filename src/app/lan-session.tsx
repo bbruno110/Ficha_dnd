@@ -125,6 +125,9 @@ export default function LanSessionScreen() {
   const [tradeCounterItemIndex, setTradeCounterItemIndex] = useState<number | null>(null);
   const [tradeCounterQty, setTradeCounterQty] = useState('1');
   const [tradeCoins, setTradeCoins] = useState({ gp: '', sp: '', cp: '' });
+  const [initiativeOrder, setInitiativeOrder] = useState<string[]>([]);
+  const [initiativeScores, setInitiativeScores] = useState<Record<string, string>>({});
+  const [collapsedMasterCards, setCollapsedMasterCards] = useState<Record<string, boolean>>({});
 
   const loadLocalData = useCallback(async () => {
     const chars = await db.getAllAsync<CharacterOption>(
@@ -359,6 +362,82 @@ export default function LanSessionScreen() {
   };
 
   const onlyNumberText = (value: string) => value.replace(/[^\d-]/g, '').replace(/(?!^)-/g, '');
+
+  useEffect(() => {
+    const activeKeys = players
+      .filter(player => player.character_id)
+      .map(player => `${player.device_id}_${player.character_id || 'none'}`);
+    setInitiativeOrder(prev => [
+      ...prev.filter(key => activeKeys.includes(key)),
+      ...activeKeys.filter(key => !prev.includes(key)),
+    ]);
+    setInitiativeScores(prev => {
+      const next: Record<string, string> = {};
+      activeKeys.forEach(key => {
+        if (prev[key] !== undefined) next[key] = prev[key];
+      });
+      return next;
+    });
+  }, [players]);
+
+  const getPlayerDisplayName = (player: typeof players[number]) => {
+    const snapshot = playerSnapshot(player);
+    return snapshot.raw?.name || snapshot.data?.name || player.character_name || player.player_name || 'Jogador';
+  };
+
+  const initiativeDexMod = (player: typeof players[number]) => {
+    const snapshot = playerSnapshot(player);
+    return Math.floor((statValue(snapshot.stats, 'DES') - 10) / 2);
+  };
+
+  const initiativeScoreFor = (player: typeof players[number]) => {
+    const key = playerActionKey(player);
+    const manual = initiativeScores[key];
+    if (manual !== undefined && manual !== '') return numericValue(manual, 0);
+    return initiativeDexMod(player);
+  };
+
+  const orderedInitiativePlayers = () => {
+    const ordered = initiativeOrder
+      .map(key => targetPlayers.find(player => playerActionKey(player) === key))
+      .filter(Boolean) as typeof players;
+    const orderedKeys = new Set(ordered.map(playerActionKey));
+    return [...ordered, ...targetPlayers.filter(player => !orderedKeys.has(playerActionKey(player)))];
+  };
+
+  const moveInitiativePlayer = (key: string, direction: -1 | 1) => {
+    setInitiativeOrder(prev => {
+      const activeKeys = targetPlayers.map(playerActionKey);
+      const list = [
+        ...prev.filter(item => activeKeys.includes(item)),
+        ...activeKeys.filter(item => !prev.includes(item)),
+      ];
+      const index = list.indexOf(key);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= list.length) return list;
+      const next = [...list];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return next;
+    });
+  };
+
+  const sortInitiativeByScore = () => {
+    setInitiativeOrder(
+      [...targetPlayers]
+        .sort((a, b) => initiativeScoreFor(b) - initiativeScoreFor(a) || getPlayerDisplayName(a).localeCompare(getPlayerDisplayName(b)))
+        .map(playerActionKey)
+    );
+  };
+
+  const clearInitiative = () => {
+    setInitiativeScores({});
+    setInitiativeOrder(targetPlayers.map(playerActionKey));
+  };
+
+  const isMasterCardCollapsed = (key: string) => Boolean(collapsedMasterCards[key]);
+  const toggleMasterCardCollapsed = (key: string) => {
+    setCollapsedMasterCards(prev => ({ ...prev, [key]: !prev[key] }));
+  };
 
   const navigateOnce = (path: string) => {
     if (navigationLockRef.current) return;
@@ -1175,6 +1254,100 @@ export default function LanSessionScreen() {
     );
   };
 
+  const renderInitiativeBoard = () => {
+    const orderedPlayers = orderedInitiativePlayers();
+    const collapsed = isMasterCardCollapsed('initiative');
+
+    return (
+      <View style={styles.initiativePanel}>
+        <View style={styles.initiativeHeader}>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.coinApplyLabel}>INICIATIVA</Text>
+            <Text style={styles.mutedSmallText}>
+              {targetPlayers.length > 0 ? `${targetPlayers.length} ficha(s) na ordem de combate.` : 'Vincule fichas para montar a ordem.'}
+            </Text>
+          </View>
+          <View style={styles.initiativeHeaderActions}>
+            {!collapsed && (
+            <TouchableOpacity style={styles.initiativeMiniButton} onPress={sortInitiativeByScore} disabled={targetPlayers.length === 0}>
+              <Ionicons name="swap-vertical-outline" size={14} color="#00bfff" />
+              <Text style={styles.initiativeMiniButtonText}>Ordenar</Text>
+            </TouchableOpacity>
+            )}
+            {!collapsed && (
+            <TouchableOpacity style={styles.initiativeMiniButton} onPress={clearInitiative} disabled={targetPlayers.length === 0}>
+              <Ionicons name="refresh-outline" size={14} color="#00bfff" />
+            </TouchableOpacity>
+            )}
+            <TouchableOpacity style={styles.initiativeMiniButton} onPress={() => toggleMasterCardCollapsed('initiative')}>
+              <Ionicons name={collapsed ? 'chevron-down-outline' : 'chevron-up-outline'} size={14} color="#00bfff" />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {!collapsed && (orderedPlayers.length === 0 ? (
+          <Text style={styles.emptyText}>Nenhum jogador com ficha vinculada para iniciativa.</Text>
+        ) : (
+          <View style={styles.initiativeList}>
+            {orderedPlayers.map((player, index) => {
+              const key = playerActionKey(player);
+              const snapshot = playerSnapshot(player);
+              const displayName = getPlayerDisplayName(player);
+              const dexMod = initiativeDexMod(player);
+              const avatarUri = playerAvatarSource(snapshot, displayName);
+
+              return (
+                <View key={key} style={styles.initiativeRow}>
+                  <Text style={styles.initiativeRank}>{index + 1}</Text>
+                  <Image source={{ uri: avatarUri }} style={styles.initiativeAvatar} />
+                  <View style={styles.initiativeInfo}>
+                    <Text style={styles.initiativeName} numberOfLines={1}>{displayName}</Text>
+                    <Text style={styles.initiativeSub} numberOfLines={1}>DES {statValue(snapshot.stats, 'DES')} ({dexMod >= 0 ? `+${dexMod}` : dexMod})</Text>
+                  </View>
+                  <TextInput
+                    style={[styles.input, styles.initiativeInput]}
+                    value={initiativeScores[key] ?? ''}
+                    onChangeText={value => setInitiativeScores(prev => ({ ...prev, [key]: onlyNumberText(value) }))}
+                    keyboardType="numeric"
+                    placeholder={dexMod >= 0 ? `+${dexMod}` : String(dexMod)}
+                    placeholderTextColor="rgba(255,255,255,0.35)"
+                    selectTextOnFocus
+                    textAlign="center"
+                  />
+                  <View style={styles.initiativeMoveColumn}>
+                    <TouchableOpacity style={styles.initiativeMoveButton} onPress={() => moveInitiativePlayer(key, -1)} disabled={index === 0}>
+                      <Ionicons name="chevron-up" size={16} color={index === 0 ? 'rgba(255,255,255,0.25)' : '#00bfff'} />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.initiativeMoveButton} onPress={() => moveInitiativePlayer(key, 1)} disabled={index === orderedPlayers.length - 1}>
+                      <Ionicons name="chevron-down" size={16} color={index === orderedPlayers.length - 1 ? 'rgba(255,255,255,0.25)' : '#00bfff'} />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        ))}
+      </View>
+    );
+  };
+
+  const renderMasterCollapsibleCard = (key: string, title: string, subtitle: string, children: React.ReactNode) => {
+    const collapsed = isMasterCardCollapsed(key);
+
+    return (
+      <View style={styles.globalRewardBox}>
+        <TouchableOpacity style={styles.globalCardHeader} activeOpacity={0.75} onPress={() => toggleMasterCardCollapsed(key)}>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.coinApplyLabel}>{title}</Text>
+            <Text style={styles.mutedSmallText} numberOfLines={1}>{subtitle}</Text>
+          </View>
+          <Ionicons name={collapsed ? 'chevron-down-outline' : 'chevron-up-outline'} size={18} color="#00bfff" />
+        </TouchableOpacity>
+        {!collapsed && children}
+      </View>
+    );
+  };
+
   const renderMasterTools = () => {
     if (!activeSession || activeSession.role !== 'master') return null;
     if (activeSession.status === 'closed') return null;
@@ -1248,8 +1421,10 @@ export default function LanSessionScreen() {
             </TouchableOpacity>
           </View>
 
-          <View style={styles.globalRewardBox}>
-            <Text style={styles.coinApplyLabel}>XP GLOBAL</Text>
+          {renderInitiativeBoard()}
+
+          {renderMasterCollapsibleCard('global-xp', 'XP GLOBAL', targetPlayers.length > 0 ? `Divide entre ${targetPlayers.length} jogador(es).` : 'Sem jogadores vinculados.', (
+            <>
             <View style={styles.compactInputRow}>
               <TextInput
                 style={[styles.input, styles.compactInput]}
@@ -1271,10 +1446,11 @@ export default function LanSessionScreen() {
             <Text style={styles.mutedSmallText}>
               {targetPlayers.length > 0 ? `Divide entre ${targetPlayers.length} jogador(es).` : 'Sem jogadores vinculados.'}
             </Text>
-          </View>
+            </>
+          ))}
 
-          <View style={styles.globalRewardBox}>
-            <Text style={styles.coinApplyLabel}>VIDA GLOBAL</Text>
+          {renderMasterCollapsibleCard('global-hp', 'VIDA GLOBAL', targetPlayers.length > 0 ? `Aplica em ${targetPlayers.length} ficha(s).` : 'Sem jogadores vinculados.', (
+            <>
             <View style={styles.compactInputRow}>
               <TextInput
                 style={[styles.input, styles.compactInput]}
@@ -1300,10 +1476,11 @@ export default function LanSessionScreen() {
             <Text style={styles.mutedSmallText}>
               {targetPlayers.length > 0 ? `Aplica em ${targetPlayers.length} ficha(s).` : 'Sem jogadores vinculados.'}
             </Text>
-          </View>
+            </>
+          ))}
 
-          <View style={styles.globalRewardBox}>
-            <Text style={styles.coinApplyLabel}>MOEDAS GLOBAIS</Text>
+          {renderMasterCollapsibleCard('global-coins', 'MOEDAS GLOBAIS', targetPlayers.length > 0 ? `Divide entre ${targetPlayers.length} jogador(es).` : 'Sem jogadores vinculados.', (
+            <>
             <View style={styles.coinInputGrid}>
               {(['gp', 'sp', 'cp'] as const).map(coin => (
                 <View key={coin} style={styles.coinInputBox}>
@@ -1326,7 +1503,8 @@ export default function LanSessionScreen() {
               <Ionicons name="git-branch-outline" size={18} color="#00bfff" />
               <Text style={styles.secondaryButtonText}>Dividir moedas</Text>
             </TouchableOpacity>
-          </View>
+            </>
+          ))}
         </View>
 
         {players.length === 0 ? (
@@ -2582,6 +2760,58 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.12)',
   },
   sessionActionText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+  initiativePanel: {
+    gap: 10,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: 'rgba(0,0,0,0.22)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,250,154,0.18)',
+  },
+  initiativeHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+  initiativeHeaderActions: { flexDirection: 'row', gap: 6, flexShrink: 0 },
+  initiativeMiniButton: {
+    minHeight: 34,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    borderRadius: 10,
+    paddingHorizontal: 9,
+    backgroundColor: 'rgba(0,191,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.22)',
+  },
+  initiativeMiniButtonText: { color: '#00bfff', fontSize: 10, fontWeight: 'bold' },
+  initiativeList: { gap: 8 },
+  initiativeRow: {
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderRadius: 12,
+    padding: 8,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  initiativeRank: { width: 20, color: '#00fa9a', fontSize: 13, fontWeight: 'bold', textAlign: 'center' },
+  initiativeAvatar: { width: 38, height: 38, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.25)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.25)' },
+  initiativeInfo: { flex: 1, minWidth: 0 },
+  initiativeName: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
+  initiativeSub: { color: 'rgba(255,255,255,0.48)', fontSize: 10, marginTop: 3 },
+  initiativeInput: { width: 54, minHeight: 38, paddingHorizontal: 6, paddingVertical: 8, fontSize: 13, fontWeight: 'bold' },
+  initiativeMoveColumn: { gap: 4 },
+  initiativeMoveButton: {
+    width: 30,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,191,255,0.07)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.16)',
+  },
   turnHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
   turnValue: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   turnSubValue: { color: 'rgba(255,255,255,0.45)', fontSize: 11, marginTop: 3 },
@@ -2603,6 +2833,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.08)',
   },
+  globalCardHeader: { minHeight: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
   playerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 7 },
   playerName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   playerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },

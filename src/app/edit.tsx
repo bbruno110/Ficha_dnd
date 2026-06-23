@@ -3,7 +3,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import AvatarAdjustModal from '../components/AvatarAdjustModal';
 import { useLanSession } from '../contexts/LanSessionContext';
@@ -90,6 +90,7 @@ export default function EditCharacterScreen() {
   const [originalAvatarUri, setOriginalAvatarUri] = useState<string | null>(null);
   const [pendingAvatarDraft, setPendingAvatarDraft] = useState<AvatarDraft | null>(null);
   const [avatarAdjustment, setAvatarAdjustment] = useState<AvatarAdjustment>({ zoom: 1, offsetX: 0, offsetY: 0 });
+  const openedLevelUpCatalogRef = useRef(false);
   const [currentStep, setCurrentStep] = useState(0);
   
   const [dbSkills, setDbSkills] = useState<any[]>([]);
@@ -184,7 +185,10 @@ export default function EditCharacterScreen() {
           setTargetLevel(tLevel);
           
           const parsedClasses = parseClassString((char as any).class, (char as any).level);
-          setClassesData(parsedClasses);
+          const levelAdjustedClasses = isLevelUpFlow && tLevel > Number((char as any).level || 1) && parsedClasses.length === 1
+            ? parsedClasses.map(cls => ({ ...cls, level: tLevel }))
+            : parsedClasses;
+          setClassesData(levelAdjustedClasses);
           setOriginalClassesData(JSON.parse(JSON.stringify(parsedClasses)));
           
           const parsedStats = JSON.parse((char as any).stats || '{}');
@@ -212,7 +216,7 @@ export default function EditCharacterScreen() {
       } catch (e) { console.error(e); } finally { setLoading(false); }
     }
     loadData();
-  }, [id]);
+  }, [id, isLevelUpFlow, levelUpTo]);
 
   useEffect(() => {
     if (!character || dbRaces.length === 0 || dbClasses.length === 0) return;
@@ -314,7 +318,7 @@ export default function EditCharacterScreen() {
       setMaxSpellsAllowed(calcSpellsKnown);
     }
     updateMagicLimits();
-  }, [classesData, character, stats, targetLevel]);
+  }, [classesData, character, stats, targetLevel, dbClasses]);
 
   useEffect(() => {
     if (!character) return;
@@ -418,6 +422,48 @@ export default function EditCharacterScreen() {
            BASE_CLASS_FEATURES.includes(s.name) || 
            BG3_ORIGIN_FEATURES.includes(s.name);
   };
+
+  const availableClassCatalog = dbSpells.filter(s => {
+    const sLvl = getSpellLevelNumber(s.level);
+    const sCategory = getCategory(s);
+    const spellClasses = String(s.classes || '');
+
+    let isAllowedByLevel = false;
+    if (sCategory === 'Magia') {
+      isAllowedByLevel = s.level === 'Truque' || (maxSpellLevelAllowed > 0 && sLvl <= maxSpellLevelAllowed);
+    } else {
+      isAllowedByLevel = true;
+    }
+
+    const isCompatibleClass = lockedFeatures.includes(s.name) || activeClassNames.some(c => spellClasses.includes(c)) || spellClasses.includes('Raça');
+
+    let reqPassed = true;
+    if (s.class_level_required && !lockedFeatures.includes(s.name)) {
+      const reqs = String(s.class_level_required).split(',').map(r => r.trim());
+      reqs.forEach(req => {
+        if (req.includes(':')) {
+          const [cName, cLevel] = req.split(':');
+          if (cName && cLevel) {
+            const playerClassData = classesData.find(cd => cd.name === cName);
+            if (playerClassData && playerClassData.level < parseInt(cLevel, 10)) {
+              reqPassed = false;
+            }
+          }
+        } else if (targetLevel < parseInt(req, 10)) {
+          reqPassed = false;
+        }
+      });
+    }
+
+    return isAllowedByLevel && isCompatibleClass && reqPassed;
+  });
+
+  useEffect(() => {
+    if (!isLevelUpFlow || loading || currentStep !== 3 || openedLevelUpCatalogRef.current) return;
+    if (availableClassCatalog.length === 0) return;
+    openedLevelUpCatalogRef.current = true;
+    setSpellsModalVisible(true);
+  }, [availableClassCatalog.length, currentStep, isLevelUpFlow, loading]);
 
   const changeClassLevel = (id: string, delta: number) => {
     setClassesData(prev => prev.map(c => {
@@ -550,10 +596,10 @@ export default function EditCharacterScreen() {
     }
   };
 
-  const confirmAvatarAdjustment = async () => {
+  const confirmAvatarAdjustment = async (finalAdjustment = avatarAdjustment) => {
     if (!pendingAvatarDraft) return;
     try {
-      const uri = await storeAdjustedCharacterAvatar(character?.id, pendingAvatarDraft, avatarAdjustment);
+      const uri = await storeAdjustedCharacterAvatar(character?.id, pendingAvatarDraft, finalAdjustment);
       if (uri) {
         if (avatarUri && avatarUri !== originalAvatarUri) deleteStoredCharacterAvatar(avatarUri);
         setAvatarUri(uri);
@@ -905,12 +951,12 @@ export default function EditCharacterScreen() {
           
           <Text style={[styles.hpHint, {marginBottom: 15, textAlign: 'left'}]}>
             {maxSpellsAllowed > 0 
-              ? `Baseado no banco de dados, você pode aprender magias até o Nível ${maxSpellLevelAllowed}. Gerencie também suas passivas.` 
-              : `Você pode gerenciar as Habilidades passivas e Manobras da sua classe aqui.`}
+              ? `Baseado no banco de dados, você pode aprender magias até o Nível ${maxSpellLevelAllowed}. Há ${availableClassCatalog.length} opção(ões) compatível(is) no catálogo.` 
+              : `Você pode gerenciar as Habilidades passivas e Manobras da sua classe aqui. Há ${availableClassCatalog.length} opção(ões) compatível(is).`}
           </Text>
           
           <TouchableOpacity style={styles.manageSpellsBtn} onPress={() => setSpellsModalVisible(true)}>
-            <Text style={styles.manageSpellsBtnText}>Abrir Catálogo de Classe</Text>
+            <Text style={styles.manageSpellsBtnText}>Abrir Catálogo de Classe ({availableClassCatalog.length})</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -951,7 +997,14 @@ export default function EditCharacterScreen() {
         <Text style={styles.sectionTitle}>NOVOS PODERES SELECIONADOS</Text>
         <View style={styles.cardBlock}>
           {selectedSpellsData.length === 0 ? (
-             <Text style={styles.hpHint}>Nenhuma habilidade ou magia extra selecionada.</Text>
+             <View>
+               <Text style={styles.hpHint}>Nenhuma habilidade ou magia extra selecionada.</Text>
+               {availableClassCatalog.length > 0 && (
+                 <TouchableOpacity style={[styles.manageSpellsBtn, { marginTop: 12 }]} onPress={() => setSpellsModalVisible(true)}>
+                   <Text style={styles.manageSpellsBtnText}>Abrir Catálogo de Escolhas</Text>
+                 </TouchableOpacity>
+               )}
+             </View>
           ) : (
             <ScrollView style={{maxHeight: 250}} nestedScrollEnabled showsVerticalScrollIndicator={false}>
               
@@ -1049,42 +1102,7 @@ export default function EditCharacterScreen() {
       <SpellSelector 
         visible={spellsModalVisible} 
         onClose={() => setSpellsModalVisible(false)}
-        availableSpells={dbSpells.filter(s => {
-          const sLvl = getSpellLevelNumber(s.level);
-          const sCategory = getCategory(s);
-          
-          let isAllowedByLevel = false;
-
-          if (sCategory === 'Magia') {
-            isAllowedByLevel = s.level === 'Truque' || (maxSpellLevelAllowed > 0 && sLvl <= maxSpellLevelAllowed);
-          } else {
-            isAllowedByLevel = true;
-          }
-
-          const isCompatibleClass = lockedFeatures.includes(s.name) || activeClassNames.some(c => s.classes.includes(c)) || s.classes.includes('Raça');
-          
-          let reqPassed = true;
-          if (s.class_level_required && !lockedFeatures.includes(s.name)) {
-            const reqStr = String(s.class_level_required);
-            const reqs = reqStr.split(',').map(r => r.trim());
-            
-            reqs.forEach(req => {
-              if (req.includes(':')) {
-                const [cName, cLevel] = req.split(':');
-                if (cName && cLevel) {
-                  const playerClassData = classesData.find(cd => cd.name === cName);
-                  if (playerClassData && playerClassData.level < parseInt(cLevel)) {
-                    reqPassed = false;
-                  }
-                }
-              } else {
-                 if (targetLevel < parseInt(req)) reqPassed = false;
-              }
-            });
-          }
-
-          return isAllowedByLevel && isCompatibleClass && reqPassed;
-        })}
+        availableSpells={availableClassCatalog}
         selectedSpellIds={activeSpells}
         lockedFeatureNames={lockedFeatures}
         onToggleSpell={toggleSpell}

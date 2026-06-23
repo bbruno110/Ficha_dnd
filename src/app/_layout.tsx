@@ -23,6 +23,7 @@ export default function RootLayout() {
             >
               <Stack.Screen name="index" options={{ headerShown: false }} />
               <Stack.Screen name="create" options={{ headerShown: false }} />
+              <Stack.Screen name="grimorio" options={{ headerShown: false }} />
               <Stack.Screen name="lan-session" options={{ headerShown: false }} />
               <Stack.Screen name="lan-master-setup" options={{ headerShown: false }} />
               <Stack.Screen name="lan-player-join" options={{ headerShown: false }} />

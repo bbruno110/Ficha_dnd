@@ -4,7 +4,7 @@ export type EffectKind = 'damage' | 'healing' | 'condition' | 'stat_modifier' | 
 
 export type EffectValueMode = 'none' | 'fixed' | 'dice';
 
-export type EffectDurationUnit = 'instant' | 'turn' | 'round' | 'minute' | 'hour' | 'day' | 'permanent';
+export type EffectDurationUnit = 'instant' | 'turn' | 'round' | 'minute' | 'hour' | 'day' | 'short_rest' | 'long_rest' | 'permanent';
 
 export type EffectDraft = {
   effect_kind: EffectKind;
@@ -25,12 +25,23 @@ export type EffectDraft = {
 
 export function formatEffectSummary(effect: EffectDraft) {
   const chance = effect.chance_percent < 100 ? `${effect.chance_percent}% ` : '';
+  const durationLabels: Record<string, string> = {
+    turn: 'turno(s)',
+    round: 'turno(s)',
+    minute: 'minuto(s)',
+    hour: 'hora(s)',
+    day: 'dia(s)',
+    short_rest: 'descanso curto',
+    long_rest: 'descanso longo',
+  };
   const duration =
     effect.duration_unit === 'instant'
       ? ''
       : effect.duration_unit === 'permanent'
         ? ' permanente'
-        : ` por ${effect.duration_value || 1} ${effect.duration_unit === 'turn' ? 'turno(s)' : effect.duration_unit}`;
+        : effect.duration_unit === 'short_rest' || effect.duration_unit === 'long_rest'
+          ? ` ate ${durationLabels[effect.duration_unit]}`
+          : ` por ${effect.duration_value || 1} ${durationLabels[effect.duration_unit] || effect.duration_unit}`;
 
   if (effect.effect_kind === 'healing') {
     return `${chance}Cura ${formatEffectValue(effect)}${duration}`.trim();

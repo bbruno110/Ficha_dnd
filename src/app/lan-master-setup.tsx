@@ -200,7 +200,7 @@ export default function LanMasterSetupScreen() {
               </Text>
             </TouchableOpacity>
 
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterScroll} contentContainerStyle={styles.filterRow}>
               {['Todos', ...CUSTOM_CONTENT_DEFINITIONS.map(definition => definition.type)].map(filter => (
                 <TouchableOpacity
                   key={filter}
@@ -215,7 +215,8 @@ export default function LanMasterSetupScreen() {
             <FlatList
               data={filteredContent}
               keyExtractor={item => item.key}
-              style={{ width: '100%' }}
+              style={styles.contentList}
+              contentContainerStyle={filteredContent.length === 0 ? styles.contentListEmpty : styles.contentListContent}
               renderItem={({ item }) => {
                 const selected = isAllCustomContentSelected || selectedContentKeys.includes(item.key);
                 return (
@@ -371,8 +372,12 @@ const styles = StyleSheet.create({
   },
   selectAllText: { color: '#00fa9a', fontSize: 13, fontWeight: 'bold', flex: 1 },
   selectAllTextActive: { color: '#02112b' },
-  filterRow: { gap: 8, paddingBottom: 12 },
+  filterScroll: { maxHeight: 44, flexGrow: 0, flexShrink: 0, marginBottom: 12 },
+  filterRow: { gap: 8, alignItems: 'center', paddingRight: 8 },
   filterChip: {
+    minHeight: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: 8,
     paddingHorizontal: 12,
     borderRadius: 999,
@@ -383,6 +388,9 @@ const styles = StyleSheet.create({
   filterChipActive: { backgroundColor: '#00bfff', borderColor: '#00bfff' },
   filterChipText: { color: 'rgba(255,255,255,0.65)', fontSize: 12, fontWeight: 'bold' },
   filterChipTextActive: { color: '#02112b' },
+  contentList: { width: '100%', flex: 1 },
+  contentListContent: { paddingBottom: 8 },
+  contentListEmpty: { flexGrow: 1, justifyContent: 'center' },
   contentItem: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -22,7 +22,15 @@ const ITEM_CATEGORIES = ['Arma', 'Armadura', 'Escudo', 'Anel', 'Amuleto', 'Capac
 const ITEM_PROPS = ['Acuidade', 'Leve', 'Pesada', 'Duas mãos', 'Versátil', 'Arremesso', 'Munição', 'Alcance', 'Recarga', 'Especial', 'Foco Arcano', 'Foco Divino', 'Foco Druídico', 'Consumível', 'Mágico'];
 
 const SPELL_COMPONENTS = ['V', 'S', 'M'];
-const SPELL_DURATION_TYPES = ['Instantânea', 'Rodada(s)', 'Minuto(s)', 'Hora(s)', 'Dia(s)', 'Concentração', 'Permanente'];
+const SPELL_DURATION_TYPES = [
+  { value: 'instant' as EffectDurationUnit, label: 'Instantaneo', needsValue: false },
+  { value: 'turn' as EffectDurationUnit, label: 'Turno(s)', needsValue: true },
+  { value: 'minute' as EffectDurationUnit, label: 'Minuto(s)', needsValue: true },
+  { value: 'hour' as EffectDurationUnit, label: 'Hora(s)', needsValue: true },
+  { value: 'short_rest' as EffectDurationUnit, label: 'Descanso curto', needsValue: false },
+  { value: 'long_rest' as EffectDurationUnit, label: 'Descanso longo', needsValue: false },
+  { value: 'permanent' as EffectDurationUnit, label: 'Permanente', needsValue: false },
+];
 const SPELL_SAVES = ['FOR', 'DES', 'CON', 'INT', 'SAB', 'CAR'];
 const SPELL_DAMAGE_TYPES = ['Cortante', 'Perfurante', 'Concussão', 'Fogo', 'Frio', 'Veneno', 'Ácido', 'Psíquico', 'Necrótico', 'Radiante', 'Elétrico', 'Trovejante', 'Força', 'Cura', 'Outro'];
 
@@ -44,10 +52,10 @@ const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 const DURATION_UNITS: { value: EffectDurationUnit; label: string }[] = [
   { value: 'instant', label: 'Instantaneo' },
   { value: 'turn', label: 'Turnos' },
-  { value: 'round', label: 'Rodadas' },
   { value: 'minute', label: 'Minutos' },
   { value: 'hour', label: 'Horas' },
-  { value: 'day', label: 'Dias' },
+  { value: 'short_rest', label: 'Descanso curto' },
+  { value: 'long_rest', label: 'Descanso longo' },
   { value: 'permanent', label: 'Permanente' },
 ];
 const MASTER_TOOL_CATEGORIES = [...CATEGORIES.slice(0, -1), 'Efeitos', 'Acervo'];
@@ -134,7 +142,8 @@ export default function AdvancedCreatorScreen() {
   const [spellRangeUnit, setSpellRangeUnit] = useState('m');
   const [spellComponents, setSpellComponents] = useState<string[]>(['V', 'S']);
   const [spellDurationValue, setSpellDurationValue] = useState('');
-  const [spellDurationType, setSpellDurationType] = useState('Instantânea');
+  const [spellDurationType, setSpellDurationType] = useState<EffectDurationUnit>('instant');
+  const [tempEffectSearch, setTempEffectSearch] = useState('');
   const [spellEffectsList, setSpellEffectsList] = useState<AdvancedEffectDraft[]>([]);
   const [tempSpellDmgType, setTempSpellDmgType] = useState('Fogo');
   const [spellSaves, setSpellSaves] = useState<string[]>([]);
@@ -345,7 +354,7 @@ export default function AdvancedCreatorScreen() {
     if(dbClasses.length > 0) setTempSubclassParent(dbClasses[0].name);
     setSpellCategory('Magia'); setSpellLevel('Truque'); setSpellClassesReq([]); setSpellClassSearch(''); setTempSpellClassLvl('1');
     if(dbClasses.length > 0) setTempSpellClass(dbClasses[0].name);
-    setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRangeShape('Distancia'); setSpellRangeValue('18'); setSpellRangeUnit('m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('Instantânea'); 
+    setCastTimeValue('1'); setCastTimeType('Ação'); setSpellRangeShape('Distancia'); setSpellRangeValue('18'); setSpellRangeUnit('m'); setSpellComponents(['V', 'S']); setSpellDurationValue(''); setSpellDurationType('instant'); 
     setSpellEffectsList([]); setTempSpellDmgType('Fogo'); setSpellSaves([]); setSpellDescription(''); 
     setKitTargetClasses([]); setTempKitClass(''); setKitClassSearch(''); setKitItems([]);
     setSelectedFeatures([]); setCasterType('total');
@@ -384,7 +393,7 @@ export default function AdvancedCreatorScreen() {
       dice_bonus: valueMode === 'dice' ?clampNumber(tempDiceBonus, 0, -99, 99) : 0,
       fixed_value: valueMode === 'fixed' ?clampNumber(tempFixedValue, 1, -999, 999) : null,
       chance_percent: clampNumber(tempChancePercent, 100, 0, 100),
-      duration_value: durationUnit === 'instant' || durationUnit === 'permanent' ?null : clampNumber(tempDurationValue, 1, 1, 999),
+      duration_value: durationUnit === 'instant' || durationUnit === 'permanent' || durationUnit === 'short_rest' || durationUnit === 'long_rest' ?null : clampNumber(tempDurationValue, 1, 1, 999),
       duration_unit: durationUnit,
       metadata: selectedCondition ? {
         condition_id: selectedCondition.id,
@@ -427,7 +436,7 @@ export default function AdvancedCreatorScreen() {
   };
 
   const buildDurationData = () => {
-    const unitMap: Record<string, string> = {
+    /*
       'Instantânea': 'instant',
       'Rodada(s)': 'round',
       'Minuto(s)': 'minute',
@@ -435,14 +444,14 @@ export default function AdvancedCreatorScreen() {
       'Dia(s)': 'day',
       'Concentração': 'concentration',
       'Permanente': 'permanent',
-    };
-    const unit = unitMap[spellDurationType] || spellDurationType;
-    const value = spellDurationValue ?clampNumber(spellDurationValue, 1, 1, 999) : null;
+    */
+    const option = SPELL_DURATION_TYPES.find(item => item.value === spellDurationType) || SPELL_DURATION_TYPES[0];
+    const value = option.needsValue && spellDurationValue ?clampNumber(spellDurationValue, 1, 1, 999) : null;
 
     return {
-      label: value ?`${value} ${spellDurationType}` : spellDurationType,
+      label: value ?`${value} ${option.label}` : option.label,
       value,
-      unit,
+      unit: option.value,
     };
   };
 
@@ -522,8 +531,18 @@ export default function AdvancedCreatorScreen() {
   ) => {
     const typeOptions = getEffectTypeOptions(tempEffectKind);
     const selectedType = typeOptions.includes(tempEffType) ?tempEffType : typeOptions[0];
+    const conditionSearchTerm = tempEffectSearch.trim().toLowerCase();
+    const conditionOptions = tempEffectKind === 'condition'
+      ? conditionCatalog
+          .filter(effect => {
+            if (!conditionSearchTerm) return true;
+            return `${effect.name} ${effect.description || ''}`.toLowerCase().includes(conditionSearchTerm);
+          })
+          .slice(0, 12)
+      : [];
     const needsValue = tempEffectKind === 'damage' || tempEffectKind === 'healing' || tempEffectKind === 'stat_modifier';
     const usesDuration = tempEffectKind === 'condition' || tempEffectKind === 'stat_modifier' || tempDurationUnit !== 'instant';
+    const durationNeedsValue = tempDurationUnit !== 'instant' && tempDurationUnit !== 'permanent' && tempDurationUnit !== 'short_rest' && tempDurationUnit !== 'long_rest';
 
     return (
       <>
@@ -539,6 +558,7 @@ export default function AdvancedCreatorScreen() {
                     setTempEffectKind(kind.value);
                     const nextType = getEffectTypeOptions(kind.value)[0];
                     setTempEffType(nextType);
+                    setTempEffectSearch('');
                     setTempValueMode(kind.value === 'condition' || kind.value === 'utility' ?'none' : 'dice');
                     if (kind.value === 'condition') setTempDurationUnit('turn');
                   }}
@@ -549,21 +569,50 @@ export default function AdvancedCreatorScreen() {
             </View>
           </ScrollView>
 
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              {typeOptions.map(option => {
-                const condition = tempEffectKind === 'condition' ? conditionCatalog.find(effect => effect.name === option) : null;
-                return (
+          {tempEffectKind === 'condition' ? (
+            <View style={styles.conditionPickerBox}>
+              <TextInput
+                style={styles.conditionPickerSearch}
+                value={tempEffectSearch}
+                onChangeText={setTempEffectSearch}
+                placeholder="Buscar condição/efeito cadastrado..."
+                placeholderTextColor="#666"
+              />
+              <View style={styles.conditionPickerMetaRow}>
+                <Text style={styles.conditionListMeta}>
+                  {conditionOptions.length} de {conditionCatalog.length} efeito(s)
+                </Text>
+                {tempEffType ? <Text style={styles.conditionListMeta}>Selecionado: {tempEffType}</Text> : null}
+              </View>
+              <View style={styles.conditionPickerList}>
+                {(conditionCatalog.length > 0 ? conditionOptions : CONDITIONS.map(name => ({ id: -1, name, description: null, color: '#F4A84D' }))).map(option => {
+                  const active = selectedType === option.name;
+                  return (
+                    <TouchableOpacity key={`${option.id}-${option.name}`} style={[styles.conditionPickerItem, active && styles.conditionPickerItemActive]} onPress={() => setTempEffType(option.name)}>
+                      <View style={[styles.effectColorDot, { backgroundColor: option.color }]} />
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={[styles.conditionPickerName, active && styles.conditionPickerNameActive]} numberOfLines={1}>{option.name}</Text>
+                        <Text style={styles.conditionPickerSub} numberOfLines={1}>{option.description || 'Sem descrição.'}</Text>
+                      </View>
+                      {active && <Ionicons name="checkmark-circle" size={20} color="#00fa9a" />}
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+          ) : (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                {typeOptions.map(option => (
                   <TouchableOpacity key={option} style={[styles.limitBtn, selectedType === option && styles.limitBtnActive]} onPress={() => setTempEffType(option)}>
                     <View style={styles.effectOptionContent}>
-                      {condition ? <View style={[styles.effectColorDot, { backgroundColor: condition.color }]} /> : null}
                       <Text style={[styles.limitBtnText, selectedType === option && styles.limitBtnTextActive]}>{option}</Text>
                     </View>
                   </TouchableOpacity>
-                );
-              })}
-            </View>
-          </ScrollView>
+                ))}
+              </View>
+            </ScrollView>
+          )}
 
           {needsValue && (
             <View style={{ marginBottom: 12 }}>
@@ -606,10 +655,10 @@ export default function AdvancedCreatorScreen() {
             <View style={{ flex: 1 }}>
               <Text style={[styles.label, { fontSize: 9 }]}>DURACAO</Text>
               <TextInput
-                style={[styles.input, { textAlign: 'center', opacity: tempDurationUnit === 'instant' || tempDurationUnit === 'permanent' ?0.45 : 1 }]}
+                style={[styles.input, { textAlign: 'center', opacity: durationNeedsValue ?1 : 0.45 }]}
                 keyboardType="numeric" selectTextOnFocus textAlign="center"
-                editable={tempDurationUnit !== 'instant' && tempDurationUnit !== 'permanent'}
-                value={tempDurationUnit === 'instant' || tempDurationUnit === 'permanent' ?'' : tempDurationValue}
+                editable={durationNeedsValue}
+                value={durationNeedsValue ?tempDurationValue : ''}
                 onChangeText={v => setTempDurationValue(onlyPositiveInt(v))}
                 placeholder="Qtd"
                 placeholderTextColor="#666"
@@ -1095,6 +1144,7 @@ export default function AdvancedCreatorScreen() {
   const renderSpellForm = () => {
     const availableLevels = getLevelsByCategory(spellCategory);
     const availableCastingTimes = getCastingTimesByCategory(spellCategory);
+    const selectedDurationOption = SPELL_DURATION_TYPES.find(option => option.value === spellDurationType) || SPELL_DURATION_TYPES[0];
 
     return (
       <View>
@@ -1110,7 +1160,7 @@ export default function AdvancedCreatorScreen() {
               } else if (cat === 'Passiva') {
                 setSpellLevel('Passiva');
                 setCastTimeType('Passiva');
-                setSpellDurationType('Permanente');
+                setSpellDurationType('permanent');
                 setSpellComponents([]);
                 setSpellRangeShape('Pessoal');
               } else {
@@ -1203,7 +1253,7 @@ export default function AdvancedCreatorScreen() {
 
         <Text style={styles.label}>DURAÇÃO</Text>
         <View style={{flexDirection: 'row', gap: 10, marginBottom: 20, alignItems: 'center'}}>
-          {(spellDurationType !== 'Instantânea' && spellDurationType !== 'Concentração' && spellDurationType !== 'Permanente') && (
+          {selectedDurationOption.needsValue && (
             <TextInput 
               style={[styles.input, {flex: 0.25, textAlign: 'center', paddingHorizontal: 5}]} 
               keyboardType="numeric" selectTextOnFocus textAlign="center" 
@@ -1216,8 +1266,8 @@ export default function AdvancedCreatorScreen() {
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{flex: 1}}>
             <View style={{flexDirection: 'row', gap: 8, alignItems: 'center'}}>
               {SPELL_DURATION_TYPES.map(dur => (
-                <TouchableOpacity key={dur} style={[styles.limitBtn, spellDurationType === dur && styles.limitBtnActive]} onPress={() => { setSpellDurationType(dur); if(dur === 'Instantânea' || dur === 'Concentração' || dur === 'Permanente') setSpellDurationValue(''); }}>
-                  <Text style={[styles.limitBtnText, spellDurationType === dur && styles.limitBtnTextActive]}>{dur}</Text>
+                <TouchableOpacity key={dur.value} style={[styles.limitBtn, spellDurationType === dur.value && styles.limitBtnActive]} onPress={() => { setSpellDurationType(dur.value); if(!dur.needsValue) setSpellDurationValue(''); }}>
+                  <Text style={[styles.limitBtnText, spellDurationType === dur.value && styles.limitBtnTextActive]}>{dur.label}</Text>
                 </TouchableOpacity>
               ))}
             </View>
@@ -1721,6 +1771,15 @@ const styles = StyleSheet.create({
   gradientSwatch: { height: 48, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   gradientOptionText: { color: 'rgba(255,255,255,0.62)', fontSize: 11, fontWeight: 'bold', textAlign: 'center', marginTop: 6 },
   gradientOptionTextActive: { color: '#00fa9a' },
+  conditionPickerBox: { gap: 8, marginBottom: 12 },
+  conditionPickerSearch: { backgroundColor: 'rgba(0,0,0,0.3)', color: '#fff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+  conditionPickerMetaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
+  conditionPickerList: { maxHeight: 276, gap: 7 },
+  conditionPickerItem: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.04)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)' },
+  conditionPickerItemActive: { backgroundColor: 'rgba(0,250,154,0.1)', borderColor: 'rgba(0,250,154,0.36)' },
+  conditionPickerName: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
+  conditionPickerNameActive: { color: '#00fa9a' },
+  conditionPickerSub: { color: 'rgba(255,255,255,0.45)', fontSize: 10, marginTop: 2 },
   conditionPreviewCard: { minHeight: 74, flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 14, padding: 14, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, marginBottom: 8 },
   conditionPreviewTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
   conditionPreviewSub: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4, lineHeight: 17 },

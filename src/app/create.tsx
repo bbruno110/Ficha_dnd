@@ -158,10 +158,10 @@ export default function CreateCharacterScreen() {
     }
   };
 
-  const confirmAvatarAdjustment = async () => {
+  const confirmAvatarAdjustment = async (finalAdjustment = avatarAdjustment) => {
     if (!pendingAvatarDraft) return;
     try {
-      const uri = await storeAdjustedCharacterAvatar(null, pendingAvatarDraft, avatarAdjustment);
+      const uri = await storeAdjustedCharacterAvatar(null, pendingAvatarDraft, finalAdjustment);
       if (uri) {
         if (avatarUri) deleteStoredCharacterAvatar(avatarUri);
         setAvatarUri(uri);
