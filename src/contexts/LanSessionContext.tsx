@@ -2453,6 +2453,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         deviceId,
         payload,
         reconnectMs: 3000,
+        serverSilenceMs: 26000,
         onStatus: status => {
           tcpClientConnectedRef.current = status === 'connected';
           setTransportReadyState(status === 'connected');

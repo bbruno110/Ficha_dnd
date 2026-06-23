@@ -9,6 +9,7 @@ type LanTcpClientOptions = {
   deviceId: string;
   payload?: Record<string, unknown>;
   reconnectMs?: number;
+  serverSilenceMs?: number;
   onStatus?: (status: 'connected' | 'reconnecting' | 'disconnected') => void;
   onMessage?: (message: LanTcpServerPushMessage) => Promise<void> | void;
   onError?: (message: string) => void;
@@ -20,6 +21,8 @@ export class LanTcpClient {
   private buffer = '';
   private closedByUser = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private lastServerMessageAt = 0;
   private connected = false;
 
   constructor(options: LanTcpClientOptions) {
@@ -37,6 +40,7 @@ export class LanTcpClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.stopWatchdog();
     this.destroySocket();
     this.options.onStatus?.('disconnected');
   }
@@ -54,11 +58,13 @@ export class LanTcpClient {
 
     const socket = TcpSocket.createConnection({ host: this.options.host, port: this.options.port }, () => {
       this.connected = true;
+      this.lastServerMessageAt = Date.now();
       this.options.onStatus?.('connected');
       try {
         socket.setNoDelay?.(true);
         socket.setKeepAlive?.(true, 10000);
       } catch {}
+      this.startWatchdog();
       this.sendHello();
     });
 
@@ -72,6 +78,7 @@ export class LanTcpClient {
   }
 
   private handleData(data: unknown) {
+    this.lastServerMessageAt = Date.now();
     const result = readFrames(this.buffer, dataToString(data));
     this.buffer = result.nextBuffer;
 
@@ -114,6 +121,7 @@ export class LanTcpClient {
   private scheduleReconnect() {
     if (this.closedByUser) return;
     this.connected = false;
+    this.stopWatchdog();
     this.destroySocket();
     if (this.reconnectTimer) return;
     this.options.onStatus?.('reconnecting');
@@ -131,5 +139,23 @@ export class LanTcpClient {
     try {
       socket.destroy?.();
     } catch {}
+  }
+
+  private startWatchdog() {
+    this.stopWatchdog();
+    const silenceMs = this.options.serverSilenceMs || 30000;
+    const tickMs = Math.max(5000, Math.floor(silenceMs / 3));
+    this.watchdogTimer = setInterval(() => {
+      if (this.closedByUser || !this.connected) return;
+      if (Date.now() - this.lastServerMessageAt <= silenceMs) return;
+      this.options.onError?.(`Servidor LAN sem resposta ha ${Math.round(silenceMs / 1000)}s. Reconectando.`);
+      this.scheduleReconnect();
+    }, tickMs);
+  }
+
+  private stopWatchdog() {
+    if (!this.watchdogTimer) return;
+    clearInterval(this.watchdogTimer);
+    this.watchdogTimer = null;
   }
 }
