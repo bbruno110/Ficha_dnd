@@ -281,7 +281,7 @@ export default function LanSessionScreen() {
 
   const playerActionKey = (player: typeof players[number]) => `${player.device_id}_${player.character_id || 'none'}`;
 
-  const getCardAmount = (player: typeof players[number]) => cardAmounts[playerActionKey(player)] ?? '';
+  const getCardAmount = (player: typeof players[number]) => cardAmounts[playerActionKey(player)] ?? '1';
   const setCardAmount = (player: typeof players[number], value: string) => {
     const key = playerActionKey(player);
     setCardAmounts(prev => ({ ...prev, [key]: onlyNumberText(value) }));
@@ -1685,6 +1685,7 @@ export default function LanSessionScreen() {
                             value={amountValue}
                             onChangeText={value => setCardAmount(player, value)}
                             onFocus={() => amountValue === '1' && setCardAmount(player, '')}
+                            onBlur={() => !getCardAmount(player) && setCardAmount(player, '1')}
                             keyboardType="numeric"
                             placeholder="Valor"
                             placeholderTextColor="rgba(255,255,255,0.35)"

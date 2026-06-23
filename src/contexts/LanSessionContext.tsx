@@ -2721,6 +2721,43 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     recoverLanSessionRef.current = recoverLanSession;
   }, [recoverLanSession]);
 
+  const forceRecoverLanSession = useCallback(
+    async (reason = 'manual-force-sync') => {
+      const session = activeSessionRef.current;
+      if (!session || session.status === 'closed' || session.status === 'inactive') {
+        setTransportReadyState(false);
+        setLanConnectionStatus('disconnected');
+        return;
+      }
+
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+
+      if (session.role === 'player') {
+        tcpClientRef.current?.close();
+        tcpClientRef.current = null;
+        tcpClientKeyRef.current = '';
+        tcpClientConnectedRef.current = false;
+      }
+
+      setLastError(null);
+      setTransportReadyState(false);
+      setLanConnectionStatus('syncing');
+      await traceLan('FUNCTION', 'forceRecoverLanSession', 'start', 'Ressincronizacao LAN manual solicitada pela ficha.', {
+        sessionId: session.id,
+        role: session.role,
+        reason,
+      }, 'info');
+
+      await recoverLanSession(reason);
+      await refreshPlayers();
+      await refreshSavedSessions();
+    },
+    [recoverLanSession, refreshPlayers, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
+  );
+
   const resumeLanSession = useCallback(
     async (sessionId: string) => {
       const stored = await getLanSessionById(db, sessionId);
@@ -3251,29 +3288,43 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         await applyRpcSyncPayload(response.payload);
       } catch (error) {
         const parsedCode = parseSessionCode(session.session_code || session.id);
-        if (!parsedCode) throw error;
-        const discovery = await discoverLanMaster(parsedCode);
-        const nextSession = { ...session, host_ip: discovery.host, port: discovery.port };
-        await saveLanSession(db, nextSession);
-        setActiveSession(nextSession);
-        activeSessionRef.current = nextSession;
-        const sinceSeq = await getLocalLastEventSeq(session.id);
-        const response = await sendLanRpc(discovery.host, discovery.port, {
-          type: 'LAN_RPC',
-          id: makeRpcId(),
-          method: 'COMMAND',
-          sessionId: session.id,
-          deviceId,
-          payload: {
-            commandMessage: message,
-            sinceSeq,
-          },
-          at: new Date().toISOString(),
-        }, 1800);
-        if (!response.ok) {
-          throw new Error(response.error || 'Mestre recusou o comando.');
+        try {
+          if (!parsedCode) throw error;
+          const discovery = await discoverLanMaster(parsedCode);
+          const nextSession = { ...session, host_ip: discovery.host, port: discovery.port };
+          await saveLanSession(db, nextSession);
+          setActiveSession(nextSession);
+          activeSessionRef.current = nextSession;
+          const sinceSeq = await getLocalLastEventSeq(session.id);
+          const response = await sendLanRpc(discovery.host, discovery.port, {
+            type: 'LAN_RPC',
+            id: makeRpcId(),
+            method: 'COMMAND',
+            sessionId: session.id,
+            deviceId,
+            payload: {
+              commandMessage: message,
+              sinceSeq,
+            },
+            at: new Date().toISOString(),
+          }, 1800);
+          if (!response.ok) {
+            throw new Error(response.error || 'Mestre recusou o comando.');
+          }
+          await applyRpcSyncPayload(response.payload);
+        } catch (retryError) {
+          setTransportReadyState(false);
+          setLanConnectionStatus('reconnecting');
+          scheduleLanReconnect('command-send-failed', 900);
+          await traceLan('LAN_COMMAND', 'sendLanCommand', 'send_failed', `Falha ao enviar comando ${command}.`, {
+            durationMs: Date.now() - startedAt,
+            command,
+            payload,
+            commandId: message.commandId,
+            error: retryError instanceof Error ? retryError.message : String(retryError),
+          }, 'warn', message.commandId);
+          throw retryError;
         }
-        await applyRpcSyncPayload(response.payload);
       }
 
       setTransportReadyState(true);
@@ -3287,7 +3338,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         commandId: message.commandId,
       }, 'info', message.commandId);
     },
-    [applyRpcSyncPayload, db, getLocalLastEventSeq, runAuthoritativeCommandQueued, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [applyRpcSyncPayload, db, getLocalLastEventSeq, runAuthoritativeCommandQueued, scheduleLanReconnect, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   const getHistoryPage = useCallback(
@@ -3468,6 +3519,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       players,
       refreshActiveSession,
       refreshSavedSessions,
+      forceRecoverLanSession,
       startMasterSession,
       joinPlayerSession,
       resumeLanSession,
@@ -3494,6 +3546,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       players,
       refreshActiveSession,
       refreshSavedSessions,
+      forceRecoverLanSession,
       startMasterSession,
       joinPlayerSession,
       resumeLanSession,

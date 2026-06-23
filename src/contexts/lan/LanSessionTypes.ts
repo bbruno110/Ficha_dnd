@@ -40,6 +40,7 @@ export type LanSessionContextValue = {
   players: LanPlayerSummary[];
   refreshActiveSession: () => Promise<void>;
   refreshSavedSessions: () => Promise<void>;
+  forceRecoverLanSession: (reason?: string) => Promise<void>;
   startMasterSession: (options: StartMasterOptions) => Promise<LanSessionRecord>;
   joinPlayerSession: (options: JoinSessionOptions) => Promise<LanSessionRecord>;
   resumeLanSession: (sessionId: string) => Promise<void>;

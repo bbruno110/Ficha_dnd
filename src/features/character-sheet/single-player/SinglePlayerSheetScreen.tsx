@@ -76,7 +76,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const id = Array.isArray(characterId) ? characterId[0] : characterId;
   const router = useRouter();
   const db = useSQLiteContext();
-  const { activeSession, sendLanCommand, players, getHistoryPage, localDeviceId } = useLanSession();
+  const { activeSession, sendLanCommand, players, getHistoryPage, localDeviceId, connectionStatus, isTransportReady, forceRecoverLanSession } = useLanSession();
 
   const [activeTab, setActiveTab] = useState<'stats' | 'profs' | 'inv' | 'spells'>('stats');
   const [character, setCharacter] = useState<any>(null);
@@ -585,6 +585,24 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const isLanPlayerControlledSheet = activeSession?.role === 'player' && Number(activeSession.linked_character_id || 0) === Number(character.id);
   const isLanPausedReadOnly = isLanPlayerControlledSheet && activeSession?.status === 'paused';
   const isDeadInLan = isLanPlayerControlledSheet && displayHpCurrent <= 0;
+  const isLanBadgeBusy = Boolean(syncAdapter?.enabled && (connectionStatus === 'syncing' || connectionStatus === 'reconnecting'));
+  const isLanBadgeHealthy = Boolean(syncAdapter?.enabled && isTransportReady && connectionStatus === 'connected');
+  const isLanBadgeWarning = Boolean(syncAdapter?.enabled && !isLanBadgeHealthy);
+
+  const handleTopLanBadgePress = async () => {
+    if (isLanPausedReadOnly || !syncAdapter?.enabled) {
+      onOpenSyncSession?.();
+      return;
+    }
+
+    try {
+      await forceRecoverLanSession('sheet-top-badge');
+      await loadData();
+      showCustomAlert('LAN sincronizada', 'A ficha tentou recuperar a conexao e recarregou os dados da mesa.');
+    } catch (error) {
+      showCustomAlert('Falha ao sincronizar LAN', error instanceof Error ? error.message : 'Nao foi possivel recuperar a conexao agora.');
+    }
+  };
 
   const avatarSourceForName = (name: string, size = 120) =>
     `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'Jogador')}&background=102b56&color=00bfff&size=${size}&bold=true`;
@@ -665,17 +683,21 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       showCustomAlert('Mesa pausada', 'A ficha fica em modo de leitura ate o mestre retomar a sessao.');
       return;
     }
-    await sendLanCommand('PLAYER_ITEM_DONATE', {
-      sourceCharacterId: character.id,
-      sourceName: character.name,
-      itemName: item?.name || 'Item',
-      item,
-      quantity: qty,
-      targetDeviceId: target.device_id,
-      targetCharacterId: Number(target.character_id || 0),
-      targetName: lanTargetName(target),
-    });
-    showCustomAlert('Envio registrado', `Voce enviou ${qty}x ${item?.name || 'item'} para ${lanTargetName(target)}.`);
+    try {
+      await sendLanCommand('PLAYER_ITEM_DONATE', {
+        sourceCharacterId: character.id,
+        sourceName: character.name,
+        itemName: item?.name || 'Item',
+        item,
+        quantity: qty,
+        targetDeviceId: target.device_id,
+        targetCharacterId: Number(target.character_id || 0),
+        targetName: lanTargetName(target),
+      });
+      showCustomAlert('Envio registrado', `Voce enviou ${qty}x ${item?.name || 'item'} para ${lanTargetName(target)}.`);
+    } catch (error) {
+      showCustomAlert('LAN sem sincronismo', error instanceof Error ? error.message : 'Nao foi possivel enviar o item agora. Toque no LAN do topo para forcar a ressincronizacao.');
+    }
   };
 
   const offerTradeToLanPlayer = async (target: any, item: any, qty: number) => {
@@ -683,17 +705,21 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       showCustomAlert('Mesa pausada', 'A ficha fica em modo de leitura ate o mestre retomar a sessao.');
       return;
     }
-    await sendLanCommand('PLAYER_TRADE_OFFER', {
-      sourceCharacterId: character.id,
-      sourceName: character.name,
-      itemName: item?.name || 'Item',
-      item,
-      quantity: qty,
-      targetDeviceId: target.device_id,
-      targetCharacterId: Number(target.character_id || 0),
-      targetName: lanTargetName(target),
-    });
-    showCustomAlert('Troca enviada', `${lanTargetName(target)} recebeu sua proposta de ${qty}x ${item?.name || 'item'}.`);
+    try {
+      await sendLanCommand('PLAYER_TRADE_OFFER', {
+        sourceCharacterId: character.id,
+        sourceName: character.name,
+        itemName: item?.name || 'Item',
+        item,
+        quantity: qty,
+        targetDeviceId: target.device_id,
+        targetCharacterId: Number(target.character_id || 0),
+        targetName: lanTargetName(target),
+      });
+      showCustomAlert('Troca enviada', `${lanTargetName(target)} recebeu sua proposta de ${qty}x ${item?.name || 'item'}.`);
+    } catch (error) {
+      showCustomAlert('LAN sem sincronismo', error instanceof Error ? error.message : 'Nao foi possivel enviar a troca agora. Toque no LAN do topo para forcar a ressincronizacao.');
+    }
   };
 
   const showLanItemTargetPicker = (mode: 'send' | 'trade', item: any, qty: number) => {
@@ -1962,9 +1988,30 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         <TouchableOpacity style={styles.topBarBack} onPress={() => router.back()}><Text style={styles.topBarBackText}>{"<"}</Text></TouchableOpacity>
         <Text style={styles.topBarTitle}>{character.name}</Text>
         {(syncAdapter?.enabled || isLanPausedReadOnly) && (
-          <TouchableOpacity style={styles.topBarLanBadge} onPress={onOpenSyncSession}>
-            <Ionicons name={isLanPausedReadOnly ? 'lock-closed-outline' : 'wifi-outline'} size={14} color="#00fa9a" />
-            <Text style={styles.topBarLanText}>{isLanPausedReadOnly ? 'PAUSADA' : 'LAN'}</Text>
+          <TouchableOpacity
+            style={[
+              styles.topBarLanBadge,
+              isLanBadgeWarning && styles.topBarLanBadgeWarning,
+              isLanPausedReadOnly && styles.topBarLanBadgePaused,
+            ]}
+            onPress={handleTopLanBadgePress}
+          >
+            {isLanBadgeBusy ? (
+              <ActivityIndicator size="small" color={isLanBadgeWarning ? '#ff6666' : '#00fa9a'} />
+            ) : (
+              <Ionicons
+                name={isLanPausedReadOnly ? 'lock-closed-outline' : isLanBadgeWarning ? 'cloud-offline-outline' : 'wifi-outline'}
+                size={14}
+                color={isLanPausedReadOnly ? '#ffd166' : isLanBadgeWarning ? '#ff6666' : '#00fa9a'}
+              />
+            )}
+            <Text style={[
+              styles.topBarLanText,
+              isLanBadgeWarning && styles.topBarLanTextWarning,
+              isLanPausedReadOnly && styles.topBarLanTextPaused,
+            ]}>
+              {isLanPausedReadOnly ? 'PAUSADA' : 'LAN'}
+            </Text>
           </TouchableOpacity>
         )}
       </View>
@@ -2803,7 +2850,11 @@ const styles = StyleSheet.create({
   topBarBack: { position: 'absolute', left: 20, bottom: 12, padding: 5, zIndex: 10 },
   topBarBackText: { color: '#00bfff', fontSize: 16, fontWeight: 'bold' },
   topBarLanBadge: { position: 'absolute', right: 20, bottom: 14, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(0,250,154,0.12)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.35)', borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
+  topBarLanBadgeWarning: { backgroundColor: 'rgba(255,102,102,0.13)', borderColor: 'rgba(255,102,102,0.42)' },
+  topBarLanBadgePaused: { backgroundColor: 'rgba(255,209,102,0.13)', borderColor: 'rgba(255,209,102,0.4)' },
   topBarLanText: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold' },
+  topBarLanTextWarning: { color: '#ff6666' },
+  topBarLanTextPaused: { color: '#ffd166' },
   topBarTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   readOnlyBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 9, paddingHorizontal: 14, backgroundColor: 'rgba(255,209,102,0.1)', borderBottomWidth: 1, borderBottomColor: 'rgba(255,209,102,0.22)' },
   readOnlyBannerText: { color: '#ffd166', fontSize: 12, fontWeight: 'bold', textAlign: 'center' },
