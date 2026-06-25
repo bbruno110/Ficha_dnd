@@ -60,7 +60,6 @@ const DURATION_UNITS: { value: EffectDurationUnit; label: string }[] = [
 ];
 const MASTER_TOOL_CATEGORIES = [...CATEGORIES.slice(0, -1), 'Efeitos', 'Acervo'];
 const IMPORT_VALID_TABLES = [...VALID_TABLES, 'condition_effects'];
-const CONDITION_COLOR_PALETTE = ['#7ED957', '#F4A84D', '#8B5CF6', '#EF4444', '#38BDF8', '#FACC15', '#EC4899', '#64748B'];
 const CONDITION_EFFECT_PAGE_SIZE = 20;
 const CONDITION_GRADIENT_PALETTE = [
   { name: 'Veneno', color: '#7ED957', colors: ['#163B22', '#7ED957', '#D4FF77'] },
@@ -72,7 +71,73 @@ const CONDITION_GRADIENT_PALETTE = [
   { name: 'Psiquico', color: '#EC4899', colors: ['#3D0D2B', '#EC4899', '#F0ABFC'] },
   { name: 'Sombra', color: '#64748B', colors: ['#020617', '#475569', '#94A3B8'] },
 ];
-const isValidHexColor = (value: string) => /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value.trim());
+const HEX_COLOR_PATTERN = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+const isValidHexColor = (value: string) => HEX_COLOR_PATTERN.test(value.trim());
+const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
+const expandHexColor = (value: string) => {
+  const raw = value.trim().replace('#', '');
+  if (raw.length === 3 || raw.length === 4) return raw.split('').map(char => char + char).join('');
+  return raw;
+};
+const hexToRgba = (value: string) => {
+  const expanded = expandHexColor(isValidHexColor(value) ? value : '#F4A84D');
+  return {
+    r: parseInt(expanded.slice(0, 2), 16),
+    g: parseInt(expanded.slice(2, 4), 16),
+    b: parseInt(expanded.slice(4, 6), 16),
+    a: expanded.length >= 8 ? parseInt(expanded.slice(6, 8), 16) / 255 : 1,
+  };
+};
+const rgbToHex = (r: number, g: number, b: number) =>
+  `#${[r, g, b].map(channel => Math.round(clamp(channel, 0, 255)).toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+const hexToHsv = (value: string) => {
+  const { r, g, b } = hexToRgba(value);
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const delta = max - min;
+  let hue = 0;
+  if (delta !== 0) {
+    if (max === red) hue = 60 * (((green - blue) / delta) % 6);
+    else if (max === green) hue = 60 * ((blue - red) / delta + 2);
+    else hue = 60 * ((red - green) / delta + 4);
+  }
+  if (hue < 0) hue += 360;
+  return { h: hue, s: max === 0 ? 0 : delta / max, v: max };
+};
+const hsvToHex = (h: number, s: number, v: number) => {
+  const chroma = v * s;
+  const section = ((h % 360) + 360) % 360 / 60;
+  const secondary = chroma * (1 - Math.abs((section % 2) - 1));
+  const offset = v - chroma;
+  let rgb = [0, 0, 0];
+  if (section < 1) rgb = [chroma, secondary, 0];
+  else if (section < 2) rgb = [secondary, chroma, 0];
+  else if (section < 3) rgb = [0, chroma, secondary];
+  else if (section < 4) rgb = [0, secondary, chroma];
+  else if (section < 5) rgb = [secondary, 0, chroma];
+  else rgb = [chroma, 0, secondary];
+  return rgbToHex(...rgb.map(channel => (channel + offset) * 255) as [number, number, number]);
+};
+const baseHexColor = (value: string) => {
+  const { r, g, b } = hexToRgba(value);
+  return rgbToHex(r, g, b);
+};
+const colorWithOpacity = (value: string, opacity: number) => {
+  const alpha = Math.round((clamp(opacity, 0, 100) / 100) * 255).toString(16).padStart(2, '0').toUpperCase();
+  return `${baseHexColor(value)}${alpha}`;
+};
+const mixHexColor = (value: string, target: string, amount: number) => {
+  const sourceRgb = hexToRgba(value);
+  const targetRgb = hexToRgba(target);
+  return rgbToHex(
+    sourceRgb.r + (targetRgb.r - sourceRgb.r) * amount,
+    sourceRgb.g + (targetRgb.g - sourceRgb.g) * amount,
+    sourceRgb.b + (targetRgb.b - sourceRgb.b) * amount
+  );
+};
 const normalizeHexColorInput = (value: string) => {
   const cleaned = value.replace(/[^0-9a-fA-F#]/g, '');
   const withoutHash = cleaned.replace(/#/g, '').slice(0, 6);
@@ -169,6 +234,10 @@ export default function AdvancedCreatorScreen() {
   const [conditionCatalog, setConditionCatalog] = useState<ConditionCatalogItem[]>([]);
   const [conditionDescription, setConditionDescription] = useState('');
   const [conditionColor, setConditionColor] = useState('#F4A84D');
+  const [conditionOpacity, setConditionOpacity] = useState(100);
+  const [conditionSvSize, setConditionSvSize] = useState({ width: 1, height: 1 });
+  const [conditionHueWidth, setConditionHueWidth] = useState(1);
+  const [conditionOpacityWidth, setConditionOpacityWidth] = useState(1);
   const [conditionSearch, setConditionSearch] = useState('');
   const [conditionPage, setConditionPage] = useState(0);
 
@@ -761,9 +830,10 @@ export default function AdvancedCreatorScreen() {
           Alert.alert('Erro', 'Informe uma cor hexadecimal valida, por exemplo #F4A84D.');
           return;
         }
+        const colorWithAlpha = colorWithOpacity(safeColor, conditionOpacity);
         await db.runAsync(
           `INSERT INTO condition_effects (name, description, color, criador) VALUES (?, ?, ?, 'proprio')`,
-          [name.trim(), conditionDescription.trim(), safeColor.toUpperCase()]
+          [name.trim(), conditionDescription.trim(), colorWithAlpha]
         );
         await loadConditionCatalog();
       }
@@ -952,8 +1022,27 @@ export default function AdvancedCreatorScreen() {
   );
 
   const renderConditionEffectForm = () => {
-    const safeColor = isValidHexColor(conditionColor) ? conditionColor : '#2A3654';
-    const selectedGradient = CONDITION_GRADIENT_PALETTE.find(preset => preset.color.toUpperCase() === safeColor.toUpperCase()) || CONDITION_GRADIENT_PALETTE[0];
+    const safeColor = isValidHexColor(conditionColor) ? baseHexColor(conditionColor) : '#2A3654';
+    const selectedColor = colorWithOpacity(safeColor, conditionOpacity);
+    const pickerHsv = hexToHsv(safeColor);
+    const hueColor = hsvToHex(pickerHsv.h, 1, 1);
+    const previewColors = [
+      colorWithOpacity(mixHexColor(safeColor, '#000000', 0.62), conditionOpacity),
+      selectedColor,
+      colorWithOpacity(mixHexColor(safeColor, '#FFFFFF', 0.48), conditionOpacity),
+    ];
+    const updateSaturationValue = (locationX: number, locationY: number) => {
+      const saturation = clamp(locationX / conditionSvSize.width);
+      const value = 1 - clamp(locationY / conditionSvSize.height);
+      setConditionColor(hsvToHex(pickerHsv.h, saturation, value));
+    };
+    const updateHue = (locationX: number) => {
+      const hue = clamp(locationX / conditionHueWidth) * 360;
+      setConditionColor(hsvToHex(hue, pickerHsv.s, pickerHsv.v));
+    };
+    const updateOpacity = (locationX: number) => {
+      setConditionOpacity(Math.round(clamp(locationX / conditionOpacityWidth) * 100));
+    };
     const normalizedSearch = conditionSearch.trim().toLowerCase();
     const filteredEffects = conditionCatalog.filter(effect => {
       if (!normalizedSearch) return true;
@@ -983,8 +1072,8 @@ export default function AdvancedCreatorScreen() {
         </View>
 
         <View style={styles.formGroup}>
-          <Text style={styles.label}>GRADIENTE DO EFEITO</Text>
-          <View style={styles.gradientPalette}>
+          <Text style={styles.label}>ATALHOS DE COR</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.gradientPalette}>
             {CONDITION_GRADIENT_PALETTE.map(preset => {
               const active = safeColor.toUpperCase() === preset.color.toUpperCase();
               return (
@@ -1000,11 +1089,70 @@ export default function AdvancedCreatorScreen() {
                 </TouchableOpacity>
               );
             })}
+          </ScrollView>
+
+          <Text style={[styles.label, { marginTop: 18 }]}>SELETOR DE COR</Text>
+          <View
+            style={[styles.saturationPicker, { backgroundColor: hueColor }]}
+            onLayout={event => setConditionSvSize(event.nativeEvent.layout)}
+            onStartShouldSetResponder={() => true}
+            onMoveShouldSetResponder={() => true}
+            onResponderTerminationRequest={() => false}
+            onResponderGrant={event => updateSaturationValue(event.nativeEvent.locationX, event.nativeEvent.locationY)}
+            onResponderMove={event => updateSaturationValue(event.nativeEvent.locationX, event.nativeEvent.locationY)}
+          >
+            <LinearGradient
+              pointerEvents="none"
+              colors={['#FFFFFF', '#FFFFFF00']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={StyleSheet.absoluteFill}
+            />
+            <LinearGradient
+              pointerEvents="none"
+              colors={['#00000000', '#000000']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 0, y: 1 }}
+              style={StyleSheet.absoluteFill}
+            />
+            <View
+              pointerEvents="none"
+              style={[
+                styles.colorPickerMarker,
+                {
+                  left: pickerHsv.s * conditionSvSize.width - 10,
+                  top: (1 - pickerHsv.v) * conditionSvSize.height - 10,
+                },
+              ]}
+            />
+          </View>
+          <View
+            style={styles.huePicker}
+            onLayout={event => setConditionHueWidth(event.nativeEvent.layout.width)}
+            onStartShouldSetResponder={() => true}
+            onMoveShouldSetResponder={() => true}
+            onResponderTerminationRequest={() => false}
+            onResponderGrant={event => updateHue(event.nativeEvent.locationX)}
+            onResponderMove={event => updateHue(event.nativeEvent.locationX)}
+          >
+            <LinearGradient
+              pointerEvents="none"
+              colors={['#FF0000', '#FFFF00', '#00FF00', '#00FFFF', '#0000FF', '#FF00FF', '#FF0000']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={StyleSheet.absoluteFill}
+            />
+            <View
+              pointerEvents="none"
+              style={[styles.huePickerMarker, { left: (pickerHsv.h / 360) * conditionHueWidth - 8 }]}
+            />
           </View>
 
-          <Text style={[styles.label, { marginTop: 14 }]}>COR HEXADECIMAL</Text>
+          <Text style={[styles.label, { marginTop: 16 }]}>COR HEXADECIMAL (RGB)</Text>
           <View style={styles.colorInputRow}>
-            <View style={[styles.colorPreview, { backgroundColor: safeColor }]} />
+            <View style={styles.transparencyPreview}>
+              <View style={[styles.colorPreview, { backgroundColor: selectedColor }]} />
+            </View>
             <TextInput
               style={[styles.input, { flex: 1 }]}
               autoCapitalize="characters"
@@ -1014,25 +1162,57 @@ export default function AdvancedCreatorScreen() {
               placeholderTextColor="#666"
             />
           </View>
-          <View style={styles.colorPalette}>
-            {CONDITION_COLOR_PALETTE.map(color => (
-              <TouchableOpacity
-                key={color}
-                style={[styles.colorSwatch, { backgroundColor: color }, conditionColor.toUpperCase() === color && styles.colorSwatchActive]}
-                onPress={() => setConditionColor(color)}
+
+          <View style={styles.opacityHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.label, { marginBottom: 3 }]}>FORCA / OPACIDADE</Text>
+              <Text style={styles.opacityHint}>100% solido · 0% invisivel</Text>
+            </View>
+            <View style={styles.opacityInputWrap}>
+              <TextInput
+                style={styles.opacityInput}
+                keyboardType="number-pad"
+                value={String(conditionOpacity)}
+                onChangeText={value => setConditionOpacity(Math.round(clamp(Number(value) || 0, 0, 100)))}
+                selectTextOnFocus
+                maxLength={3}
               />
-            ))}
+              <Text style={styles.opacityPercent}>%</Text>
+            </View>
+          </View>
+          <View
+            style={styles.opacityPicker}
+            onLayout={event => setConditionOpacityWidth(event.nativeEvent.layout.width)}
+            onStartShouldSetResponder={() => true}
+            onMoveShouldSetResponder={() => true}
+            onResponderTerminationRequest={() => false}
+            onResponderGrant={event => updateOpacity(event.nativeEvent.locationX)}
+            onResponderMove={event => updateOpacity(event.nativeEvent.locationX)}
+          >
+            <LinearGradient
+              pointerEvents="none"
+              colors={[colorWithOpacity(safeColor, 0), colorWithOpacity(safeColor, 100)]}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={StyleSheet.absoluteFill}
+            />
+            <View
+              pointerEvents="none"
+              style={[styles.opacityPickerMarker, { left: (conditionOpacity / 100) * conditionOpacityWidth - 8 }]}
+            />
           </View>
         </View>
 
         <Text style={styles.label}>PREVIEW</Text>
-        <LinearGradient colors={selectedGradient.colors as any} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[styles.conditionPreviewCard, { borderColor: safeColor }]}>
-          <View style={[styles.effectColorDot, { backgroundColor: safeColor }]} />
-          <View style={{ flex: 1 }}>
-            <Text style={styles.conditionPreviewTitle}>{name.trim() || 'Nome do efeito'}</Text>
-            <Text style={styles.conditionPreviewSub}>{conditionDescription.trim() || 'Descricao amigavel do efeito.'}</Text>
-          </View>
-        </LinearGradient>
+        <View style={styles.previewBackdrop}>
+          <LinearGradient colors={previewColors as any} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[styles.conditionPreviewCard, { borderColor: selectedColor }]}>
+            <View style={[styles.effectColorDot, { backgroundColor: selectedColor }]} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.conditionPreviewTitle}>{name.trim() || 'Nome do efeito'}</Text>
+              <Text style={styles.conditionPreviewSub}>{conditionDescription.trim() || 'Descricao amigavel do efeito.'}</Text>
+            </View>
+          </LinearGradient>
+        </View>
 
         <Text style={[styles.label, { marginTop: 20 }]}>EFEITOS CADASTRADOS</Text>
         <TextInput
@@ -1762,15 +1942,25 @@ const styles = StyleSheet.create({
   effectColorDot: { width: 12, height: 12, borderRadius: 6 },
   colorInputRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   colorPreview: { width: 48, height: 48, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)' },
-  colorPalette: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 12 },
-  colorSwatch: { width: 34, height: 34, borderRadius: 17, borderWidth: 2, borderColor: 'rgba(255,255,255,0.18)' },
-  colorSwatchActive: { borderColor: '#fff' },
-  gradientPalette: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  gradientOption: { width: '47.5%', minWidth: 132, borderRadius: 14, padding: 8, backgroundColor: 'rgba(0,0,0,0.22)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.09)' },
+  gradientPalette: { gap: 8, paddingRight: 4 },
+  gradientOption: { width: 82, borderRadius: 12, padding: 6, backgroundColor: 'rgba(0,0,0,0.22)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.09)' },
   gradientOptionActive: { borderColor: '#00fa9a', backgroundColor: 'rgba(0,250,154,0.08)' },
-  gradientSwatch: { height: 48, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
-  gradientOptionText: { color: 'rgba(255,255,255,0.62)', fontSize: 11, fontWeight: 'bold', textAlign: 'center', marginTop: 6 },
+  gradientSwatch: { height: 34, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
+  gradientOptionText: { color: 'rgba(255,255,255,0.62)', fontSize: 10, fontWeight: 'bold', textAlign: 'center', marginTop: 5 },
   gradientOptionTextActive: { color: '#00fa9a' },
+  saturationPicker: { height: 176, borderRadius: 14, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)' },
+  colorPickerMarker: { position: 'absolute', width: 20, height: 20, borderRadius: 10, borderWidth: 3, borderColor: '#fff', backgroundColor: 'transparent', shadowColor: '#000', shadowOpacity: 0.8, shadowRadius: 3, elevation: 4 },
+  huePicker: { height: 28, borderRadius: 14, overflow: 'hidden', marginTop: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)' },
+  huePickerMarker: { position: 'absolute', top: 3, width: 16, height: 20, borderRadius: 8, borderWidth: 3, borderColor: '#fff', backgroundColor: 'transparent', shadowColor: '#000', shadowOpacity: 0.8, shadowRadius: 2, elevation: 4 },
+  transparencyPreview: { width: 50, height: 50, padding: 1, borderRadius: 13, backgroundColor: '#26334A', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)' },
+  opacityHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 18 },
+  opacityHint: { color: 'rgba(255,255,255,0.44)', fontSize: 11 },
+  opacityInputWrap: { width: 76, height: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', borderRadius: 11, backgroundColor: 'rgba(0,0,0,0.3)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  opacityInput: { minWidth: 38, color: '#fff', fontSize: 16, fontWeight: 'bold', textAlign: 'right', paddingVertical: 6 },
+  opacityPercent: { color: 'rgba(255,255,255,0.55)', fontSize: 14, marginLeft: 2 },
+  opacityPicker: { height: 28, borderRadius: 14, overflow: 'hidden', marginTop: 10, backgroundColor: '#26334A', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)' },
+  opacityPickerMarker: { position: 'absolute', top: 3, width: 16, height: 20, borderRadius: 8, borderWidth: 3, borderColor: '#fff', backgroundColor: 'transparent', shadowColor: '#000', shadowOpacity: 0.8, shadowRadius: 2, elevation: 4 },
+  previewBackdrop: { borderRadius: 14, padding: 1, backgroundColor: '#17243A', marginBottom: 8 },
   conditionPickerBox: { gap: 8, marginBottom: 12 },
   conditionPickerSearch: { backgroundColor: 'rgba(0,0,0,0.3)', color: '#fff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
   conditionPickerMetaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
@@ -1780,7 +1970,7 @@ const styles = StyleSheet.create({
   conditionPickerName: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
   conditionPickerNameActive: { color: '#00fa9a' },
   conditionPickerSub: { color: 'rgba(255,255,255,0.45)', fontSize: 10, marginTop: 2 },
-  conditionPreviewCard: { minHeight: 74, flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 14, padding: 14, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, marginBottom: 8 },
+  conditionPreviewCard: { minHeight: 74, flexDirection: 'row', alignItems: 'center', gap: 12, borderRadius: 13, padding: 14, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1 },
   conditionPreviewTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
   conditionPreviewSub: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4, lineHeight: 17 },
   conditionListHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 8 },

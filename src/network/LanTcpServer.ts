@@ -20,7 +20,7 @@ export type LanTcpStreamMessage = {
 export type LanTcpServerPushMessage = {
   type: 'LAN_STREAM_PUSH';
   id: string;
-  method: 'SYNC' | 'PING' | 'NOTICE';
+  method: 'SYNC' | 'PING' | 'NOTICE' | 'SESSION_CLOSED';
   sessionId?: string | null;
   payload?: Record<string, unknown>;
   at: string;
@@ -59,7 +59,7 @@ export class LanTcpServer {
 
   async start(port: number) {
     const TcpSocket = getTcpSocketModule();
-    this.close();
+    await this.close();
 
     this.server = TcpSocket.createServer((socket: any) => this.handleSocket(socket));
 
@@ -76,7 +76,7 @@ export class LanTcpServer {
     });
   }
 
-  close() {
+  async close() {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -89,12 +89,27 @@ export class LanTcpServer {
     }
     this.clients.clear();
 
-    if (!this.server) return;
-    try {
-      this.server.close?.();
-    } finally {
-      this.server = null;
-    }
+    const server = this.server;
+    this.server = null;
+    if (!server) return;
+
+    await new Promise<void>(resolve => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(finish, 900);
+
+      try {
+        server.close?.(finish);
+        if (!server.close) finish();
+      } catch {
+        finish();
+      }
+    });
   }
 
   connectedDeviceIds() {
@@ -171,6 +186,14 @@ export class LanTcpServer {
               this.write(socket, this.makePush('NOTICE', { error: 'HELLO LAN sem deviceId/sessionId.' }, streamSessionId));
               continue;
             }
+            const payload = await this.callbacks.onClientHello?.(message);
+            if (payload?.error) {
+              this.write(socket, this.makePush('NOTICE', payload, streamSessionId));
+              streamDeviceId = null;
+              streamSessionId = null;
+              this.destroySoon(socket);
+              continue;
+            }
             this.clients.get(streamDeviceId)?.socket?.destroy?.();
             this.clients.set(streamDeviceId, {
               socket,
@@ -180,7 +203,6 @@ export class LanTcpServer {
               lastPongAt: Date.now(),
               missedPings: 0,
             });
-            const payload = await this.callbacks.onClientHello?.(message);
             if (payload) {
               this.write(socket, this.makePush('SYNC', payload, streamSessionId));
             }

@@ -167,7 +167,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   }, [selectedSpell]);
 
   const activeVisualEffects = Array.isArray(character?.stats?.timed_effects) ? character.stats.timed_effects : [];
-  const coloredVisualEffects = activeVisualEffects.filter((effect: any) => (effect?.kind !== 'temp_hp' || Number(character?.hp_temp || 0) > 0) && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(effect?.color || '')));
+  const coloredVisualEffects = activeVisualEffects.filter((effect: any) => (effect?.kind !== 'temp_hp' || Number(character?.hp_temp || 0) > 0) && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(String(effect?.color || '')));
   const currentPulseEffect = coloredVisualEffects.length > 0 ? coloredVisualEffects[effectPulseIndex % coloredVisualEffects.length] : null;
 
   useEffect(() => {
@@ -2074,7 +2074,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                 <Text style={styles.activeEffectsTitle}>EFEITOS ATIVOS</Text>
                 <View style={styles.activeEffectsWrap}>
                   {activeEffects.map((effect: any, index: number) => {
-                    const effectColor = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(effect?.color || '')) ? String(effect.color) : '';
+                    const effectColor = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(String(effect?.color || '')) ? String(effect.color) : '';
                     return (
                       <View key={String(effect.id || index)} style={[styles.activeEffectChip, effect.kind === 'temp_hp' && styles.activeEffectChipTempHp, effectColor ? { borderColor: effectColor } : null]}>
                         <Ionicons name={effect.kind === 'temp_hp' ? 'heart-circle-outline' : 'sparkles-outline'} size={13} color={effect.kind === 'temp_hp' ? '#00fa9a' : effectColor || '#ffd166'} />

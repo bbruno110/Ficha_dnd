@@ -13,6 +13,7 @@ import {
   LanRole,
   LanSessionRecord,
   LanSessionStatus,
+  LanVirtualCombatant,
 } from '../types/lan';
 
 export const CUSTOM_CONTENT_DEFINITIONS: {
@@ -258,14 +259,14 @@ export async function getLocalPlayerName(db: SQLiteDatabase) {
 export async function closeOpenLanSessions(db: SQLiteDatabase, role?: LanRole) {
   if (role) {
     await db.runAsync(
-      `UPDATE lan_sessions SET status = 'inactive', linked_character_id = NULL WHERE role = ? AND status IN ('open', 'connected')`,
+      `UPDATE lan_sessions SET status = 'inactive' WHERE role = ? AND status IN ('open', 'connected')`,
       [role]
     );
     return;
   }
 
   await db.runAsync(
-    `UPDATE lan_sessions SET status = 'inactive', linked_character_id = NULL WHERE status IN ('open', 'connected')`
+    `UPDATE lan_sessions SET status = 'inactive' WHERE status IN ('open', 'connected')`
   );
 }
 
@@ -303,7 +304,7 @@ export async function setLanSessionStatus(db: SQLiteDatabase, sessionId: string,
          paused_at = CASE WHEN ? = 'paused' THEN CURRENT_TIMESTAMP ELSE paused_at END,
          resumed_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE resumed_at END,
          last_connected_at = CASE WHEN ? IN ('open', 'connected') THEN CURRENT_TIMESTAMP ELSE last_connected_at END,
-         linked_character_id = CASE WHEN ? IN ('closed', 'inactive') THEN NULL ELSE linked_character_id END
+         linked_character_id = CASE WHEN ? = 'closed' THEN NULL ELSE linked_character_id END
      WHERE id = ?`,
     [status, status, status, status, status, status, sessionId]
   );
@@ -319,7 +320,7 @@ export async function setLanSessionStatus(db: SQLiteDatabase, sessionId: string,
 export async function getLanSessions(db: SQLiteDatabase, includeClosed = false) {
   return db.getAllAsync<LanSessionRecord>(
     `SELECT * FROM lan_sessions
-     ${includeClosed ? '' : `WHERE status NOT IN ('closed', 'inactive')`}
+     ${includeClosed ? '' : `WHERE status <> 'closed'`}
      ORDER BY
        CASE status
          WHEN 'open' THEN 0
@@ -336,6 +337,23 @@ export async function getLanSessionById(db: SQLiteDatabase, sessionId: string) {
   return db.getFirstAsync<LanSessionRecord>(
     `SELECT * FROM lan_sessions WHERE id = ? LIMIT 1`,
     [sessionId]
+  );
+}
+
+export async function getCharacterLinkedLanSession(
+  db: SQLiteDatabase,
+  characterId: number,
+  excludeSessionId?: string | null
+) {
+  return db.getFirstAsync<Pick<LanSessionRecord, 'id' | 'name' | 'role' | 'status'>>(
+    `SELECT id, name, role, status
+     FROM lan_sessions
+     WHERE linked_character_id = ?
+       AND status <> 'closed'
+       AND (? IS NULL OR id <> ?)
+     ORDER BY COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC
+     LIMIT 1`,
+    [characterId, excludeSessionId || null, excludeSessionId || null]
   );
 }
 
@@ -357,8 +375,11 @@ export async function getActiveLanSession(db: SQLiteDatabase) {
 
 export async function ensureLanSessionState(db: SQLiteDatabase, sessionId: string, status: LanSessionStatus = 'open') {
   await db.runAsync(
-    `INSERT OR IGNORE INTO lan_session_state (session_id, status, turn, campaign_minutes, paused, last_event_seq)
-     VALUES (?, ?, 1, 0, ?, 0)`,
+    `INSERT OR IGNORE INTO lan_session_state (
+      session_id, status, turn, campaign_minutes, paused,
+      initiative_order, initiative_scores, virtual_combatants, last_event_seq
+    )
+     VALUES (?, ?, 1, 0, ?, '[]', '{}', '[]', 0)`,
     [sessionId, status, status === 'paused' ? 1 : 0]
   );
 }
@@ -371,8 +392,19 @@ export async function getLanSessionState(db: SQLiteDatabase, sessionId: string):
     turn: number;
     campaign_minutes: number;
     paused: number;
+    initiative_order?: string | null;
+    initiative_scores?: string | null;
+    virtual_combatants?: string | null;
     updated_at: string;
   }>(`SELECT * FROM lan_session_state WHERE session_id = ?`, [sessionId]);
+
+  const parseStateJson = <T,>(value: string | null | undefined, fallback: T): T => {
+    try {
+      return value ? JSON.parse(value) as T : fallback;
+    } catch {
+      return fallback;
+    }
+  };
 
   return {
     sessionId,
@@ -380,6 +412,9 @@ export async function getLanSessionState(db: SQLiteDatabase, sessionId: string):
     turn: Number(row?.turn || 1),
     campaignMinutes: Number(row?.campaign_minutes || 0),
     paused: Boolean(row?.paused),
+    initiativeOrder: parseStateJson<string[]>(row?.initiative_order, []),
+    initiativeScores: parseStateJson<Record<string, number>>(row?.initiative_scores, {}),
+    virtualCombatants: parseStateJson<LanVirtualCombatant[]>(row?.virtual_combatants, []),
     updatedAt: row?.updated_at || new Date().toISOString(),
   };
 }
@@ -387,7 +422,10 @@ export async function getLanSessionState(db: SQLiteDatabase, sessionId: string):
 export async function updateLanSessionState(
   db: SQLiteDatabase,
   sessionId: string,
-  updates: Partial<Pick<LanCampaignState, 'status' | 'turn' | 'campaignMinutes' | 'paused'>>
+  updates: Partial<Pick<
+    LanCampaignState,
+    'status' | 'turn' | 'campaignMinutes' | 'paused' | 'initiativeOrder' | 'initiativeScores' | 'virtualCombatants'
+  >>
 ) {
   await ensureLanSessionState(db, sessionId);
   const entries: [string, string | number][] = [];
@@ -395,6 +433,9 @@ export async function updateLanSessionState(
   if (updates.turn !== undefined) entries.push(['turn', updates.turn]);
   if (updates.campaignMinutes !== undefined) entries.push(['campaign_minutes', updates.campaignMinutes]);
   if (updates.paused !== undefined) entries.push(['paused', updates.paused ? 1 : 0]);
+  if (updates.initiativeOrder !== undefined) entries.push(['initiative_order', JSON.stringify(updates.initiativeOrder)]);
+  if (updates.initiativeScores !== undefined) entries.push(['initiative_scores', JSON.stringify(updates.initiativeScores)]);
+  if (updates.virtualCombatants !== undefined) entries.push(['virtual_combatants', JSON.stringify(updates.virtualCombatants)]);
   if (entries.length === 0) return;
 
   await db.runAsync(

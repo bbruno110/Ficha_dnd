@@ -9,9 +9,10 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "build:android": "npm run clean:android-native && cd android && gradlew clean && gradlew assembleRelease",
+    "sync:android-version": "node ./scripts/sync-android-version.js",
+    "build:android": "npm run sync:android-version && npm run clean:android-native && cd android && gradlew clean && gradlew assembleRelease",
     "clean:android-native": "node ./scripts/clean-android-native-cache.js",
-    "build:android:debug": "npm run clean:android-native && cd android && gradlew clean && gradlew assembleDebug"
+    "build:android:debug": "npm run sync:android-version && npm run clean:android-native && cd android && gradlew clean && gradlew assembleDebug"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

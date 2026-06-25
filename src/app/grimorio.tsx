@@ -576,13 +576,20 @@ export default function GrimoireScreen() {
     );
   };
 
-  const renderMetric = (label: string, value: unknown, icon: keyof typeof Ionicons.glyphMap = 'ellipse-outline') => (
-    <View style={styles.metricBox}>
-      <View style={styles.metricIcon}>
+  const renderMetric = (
+    label: string,
+    value: unknown,
+    icon: keyof typeof Ionicons.glyphMap = 'ellipse-outline',
+    wide = false
+  ) => (
+    <View style={[styles.metricBox, wide && styles.metricBoxWide]}>
+      <View style={[styles.metricIcon, wide && styles.metricIconWide]}>
         <Ionicons name={icon} size={26} color="#65f3ff" />
       </View>
-      <Text style={styles.metricLabel}>{label}</Text>
-      <Text style={styles.metricValue} numberOfLines={2}>{compactText(value)}</Text>
+      <View style={[styles.metricTextWrap, wide && styles.metricTextWrapWide]}>
+        <Text style={[styles.metricLabel, wide && styles.metricTextWide]}>{label}</Text>
+        <Text style={[styles.metricValue, wide && styles.metricTextWide]} numberOfLines={2}>{compactText(value)}</Text>
+      </View>
     </View>
   );
 
@@ -613,6 +620,7 @@ export default function GrimoireScreen() {
   const renderSheetHero = (entry: CatalogEntry) => {
     const raw = entry.raw;
     const features = featureNames(raw.features).slice(0, 2);
+    const sectionIcon = SECTIONS.find(section => section.key === entry.section)?.icon || 'book-outline';
     const metaBySection: Record<SectionKey, string> = {
       spells: `${raw.category || 'Magia'}  •  ${raw.level || 'Nivel 1'}`,
       items: `${raw.category || 'Item'}  •  ${Number(raw.is_consumable) ? 'Consumivel' : 'Equipavel/uso livre'}`,
@@ -642,7 +650,7 @@ export default function GrimoireScreen() {
         <View style={styles.sheetHeroRow}>
           <View style={styles.sheetEmblem}>
             <View style={styles.sheetEmblemInner}>
-              <Ionicons name={activeSectionMeta.icon} size={34} color="#65f3ff" />
+              <Ionicons name={sectionIcon} size={28} color="#65f3ff" />
             </View>
           </View>
           <View style={styles.sheetHeroText}>
@@ -650,20 +658,11 @@ export default function GrimoireScreen() {
             <Text style={styles.sheetTitle} numberOfLines={3}>{entry.name}</Text>
             <Text style={styles.sheetMeta}>{metaBySection[entry.section]}</Text>
             {sublineBySection[entry.section] ? <Text style={styles.sheetSubline} numberOfLines={2}>{sublineBySection[entry.section]}</Text> : null}
-            <View style={styles.sheetSummaryBox}>
-              <Text style={styles.sheetSummaryLabel}>O que faz</Text>
-              <Text style={styles.sheetSummaryText}>{entry.description || 'Sem descricao cadastrada.'}</Text>
-            </View>
-            {features.length > 0 ? (
-              <View style={styles.sheetHeroChips}>
-                {features.map(feature => (
-                  <View key={feature} style={styles.visualChip}>
-                    <Text style={styles.visualChipText}>{feature}</Text>
-                  </View>
-                ))}
-              </View>
-            ) : null}
           </View>
+        </View>
+        <View style={styles.sheetSummaryBox}>
+          <Text style={styles.sheetSummaryLabel}>O que faz</Text>
+          <Text style={styles.sheetSummaryText}>{entry.description || 'Sem descricao cadastrada.'}</Text>
         </View>
       </LinearGradient>
     );
@@ -794,7 +793,7 @@ export default function GrimoireScreen() {
           <View style={styles.metricGrid}>
             {renderMetric('Classe', raw.class_name, 'shield-half-outline')}
             {renderMetric('Nivel requerido', raw.level_required, 'trending-up-outline')}
-            {renderMetric('Pericias extras', raw.bonus_skills || 0, 'school-outline')}
+            {renderMetric('Pericias extras', raw.bonus_skills || 0, 'school-outline', true)}
           </View>
           {renderFeatureCards('Habilidades da subclasse', featureNames(raw.features))}
         </View>
@@ -808,7 +807,7 @@ export default function GrimoireScreen() {
           <View style={styles.metricGrid}>
             {renderMetric('Destino', raw.target_name, 'person-outline')}
             {renderMetric('Tipo', raw.target_type, 'pricetag-outline')}
-            {renderMetric('Itens', items.length, 'cube-outline')}
+            {renderMetric('Itens', items.length, 'cube-outline', true)}
           </View>
           {renderItemRows('Itens do kit', raw.items)}
         </View>
@@ -840,7 +839,7 @@ export default function GrimoireScreen() {
     return (
       <Modal visible transparent animationType="slide" onRequestClose={() => setDetailEntry(null)}>
         <View style={styles.modalOverlay}>
-          <View style={styles.detailCard}>
+          <View style={[styles.detailCard, { marginTop: Math.max(insets.top + 6, 20) }]}>
             <ScrollView
               style={styles.detailBody}
               showsVerticalScrollIndicator={false}
@@ -863,15 +862,6 @@ export default function GrimoireScreen() {
                   ))}
                 </>
               )}
-
-              {renderSheetSectionTitle('Classificacoes', 'book-outline')}
-              <View style={styles.tagWrap}>
-                {detailEntry.tags.map(tag => (
-                  <View key={tag} style={styles.tagPillStrong}>
-                    <Text style={styles.tagTextStrong}>{tag}</Text>
-                  </View>
-                ))}
-              </View>
 
               <View style={styles.technicalCard}>
                 <View style={styles.technicalTitleWrap}>
@@ -1154,48 +1144,52 @@ const styles = StyleSheet.create({
   pagerButtonText: { color: '#00bfff', fontSize: 11, fontWeight: 'bold' },
   pageText: { color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: 'bold', minWidth: 76, textAlign: 'center' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.84)', justifyContent: 'flex-end' },
-  detailCard: { width: '100%', height: '98%', borderTopLeftRadius: 28, borderTopRightRadius: 28, overflow: 'hidden', backgroundColor: '#061a37', borderWidth: 1, borderColor: 'rgba(76,177,255,0.36)', borderBottomWidth: 0 },
+  detailCard: { flex: 1, width: '100%', borderTopLeftRadius: 24, borderTopRightRadius: 24, overflow: 'hidden', backgroundColor: '#061a37', borderWidth: 1, borderColor: 'rgba(76,177,255,0.3)', borderBottomWidth: 0 },
   detailHeader: { minHeight: 86, flexDirection: 'row', alignItems: 'center', gap: 10, padding: 14, backgroundColor: 'rgba(0,0,0,0.24)', borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.08)' },
   closeButton: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center', borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.08)' },
-  sheetHero: { margin: 6, marginBottom: 12, paddingHorizontal: 16, paddingTop: 26, paddingBottom: 16, minHeight: 236, borderRadius: 24, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(88,207,255,0.22)' },
-  sheetGrip: { position: 'absolute', top: 10, alignSelf: 'center', width: 58, height: 7, borderRadius: 99, backgroundColor: 'rgba(176,206,255,0.45)' },
-  sheetCloseButton: { position: 'absolute', top: 22, right: 16, zIndex: 4, width: 48, height: 48, alignItems: 'center', justifyContent: 'center', borderRadius: 999, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.16)' },
-  sheetHeroGlow: { position: 'absolute', right: -40, top: -40, width: 220, height: 220, borderRadius: 140, backgroundColor: 'rgba(0,191,255,0.08)' },
-  sheetHeroRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingRight: 42 },
-  sheetEmblem: { width: 88, height: 88, borderRadius: 44, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.26)', borderWidth: 2, borderColor: 'rgba(80,235,255,0.58)' },
-  sheetEmblemInner: { width: 66, height: 66, borderRadius: 33, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.055)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  sheetHero: { marginBottom: 10, paddingHorizontal: 16, paddingTop: 28, paddingBottom: 16, borderRadius: 20, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(88,207,255,0.2)' },
+  sheetGrip: { position: 'absolute', top: 9, alignSelf: 'center', width: 52, height: 5, borderRadius: 99, backgroundColor: 'rgba(176,206,255,0.42)' },
+  sheetCloseButton: { position: 'absolute', top: 18, right: 14, zIndex: 4, width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  sheetHeroGlow: { position: 'absolute', right: -55, top: -60, width: 210, height: 210, borderRadius: 140, backgroundColor: 'rgba(0,191,255,0.07)' },
+  sheetHeroRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingRight: 36 },
+  sheetEmblem: { width: 66, height: 66, borderRadius: 33, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.24)', borderWidth: 2, borderColor: 'rgba(80,235,255,0.52)' },
+  sheetEmblemInner: { width: 50, height: 50, borderRadius: 25, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.055)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.13)' },
   sheetHeroText: { flex: 1, minWidth: 0 },
   sheetEyebrow: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, marginBottom: 3, textTransform: 'uppercase' },
-  sheetTitle: { color: '#f7fbff', fontSize: 30, fontWeight: 'bold', letterSpacing: 0, lineHeight: 34 },
-  sheetMeta: { color: '#65d9ff', fontSize: 14, marginTop: 7, fontWeight: 'bold' },
-  sheetSubline: { color: 'rgba(255,255,255,0.68)', fontSize: 13, lineHeight: 19, marginTop: 8 },
-  sheetSummaryBox: { marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)' },
+  sheetTitle: { color: '#f7fbff', fontSize: 26, fontWeight: 'bold', letterSpacing: 0, lineHeight: 30 },
+  sheetMeta: { color: '#65d9ff', fontSize: 13, marginTop: 5, fontWeight: 'bold', lineHeight: 18 },
+  sheetSubline: { color: 'rgba(255,255,255,0.62)', fontSize: 12, lineHeight: 17, marginTop: 5 },
+  sheetSummaryBox: { marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)' },
   sheetSummaryLabel: { color: '#65f3ff', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 },
   sheetSummaryText: { color: 'rgba(255,255,255,0.86)', fontSize: 13, lineHeight: 19 },
-  sheetHeroChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
   detailTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   detailSub: { color: 'rgba(255,255,255,0.52)', fontSize: 12, marginTop: 4 },
   detailBody: { flex: 1 },
-  detailScroll: { paddingHorizontal: 12, paddingTop: 8 },
-  sheetSectionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 16, marginBottom: 10, paddingHorizontal: 2 },
-  detailSectionTitle: { color: 'rgba(222,239,255,0.78)', fontSize: 14, fontWeight: 'bold', letterSpacing: 2, textTransform: 'uppercase' },
+  detailScroll: { paddingHorizontal: 14, paddingTop: 10 },
+  sheetSectionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 18, marginBottom: 9, paddingHorizontal: 2 },
+  detailSectionTitle: { flexShrink: 1, color: 'rgba(222,239,255,0.8)', fontSize: 12, fontWeight: 'bold', letterSpacing: 1.2, textTransform: 'uppercase' },
   detailDescription: { color: 'rgba(255,255,255,0.76)', fontSize: 13, lineHeight: 20 },
   effectBox: { borderRadius: 12, padding: 11, marginBottom: 8, backgroundColor: 'rgba(0,250,154,0.08)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.2)' },
   effectText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
   effectSub: { color: 'rgba(255,255,255,0.48)', fontSize: 11, marginTop: 4 },
-  heroPanel: { marginTop: 2, borderRadius: 20, paddingHorizontal: 10, paddingBottom: 8 },
-  metricGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  metricBox: { width: '48%', minHeight: 112, padding: 11, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.045)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
-  metricIcon: { width: 44, height: 44, borderRadius: 16, alignItems: 'center', justifyContent: 'center', marginBottom: 12, backgroundColor: 'rgba(0,191,255,0.1)' },
-  metricLabel: { color: 'rgba(218,234,255,0.58)', fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 1, textAlign: 'center' },
-  metricValue: { color: '#fff', fontSize: 20, fontWeight: 'bold', marginTop: 8, lineHeight: 25, textAlign: 'center' },
+  heroPanel: { marginTop: 2, paddingHorizontal: 2, paddingBottom: 4 },
+  metricGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  metricBox: { width: '48.7%', minHeight: 98, padding: 10, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.045)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
+  metricBoxWide: { width: '100%', minHeight: 76, flexDirection: 'row', justifyContent: 'flex-start', paddingHorizontal: 14 },
+  metricIcon: { width: 38, height: 38, borderRadius: 13, alignItems: 'center', justifyContent: 'center', marginBottom: 8, backgroundColor: 'rgba(0,191,255,0.1)' },
+  metricIconWide: { marginBottom: 0, marginRight: 12 },
+  metricTextWrap: { alignItems: 'center', maxWidth: '100%' },
+  metricTextWrapWide: { flex: 1, alignItems: 'flex-start' },
+  metricTextWide: { textAlign: 'left' },
+  metricLabel: { color: 'rgba(218,234,255,0.58)', fontSize: 10, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 0.8, textAlign: 'center' },
+  metricValue: { color: '#fff', fontSize: 17, fontWeight: 'bold', marginTop: 5, lineHeight: 21, textAlign: 'center' },
   visualChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
   visualChip: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 10, backgroundColor: 'rgba(0,191,255,0.08)', borderWidth: 1, borderColor: 'rgba(0,214,255,0.38)' },
   visualChipText: { color: '#8de4ff', fontSize: 12, fontWeight: 'bold' },
-  featureGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  featureCard: { width: '48%', minHeight: 72, flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.052)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
-  featureIcon: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 14, backgroundColor: 'rgba(0,191,255,0.09)', borderWidth: 1, borderColor: 'rgba(0,214,255,0.28)' },
-  featureName: { flex: 1, color: '#eef7ff', fontSize: 13, fontWeight: 'bold', lineHeight: 18 },
+  featureGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  featureCard: { width: '48.7%', minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: 9, padding: 10, borderRadius: 13, backgroundColor: 'rgba(255,255,255,0.052)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
+  featureIcon: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center', borderRadius: 12, backgroundColor: 'rgba(0,191,255,0.09)', borderWidth: 1, borderColor: 'rgba(0,214,255,0.28)' },
+  featureName: { flex: 1, color: '#eef7ff', fontSize: 12, fontWeight: 'bold', lineHeight: 16 },
   statBoxGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   statBox: { width: '31%', minHeight: 64, alignItems: 'center', justifyContent: 'center', borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
   statBoxLabel: { color: 'rgba(255,255,255,0.68)', fontSize: 12, fontWeight: 'bold' },
@@ -1210,14 +1204,14 @@ const styles = StyleSheet.create({
   colorPreviewLarge: { width: 58, height: 58, borderRadius: 18, borderWidth: 2, borderColor: 'rgba(255,255,255,0.28)' },
   conditionHeroTitle: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   conditionHeroSub: { color: 'rgba(255,255,255,0.55)', fontSize: 12, marginTop: 4 },
-  technicalCard: { marginTop: 18, borderRadius: 16, padding: 12, backgroundColor: 'rgba(255,255,255,0.035)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
+  technicalCard: { marginTop: 20, borderRadius: 15, paddingHorizontal: 12, paddingTop: 13, paddingBottom: 4, backgroundColor: 'rgba(255,255,255,0.035)', borderWidth: 1, borderColor: 'rgba(94,180,255,0.18)' },
   technicalTitleWrap: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
   technicalLine: { flex: 1, height: 1, backgroundColor: 'rgba(255,255,255,0.16)' },
-  technicalTitle: { color: 'rgba(222,239,255,0.78)', fontSize: 14, fontWeight: 'bold', letterSpacing: 2, textTransform: 'uppercase' },
-  detailRow: { minHeight: 44, flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.055)' },
-  detailKeyWrap: { width: '50%', flexDirection: 'row', alignItems: 'flex-start', gap: 8, paddingRight: 4 },
-  detailKey: { flex: 1, color: 'rgba(220,236,255,0.55)', fontSize: 10, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 1, lineHeight: 15 },
-  detailValue: { flex: 1, color: 'rgba(255,255,255,0.84)', fontSize: 13, lineHeight: 18, paddingTop: 1 },
+  technicalTitle: { color: 'rgba(222,239,255,0.78)', fontSize: 12, fontWeight: 'bold', letterSpacing: 1.4, textTransform: 'uppercase' },
+  detailRow: { minHeight: 46, flexDirection: 'row', alignItems: 'flex-start', gap: 10, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.055)' },
+  detailKeyWrap: { width: '43%', flexDirection: 'row', alignItems: 'flex-start', gap: 7, paddingRight: 2 },
+  detailKey: { flex: 1, color: 'rgba(220,236,255,0.55)', fontSize: 9, fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: 0.8, lineHeight: 14 },
+  detailValue: { flex: 1, color: 'rgba(255,255,255,0.86)', fontSize: 13, lineHeight: 18, paddingTop: 0 },
   filterModalOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.78)' },
   filterModalCard: { width: '100%', maxHeight: '82%', paddingHorizontal: 14, paddingTop: 14, borderTopLeftRadius: 24, borderTopRightRadius: 24, backgroundColor: '#102b56', borderWidth: 1, borderBottomWidth: 0, borderColor: 'rgba(0,191,255,0.32)' },
   filterModalHeader: { minHeight: 48, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 },

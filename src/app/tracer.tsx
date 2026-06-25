@@ -1,11 +1,12 @@
 import { Ionicons } from '@expo/vector-icons';
+import Constants from 'expo-constants';
 import { cacheDirectory, documentDirectory, EncodingType, writeAsStringAsync } from 'expo-file-system/legacy';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useFocusEffect, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, FlatList, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, FlatList, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import {
   addTraceLog,
   clearTraceLogs,
@@ -19,6 +20,13 @@ import {
 } from '../network/traceRepository';
 
 const PAGE_SIZE = 100;
+const expoConfig = Constants.expoConfig as any;
+const TRACE_APP_INFO = {
+  version: String(Constants.nativeApplicationVersion || expoConfig?.version || 'dev'),
+  build: String(Constants.nativeBuildVersion || expoConfig?.android?.versionCode || 'local'),
+  platform: Platform.OS,
+  applicationId: String(expoConfig?.android?.package || expoConfig?.ios?.bundleIdentifier || ''),
+};
 const ACTION_FILTERS = [
   'Todos',
   'INSERT',
@@ -128,7 +136,7 @@ export default function TracerScreen() {
         maxRows: 10000,
       });
 
-      const txt = formatTraceLogsAsTxt(exportLogs);
+      const txt = formatTraceLogsAsTxt(exportLogs, new Date(), TRACE_APP_INFO);
       const safeDate = new Date().toISOString().replace(/[:.]/g, '-');
       const filename = `ficha-dnd-tracer-${safeDate}.txt`;
       const targetDir = documentDirectory || cacheDirectory;
@@ -149,7 +157,12 @@ export default function TracerScreen() {
         step: 'write_and_share_txt',
         entityTable: 'tracer',
         message: `Tracer exportado em TXT com ${exportLogs.length} registro(s).`,
-        metadata: { fileUri, filters: { query, actionFilter, tableFilter }, exportedRows: exportLogs.length },
+        metadata: {
+          fileUri,
+          app: TRACE_APP_INFO,
+          filters: { query, actionFilter, tableFilter },
+          exportedRows: exportLogs.length,
+        },
       });
 
       if (await Sharing.isAvailableAsync()) {

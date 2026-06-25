@@ -175,7 +175,7 @@ export default function EditCharacterScreen() {
             `SELECT id, name, status
              FROM lan_sessions
              WHERE linked_character_id = ?
-               AND status IN ('open', 'connected', 'paused')
+               AND status <> 'closed'
              ORDER BY COALESCE(last_connected_at, resumed_at, paused_at, opened_at, created_at) DESC
              LIMIT 1`,
             [Number(id)]

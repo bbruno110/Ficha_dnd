@@ -25,6 +25,13 @@ export type TraceSummary = {
   total: number;
 };
 
+export type TraceExportAppInfo = {
+  version: string;
+  build: string;
+  platform?: string | null;
+  applicationId?: string | null;
+};
+
 type TraceInput = {
   level?: TraceLogLevel;
   category?: string;
@@ -182,10 +189,20 @@ export async function getTraceExportLogs(
   });
 }
 
-export function formatTraceLogsAsTxt(logs: TraceLog[], generatedAt = new Date()) {
+export function formatTraceLogsAsTxt(
+  logs: TraceLog[],
+  generatedAt = new Date(),
+  appInfo?: TraceExportAppInfo
+) {
   const lines: string[] = [];
   lines.push('FICHA D&D - TRACER / DEBUG EXPORT');
   lines.push(`Gerado em: ${generatedAt.toLocaleString()}`);
+  if (appInfo) {
+    lines.push(`Versao do app: ${appInfo.version}`);
+    lines.push(`Build: ${appInfo.build}`);
+    if (appInfo.platform) lines.push(`Plataforma: ${appInfo.platform}`);
+    if (appInfo.applicationId) lines.push(`Pacote: ${appInfo.applicationId}`);
+  }
   lines.push(`Total exportado: ${logs.length}`);
   lines.push('='.repeat(90));
 

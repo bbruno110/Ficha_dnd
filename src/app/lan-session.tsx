@@ -21,7 +21,7 @@ import QRCode from 'react-native-qrcode-svg';
 import { useLanSession } from '../contexts/LanSessionContext';
 import { isTradeEventExpired } from '../contexts/lan/lanSessionHelpers';
 import { getLanSessionState } from '../network/lanRepository';
-import { LanOfficialEventMessage, LanSessionRecord } from '../types/lan';
+import { LanOfficialEventMessage, LanSessionRecord, LanVirtualCombatant } from '../types/lan';
 
 type CharacterOption = {
   id: number;
@@ -127,11 +127,29 @@ export default function LanSessionScreen() {
   const [tradeCoins, setTradeCoins] = useState({ gp: '', sp: '', cp: '' });
   const [initiativeOrder, setInitiativeOrder] = useState<string[]>([]);
   const [initiativeScores, setInitiativeScores] = useState<Record<string, string>>({});
-  const [collapsedMasterCards, setCollapsedMasterCards] = useState<Record<string, boolean>>({});
+  const [virtualCombatants, setVirtualCombatants] = useState<LanVirtualCombatant[]>([]);
+  const [virtualHpAmounts, setVirtualHpAmounts] = useState<Record<string, string>>({});
+  const [initiativeActorModalVisible, setInitiativeActorModalVisible] = useState(false);
+  const [newActorName, setNewActorName] = useState('');
+  const [newActorInitiative, setNewActorInitiative] = useState('10');
+  const [newActorHp, setNewActorHp] = useState('10');
+  const [collapsedMasterCards, setCollapsedMasterCards] = useState<Record<string, boolean>>({
+    'global-actions': true,
+  });
 
   const loadLocalData = useCallback(async () => {
     const chars = await db.getAllAsync<CharacterOption>(
-      `SELECT id, name, race, class, level FROM characters ORDER BY created_at DESC`
+      `SELECT c.id, c.name, c.race, c.class, c.level
+       FROM characters c
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM lan_sessions s
+         WHERE s.linked_character_id = c.id
+           AND s.status <> 'closed'
+           AND (? IS NULL OR s.id <> ?)
+       )
+       ORDER BY c.created_at DESC`,
+      [activeSession?.id || null, activeSession?.id || null]
     );
     setCharacters(chars);
     const items = await db.getAllAsync<ItemOption>(
@@ -142,7 +160,7 @@ export default function LanSessionScreen() {
       `SELECT id, name, description, color FROM condition_effects ORDER BY name ASC`
     );
     setEffectCatalog(effects.map(effect => ({ ...effect, color: effect.color || '#F4A84D' })));
-  }, [db]);
+  }, [activeSession?.id, db]);
 
   const loadHistory = useCallback(
     async (page = 0, pageSize = historyPageSize) => {
@@ -158,6 +176,11 @@ export default function LanSessionScreen() {
     const state = await getLanSessionState(db, activeSession.id);
     setCampaignTurn(state.turn);
     setCampaignMinutes(state.campaignMinutes);
+    setInitiativeOrder(state.initiativeOrder || []);
+    setInitiativeScores(Object.fromEntries(
+      Object.entries(state.initiativeScores || {}).map(([key, value]) => [key, String(value)])
+    ));
+    setVirtualCombatants(state.virtualCombatants || []);
   }, [activeSession, db]);
 
   const refreshSessionViews = useCallback(
@@ -232,7 +255,7 @@ export default function LanSessionScreen() {
     Number(player.character_id) === selectedTargetCharacterId &&
     (!selectedTargetDeviceId || player.device_id === selectedTargetDeviceId)
   );
-  const visibleSavedSessions = savedSessions.filter(session => session.status !== 'inactive' && session.status !== 'closed');
+  const visibleSavedSessions = savedSessions.filter(session => session.status !== 'closed');
 
   const safeJson = (value: unknown, fallback: any = null) => {
     if (value === null || value === undefined || value === '') return fallback;
@@ -323,7 +346,7 @@ export default function LanSessionScreen() {
     return String(base);
   };
   const effectColor = (effect: any, fallback = '#ffd166') =>
-    /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(effect?.color || '')) ? String(effect.color) : fallback;
+    /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(String(effect?.color || '')) ? String(effect.color) : fallback;
 
   const getExpanded = (player: typeof players[number]) => expandedCards[playerActionKey(player)] ?? false;
   const toggleExpanded = (player: typeof players[number]) => {
@@ -364,9 +387,11 @@ export default function LanSessionScreen() {
   const onlyNumberText = (value: string) => value.replace(/[^\d-]/g, '').replace(/(?!^)-/g, '');
 
   useEffect(() => {
-    const activeKeys = players
+    const playerKeys = players
       .filter(player => player.character_id)
       .map(player => `${player.device_id}_${player.character_id || 'none'}`);
+    const virtualKeys = virtualCombatants.map(combatant => `virtual:${combatant.id}`);
+    const activeKeys = [...playerKeys, ...virtualKeys];
     setInitiativeOrder(prev => [
       ...prev.filter(key => activeKeys.includes(key)),
       ...activeKeys.filter(key => !prev.includes(key)),
@@ -378,7 +403,7 @@ export default function LanSessionScreen() {
       });
       return next;
     });
-  }, [players]);
+  }, [players, virtualCombatants]);
 
   const getPlayerDisplayName = (player: typeof players[number]) => {
     const snapshot = playerSnapshot(player);
@@ -390,48 +415,142 @@ export default function LanSessionScreen() {
     return Math.floor((statValue(snapshot.stats, 'DES') - 10) / 2);
   };
 
-  const initiativeScoreFor = (player: typeof players[number]) => {
-    const key = playerActionKey(player);
-    const manual = initiativeScores[key];
+  type InitiativeEntry =
+    | { key: string; kind: 'player'; player: typeof players[number] }
+    | { key: string; kind: 'virtual'; combatant: LanVirtualCombatant };
+
+  const allInitiativeEntries = (): InitiativeEntry[] => [
+    ...targetPlayers.map(player => ({ key: playerActionKey(player), kind: 'player' as const, player })),
+    ...virtualCombatants.map(combatant => ({ key: `virtual:${combatant.id}`, kind: 'virtual' as const, combatant })),
+  ];
+
+  const orderedInitiativeEntries = () => {
+    const entries = allInitiativeEntries();
+    const byKey = new Map(entries.map(entry => [entry.key, entry]));
+    const ordered = initiativeOrder.map(key => byKey.get(key)).filter(Boolean) as InitiativeEntry[];
+    const orderedKeys = new Set(ordered.map(entry => entry.key));
+    return [...ordered, ...entries.filter(entry => !orderedKeys.has(entry.key))];
+  };
+
+  const initiativeEntryScore = (entry: InitiativeEntry) => {
+    const manual = initiativeScores[entry.key];
     if (manual !== undefined && manual !== '') return numericValue(manual, 0);
-    return initiativeDexMod(player);
+    return entry.kind === 'virtual' ? entry.combatant.initiative : initiativeDexMod(entry.player);
   };
 
-  const orderedInitiativePlayers = () => {
-    const ordered = initiativeOrder
-      .map(key => targetPlayers.find(player => playerActionKey(player) === key))
-      .filter(Boolean) as typeof players;
-    const orderedKeys = new Set(ordered.map(playerActionKey));
-    return [...ordered, ...targetPlayers.filter(player => !orderedKeys.has(playerActionKey(player)))];
-  };
+  const initiativeEntryName = (entry: InitiativeEntry) =>
+    entry.kind === 'virtual' ? entry.combatant.name : getPlayerDisplayName(entry.player);
 
-  const moveInitiativePlayer = (key: string, direction: -1 | 1) => {
-    setInitiativeOrder(prev => {
-      const activeKeys = targetPlayers.map(playerActionKey);
-      const list = [
-        ...prev.filter(item => activeKeys.includes(item)),
-        ...activeKeys.filter(item => !prev.includes(item)),
-      ];
-      const index = list.indexOf(key);
-      const nextIndex = index + direction;
-      if (index < 0 || nextIndex < 0 || nextIndex >= list.length) return list;
-      const next = [...list];
-      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
-      return next;
+  const persistInitiative = async (
+    order = initiativeOrder,
+    scores = initiativeScores,
+    combatants = virtualCombatants
+  ) => {
+    if (!activeSession || activeSession.role !== 'master') return;
+    await sendLanCommand('MASTER_UPDATE_INITIATIVE', {
+      initiativeOrder: order,
+      initiativeScores: Object.fromEntries(
+        Object.entries(scores).map(([key, value]) => [key, numericValue(value, 0)])
+      ),
+      virtualCombatants: combatants,
     });
   };
 
+  const moveInitiativeEntry = (key: string, direction: -1 | 1) => {
+    const list = orderedInitiativeEntries().map(entry => entry.key);
+    const index = list.indexOf(key);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= list.length) return;
+    const next = [...list];
+    [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+    setInitiativeOrder(next);
+    void persistInitiative(next);
+  };
+
   const sortInitiativeByScore = () => {
-    setInitiativeOrder(
-      [...targetPlayers]
-        .sort((a, b) => initiativeScoreFor(b) - initiativeScoreFor(a) || getPlayerDisplayName(a).localeCompare(getPlayerDisplayName(b)))
-        .map(playerActionKey)
-    );
+    const next = allInitiativeEntries()
+      .sort((a, b) => initiativeEntryScore(b) - initiativeEntryScore(a) || initiativeEntryName(a).localeCompare(initiativeEntryName(b)))
+      .map(entry => entry.key);
+    setInitiativeOrder(next);
+    void persistInitiative(next);
   };
 
   const clearInitiative = () => {
-    setInitiativeScores({});
-    setInitiativeOrder(targetPlayers.map(playerActionKey));
+    const nextScores = Object.fromEntries(
+      virtualCombatants.map(combatant => [`virtual:${combatant.id}`, String(combatant.initiative)])
+    );
+    const nextOrder = allInitiativeEntries().map(entry => entry.key);
+    setInitiativeScores(nextScores);
+    setInitiativeOrder(nextOrder);
+    void persistInitiative(nextOrder, nextScores);
+  };
+
+  const commitInitiativeScore = (entry: InitiativeEntry) => {
+    const score = numericValue(initiativeScores[entry.key] || '', entry.kind === 'virtual' ? entry.combatant.initiative : initiativeDexMod(entry.player));
+    const nextScores = { ...initiativeScores, [entry.key]: String(score) };
+    const nextCombatants = entry.kind === 'virtual'
+      ? virtualCombatants.map(combatant => combatant.id === entry.combatant.id ? { ...combatant, initiative: score } : combatant)
+      : virtualCombatants;
+    setInitiativeScores(nextScores);
+    if (entry.kind === 'virtual') setVirtualCombatants(nextCombatants);
+    void persistInitiative(initiativeOrder, nextScores, nextCombatants);
+  };
+
+  const addVirtualCombatant = () => {
+    const name = newActorName.trim() || 'Monstro';
+    const hpMax = Math.max(1, numericValue(newActorHp, 1));
+    const initiative = numericValue(newActorInitiative, 0);
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const combatant: LanVirtualCombatant = {
+      id,
+      name,
+      initiative,
+      hpCurrent: hpMax,
+      hpMax,
+      avatarSeed: name,
+    };
+    const key = `virtual:${id}`;
+    const nextCombatants = [...virtualCombatants, combatant];
+    const nextOrder = [...orderedInitiativeEntries().map(entry => entry.key), key];
+    const nextScores = { ...initiativeScores, [key]: String(initiative) };
+    setVirtualCombatants(nextCombatants);
+    setInitiativeOrder(nextOrder);
+    setInitiativeScores(nextScores);
+    setVirtualHpAmounts(prev => ({ ...prev, [id]: '1' }));
+    setInitiativeActorModalVisible(false);
+    setNewActorName('');
+    setNewActorInitiative('10');
+    setNewActorHp('10');
+    void persistInitiative(nextOrder, nextScores, nextCombatants);
+  };
+
+  const removeVirtualCombatant = (id: string) => {
+    const key = `virtual:${id}`;
+    const nextCombatants = virtualCombatants.filter(combatant => combatant.id !== id);
+    const nextOrder = initiativeOrder.filter(item => item !== key);
+    const nextScores = { ...initiativeScores };
+    delete nextScores[key];
+    setVirtualCombatants(nextCombatants);
+    setInitiativeOrder(nextOrder);
+    setInitiativeScores(nextScores);
+    void persistInitiative(nextOrder, nextScores, nextCombatants);
+  };
+
+  const adjustVirtualCombatantHp = (id: string, mode: 'damage' | 'heal') => {
+    const amount = Math.max(0, numericValue(virtualHpAmounts[id] || '1', 1));
+    if (amount <= 0) return;
+    const current = virtualCombatants.find(combatant => combatant.id === id);
+    if (!current) return;
+    const hpCurrent = mode === 'heal'
+      ? Math.min(current.hpMax, current.hpCurrent + amount)
+      : Math.max(0, current.hpCurrent - amount);
+    if (hpCurrent <= 0) {
+      removeVirtualCombatant(id);
+      return;
+    }
+    const nextCombatants = virtualCombatants.map(combatant => combatant.id === id ? { ...combatant, hpCurrent } : combatant);
+    setVirtualCombatants(nextCombatants);
+    void persistInitiative(initiativeOrder, initiativeScores, nextCombatants);
   };
 
   const isMasterCardCollapsed = (key: string) => Boolean(collapsedMasterCards[key]);
@@ -474,13 +593,18 @@ export default function LanSessionScreen() {
   };
 
   const handleActiveCharacterChange = async (characterId: number | null) => {
-    setSelectedCharacterId(characterId);
-    if (activeSession) {
-      await linkCharacterToActiveSession(characterId);
-      if (activeSession.role === 'player' && characterId) {
-        await broadcastCharacter(characterId, 'character-linked');
-        router.replace(`/sheet?id=${characterId}`);
+    try {
+      setSelectedCharacterId(characterId);
+      if (activeSession) {
+        await linkCharacterToActiveSession(characterId);
+        if (activeSession.role === 'player' && characterId) {
+          await broadcastCharacter(characterId, 'character-linked');
+          router.replace(`/sheet?id=${characterId}`);
+        }
       }
+    } catch (error) {
+      setSelectedCharacterId(activeSession?.linked_character_id || null);
+      Alert.alert('Ficha indisponivel', error instanceof Error ? error.message : 'Esta ficha pertence a outra sessao.');
     }
   };
 
@@ -1210,6 +1334,12 @@ export default function LanSessionScreen() {
           <Ionicons name={isPaused ? 'play-outline' : 'pause-outline'} size={18} color="#00bfff" />
           <Text style={styles.secondaryButtonText}>{isPaused ? 'Retomar' : 'Pausar'}</Text>
         </TouchableOpacity>
+        {isPaused && (
+          <TouchableOpacity style={styles.secondaryButton} onPress={closeActiveSession}>
+            <Ionicons name="swap-horizontal-outline" size={18} color="#00bfff" />
+            <Text style={styles.secondaryButtonText}>Trocar de mesa</Text>
+          </TouchableOpacity>
+        )}
         <TouchableOpacity style={styles.dangerButton} onPress={endActiveSession}>
           <Ionicons name="close-circle-outline" size={18} color="#ff6666" />
           <Text style={styles.dangerButtonText}>Encerrar</Text>
@@ -1255,8 +1385,9 @@ export default function LanSessionScreen() {
   };
 
   const renderInitiativeBoard = () => {
-    const orderedPlayers = orderedInitiativePlayers();
+    const orderedEntries = orderedInitiativeEntries();
     const collapsed = isMasterCardCollapsed('initiative');
+    const combatantCount = targetPlayers.length + virtualCombatants.length;
 
     return (
       <View style={styles.initiativePanel}>
@@ -1264,18 +1395,18 @@ export default function LanSessionScreen() {
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={styles.coinApplyLabel}>INICIATIVA</Text>
             <Text style={styles.mutedSmallText}>
-              {targetPlayers.length > 0 ? `${targetPlayers.length} ficha(s) na ordem de combate.` : 'Vincule fichas para montar a ordem.'}
+              {combatantCount > 0 ? `${combatantCount} combatente(s) na ordem.` : 'Adicione fichas ou criaturas ao combate.'}
             </Text>
           </View>
           <View style={styles.initiativeHeaderActions}>
             {!collapsed && (
-            <TouchableOpacity style={styles.initiativeMiniButton} onPress={sortInitiativeByScore} disabled={targetPlayers.length === 0}>
+            <TouchableOpacity style={styles.initiativeMiniButton} onPress={sortInitiativeByScore} disabled={combatantCount === 0}>
               <Ionicons name="swap-vertical-outline" size={14} color="#00bfff" />
               <Text style={styles.initiativeMiniButtonText}>Ordenar</Text>
             </TouchableOpacity>
             )}
             {!collapsed && (
-            <TouchableOpacity style={styles.initiativeMiniButton} onPress={clearInitiative} disabled={targetPlayers.length === 0}>
+            <TouchableOpacity style={styles.initiativeMiniButton} onPress={clearInitiative} disabled={combatantCount === 0}>
               <Ionicons name="refresh-outline" size={14} color="#00bfff" />
             </TouchableOpacity>
             )}
@@ -1285,48 +1416,134 @@ export default function LanSessionScreen() {
           </View>
         </View>
 
-        {!collapsed && (orderedPlayers.length === 0 ? (
-          <Text style={styles.emptyText}>Nenhum jogador com ficha vinculada para iniciativa.</Text>
+        {!collapsed && (
+          <TouchableOpacity style={styles.addVirtualCombatantButton} onPress={() => setInitiativeActorModalVisible(true)}>
+            <Ionicons name="add-circle-outline" size={18} color="#00fa9a" />
+            <Text style={styles.addVirtualCombatantText}>Adicionar criatura à iniciativa</Text>
+          </TouchableOpacity>
+        )}
+
+        {!collapsed && (orderedEntries.length === 0 ? (
+          <Text style={styles.emptyText}>Nenhum combatente. Adicione uma criatura ou aguarde as fichas dos jogadores.</Text>
         ) : (
           <View style={styles.initiativeList}>
-            {orderedPlayers.map((player, index) => {
-              const key = playerActionKey(player);
-              const snapshot = playerSnapshot(player);
-              const displayName = getPlayerDisplayName(player);
-              const dexMod = initiativeDexMod(player);
-              const avatarUri = playerAvatarSource(snapshot, displayName);
+            {orderedEntries.map((entry, index) => {
+              const key = entry.key;
+              const isVirtual = entry.kind === 'virtual';
+              const snapshot = entry.kind === 'player' ? playerSnapshot(entry.player) : null;
+              const displayName = initiativeEntryName(entry);
+              const dexMod = entry.kind === 'player' ? initiativeDexMod(entry.player) : entry.combatant.initiative;
+              const avatarUri = snapshot ? playerAvatarSource(snapshot, displayName) : '';
 
               return (
-                <View key={key} style={styles.initiativeRow}>
-                  <Text style={styles.initiativeRank}>{index + 1}</Text>
-                  <Image source={{ uri: avatarUri }} style={styles.initiativeAvatar} />
-                  <View style={styles.initiativeInfo}>
-                    <Text style={styles.initiativeName} numberOfLines={1}>{displayName}</Text>
-                    <Text style={styles.initiativeSub} numberOfLines={1}>DES {statValue(snapshot.stats, 'DES')} ({dexMod >= 0 ? `+${dexMod}` : dexMod})</Text>
+                <View key={key} style={[styles.initiativeEntryCard, isVirtual && styles.initiativeVirtualCard]}>
+                  <View style={styles.initiativeRow}>
+                    <Text style={styles.initiativeRank}>{index + 1}</Text>
+                    {entry.kind === 'player' ? (
+                      <Image source={{ uri: avatarUri }} style={styles.initiativeAvatar} />
+                    ) : (
+                      <View style={[styles.initiativeAvatar, styles.virtualAvatar]}>
+                        <Ionicons name="skull-outline" size={22} color="#ff9f68" />
+                      </View>
+                    )}
+                    <View style={styles.initiativeInfo}>
+                      <Text style={styles.initiativeName} numberOfLines={1}>{displayName}</Text>
+                      <Text style={styles.initiativeSub} numberOfLines={1}>
+                        {entry.kind === 'player'
+                          ? `DES ${statValue(snapshot?.stats, 'DES')} (${dexMod >= 0 ? `+${dexMod}` : dexMod})`
+                          : `${entry.combatant.hpCurrent}/${entry.combatant.hpMax} PV`}
+                      </Text>
+                    </View>
+                    <TextInput
+                      style={[styles.input, styles.initiativeInput]}
+                      value={initiativeScores[key] ?? ''}
+                      onChangeText={value => setInitiativeScores(prev => ({ ...prev, [key]: onlyNumberText(value) }))}
+                      onBlur={() => commitInitiativeScore(entry)}
+                      keyboardType="numeric"
+                      placeholder={dexMod >= 0 ? `+${dexMod}` : String(dexMod)}
+                      placeholderTextColor="rgba(255,255,255,0.35)"
+                      selectTextOnFocus
+                      textAlign="center"
+                    />
+                    <View style={styles.initiativeMoveColumn}>
+                      <TouchableOpacity style={styles.initiativeMoveButton} onPress={() => moveInitiativeEntry(key, -1)} disabled={index === 0}>
+                        <Ionicons name="chevron-up" size={16} color={index === 0 ? 'rgba(255,255,255,0.25)' : '#00bfff'} />
+                      </TouchableOpacity>
+                      <TouchableOpacity style={styles.initiativeMoveButton} onPress={() => moveInitiativeEntry(key, 1)} disabled={index === orderedEntries.length - 1}>
+                        <Ionicons name="chevron-down" size={16} color={index === orderedEntries.length - 1 ? 'rgba(255,255,255,0.25)' : '#00bfff'} />
+                      </TouchableOpacity>
+                    </View>
                   </View>
-                  <TextInput
-                    style={[styles.input, styles.initiativeInput]}
-                    value={initiativeScores[key] ?? ''}
-                    onChangeText={value => setInitiativeScores(prev => ({ ...prev, [key]: onlyNumberText(value) }))}
-                    keyboardType="numeric"
-                    placeholder={dexMod >= 0 ? `+${dexMod}` : String(dexMod)}
-                    placeholderTextColor="rgba(255,255,255,0.35)"
-                    selectTextOnFocus
-                    textAlign="center"
-                  />
-                  <View style={styles.initiativeMoveColumn}>
-                    <TouchableOpacity style={styles.initiativeMoveButton} onPress={() => moveInitiativePlayer(key, -1)} disabled={index === 0}>
-                      <Ionicons name="chevron-up" size={16} color={index === 0 ? 'rgba(255,255,255,0.25)' : '#00bfff'} />
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.initiativeMoveButton} onPress={() => moveInitiativePlayer(key, 1)} disabled={index === orderedPlayers.length - 1}>
-                      <Ionicons name="chevron-down" size={16} color={index === orderedPlayers.length - 1 ? 'rgba(255,255,255,0.25)' : '#00bfff'} />
-                    </TouchableOpacity>
-                  </View>
+                  {entry.kind === 'virtual' && (
+                    <View style={styles.virtualHpControls}>
+                      <TextInput
+                        style={[styles.input, styles.virtualHpInput]}
+                        value={virtualHpAmounts[entry.combatant.id] ?? '1'}
+                        onChangeText={value => setVirtualHpAmounts(prev => ({ ...prev, [entry.combatant.id]: onlyNumberText(value) }))}
+                        keyboardType="numeric"
+                        selectTextOnFocus
+                        textAlign="center"
+                      />
+                      <TouchableOpacity style={styles.virtualDamageButton} onPress={() => adjustVirtualCombatantHp(entry.combatant.id, 'damage')}>
+                        <Ionicons name="flash-outline" size={16} color="#ff7b7b" />
+                        <Text style={styles.virtualDamageText}>Dano</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity style={styles.virtualHealButton} onPress={() => adjustVirtualCombatantHp(entry.combatant.id, 'heal')}>
+                        <Ionicons name="medkit-outline" size={16} color="#00fa9a" />
+                        <Text style={styles.virtualHealText}>Cura</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity style={styles.virtualRemoveButton} onPress={() => removeVirtualCombatant(entry.combatant.id)}>
+                        <Ionicons name="trash-outline" size={17} color="#ff6666" />
+                      </TouchableOpacity>
+                    </View>
+                  )}
                 </View>
               );
             })}
           </View>
         ))}
+      </View>
+    );
+  };
+
+  const renderPlayerInitiativeBoard = () => {
+    if (!activeSession || activeSession.role !== 'player') return null;
+    const orderedEntries = orderedInitiativeEntries();
+    if (orderedEntries.length === 0) return null;
+
+    return (
+      <View style={styles.playerInitiativePanel}>
+        <View style={styles.playerInitiativeHeader}>
+          <Ionicons name="list-outline" size={18} color="#00fa9a" />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.coinApplyLabel}>ORDEM DE COMBATE</Text>
+            <Text style={styles.mutedSmallText}>Atualizada pelo mestre em tempo real.</Text>
+          </View>
+        </View>
+        <View style={styles.playerInitiativeList}>
+          {orderedEntries.map((entry, index) => (
+            <View key={entry.key} style={[styles.playerInitiativeRow, entry.kind === 'virtual' && styles.initiativeVirtualCard]}>
+              <Text style={styles.initiativeRank}>{index + 1}</Text>
+              <View style={[styles.playerInitiativeAvatar, entry.kind === 'virtual' && styles.virtualAvatar]}>
+                <Ionicons
+                  name={entry.kind === 'virtual' ? 'skull-outline' : 'person-outline'}
+                  size={18}
+                  color={entry.kind === 'virtual' ? '#ff9f68' : '#65d9ff'}
+                />
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.initiativeName} numberOfLines={1}>{initiativeEntryName(entry)}</Text>
+                <Text style={styles.initiativeSub}>
+                  {entry.kind === 'virtual' ? `${entry.combatant.hpCurrent}/${entry.combatant.hpMax} PV` : 'Personagem'}
+                </Text>
+              </View>
+              <View style={styles.playerInitiativeScore}>
+                <Text style={styles.playerInitiativeScoreLabel}>INI</Text>
+                <Text style={styles.playerInitiativeScoreValue}>{initiativeEntryScore(entry)}</Text>
+              </View>
+            </View>
+          ))}
+        </View>
       </View>
     );
   };
@@ -1421,8 +1638,38 @@ export default function LanSessionScreen() {
             </TouchableOpacity>
           </View>
 
-          {renderInitiativeBoard()}
+          <View style={styles.combatToolsGroup}>
+            <TouchableOpacity style={styles.combatToolsHeader} onPress={() => toggleMasterCardCollapsed('combat-tools')}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.coinApplyLabel}>COMBATE E ACOES GLOBAIS</Text>
+                <Text style={styles.mutedSmallText}>Iniciativa, XP, vida e moedas.</Text>
+              </View>
+              <Ionicons
+                name={isMasterCardCollapsed('combat-tools') ? 'chevron-down-outline' : 'chevron-up-outline'}
+                size={18}
+                color="#00bfff"
+              />
+            </TouchableOpacity>
 
+            {!isMasterCardCollapsed('combat-tools') && (
+              <>
+                {renderInitiativeBoard()}
+
+                <View style={styles.globalActionsGroup}>
+                  <TouchableOpacity style={styles.globalActionsHeader} onPress={() => toggleMasterCardCollapsed('global-actions')}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.coinApplyLabel}>ACOES GLOBAIS</Text>
+                      <Text style={styles.mutedSmallText}>Minimiza XP, vida e moedas de uma vez.</Text>
+                    </View>
+                    <Ionicons
+                      name={isMasterCardCollapsed('global-actions') ? 'chevron-down-outline' : 'chevron-up-outline'}
+                      size={18}
+                      color="#00bfff"
+                    />
+                  </TouchableOpacity>
+
+                  {!isMasterCardCollapsed('global-actions') && (
+                    <View style={styles.globalCardsList}>
           {renderMasterCollapsibleCard('global-xp', 'XP GLOBAL', targetPlayers.length > 0 ? `Divide entre ${targetPlayers.length} jogador(es).` : 'Sem jogadores vinculados.', (
             <>
             <View style={styles.compactInputRow}>
@@ -1505,6 +1752,12 @@ export default function LanSessionScreen() {
             </TouchableOpacity>
             </>
           ))}
+                    </View>
+                  )}
+                </View>
+              </>
+            )}
+          </View>
         </View>
 
         {players.length === 0 ? (
@@ -2376,6 +2629,7 @@ export default function LanSessionScreen() {
           )}
           {!activeSession.linked_character_id && renderPlayerCharacterGate()}
 
+          {renderPlayerInitiativeBoard()}
           {renderHistory()}
           {lastNotice && <Text style={styles.noticeText}>{lastNotice}</Text>}
           {lastError && <Text style={styles.errorText}>{lastError}</Text>}
@@ -2477,8 +2731,74 @@ export default function LanSessionScreen() {
 
         {renderSessionControls()}
       </View>
-    );
+      );
   };
+
+  const renderInitiativeActorModal = () => (
+    <Modal
+      visible={initiativeActorModalVisible}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setInitiativeActorModalVisible(false)}
+    >
+      <Pressable style={styles.modalOverlay} onPress={() => setInitiativeActorModalVisible(false)}>
+        <Pressable style={styles.initiativeActorModal} onPress={event => event.stopPropagation()}>
+          <View style={styles.initiativeActorModalHeader}>
+            <View style={styles.virtualAvatarLarge}>
+              <Ionicons name="skull-outline" size={28} color="#ff9f68" />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.masterModalTitle}>Adicionar criatura</Text>
+              <Text style={styles.modalHint}>Um combatente rápido, sem criar uma ficha completa.</Text>
+            </View>
+            <TouchableOpacity style={styles.modalIconButton} onPress={() => setInitiativeActorModalVisible(false)}>
+              <Ionicons name="close" size={20} color="#fff" />
+            </TouchableOpacity>
+          </View>
+
+          <Text style={styles.label}>NOME / IDENTIFICACAO</Text>
+          <TextInput
+            style={styles.input}
+            value={newActorName}
+            onChangeText={setNewActorName}
+            placeholder="Ex: Goblin 1"
+            placeholderTextColor="rgba(255,255,255,0.35)"
+            autoFocus
+          />
+
+          <View style={styles.initiativeActorFieldRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.label}>INICIATIVA</Text>
+              <TextInput
+                style={styles.input}
+                value={newActorInitiative}
+                onChangeText={value => setNewActorInitiative(onlyNumberText(value))}
+                keyboardType="numeric"
+                selectTextOnFocus
+                textAlign="center"
+              />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.label}>VIDA MAXIMA</Text>
+              <TextInput
+                style={styles.input}
+                value={newActorHp}
+                onChangeText={value => setNewActorHp(onlyNumberText(value))}
+                keyboardType="numeric"
+                selectTextOnFocus
+                textAlign="center"
+              />
+            </View>
+          </View>
+
+          <TouchableOpacity style={styles.primaryButton} onPress={addVirtualCombatant}>
+            <Ionicons name="add-circle-outline" size={20} color="#02112b" />
+            <Text style={styles.primaryButtonText}>ADICIONAR À INICIATIVA</Text>
+          </TouchableOpacity>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
 
   const renderAdminMenu = () => {
     const hasRunningSession = activeSession && activeSession.status !== 'inactive' && activeSession.status !== 'closed';
@@ -2589,6 +2909,7 @@ export default function LanSessionScreen() {
       </KeyboardAvoidingView>
       {renderMasterModal()}
       {renderTradeModal()}
+      {renderInitiativeActorModal()}
     </LinearGradient>
   );
 }
@@ -2761,6 +3082,11 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.12)',
   },
   sessionActionText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+  combatToolsGroup: { gap: 10, marginTop: 2 },
+  combatToolsHeader: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 4, borderBottomWidth: 1, borderBottomColor: 'rgba(0,191,255,0.15)' },
+  globalActionsGroup: { gap: 8 },
+  globalActionsHeader: { minHeight: 42, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 4 },
+  globalCardsList: { gap: 10 },
   initiativePanel: {
     gap: 10,
     borderRadius: 12,
@@ -2784,20 +3110,21 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(0,191,255,0.22)',
   },
   initiativeMiniButtonText: { color: '#00bfff', fontSize: 10, fontWeight: 'bold' },
+  addVirtualCombatantButton: { minHeight: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, borderRadius: 10, backgroundColor: 'rgba(0,250,154,0.07)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.23)' },
+  addVirtualCombatantText: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold' },
   initiativeList: { gap: 8 },
+  initiativeEntryCard: { borderRadius: 12, overflow: 'hidden', backgroundColor: 'rgba(255,255,255,0.04)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)' },
+  initiativeVirtualCard: { borderColor: 'rgba(255,159,104,0.3)', backgroundColor: 'rgba(255,159,104,0.045)' },
   initiativeRow: {
     minHeight: 58,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    borderRadius: 12,
     padding: 8,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
   },
   initiativeRank: { width: 20, color: '#00fa9a', fontSize: 13, fontWeight: 'bold', textAlign: 'center' },
   initiativeAvatar: { width: 38, height: 38, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.25)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.25)' },
+  virtualAvatar: { alignItems: 'center', justifyContent: 'center', borderColor: 'rgba(255,159,104,0.4)', backgroundColor: 'rgba(255,159,104,0.1)' },
   initiativeInfo: { flex: 1, minWidth: 0 },
   initiativeName: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
   initiativeSub: { color: 'rgba(255,255,255,0.48)', fontSize: 10, marginTop: 3 },
@@ -2813,6 +3140,21 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.16)',
   },
+  virtualHpControls: { minHeight: 48, flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 7, paddingHorizontal: 10, paddingTop: 8, paddingBottom: 10, borderTopWidth: 1, borderTopColor: 'rgba(255,159,104,0.14)' },
+  virtualHpInput: { width: 54, minHeight: 36, paddingHorizontal: 5, paddingVertical: 6, fontSize: 13 },
+  virtualDamageButton: { minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, borderRadius: 9, backgroundColor: 'rgba(255,102,102,0.08)', borderWidth: 1, borderColor: 'rgba(255,102,102,0.24)' },
+  virtualDamageText: { color: '#ff7b7b', fontSize: 10, fontWeight: 'bold' },
+  virtualHealButton: { minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, borderRadius: 9, backgroundColor: 'rgba(0,250,154,0.07)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.22)' },
+  virtualHealText: { color: '#00fa9a', fontSize: 10, fontWeight: 'bold' },
+  virtualRemoveButton: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: 'rgba(255,102,102,0.07)', borderWidth: 1, borderColor: 'rgba(255,102,102,0.18)' },
+  playerInitiativePanel: { gap: 10, marginTop: 14, borderRadius: 14, padding: 12, backgroundColor: 'rgba(0,0,0,0.2)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.18)' },
+  playerInitiativeHeader: { flexDirection: 'row', alignItems: 'center', gap: 9 },
+  playerInitiativeList: { gap: 7 },
+  playerInitiativeRow: { minHeight: 54, flexDirection: 'row', alignItems: 'center', gap: 8, padding: 8, borderRadius: 11, backgroundColor: 'rgba(255,255,255,0.04)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.07)' },
+  playerInitiativeAvatar: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center', borderRadius: 11, backgroundColor: 'rgba(0,191,255,0.08)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.2)' },
+  playerInitiativeScore: { width: 42, alignItems: 'center', justifyContent: 'center' },
+  playerInitiativeScoreLabel: { color: 'rgba(255,255,255,0.4)', fontSize: 8, fontWeight: 'bold' },
+  playerInitiativeScoreValue: { color: '#00fa9a', fontSize: 16, fontWeight: 'bold', marginTop: 2 },
   turnHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
   turnValue: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   turnSubValue: { color: 'rgba(255,255,255,0.45)', fontSize: 11, marginTop: 3 },
@@ -3336,6 +3678,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.35)',
   },
+  initiativeActorModal: { width: '100%', maxWidth: 460, borderRadius: 20, padding: 16, backgroundColor: '#102b56', borderWidth: 1, borderColor: 'rgba(255,159,104,0.38)' },
+  initiativeActorModalHeader: { flexDirection: 'row', alignItems: 'center', gap: 11, marginBottom: 16 },
+  virtualAvatarLarge: { width: 48, height: 48, alignItems: 'center', justifyContent: 'center', borderRadius: 15, backgroundColor: 'rgba(255,159,104,0.1)', borderWidth: 1, borderColor: 'rgba(255,159,104,0.35)' },
+  initiativeActorFieldRow: { flexDirection: 'row', gap: 10, marginTop: 14, marginBottom: 18 },
   masterModalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 },
   masterModalTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', flex: 1 },
   modalIconButton: {

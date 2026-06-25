@@ -23,12 +23,24 @@ export type LanSessionRecord = {
   last_connected_at?: string | null;
 };
 
+export type LanVirtualCombatant = {
+  id: string;
+  name: string;
+  initiative: number;
+  hpCurrent: number;
+  hpMax: number;
+  avatarSeed?: string;
+};
+
 export type LanCampaignState = {
   sessionId: string;
   status: LanSessionStatus;
   turn: number;
   campaignMinutes: number;
   paused: boolean;
+  initiativeOrder: string[];
+  initiativeScores: Record<string, number>;
+  virtualCombatants: LanVirtualCombatant[];
   updatedAt: string;
 };
 
@@ -129,6 +141,7 @@ export type LanCommandKind =
   | 'MASTER_ADVANCE_TIME'
   | 'MASTER_SHORT_REST'
   | 'MASTER_LONG_REST'
+  | 'MASTER_UPDATE_INITIATIVE'
   | 'MASTER_PAUSE_SESSION'
   | 'MASTER_RESUME_SESSION'
   | 'MASTER_END_SESSION'
@@ -155,6 +168,7 @@ export type LanOfficialEventType =
   | 'TURN_CHANGED'
   | 'TIME_CHANGED'
   | 'REST_APPLIED'
+  | 'INITIATIVE_UPDATED'
   | 'HP_CHANGED'
   | 'TEMP_HP_CHANGED'
   | 'XP_CHANGED'

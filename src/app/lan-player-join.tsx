@@ -93,7 +93,7 @@ export default function LanPlayerJoinScreen() {
           {activeSession && (
             <View style={styles.warningBox}>
               <Ionicons name="warning-outline" size={20} color="#ffd166" />
-              <Text style={styles.warningText}>Este aparelho já possui uma sessão LAN ativa. Entrar em outra mesa pode substituir a sessão atual.</Text>
+              <Text style={styles.warningText}>Este aparelho já possui uma sessão selecionada. Ao entrar em outra, a anterior será mantida como mesa salva para retomada.</Text>
             </View>
           )}
 

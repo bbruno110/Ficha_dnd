@@ -9,6 +9,7 @@ export type Character = {
   race: string;
   avatar_uri?: string | null;
   linked_session_name?: string | null;
+  linked_session_id?: string | null;
   linked_session_status?: string | null;
   linked_session_role?: string | null;
 };
@@ -18,11 +19,10 @@ type Props = {
   onPress: () => void;
   onDelete: (id: number) => void;
   onEdit: (id: number) => void;
-  onUnlinkSession?: (id: number) => void;
   isLinkedToSession?: boolean;
 };
 
-export default function CharacterCard({ character, onPress, onDelete, onEdit, onUnlinkSession, isLinkedToSession = false }: Props) {
+export default function CharacterCard({ character, onPress, onDelete, onEdit, isLinkedToSession = false }: Props) {
   // Estados que controlam o nosso Menu Customizado
   const [modalVisible, setModalVisible] = useState(false);
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
@@ -47,11 +47,6 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, on
 
   const handleDeleteClick = () => {
     setIsConfirmingDelete(true); // Muda o conteúdo do modal para a pergunta de confirmação
-  };
-
-  const handleUnlinkSession = () => {
-    handleClose();
-    onUnlinkSession?.(character.id);
   };
 
   const handleConfirmDelete = () => {
@@ -107,14 +102,16 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, on
                 </TouchableOpacity>
                 
                 {isLinkedToSession && (
-                  <TouchableOpacity style={styles.optionButton} onPress={handleUnlinkSession}>
-                    <Text style={styles.unlinkText}>Desvincular da sessao LAN</Text>
-                  </TouchableOpacity>
+                  <Text style={styles.linkedWarningText}>
+                    Esta ficha pertence a uma sessao LAN e sera liberada quando a sessao for encerrada.
+                  </Text>
                 )}
 
-                <TouchableOpacity style={[styles.optionButton, styles.optionButtonNoBorder]} onPress={handleDeleteClick}>
-                  <Text style={styles.deleteText}>🗑️ Excluir Personagem</Text>
-                </TouchableOpacity>
+                {!isLinkedToSession && (
+                  <TouchableOpacity style={[styles.optionButton, styles.optionButtonNoBorder]} onPress={handleDeleteClick}>
+                    <Text style={styles.deleteText}>🗑️ Excluir Personagem</Text>
+                  </TouchableOpacity>
+                )}
                 
                 <TouchableOpacity style={styles.cancelButton} onPress={handleClose}>
                   <Text style={styles.cancelText}>Cancelar</Text>
@@ -258,10 +255,12 @@ const styles = StyleSheet.create({
     color: '#ff6666',
     fontWeight: '600',
   },
-  unlinkText: {
-    fontSize: 16,
-    color: '#00fa9a',
-    fontWeight: '600',
+  linkedWarningText: {
+    color: '#ffd166',
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: 'center',
+    paddingVertical: 14,
   },
   confirmDeleteButton: {
     backgroundColor: 'rgba(255, 50, 50, 0.15)',

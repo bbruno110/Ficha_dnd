@@ -1632,6 +1632,9 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       turn INTEGER DEFAULT 1,
       campaign_minutes INTEGER DEFAULT 0,
       paused INTEGER DEFAULT 0,
+      initiative_order TEXT DEFAULT '[]',
+      initiative_scores TEXT DEFAULT '{}',
+      virtual_combatants TEXT DEFAULT '[]',
       last_event_seq INTEGER DEFAULT 0,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -1730,6 +1733,9 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await ensureColumn(db, 'spellcasting_progression', 'slot_9', 'INTEGER DEFAULT 0');
   await ensureColumn(db, 'lan_sessions', 'paused_at', 'DATETIME');
   await ensureColumn(db, 'lan_sessions', 'resumed_at', 'DATETIME');
+  await ensureColumn(db, 'lan_session_state', 'initiative_order', `TEXT DEFAULT '[]'`);
+  await ensureColumn(db, 'lan_session_state', 'initiative_scores', `TEXT DEFAULT '{}'`);
+  await ensureColumn(db, 'lan_session_state', 'virtual_combatants', `TEXT DEFAULT '[]'`);
   await ensureColumn(db, 'lan_event_log', 'seq', 'INTEGER');
   await ensureColumn(db, 'lan_event_log', 'event_id', 'TEXT');
   await ensureColumn(db, 'lan_event_log', 'command_id', 'TEXT');

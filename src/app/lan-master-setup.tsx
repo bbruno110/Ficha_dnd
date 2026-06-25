@@ -124,7 +124,7 @@ export default function LanMasterSetupScreen() {
           {activeSession && (
             <View style={styles.warningBox}>
               <Ionicons name="warning-outline" size={20} color="#ffd166" />
-              <Text style={styles.warningText}>Existe uma sessão LAN ativa. Ao iniciar outra mesa, a sessão atual pode ser substituída neste aparelho.</Text>
+              <Text style={styles.warningText}>Existe uma sessão selecionada neste aparelho. Ao iniciar outra, a anterior será mantida como mesa salva para retomada.</Text>
             </View>
           )}
 
