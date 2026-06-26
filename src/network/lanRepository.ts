@@ -862,14 +862,18 @@ export async function saveCharacterSnapshot(
     }
   }
 
+  const snapshotJson = JSON.stringify(snapshotToSave);
+  if (existing?.payload === snapshotJson) return false;
+
   await db.runAsync(
     `INSERT INTO lan_character_snapshots (
       session_id, owner_device_id, remote_character_id, character_name, payload, updated_at
     ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(session_id, owner_device_id, remote_character_id)
     DO UPDATE SET character_name = excluded.character_name, payload = excluded.payload, updated_at = CURRENT_TIMESTAMP`,
-    [sessionId, ownerDeviceId, String(snapshotToSave.localId), snapshotToSave.name, JSON.stringify(snapshotToSave)]
+    [sessionId, ownerDeviceId, String(snapshotToSave.localId), snapshotToSave.name, snapshotJson]
   );
+  return true;
 }
 
 export async function upsertLanPlayer(

@@ -21,6 +21,7 @@ import QRCode from 'react-native-qrcode-svg';
 import { useLanSession } from '../contexts/LanSessionContext';
 import { isTradeEventExpired } from '../contexts/lan/lanSessionHelpers';
 import { getLanSessionState } from '../network/lanRepository';
+import { addTraceLog } from '../network/traceRepository';
 import { LanOfficialEventMessage, LanSessionRecord, LanVirtualCombatant } from '../types/lan';
 
 type CharacterOption = {
@@ -188,13 +189,43 @@ export default function LanSessionScreen() {
 
   const refreshSessionViews = useCallback(
     async (includeState = false) => {
+      const startedAt = Date.now();
+      const timings: Record<string, number> = {};
+      const timeTask = async (name: string, task: () => Promise<unknown>) => {
+        const taskStartedAt = Date.now();
+        try {
+          return await task();
+        } finally {
+          timings[name] = Date.now() - taskStartedAt;
+        }
+      };
       await Promise.all([
-        refreshPlayers(),
-        loadHistory(0),
-        includeState ? loadSessionState() : Promise.resolve(),
+        timeTask('refreshPlayersMs', () => refreshPlayers()),
+        timeTask('loadHistoryMs', () => loadHistory(0)),
+        includeState ? timeTask('loadSessionStateMs', () => loadSessionState()) : Promise.resolve(),
       ]);
+      await addTraceLog(db, {
+        level: 'debug',
+        category: 'lan-ui',
+        action: 'REFRESH_SESSION_VIEWS',
+        functionName: 'refreshSessionViews',
+        sourceFile: 'src/app/lan-session.tsx',
+        step: includeState ? 'with-state' : 'players-history',
+        durationMs: Date.now() - startedAt,
+        entityTable: 'lan_sessions',
+        entityId: activeSession?.id || null,
+        message: 'Tela LAN recarregou jogadores/historico/estado.',
+        metadata: {
+          sessionId: activeSession?.id || null,
+          role: activeSession?.role || null,
+          status: activeSession?.status || null,
+          includeState,
+          ...timings,
+          historyPageSize,
+        },
+      }).catch(() => undefined);
     },
-    [loadHistory, loadSessionState, refreshPlayers]
+    [activeSession?.id, activeSession?.role, activeSession?.status, db, historyPageSize, loadHistory, loadSessionState, refreshPlayers]
   );
 
   useEffect(() => {
@@ -2194,45 +2225,55 @@ export default function LanSessionScreen() {
     return (
       <Modal visible transparent animationType="fade" onRequestClose={() => setTradeModal(null)}>
         <Pressable style={styles.modalOverlay} onPress={() => setTradeModal(null)}>
-          <Pressable style={styles.masterModalContent} onPress={event => event.stopPropagation()}>
-            <View style={styles.masterModalHeader}>
-              <Text style={styles.masterModalTitle}>{isConfirmingCounter ? 'Confirmar troca' : 'Responder troca'}</Text>
-              <TouchableOpacity style={styles.modalIconButton} onPress={() => setTradeModal(null)}>
+          <Pressable style={styles.tradeModalContent} onPress={event => event.stopPropagation()}>
+            <View style={styles.tradeModalHeader}>
+              <View style={styles.tradeTitleWrap}>
+                <Text style={styles.tradeStepNumber}>{isConfirmingCounter ? '04' : '02'}</Text>
+                <View style={styles.tradeTitleTextWrap}>
+                  <Text style={styles.tradeModalTitle}>{isConfirmingCounter ? 'Revisar contraproposta' : 'Proposta recebida'}</Text>
+                  <Text style={styles.tradeModalSubtitle}>
+                    {isConfirmingCounter ? `${counterName} respondeu sua solicitação.` : `${sourceName} quer trocar com você.`}
+                  </Text>
+                </View>
+              </View>
+              <TouchableOpacity style={styles.tradeCloseButton} onPress={() => setTradeModal(null)}>
                 <Ionicons name="close" size={20} color="#fff" />
               </TouchableOpacity>
             </View>
 
-            <ScrollView showsVerticalScrollIndicator={false}>
-              <Text style={styles.modalHint}>
-                {isConfirmingCounter
-                  ? `${counterName} respondeu oferecendo ${counterLabel}. Confirme para executar a troca.`
-                  : `${sourceName} ofereceu ${offeredQty}x ${offeredItemName}.`}
-              </Text>
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.tradeModalScrollContent}>
+              <View style={styles.tradeDividerRow}>
+                <View style={styles.tradeDividerLine} />
+                <Ionicons name="swap-horizontal-outline" size={15} color="#c48a44" />
+                <View style={styles.tradeDividerLine} />
+              </View>
 
               <View style={styles.tradeBoard}>
                 <View style={styles.tradeSidePanel}>
-                  <Text style={styles.tradeSideLabel}>{isConfirmingCounter ? 'ENVIAR' : 'RECEBER'}</Text>
+                  <Text style={styles.tradeSideLabel}>{isConfirmingCounter ? 'VOCÊ ENVIA' : 'VOCÊ RECEBE'}</Text>
                   <View style={styles.tradeSlotFilled}>
-                    <Ionicons name="cube-outline" size={18} color="#00fa9a" />
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.tradeItemName}>{offeredItemName}</Text>
-                      <Text style={styles.tradeItemQty}>x{offeredQty}</Text>
-                    </View>
+                    <Text style={styles.tradeSlotItemName}>{offeredItemName}</Text>
+                    <Text style={styles.tradeSlotItemQty}>x{offeredQty}</Text>
                   </View>
                 </View>
 
                 <View style={styles.tradeSidePanel}>
-                  <Text style={styles.tradeSideLabel}>{isConfirmingCounter ? 'RECEBER' : 'ENVIAR'}</Text>
+                  <Text style={styles.tradeSideLabel}>{isConfirmingCounter ? 'VOCÊ RECEBE' : 'VOCÊ ENVIA'}</Text>
                   <View style={isConfirmingCounter && counterLabel !== 'Nada' ? styles.tradeSlotFilled : styles.tradeSlotEmpty}>
-                    <Ionicons name={isConfirmingCounter && counterLabel !== 'Nada' ? 'cube-outline' : 'swap-horizontal-outline'} size={18} color={isConfirmingCounter && counterLabel !== 'Nada' ? '#00fa9a' : 'rgba(255,255,255,0.5)'} />
-                    <Text style={styles.tradeItemQty}>{isConfirmingCounter ? counterLabel : selectedCounterLabel}</Text>
+                    <Text style={[styles.tradeSlotItemName, !isConfirmingCounter && selectedCounterLabel === 'Nada' && styles.tradeSlotMuted]}>
+                      {isConfirmingCounter ? counterLabel : selectedCounterLabel}
+                    </Text>
                   </View>
                 </View>
               </View>
 
               {!isConfirmingCounter && (
                 <>
-                  <Text style={styles.modalFieldLabel}>SUA MOCHILA</Text>
+                  <View style={styles.tradeDividerRow}>
+                    <View style={styles.tradeDividerLine} />
+                    <Text style={styles.tradeDividerLabel}>ESCOLHA UM ITEM DA SUA MOCHILA</Text>
+                    <View style={styles.tradeDividerLine} />
+                  </View>
                   <View style={styles.tradeItemList}>
                     <TouchableOpacity
                       style={[styles.tradeItemRow, tradeCounterItemIndex === null && styles.tradeItemRowActive]}
@@ -2241,8 +2282,9 @@ export default function LanSessionScreen() {
                         setTradeCounterQty('1');
                       }}
                     >
+                      <View style={[styles.tradeChoiceBullet, tradeCounterItemIndex === null && styles.tradeChoiceBulletActive]} />
                       <Text style={styles.tradeItemName}>Nada</Text>
-                      <Text style={styles.tradeItemQty}>sem item</Text>
+                      <Text style={styles.tradeItemQty}>sem retorno</Text>
                     </TouchableOpacity>
                     {tradeCounterItems.length === 0 ? (
                       <Text style={styles.emptyText}>Nenhum item disponivel.</Text>
@@ -2256,6 +2298,7 @@ export default function LanSessionScreen() {
                             setTradeCounterQty('1');
                           }}
                         >
+                          <View style={[styles.tradeChoiceBullet, tradeCounterItemIndex === index && styles.tradeChoiceBulletActive]} />
                           <Text style={styles.tradeItemName}>{item?.name || 'Item'}</Text>
                           <Text style={styles.tradeItemQty}>x{Number(item?.qty || 1)}</Text>
                         </TouchableOpacity>
@@ -2265,7 +2308,7 @@ export default function LanSessionScreen() {
 
                   {selectedItem && (
                     <>
-                      <Text style={styles.modalFieldLabel}>QUANTIDADE</Text>
+                      <Text style={styles.tradeSectionLabel}>QUANTIDADE</Text>
                       <TextInput
                         style={[styles.input, styles.modalNumberInput]}
                         value={tradeCounterQty}
@@ -2279,7 +2322,11 @@ export default function LanSessionScreen() {
                     </>
                   )}
 
-                  <Text style={styles.modalFieldLabel}>MOEDAS EM TROCA</Text>
+                  <View style={styles.tradeDividerRow}>
+                    <View style={styles.tradeDividerLine} />
+                    <Text style={styles.tradeDividerLabel}>MOEDAS OPCIONAIS</Text>
+                    <View style={styles.tradeDividerLine} />
+                  </View>
                   <View style={styles.coinInputGrid}>
                     {(['gp', 'sp', 'cp'] as const).map(type => (
                       <View key={type} style={styles.coinInputBox}>
@@ -2301,15 +2348,15 @@ export default function LanSessionScreen() {
 
               <TouchableOpacity style={styles.primaryWideButton} onPress={handleAcceptTrade}>
                 <Ionicons name="checkmark-circle-outline" size={18} color="#02112b" />
-                <Text style={styles.primaryWideButtonText}>{isConfirmingCounter ? 'Confirmar e trocar' : 'Enviar resposta'}</Text>
+                <Text style={styles.primaryWideButtonText}>{isConfirmingCounter ? 'ACEITAR TROCA' : 'ENVIAR CONTRAPROPOSTA'}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.dangerWideButton} onPress={() => handleDeclineTrade(tradeModal)}>
                 <Ionicons name="close-circle-outline" size={18} color="#ff6666" />
-                <Text style={styles.dangerButtonText}>Recusar</Text>
+                <Text style={styles.dangerButtonText}>{isConfirmingCounter ? 'RECUSAR CONTRAPROPOSTA' : 'RECUSAR'}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.secondaryWideButton} onPress={() => setTradeModal(null)}>
                 <Ionicons name="time-outline" size={18} color="#00bfff" />
-                <Text style={styles.secondaryButtonText}>Ignorar por enquanto</Text>
+                <Text style={styles.secondaryButtonText}>FECHAR PARA DECIDIR DEPOIS</Text>
               </TouchableOpacity>
             </ScrollView>
           </Pressable>
@@ -3318,53 +3365,71 @@ const styles = StyleSheet.create({
   coinInputBox: { flex: 1, minWidth: 0 },
   coinMiniLabel: { color: 'rgba(255,255,255,0.48)', fontSize: 10, fontWeight: 'bold', marginBottom: 5, textAlign: 'center' },
   tradeItemList: { gap: 8, marginBottom: 10 },
-  tradeBoard: { flexDirection: 'row', gap: 10, marginBottom: 12 },
+  tradeModalHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 6 },
+  tradeTitleWrap: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  tradeStepNumber: { color: '#66e8ff', fontSize: 22, fontWeight: 'bold', textShadowColor: 'rgba(102,232,255,0.75)', textShadowRadius: 8 },
+  tradeTitleTextWrap: { flex: 1, minWidth: 0 },
+  tradeModalTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', letterSpacing: 0.2 },
+  tradeModalSubtitle: { color: 'rgba(255,255,255,0.66)', fontSize: 12, lineHeight: 17, marginTop: 3 },
+  tradeCloseButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  tradeModalScrollContent: { paddingTop: 4, paddingBottom: 2 },
+  tradeDividerRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginVertical: 10 },
+  tradeDividerLine: { flex: 1, height: 1, backgroundColor: 'rgba(196,138,68,0.38)' },
+  tradeDividerLabel: { color: '#c48a44', fontSize: 10, fontWeight: 'bold', letterSpacing: 0.8 },
+  tradeSectionLabel: { color: '#c48a44', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, marginTop: 10, marginBottom: 6 },
+  tradeBoard: { flexDirection: 'row', gap: 10, marginBottom: 10 },
   tradeSidePanel: {
     flex: 1,
     minWidth: 0,
     gap: 8,
-    borderRadius: 14,
-    padding: 10,
-    backgroundColor: 'rgba(0,0,0,0.22)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
-  },
-  tradeSideLabel: { color: 'rgba(255,255,255,0.48)', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, textAlign: 'center' },
-  tradeSlotFilled: {
-    minHeight: 56,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
     borderRadius: 12,
-    paddingHorizontal: 12,
-    backgroundColor: 'rgba(0,250,154,0.1)',
+    padding: 10,
+    backgroundColor: 'rgba(3,15,31,0.82)',
     borderWidth: 1,
-    borderColor: 'rgba(0,250,154,0.32)',
+    borderColor: 'rgba(196,138,68,0.28)',
+  },
+  tradeSideLabel: { color: '#8df5b2', fontSize: 10, fontWeight: 'bold', letterSpacing: 0.7, textAlign: 'center' },
+  tradeSlotFilled: {
+    minHeight: 86,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: 'rgba(0,191,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.28)',
   },
   tradeSlotEmpty: {
-    minHeight: 56,
-    flexDirection: 'row',
+    minHeight: 86,
     alignItems: 'center',
-    gap: 10,
-    borderRadius: 12,
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 10,
     paddingHorizontal: 12,
-    backgroundColor: 'rgba(255,255,255,0.04)',
+    paddingVertical: 12,
+    backgroundColor: 'rgba(255,255,255,0.025)',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.1)',
   },
+  tradeSlotItemName: { color: '#fff', fontSize: 13, fontWeight: 'bold', textAlign: 'center', lineHeight: 18 },
+  tradeSlotItemQty: { color: '#fff', fontSize: 16, fontWeight: 'bold', textAlign: 'center' },
+  tradeSlotMuted: { color: 'rgba(255,255,255,0.52)' },
   tradeItemRow: {
     minHeight: 46,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
     gap: 10,
-    borderRadius: 12,
+    borderRadius: 10,
     paddingHorizontal: 12,
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    backgroundColor: 'rgba(0,0,0,0.20)',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.09)',
+    borderColor: 'rgba(255,255,255,0.10)',
   },
-  tradeItemRowActive: { backgroundColor: 'rgba(0,250,154,0.12)', borderColor: 'rgba(0,250,154,0.35)' },
+  tradeItemRowActive: { backgroundColor: 'rgba(0,191,255,0.14)', borderColor: 'rgba(0,191,255,0.55)' },
+  tradeChoiceBullet: { width: 18, height: 18, borderRadius: 9, borderWidth: 1, borderColor: 'rgba(255,255,255,0.38)', backgroundColor: 'transparent' },
+  tradeChoiceBulletActive: { borderColor: '#66e8ff', backgroundColor: '#00bfff', shadowColor: '#00d7ff', shadowOpacity: 0.45, shadowRadius: 6 },
   tradeItemName: { flex: 1, color: '#fff', fontSize: 13, fontWeight: 'bold' },
   tradeItemQty: { color: 'rgba(255,255,255,0.55)', fontSize: 12, fontWeight: 'bold' },
   historyRow: {
@@ -3760,6 +3825,20 @@ const styles = StyleSheet.create({
     backgroundColor: '#102b56',
     borderWidth: 1,
     borderColor: 'rgba(0,191,255,0.35)',
+  },
+  tradeModalContent: {
+    width: '100%',
+    maxWidth: 520,
+    maxHeight: '86%',
+    borderRadius: 18,
+    padding: 14,
+    backgroundColor: '#06182f',
+    borderWidth: 1,
+    borderColor: 'rgba(196,138,68,0.58)',
+    shadowColor: '#00d7ff',
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    elevation: 10,
   },
   initiativeActorModal: { width: '100%', maxWidth: 460, borderRadius: 20, padding: 16, backgroundColor: '#102b56', borderWidth: 1, borderColor: 'rgba(255,159,104,0.38)' },
   initiativeActorModalHeader: { flexDirection: 'row', alignItems: 'center', gap: 11, marginBottom: 16 },

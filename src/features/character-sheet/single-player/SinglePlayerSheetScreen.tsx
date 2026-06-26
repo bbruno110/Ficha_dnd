@@ -1764,43 +1764,53 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         <Pressable style={styles.modalOverlay} onPress={() => setSheetTradeModal(null)}>
           <Pressable style={styles.sheetTradeBox} onPress={event => event.stopPropagation()}>
             <View style={styles.sheetTradeHeader}>
-              <Text style={styles.modalTitle}>{isConfirmingCounter ? 'Confirmar troca' : 'Responder troca'}</Text>
+              <View style={styles.sheetTradeTitleWrap}>
+                <Text style={styles.sheetTradeStepNumber}>{isConfirmingCounter ? '04' : '02'}</Text>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={styles.sheetTradeTitle}>{isConfirmingCounter ? 'Revisar contraproposta' : 'Proposta recebida'}</Text>
+                  <Text style={styles.sheetTradeSubTitle}>
+                    {isConfirmingCounter ? `${counterName} respondeu sua solicitação.` : `${sourceName} quer trocar com você.`}
+                  </Text>
+                </View>
+              </View>
               <TouchableOpacity style={styles.sheetTradeClose} onPress={() => setSheetTradeModal(null)}>
                 <Ionicons name="close" size={20} color="#fff" />
               </TouchableOpacity>
             </View>
 
             <ScrollView style={styles.sheetTradeScroll} contentContainerStyle={styles.sheetTradeContent} showsVerticalScrollIndicator={false}>
-              <Text style={styles.sheetTradeHint}>
-                {isConfirmingCounter
-                  ? `${counterName} respondeu oferecendo ${counterLabel}. Confirme para executar a troca.`
-                  : `${sourceName} ofereceu ${offeredQty}x ${offeredItemName}.`}
-              </Text>
+              <View style={styles.sheetTradeDividerRow}>
+                <View style={styles.sheetTradeDividerLine} />
+                <Ionicons name="swap-horizontal-outline" size={15} color="#c48a44" />
+                <View style={styles.sheetTradeDividerLine} />
+              </View>
 
               <View style={styles.sheetTradeBoard}>
                 <View style={styles.sheetTradeSide}>
-                  <Text style={styles.sheetTradeSideLabel}>{isConfirmingCounter ? 'ENVIAR' : 'RECEBER'}</Text>
+                  <Text style={styles.sheetTradeSideLabel}>{isConfirmingCounter ? 'VOCÊ ENVIA' : 'VOCÊ RECEBE'}</Text>
                   <View style={styles.sheetTradeSlotFilled}>
-                    <Ionicons name="cube-outline" size={18} color="#00fa9a" />
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.sheetTradeItemName}>{offeredItemName}</Text>
-                      <Text style={styles.sheetTradeItemQty}>x{offeredQty}</Text>
-                    </View>
+                    <Text style={styles.sheetTradeSlotItemName}>{offeredItemName}</Text>
+                    <Text style={styles.sheetTradeSlotItemQty}>x{offeredQty}</Text>
                   </View>
                 </View>
 
                 <View style={styles.sheetTradeSide}>
-                  <Text style={styles.sheetTradeSideLabel}>{isConfirmingCounter ? 'RECEBER' : 'ENVIAR'}</Text>
+                  <Text style={styles.sheetTradeSideLabel}>{isConfirmingCounter ? 'VOCÊ RECEBE' : 'VOCÊ ENVIA'}</Text>
                   <View style={isConfirmingCounter && counterLabel !== 'Nada' ? styles.sheetTradeSlotFilled : styles.sheetTradeSlotEmpty}>
-                    <Ionicons name={isConfirmingCounter && counterLabel !== 'Nada' ? 'cube-outline' : 'swap-horizontal-outline'} size={18} color={isConfirmingCounter && counterLabel !== 'Nada' ? '#00fa9a' : 'rgba(255,255,255,0.5)'} />
-                    <Text style={styles.sheetTradeItemQty}>{isConfirmingCounter ? counterLabel : selectedCounterLabel}</Text>
+                    <Text style={[styles.sheetTradeSlotItemName, !isConfirmingCounter && selectedCounterLabel === 'Nada' && styles.sheetTradeSlotMuted]}>
+                      {isConfirmingCounter ? counterLabel : selectedCounterLabel}
+                    </Text>
                   </View>
                 </View>
               </View>
 
               {!isConfirmingCounter && (
                 <>
-                  <Text style={styles.sheetTradeLabel}>SUA MOCHILA</Text>
+                  <View style={styles.sheetTradeDividerRow}>
+                    <View style={styles.sheetTradeDividerLine} />
+                    <Text style={styles.sheetTradeDividerLabel}>ESCOLHA UM ITEM DA SUA MOCHILA</Text>
+                    <View style={styles.sheetTradeDividerLine} />
+                  </View>
                   <View style={styles.sheetTradeItemList}>
                     <TouchableOpacity
                       style={[styles.sheetTradeItemRow, sheetTradeCounterItemIndex === null && styles.sheetTradeItemRowActive]}
@@ -1809,6 +1819,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                         setSheetTradeCounterQty('1');
                       }}
                     >
+                      <View style={[styles.sheetTradeChoiceBullet, sheetTradeCounterItemIndex === null && styles.sheetTradeChoiceBulletActive]} />
                       <Text style={styles.sheetTradeItemName}>Nada</Text>
                       <Text style={styles.sheetTradeItemQty}>aceitar sem retorno</Text>
                     </TouchableOpacity>
@@ -1824,6 +1835,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                             setSheetTradeCounterQty('1');
                           }}
                         >
+                          <View style={[styles.sheetTradeChoiceBullet, sheetTradeCounterItemIndex === index && styles.sheetTradeChoiceBulletActive]} />
                           <Text style={styles.sheetTradeItemName}>{item?.name || 'Item'}</Text>
                           <Text style={styles.sheetTradeItemQty}>x{Number(item?.qty || 1)}</Text>
                         </TouchableOpacity>
@@ -1847,7 +1859,11 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                     </>
                   )}
 
-                  <Text style={styles.sheetTradeLabel}>MOEDAS EM TROCA</Text>
+                  <View style={styles.sheetTradeDividerRow}>
+                    <View style={styles.sheetTradeDividerLine} />
+                    <Text style={styles.sheetTradeDividerLabel}>MOEDAS OPCIONAIS</Text>
+                    <View style={styles.sheetTradeDividerLine} />
+                  </View>
                   <View style={styles.sheetTradeCoinsRow}>
                     {(['gp', 'sp', 'cp'] as const).map(type => (
                       <View key={type} style={styles.sheetTradeCoinBox}>
@@ -1868,10 +1884,10 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
               )}
 
               <TouchableOpacity style={styles.sheetTradePrimaryButton} onPress={submitSheetTrade}>
-                <Text style={styles.sheetTradePrimaryText}>{isConfirmingCounter ? 'Confirmar e trocar' : 'Enviar resposta'}</Text>
+                <Text style={styles.sheetTradePrimaryText}>{isConfirmingCounter ? 'ACEITAR TROCA' : 'ENVIAR CONTRAPROPOSTA'}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.sheetTradeDangerButton} onPress={() => void declineSheetTrade(sheetTradeModal)}>
-                <Text style={styles.sheetTradeDangerText}>Recusar</Text>
+                <Text style={styles.sheetTradeDangerText}>{isConfirmingCounter ? 'RECUSAR CONTRAPROPOSTA' : 'RECUSAR'}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.actionBtnCancel} onPress={() => setSheetTradeModal(null)}>
                 <Text style={styles.actionBtnCancelText}>Ignorar por enquanto</Text>
@@ -3061,21 +3077,33 @@ const styles = StyleSheet.create({
   actionBtnCancel: { paddingVertical: 15, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   actionBtnCancelText: { color: 'rgba(255,255,255,0.5)', fontWeight: 'bold', fontSize: 14 },
 
-  sheetTradeBox: { backgroundColor: '#102b56', width: '92%', maxHeight: '86%', borderRadius: 22, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)', overflow: 'hidden' },
-  sheetTradeHeader: { minHeight: 58, alignItems: 'center', justifyContent: 'center', borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.08)' },
-  sheetTradeClose: { position: 'absolute', right: 14, top: 14, width: 32, height: 32, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)' },
+  sheetTradeBox: { backgroundColor: '#06182f', width: '92%', maxHeight: '86%', borderRadius: 20, borderWidth: 1, borderColor: 'rgba(196,138,68,0.58)', overflow: 'hidden', shadowColor: '#00d7ff', shadowOpacity: 0.22, shadowRadius: 18, elevation: 10 },
+  sheetTradeHeader: { minHeight: 70, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, paddingHorizontal: 14, paddingTop: 14, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(196,138,68,0.18)' },
+  sheetTradeTitleWrap: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  sheetTradeStepNumber: { color: '#66e8ff', fontSize: 22, fontWeight: 'bold', textShadowColor: 'rgba(102,232,255,0.75)', textShadowRadius: 8 },
+  sheetTradeTitle: { color: '#fff', fontSize: 17, fontWeight: 'bold', letterSpacing: 0.2 },
+  sheetTradeSubTitle: { color: 'rgba(255,255,255,0.66)', fontSize: 12, lineHeight: 17, marginTop: 3 },
+  sheetTradeClose: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
   sheetTradeScroll: { width: '100%' },
   sheetTradeContent: { padding: 16 },
   sheetTradeHint: { color: 'rgba(255,255,255,0.78)', fontSize: 13, lineHeight: 19, textAlign: 'center', marginBottom: 12 },
-  sheetTradeBoard: { flexDirection: 'row', gap: 10, marginBottom: 12 },
-  sheetTradeSide: { flex: 1, minWidth: 0, gap: 8, borderRadius: 14, padding: 10, backgroundColor: 'rgba(0,0,0,0.22)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)' },
-  sheetTradeSideLabel: { color: 'rgba(255,255,255,0.48)', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, textAlign: 'center' },
-  sheetTradeSlotFilled: { minHeight: 56, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 12, paddingHorizontal: 12, backgroundColor: 'rgba(0,250,154,0.1)', borderWidth: 1, borderColor: 'rgba(0,250,154,0.32)' },
-  sheetTradeSlotEmpty: { minHeight: 56, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 12, paddingHorizontal: 12, backgroundColor: 'rgba(255,255,255,0.04)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
-  sheetTradeLabel: { color: '#00bfff', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, marginBottom: 8, marginTop: 8 },
+  sheetTradeDividerRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginVertical: 10 },
+  sheetTradeDividerLine: { flex: 1, height: 1, backgroundColor: 'rgba(196,138,68,0.38)' },
+  sheetTradeDividerLabel: { color: '#c48a44', fontSize: 9, fontWeight: 'bold', letterSpacing: 0.7, textAlign: 'center' },
+  sheetTradeBoard: { flexDirection: 'row', gap: 10, marginBottom: 10 },
+  sheetTradeSide: { flex: 1, minWidth: 0, gap: 8, borderRadius: 12, padding: 10, backgroundColor: 'rgba(3,15,31,0.82)', borderWidth: 1, borderColor: 'rgba(196,138,68,0.28)' },
+  sheetTradeSideLabel: { color: '#8df5b2', fontSize: 10, fontWeight: 'bold', letterSpacing: 0.7, textAlign: 'center' },
+  sheetTradeSlotFilled: { minHeight: 86, alignItems: 'center', justifyContent: 'center', gap: 8, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, backgroundColor: 'rgba(0,191,255,0.06)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.28)' },
+  sheetTradeSlotEmpty: { minHeight: 86, alignItems: 'center', justifyContent: 'center', gap: 8, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, backgroundColor: 'rgba(255,255,255,0.025)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+  sheetTradeSlotItemName: { color: '#fff', fontSize: 13, fontWeight: 'bold', textAlign: 'center', lineHeight: 18 },
+  sheetTradeSlotItemQty: { color: '#fff', fontSize: 16, fontWeight: 'bold', textAlign: 'center' },
+  sheetTradeSlotMuted: { color: 'rgba(255,255,255,0.52)' },
+  sheetTradeLabel: { color: '#c48a44', fontSize: 10, fontWeight: 'bold', letterSpacing: 1, marginBottom: 8, marginTop: 8 },
   sheetTradeItemList: { gap: 8, marginBottom: 10 },
-  sheetTradeItemRow: { minHeight: 46, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, borderRadius: 12, paddingHorizontal: 12, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.09)' },
-  sheetTradeItemRowActive: { backgroundColor: 'rgba(0,250,154,0.12)', borderColor: 'rgba(0,250,154,0.35)' },
+  sheetTradeItemRow: { minHeight: 46, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 10, paddingHorizontal: 12, backgroundColor: 'rgba(0,0,0,0.20)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.10)' },
+  sheetTradeItemRowActive: { backgroundColor: 'rgba(0,191,255,0.14)', borderColor: 'rgba(0,191,255,0.55)' },
+  sheetTradeChoiceBullet: { width: 18, height: 18, borderRadius: 9, borderWidth: 1, borderColor: 'rgba(255,255,255,0.38)', backgroundColor: 'transparent' },
+  sheetTradeChoiceBulletActive: { borderColor: '#66e8ff', backgroundColor: '#00bfff', shadowColor: '#00d7ff', shadowOpacity: 0.45, shadowRadius: 6 },
   sheetTradeItemName: { flex: 1, color: '#fff', fontSize: 13, fontWeight: 'bold' },
   sheetTradeItemQty: { color: 'rgba(255,255,255,0.58)', fontSize: 12, fontWeight: 'bold' },
   sheetTradeInput: { backgroundColor: 'rgba(0,0,0,0.3)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, color: '#fff', fontSize: 15, textAlign: 'center' },

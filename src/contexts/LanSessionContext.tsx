@@ -112,6 +112,81 @@ function formatPlayerRequestDescription(actorName: string, command: LanCommandKi
   return `${actorName} enviou uma solicitação ao mestre.`;
 }
 
+function estimateJsonBytes(value: unknown) {
+  try {
+    return JSON.stringify(value)?.length || 0;
+  } catch {
+    return -1;
+  }
+}
+
+const LAN_SYNC_DEFAULT_EVENT_LIMIT = 200;
+const LAN_SYNC_PUSH_EVENT_WINDOW = 24;
+const LAN_SYNC_PUSH_EVENT_LIMIT = 32;
+const LAN_SYNC_PUSH_RECENT_LIMIT = 6;
+const LAN_HP_BATCH_WINDOW_MS = 90;
+
+type BuildRpcSyncPayloadOptions = {
+  sinceSeq?: number;
+  eventLimit?: number;
+  recentLimit?: number;
+  includeRecentEvents?: boolean;
+  includePlayerSnapshots?: boolean;
+  includeCustomContent?: boolean;
+  compact?: boolean;
+};
+
+type PendingHpBatchCommand = {
+  command: LanCommandMessage;
+  peerId?: string;
+  queuedAt: number;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
+
+type PendingHpBatch = {
+  timer: ReturnType<typeof setTimeout>;
+  entries: PendingHpBatchCommand[];
+};
+
+function isBatchableMasterHpCommand(command: LanCommandMessage) {
+  if (command.command !== 'MASTER_APPLY_HP') return false;
+  if (command.payload?.requestCommandId) return false;
+  const mode = String(command.payload?.mode || 'damage');
+  if (mode !== 'damage' && mode !== 'heal') return false;
+  const targetCharacterId = Number(command.payload?.targetCharacterId || 0);
+  if (!targetCharacterId) return false;
+  return Math.abs(numberFromPayload(command.payload, 'amount', 0)) > 0;
+}
+
+function makeHpBatchKey(command: LanCommandMessage) {
+  const mode = String(command.payload?.mode || 'damage');
+  const targetDeviceId = String(command.payload?.targetDeviceId || 'local');
+  const targetCharacterId = String(command.payload?.targetCharacterId || '');
+  const targetName = String(command.payload?.targetName || '').trim();
+  const actorDeviceId = String(command.deviceId || 'master');
+  return [mode, targetDeviceId, targetCharacterId, targetName, actorDeviceId].join('|');
+}
+
+function makeBatchedHpCommand(entries: PendingHpBatchCommand[]) {
+  const first = entries[0].command;
+  if (entries.length <= 1) return first;
+
+  const amount = entries.reduce((total, entry) => (
+    total + Math.abs(numberFromPayload(entry.command.payload, 'amount', 0))
+  ), 0);
+
+  return {
+    ...first,
+    payload: {
+      ...(first.payload || {}),
+      amount,
+      batchCount: entries.length,
+      batchedCommandIds: entries.map(entry => entry.command.commandId),
+    },
+  };
+}
+
 export function LanSessionProvider({ children }: { children: React.ReactNode }) {
   const db = useSQLiteContext();
   const [activeSession, setActiveSession] = useState<LanSessionRecord | null>(null);
@@ -147,8 +222,14 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const recoverLanSessionRef = useRef<((reason?: string) => Promise<void>) | null>(null);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const hpCommandBatchRef = useRef<Record<string, PendingHpBatch>>({});
   const playerPollInFlightRef = useRef(false);
   const pushTcpSyncRef = useRef<((session: LanSessionRecord, reason?: string) => Promise<void>) | null>(null);
+  const scheduledPushSyncRef = useRef<{
+    timer: ReturnType<typeof setTimeout>;
+    session: LanSessionRecord;
+    reasons: Set<string>;
+  } | null>(null);
 
   const setTransportReadyState = useCallback((ready: boolean) => {
     setIsTransportReady(ready);
@@ -1769,10 +1850,15 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         return;
       }
 
-      let target = await db.getFirstAsync<any>(`SELECT id, name, stats, equipment, hp_current, hp_max, hp_temp, xp, gp, sp, cp FROM characters WHERE id = ?`, [
-        targetCharacterId,
-      ]);
-      if (!target && targetDeviceId) {
+      const localDeviceId = deviceIdRef.current;
+      const isLocalTarget = !targetDeviceId || targetDeviceId === localDeviceId;
+      let target: any = null;
+
+      if (isLocalTarget) {
+        target = await db.getFirstAsync<any>(`SELECT id, name, stats, equipment, hp_current, hp_max, hp_temp, xp, gp, sp, cp FROM characters WHERE id = ?`, [
+          targetCharacterId,
+        ]);
+      } else {
         const snapshotRow = await db.getFirstAsync<{ payload: string }>(
           `SELECT payload FROM lan_character_snapshots
            WHERE session_id = ? AND owner_device_id = ? AND remote_character_id = ?
@@ -1792,7 +1878,28 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           }
         }
       }
-      const targetName = target?.name || String(command.payload?.targetName || 'Personagem');
+      if (!target) {
+        await rejectCommand(
+          session.id,
+          command,
+          isLocalTarget
+            ? 'Ficha alvo nao encontrada no mestre.'
+            : 'Snapshot da ficha remota alvo nao encontrado. Aguarde a sincronizacao do jogador e tente novamente.',
+          peerId
+        );
+        return;
+      }
+      const requestedTargetName = String(command.payload?.targetName || '').trim();
+      const targetName = target?.name || requestedTargetName || 'Personagem';
+      if (!isLocalTarget && requestedTargetName && requestedTargetName !== 'Personagem' && target?.name && String(target.name).trim() !== requestedTargetName) {
+        await rejectCommand(
+          session.id,
+          command,
+          `Snapshot remoto divergente para o alvo. Comando pediu "${requestedTargetName}", mas o snapshot atual aponta "${String(target.name).trim()}". Aguarde a sincronizacao e tente novamente.`,
+          peerId
+        );
+        return;
+      }
 
       if (command.command === 'MASTER_APPLY_HP') {
         const amount = numberFromPayload(command.payload, 'amount', 0);
@@ -1844,6 +1951,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             amount: Math.abs(amount),
             absorbedByTemp,
             requestCommandId: command.payload?.requestCommandId || null,
+            batchCount: command.payload?.batchCount || null,
+            batchedCommandIds: command.payload?.batchedCommandIds || null,
           },
         });
         return;
@@ -2109,15 +2218,116 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
   const runAuthoritativeCommandQueued = useCallback(
     async (command: LanCommandMessage, peerId?: string) => {
-      const run = commandQueueRef.current.then(() => handleAuthoritativeCommand(command, peerId));
-      commandQueueRef.current = run.catch(() => undefined);
-      await run;
-      const session = activeSessionRef.current || closingSessionRef.current;
-      if (session?.role === 'master') {
-        await pushTcpSyncRef.current?.(session, `command:${command.command}`);
+      const queuedAt = Date.now();
+      const enqueueCommand = async (
+        queuedCommand: LanCommandMessage,
+        queuedPeerId: string | undefined,
+        originalQueuedAt: number,
+        batchMetadata?: Record<string, unknown>
+      ) => {
+        const run = commandQueueRef.current.then(async () => {
+          const processStartedAt = Date.now();
+          await traceLan('LAN_COMMAND', 'runAuthoritativeCommandQueued', 'process_start', `Processamento autoritativo iniciado: ${queuedCommand.command}.`, {
+            command: queuedCommand.command,
+            commandId: queuedCommand.commandId,
+            peerId: queuedPeerId,
+            queueWaitMs: processStartedAt - originalQueuedAt,
+            ...batchMetadata,
+          }, 'debug', queuedCommand.commandId);
+          await handleAuthoritativeCommand(queuedCommand, queuedPeerId);
+          const processedAt = Date.now();
+          const session = activeSessionRef.current || closingSessionRef.current;
+          let syncPushScheduled = false;
+          if (session?.role === 'master') {
+            const reason = `command:${queuedCommand.command}`;
+            const scheduled = scheduledPushSyncRef.current;
+            if (scheduled) {
+              scheduled.session = session;
+              scheduled.reasons.add(reason);
+            } else {
+              const reasons = new Set<string>([reason]);
+              const timer = setTimeout(() => {
+                const pending = scheduledPushSyncRef.current;
+                scheduledPushSyncRef.current = null;
+                if (!pending) return;
+                const batchReason = pending.reasons.size > 1
+                  ? `batch:${[...pending.reasons].slice(0, 4).join(',')}${pending.reasons.size > 4 ? ',...' : ''}`
+                  : [...pending.reasons][0] || 'command-batch';
+                void pushTcpSyncRef.current?.(pending.session, batchReason).catch(error => {
+                  void traceLan('LAN_TCP', 'pushTcpSync', 'scheduled_failed', 'Falha ao enviar sync LAN agendado.', {
+                    sessionId: pending.session.id,
+                    reason: batchReason,
+                    error: error instanceof Error ? error.message : String(error),
+                  }, 'warn');
+                });
+              }, 80);
+              scheduledPushSyncRef.current = { timer, session, reasons };
+            }
+            syncPushScheduled = true;
+          }
+          await traceLan('LAN_COMMAND', 'runAuthoritativeCommandQueued', 'process_done', `Processamento autoritativo finalizado: ${queuedCommand.command}.`, {
+            durationMs: Date.now() - processStartedAt,
+            handlerDurationMs: processedAt - processStartedAt,
+            syncPushDurationMs: Date.now() - processedAt,
+            syncPushScheduled,
+            queueWaitMs: processStartedAt - originalQueuedAt,
+            command: queuedCommand.command,
+            commandId: queuedCommand.commandId,
+            peerId: queuedPeerId,
+            ...batchMetadata,
+          }, 'debug', queuedCommand.commandId);
+        });
+        commandQueueRef.current = run.catch(() => undefined);
+        await run;
+      };
+
+      const flushHpBatch = (batchKey: string, pending: PendingHpBatch) => {
+        clearTimeout(pending.timer);
+        delete hpCommandBatchRef.current[batchKey];
+
+        const batchedCommand = makeBatchedHpCommand(pending.entries);
+        const oldestQueuedAt = Math.min(...pending.entries.map(entry => entry.queuedAt));
+        const batchMetadata = pending.entries.length > 1
+          ? {
+              batchCount: pending.entries.length,
+              batchedCommandIds: pending.entries.map(entry => entry.command.commandId),
+              batchWindowMs: LAN_HP_BATCH_WINDOW_MS,
+            }
+          : undefined;
+
+        void enqueueCommand(batchedCommand, pending.entries[0]?.peerId, oldestQueuedAt, batchMetadata)
+          .then(() => pending.entries.forEach(entry => entry.resolve()))
+          .catch(error => pending.entries.forEach(entry => entry.reject(error)));
+      };
+
+      if (isBatchableMasterHpCommand(command)) {
+        await new Promise<void>((resolve, reject) => {
+          const batchKey = makeHpBatchKey(command);
+          const pendingEntry: PendingHpBatchCommand = { command, peerId, queuedAt, resolve, reject };
+          const existing = hpCommandBatchRef.current[batchKey];
+          if (existing) {
+            existing.entries.push(pendingEntry);
+            return;
+          }
+
+          const timer = setTimeout(() => {
+            const pending = hpCommandBatchRef.current[batchKey];
+            if (!pending) return;
+            flushHpBatch(batchKey, pending);
+          }, LAN_HP_BATCH_WINDOW_MS);
+
+          hpCommandBatchRef.current[batchKey] = { timer, entries: [pendingEntry] };
+        });
+        return;
       }
+
+      Object.entries(hpCommandBatchRef.current)
+        .sort(([, left], [, right]) => Math.min(...left.entries.map(entry => entry.queuedAt)) - Math.min(...right.entries.map(entry => entry.queuedAt)))
+        .forEach(([batchKey, pending]) => flushHpBatch(batchKey, pending));
+
+      await enqueueCommand(command, peerId, queuedAt);
     },
-    [handleAuthoritativeCommand]
+    [handleAuthoritativeCommand, traceLan]
   );
 
   const handleCharacterUpsert = useCallback(
@@ -2128,6 +2338,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         deviceId: characterMessage.deviceId,
         characterId: characterMessage.snapshot?.localId || null,
         characterName: characterMessage.snapshot?.name || null,
+        snapshotBytes: estimateJsonBytes(characterMessage.snapshot),
+        includesAvatarDataUri: Boolean(characterMessage.snapshot?.data?.avatar_data_uri),
       }, 'debug');
 
       if (!session || session.role !== 'master') return;
@@ -2205,23 +2417,42 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   );
 
   const buildRpcSyncPayload = useCallback(
-    async (session: LanSessionRecord, sinceSeq = 0) => {
+    async (session: LanSessionRecord, sinceOrOptions: number | BuildRpcSyncPayloadOptions = 0) => {
+      const startedAt = Date.now();
+      const options: BuildRpcSyncPayloadOptions = typeof sinceOrOptions === 'number'
+        ? { sinceSeq: sinceOrOptions }
+        : sinceOrOptions;
+      const sinceSeq = Math.max(0, Number(options.sinceSeq || 0));
+      const eventLimit = Math.max(1, Number(options.eventLimit || LAN_SYNC_DEFAULT_EVENT_LIMIT));
+      const recentLimit = Math.max(0, Number(options.recentLimit ?? 20));
+      const includeRecentEvents = options.includeRecentEvents ?? true;
+      const includePlayerSnapshots = options.includePlayerSnapshots ?? sinceSeq <= 0;
+      const includeCustomContent = options.includeCustomContent ?? (session.sync_custom_content && sinceSeq <= 0);
       if (session.role === 'master' && session.status !== 'closed') {
         await expireStaleTrades(session);
       }
       const selectedContent = selectedContentFromSession(session);
-      const [state, playersRows, events, recentEvents, customContent] = await Promise.all([
+      const [state, playersRows, events, recentEvents, customContent, lastEventSeq] = await Promise.all([
         getLanSessionState(db, session.id),
         getLanPlayers(db, session.id),
-        getLanEventsSince(db, session.id, sinceSeq, 200),
-        getLanHistoryPage(db, session.id, 0, 20),
-        session.sync_custom_content ? getSelectedCustomContentPayloads(db, selectedContent) : Promise.resolve([]),
+        getLanEventsSince(db, session.id, sinceSeq, eventLimit),
+        includeRecentEvents && recentLimit > 0 ? getLanHistoryPage(db, session.id, 0, recentLimit) : Promise.resolve([]),
+        includeCustomContent ? getSelectedCustomContentPayloads(db, selectedContent) : Promise.resolve([]),
+        getLocalLastEventSeq(session.id),
       ]);
-      if (session.sync_custom_content) {
+      if (includeCustomContent) {
         customContentCacheRef.current = customContent;
       }
+      const playersPayload = includePlayerSnapshots
+        ? playersRows
+        : playersRows.map(player => {
+            const compactPlayer = { ...player } as Record<string, unknown>;
+            delete compactPlayer.snapshot_payload;
+            delete compactPlayer.snapshot_updated_at;
+            return compactPlayer;
+          });
 
-      return {
+      const payload = {
         session: {
           id: session.id,
           name: session.name,
@@ -2229,14 +2460,28 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           config: makeSessionConfig(session),
         },
         state,
-        players: playersRows,
+        players: playersPayload,
         events,
         recentEvents,
-        seq: Math.max(...[0, ...events.map(event => event.seq), ...recentEvents.map(event => event.seq)]),
+        seq: Math.max(lastEventSeq, ...events.map(event => event.seq), ...recentEvents.map(event => event.seq)),
         customContent,
       };
+      await traceLan('LAN_SYNC', 'buildRpcSyncPayload', 'built', 'Payload de sincronizacao LAN montado.', {
+        durationMs: Date.now() - startedAt,
+        sinceSeq,
+        resultSeq: payload.seq,
+        playersCount: playersPayload.length,
+        playerSnapshotsIncluded: includePlayerSnapshots,
+        eventsCount: events.length,
+        recentEventsCount: recentEvents.length,
+        customContentCount: customContent.length,
+        syncCustomContent: includeCustomContent,
+        compact: Boolean(options.compact),
+        payloadBytes: estimateJsonBytes(payload),
+      }, 'debug');
+      return payload;
     },
-    [db, expireStaleTrades, traceLan]
+    [db, expireStaleTrades, getLocalLastEventSeq, traceLan]
   );
 
   const pushTcpSync = useCallback(
@@ -2244,7 +2489,17 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       const server = rpcServerRef.current;
       if (!server || session.role !== 'master') return;
 
-      const payload = await buildRpcSyncPayload(session, 0);
+      const lastEventSeq = await getLocalLastEventSeq(session.id);
+      const isCharacterUpsert = reason === 'character-upsert';
+      const payload = await buildRpcSyncPayload(session, {
+        sinceSeq: isCharacterUpsert ? 0 : Math.max(0, lastEventSeq - LAN_SYNC_PUSH_EVENT_WINDOW),
+        eventLimit: isCharacterUpsert ? LAN_SYNC_DEFAULT_EVENT_LIMIT : LAN_SYNC_PUSH_EVENT_LIMIT,
+        recentLimit: LAN_SYNC_PUSH_RECENT_LIMIT,
+        includeRecentEvents: false,
+        includePlayerSnapshots: isCharacterUpsert,
+        includeCustomContent: false,
+        compact: !isCharacterUpsert,
+      });
       const sent = server.broadcast({
         method: 'SYNC',
         sessionId: session.id,
@@ -2256,10 +2511,18 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           sessionId: session.id,
           reason,
           sent,
+          payloadBytes: estimateJsonBytes(payload),
+          playersCount: Array.isArray(payload.players) ? payload.players.length : 0,
+          eventsCount: Array.isArray(payload.events) ? payload.events.length : 0,
+          recentEventsCount: Array.isArray(payload.recentEvents) ? payload.recentEvents.length : 0,
+          customContentCount: Array.isArray(payload.customContent) ? payload.customContent.length : 0,
+          playerSnapshotsIncluded: isCharacterUpsert,
+          compact: !isCharacterUpsert,
+          seq: Number(payload.seq || 0),
         }, 'debug');
       }
     },
-    [buildRpcSyncPayload, traceLan]
+    [buildRpcSyncPayload, getLocalLastEventSeq, traceLan]
   );
 
   useEffect(() => {
@@ -2269,6 +2532,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const applyRpcSyncPayload = useCallback(
     async (payload: Record<string, unknown> | undefined) => {
       if (!payload) return;
+      const startedAt = Date.now();
+      const payloadBytes = estimateJsonBytes(payload);
+      let snapshotsSaved = 0;
+      let newEventsCount = 0;
 
       const customContent = payload.customContent as LanCustomContentMessage['records'] | undefined;
       if (Array.isArray(customContent) && customContent.length > 0) {
@@ -2279,6 +2546,13 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (state?.sessionId) {
         const currentBeforeUpdate = activeSessionRef.current;
         if (state.status === 'closed' && currentBeforeUpdate?.role === 'player' && currentBeforeUpdate.id === state.sessionId) {
+          await traceLan('LAN_SYNC', 'applyRpcSyncPayload', 'closed_state_received', 'Payload de sync informou sessao encerrada.', {
+            durationMs: Date.now() - startedAt,
+            payloadBytes,
+            sessionId: state.sessionId,
+            stateStatus: state.status,
+            customContentCount: Array.isArray(customContent) ? customContent.length : 0,
+          }, 'info');
           await finalizeClosedPlayerSession(currentBeforeUpdate, 'sync-state');
           return;
         }
@@ -2323,7 +2597,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           }
         }
         if (snapshot?.localId) {
-          await saveCharacterSnapshot(db, state?.sessionId || activeSessionRef.current?.id || '', String(player.device_id), snapshot);
+          const snapshotChanged = await saveCharacterSnapshot(db, state?.sessionId || activeSessionRef.current?.id || '', String(player.device_id), snapshot);
+          if (snapshotChanged) snapshotsSaved += 1;
         }
         await upsertLanPlayer(
           db,
@@ -2337,17 +2612,66 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
 
       const events = Array.isArray(payload.events) ? payload.events as LanOfficialEventMessage[] : [];
-      for (const event of events) {
+      const syncSessionId = state?.sessionId || activeSessionRef.current?.id || '';
+      const localSeqBeforeEvents = syncSessionId ? await getLocalLastEventSeq(syncSessionId) : 0;
+      let expectedSeq = localSeqBeforeEvents;
+      let skippedEventsDueToGap = 0;
+      const orderedEvents = [...events].sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+      const payloadSeq = Number(payload.seq || 0);
+      for (const event of orderedEvents) {
+        const eventSeq = Number(event.seq || 0);
+        if (eventSeq <= expectedSeq) continue;
+        if (eventSeq > expectedSeq + 1) {
+          skippedEventsDueToGap = orderedEvents.filter(nextEvent => Number(nextEvent.seq || 0) > expectedSeq).length;
+          break;
+        }
         const isNewEvent = await saveLanOfficialEvent(db, event);
+        expectedSeq = Math.max(expectedSeq, eventSeq);
         if (isNewEvent) {
+          newEventsCount += 1;
           await applyOfficialEventLocally(event);
         }
       }
 
+      const shouldRequestCatchUp = skippedEventsDueToGap > 0 || (payloadSeq > expectedSeq && events.length >= LAN_SYNC_DEFAULT_EVENT_LIMIT);
+      if (shouldRequestCatchUp) {
+        const current = activeSessionRef.current;
+        const sinceSeq = syncSessionId ? await getLocalLastEventSeq(syncSessionId) : localSeqBeforeEvents;
+        tcpClientRef.current?.updatePayload({ sinceSeq });
+        await traceLan('LAN_SYNC', 'applyRpcSyncPayload', skippedEventsDueToGap > 0 ? 'event_gap_detected' : 'event_page_pending', skippedEventsDueToGap > 0 ? 'Payload compacto chegou com lacuna de eventos; solicitando catch-up.' : 'Payload de sync ainda tem mais eventos; solicitando proxima pagina.', {
+          durationMs: Date.now() - startedAt,
+          payloadBytes,
+          sessionId: syncSessionId || null,
+          stateStatus: state?.status || null,
+          localSeqBeforeEvents,
+          currentLocalSeq: sinceSeq,
+          payloadSeq,
+          expectedSeqAfterApply: expectedSeq,
+          firstPayloadEventSeq: orderedEvents[0]?.seq || null,
+          lastPayloadEventSeq: orderedEvents[orderedEvents.length - 1]?.seq || null,
+          skippedEventsDueToGap,
+          eventsCount: events.length,
+          role: current?.role || null,
+        }, 'warn');
+      }
+
       await refreshPlayers();
       setLanRevision(prev => prev + 1);
+      await traceLan('LAN_SYNC', 'applyRpcSyncPayload', 'applied', 'Payload de sincronizacao LAN aplicado localmente.', {
+        durationMs: Date.now() - startedAt,
+        payloadBytes,
+        sessionId: state?.sessionId || activeSessionRef.current?.id || null,
+        stateStatus: state?.status || null,
+        playersCount: playerRows.length,
+        snapshotsSaved,
+        eventsCount: events.length,
+        newEventsCount,
+        skippedEventsDueToGap,
+        customContentCount: Array.isArray(customContent) ? customContent.length : 0,
+        seq: payloadSeq,
+      }, 'debug');
     },
-    [applyOfficialEventLocally, db, finalizeClosedPlayerSession, refreshPlayers, refreshSavedSessions]
+    [applyOfficialEventLocally, db, finalizeClosedPlayerSession, getLocalLastEventSeq, refreshPlayers, refreshSavedSessions, traceLan]
   );
 
   const acknowledgeClosedSessionDelivery = useCallback(
@@ -2388,7 +2712,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         requestId: request.id,
         sessionId: request.sessionId || null,
         deviceId: request.deviceId || null,
-        payload: request.payload || {},
+        payloadBytes: estimateJsonBytes(request.payload || {}),
+        command: (request.payload?.commandMessage as LanCommandMessage | undefined)?.command || null,
+        commandId: (request.payload?.commandMessage as LanCommandMessage | undefined)?.commandId || null,
+        sinceSeq: Number(request.payload?.sinceSeq || 0),
       }, 'debug', request.id);
 
       if (!session || session.role !== 'master') {
@@ -2540,6 +2867,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           durationMs: Date.now() - startedAt,
           method: request.method,
           requestId: request.id,
+          payloadBytes: estimateJsonBytes(request.payload || {}),
+          command: (request.payload?.commandMessage as LanCommandMessage | undefined)?.command || null,
+          commandId: (request.payload?.commandMessage as LanCommandMessage | undefined)?.commandId || null,
         }, 'debug', request.id);
       }
     },
@@ -3360,6 +3690,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         includeAvatarDataUri: shouldIncludeAvatarInSnapshot(reason),
       });
       if (!snapshot) return;
+      const snapshotBytes = estimateJsonBytes(snapshot);
+      const includesAvatarDataUri = Boolean(snapshot.data?.avatar_data_uri);
 
       await saveCharacterSnapshot(db, session.id, deviceId, snapshot);
 
@@ -3413,6 +3745,15 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         if (!response.ok) {
           throw new Error(response.error || 'Mestre recusou sincronizacao da ficha.');
         }
+        await traceLan('LAN_SEND', 'broadcastCharacter', 'character_upsert_response', `Resposta de sincronizacao da ficha recebida (${reason}).`, {
+          durationMs: Date.now() - startedAt,
+          characterId,
+          reason,
+          snapshotBytes,
+          includesAvatarDataUri,
+          responsePayloadBytes: estimateJsonBytes(response.payload),
+          responseSeq: Number(response.payload?.seq || 0),
+        }, 'debug');
         await applyRpcSyncPayload(response.payload);
         sent = true;
       }
@@ -3428,6 +3769,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           characterId,
           reason,
           snapshotName: snapshot.name,
+          snapshotBytes,
+          includesAvatarDataUri,
         }, 'warn');
         return;
       }
@@ -3440,6 +3783,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         characterId,
         reason,
         snapshotName: snapshot.name,
+        snapshotBytes,
+        includesAvatarDataUri,
         sentCount: session.role === 'master' ? sentCount : 1,
       }, 'debug');
     },
@@ -3503,6 +3848,13 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
       try {
         const sinceSeq = await getLocalLastEventSeq(session.id);
+        const rpcStartedAt = Date.now();
+        await traceLan('LAN_RPC', 'sendLanCommand', 'rpc_send_start', `Enviando comando ${command} ao mestre.`, {
+          command,
+          commandId: message.commandId,
+          sinceSeq,
+          payloadBytes: estimateJsonBytes(payload),
+        }, 'debug', message.commandId);
         const response = await sendLanRpc(session.host_ip, Number(session.port || LAN_DEFAULT_PORT), {
           type: 'LAN_RPC',
           id: makeRpcId(),
@@ -3520,17 +3872,43 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           throw new Error(response.error || 'Mestre recusou o comando.');
         }
 
+        await traceLan('LAN_RPC', 'sendLanCommand', 'rpc_response_received', `Resposta RPC recebida para ${command}.`, {
+          durationMs: Date.now() - rpcStartedAt,
+          command,
+          commandId: message.commandId,
+          responsePayloadBytes: estimateJsonBytes(response.payload),
+          responseSeq: Number(response.payload?.seq || 0),
+        }, 'debug', message.commandId);
+        const applyStartedAt = Date.now();
         await applyRpcSyncPayload(response.payload);
+        await traceLan('LAN_SYNC', 'sendLanCommand', 'response_sync_applied', `Sync da resposta aplicado para ${command}.`, {
+          durationMs: Date.now() - applyStartedAt,
+          totalDurationMs: Date.now() - startedAt,
+          command,
+          commandId: message.commandId,
+        }, 'debug', message.commandId);
       } catch (error) {
         const parsedCode = parseSessionCode(session.session_code || session.id);
         try {
           if (!parsedCode) throw error;
+          const rediscoverStartedAt = Date.now();
           const discovery = await discoverLanMaster(parsedCode);
+          const rediscoverDurationMs = Date.now() - rediscoverStartedAt;
           const nextSession = { ...session, host_ip: discovery.host, port: discovery.port };
           await saveLanSession(db, nextSession);
           setActiveSession(nextSession);
           activeSessionRef.current = nextSession;
           const sinceSeq = await getLocalLastEventSeq(session.id);
+          const retryRpcStartedAt = Date.now();
+          await traceLan('LAN_RPC', 'sendLanCommand', 'retry_rpc_send_start', `Reenviando comando ${command} apos redescoberta.`, {
+            command,
+            commandId: message.commandId,
+            sinceSeq,
+            rediscoverDurationMs,
+            host: discovery.host,
+            port: discovery.port,
+            payloadBytes: estimateJsonBytes(payload),
+          }, 'debug', message.commandId);
           const response = await sendLanRpc(discovery.host, discovery.port, {
             type: 'LAN_RPC',
             id: makeRpcId(),
@@ -3546,7 +3924,23 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           if (!response.ok) {
             throw new Error(response.error || 'Mestre recusou o comando.');
           }
+          await traceLan('LAN_RPC', 'sendLanCommand', 'retry_rpc_response_received', `Resposta RPC recebida no retry para ${command}.`, {
+            durationMs: Date.now() - retryRpcStartedAt,
+            command,
+            commandId: message.commandId,
+            rediscoverDurationMs,
+            responsePayloadBytes: estimateJsonBytes(response.payload),
+            responseSeq: Number(response.payload?.seq || 0),
+          }, 'debug', message.commandId);
+          const retryApplyStartedAt = Date.now();
           await applyRpcSyncPayload(response.payload);
+          await traceLan('LAN_SYNC', 'sendLanCommand', 'retry_response_sync_applied', `Sync da resposta retry aplicado para ${command}.`, {
+            durationMs: Date.now() - retryApplyStartedAt,
+            totalDurationMs: Date.now() - startedAt,
+            command,
+            commandId: message.commandId,
+            rediscoverDurationMs,
+          }, 'debug', message.commandId);
         } catch (retryError) {
           setTransportReadyState(false);
           setLanConnectionStatus('reconnecting');
