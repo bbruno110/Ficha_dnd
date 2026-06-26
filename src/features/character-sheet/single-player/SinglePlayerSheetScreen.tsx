@@ -116,6 +116,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const [lanTargetPicker, setLanTargetPicker] = useState<{ mode: 'send' | 'trade'; item: any; qty: number } | null>(null);
   const [actionQty, setActionQty] = useState(1);
   const [customAlert, setCustomAlert] = useState<{visible: boolean, title: string, message: string, buttons: any[]}>({visible: false, title: '', message: '', buttons: []});
+  const [tradeAlertEvent, setTradeAlertEvent] = useState<LanOfficialEventMessage | null>(null);
   const [sheetTradeOffers, setSheetTradeOffers] = useState<LanOfficialEventMessage[]>([]);
   const [sheetTradeModal, setSheetTradeModal] = useState<LanOfficialEventMessage | null>(null);
   const [sheetTradeCounterItems, setSheetTradeCounterItems] = useState<any[]>([]);
@@ -352,27 +353,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
       const key = unseen.commandId || unseen.eventId;
       alertedTradeIdsRef.current[key] = true;
-      const payload = (unseen.payload || {}) as any;
-      const isCounter = unseen.eventType === 'TRADE_COUNTERED';
-      const itemName = isCounter ? payload.offeredItemName || payload.offeredItem?.name || 'item' : payload.itemName || payload.item?.name || 'item';
-      const qty = Math.max(1, Number(isCounter ? payload.offeredQuantity || 1 : payload.quantity || 1));
-      const sourceName = isCounter ? payload.targetName || unseen.actorName || 'Personagem' : payload.sourceName || unseen.actorName || 'Personagem';
-      showCustomAlert(isCounter ? 'Contraproposta de troca' : 'Proposta de troca', isCounter ? `${sourceName} respondeu sua troca de ${qty}x ${itemName}.` : `${sourceName} ofereceu ${qty}x ${itemName}.`, [
-        {
-          text: 'Aceitar',
-          color: '#00fa9a',
-          onPress: () => void respondToSheetTradeOffer(unseen, 'accept'),
-        },
-        {
-          text: 'Recusar',
-          color: '#ff6666',
-          onPress: () => void respondToSheetTradeOffer(unseen, 'decline'),
-        },
-        {
-          text: 'Ignorar',
-          color: '#00bfff',
-        },
-      ]);
+      setTradeAlertEvent(unseen);
     };
 
     void loadTradeOffers();
@@ -618,6 +599,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           hpMax: 1,
           hpTemp: 0,
           hpUnknown: true,
+          race: '',
+          className: '',
           avatarUri: avatarSourceForName(player?.character_name || player?.player_name || 'Jogador'),
         };
       }
@@ -630,6 +613,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         hpMax: Math.max(1, Number(data.hp_max ?? 1)),
         hpTemp: Math.max(0, Number(data.hp_temp ?? 0)),
         hpUnknown: false,
+        race: String(data.race ?? snapshot?.race ?? ''),
+        className: String(data.class ?? snapshot?.class ?? ''),
         avatarUri: String(data.avatar_data_uri || snapshot?.avatar_data_uri || '') || avatarSourceForName(name),
       };
     } catch {
@@ -641,9 +626,31 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         hpMax: 1,
         hpTemp: 0,
         hpUnknown: true,
+        race: '',
+        className: '',
         avatarUri: avatarSourceForName(name),
       };
     }
+  };
+
+  const tradeParticipantInfo = (event: LanOfficialEventMessage, side: 'source' | 'target' = 'source') => {
+    const payload = (event.payload || {}) as any;
+    const deviceId = String(side === 'source' ? payload.sourceDeviceId || event.actorDeviceId || '' : payload.targetDeviceId || event.targetDeviceId || '');
+    const characterId = Number(side === 'source' ? payload.sourceCharacterId || event.targetCharacterId || 0 : payload.targetCharacterId || event.targetCharacterId || 0);
+    const fallbackName = String(side === 'source' ? payload.sourceName || event.actorName || 'Personagem' : payload.targetName || event.targetName || 'Personagem');
+    const player = players.find((candidate: any) => (
+      String(candidate.device_id || '') === deviceId &&
+      (!characterId || Number(candidate.character_id || 0) === characterId)
+    )) || players.find((candidate: any) => String(candidate.device_id || '') === deviceId);
+    const snapshot = player ? parseLanSnapshot(player) : null;
+    const name = String(snapshot?.name || fallbackName);
+    return {
+      name,
+      race: String(snapshot?.race || ''),
+      className: String(snapshot?.className || ''),
+      level: Number(snapshot?.level || 0),
+      avatarUri: snapshot?.avatarUri || avatarSourceForName(name),
+    };
   };
 
   const lanPlayersWithCharacters = players.filter((player: any) => player.character_id);
@@ -1889,10 +1896,80 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
               <TouchableOpacity style={styles.sheetTradeDangerButton} onPress={() => void declineSheetTrade(sheetTradeModal)}>
                 <Text style={styles.sheetTradeDangerText}>{isConfirmingCounter ? 'RECUSAR CONTRAPROPOSTA' : 'RECUSAR'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.actionBtnCancel} onPress={() => setSheetTradeModal(null)}>
-                <Text style={styles.actionBtnCancelText}>Ignorar por enquanto</Text>
-              </TouchableOpacity>
+              <Text style={styles.sheetTradeFooterHint}>Toque fora do card ou no X para responder depois.</Text>
             </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  };
+
+  const renderTradeAlertModal = () => {
+    if (!tradeAlertEvent) return null;
+    const payload = (tradeAlertEvent.payload || {}) as any;
+    const isCounter = tradeAlertEvent.eventType === 'TRADE_COUNTERED';
+    const offeredItemName = isCounter
+      ? payload.offeredItemName || payload.offeredItem?.name || 'item'
+      : payload.itemName || payload.item?.name || 'item';
+    const offeredQty = Math.max(1, tradeNumberValue(isCounter ? payload.offeredQuantity || 1 : payload.quantity || 1, 1));
+    const sourceInfo = tradeParticipantInfo(tradeAlertEvent, isCounter ? 'target' : 'source');
+
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={() => setTradeAlertEvent(null)}>
+        <Pressable style={styles.modalOverlay} onPress={() => setTradeAlertEvent(null)}>
+          <Pressable style={styles.sheetTradeAlertBox} onPress={event => event.stopPropagation()}>
+            <View style={styles.sheetTradeAlertSender}>
+              <Image source={{ uri: sourceInfo.avatarUri }} style={styles.sheetTradeAlertAvatar} />
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.sheetTradeAlertOverline}>{isCounter ? 'CONTRAPROPOSTA DE' : 'PROPOSTA RECEBIDA DE'}</Text>
+                <Text style={styles.sheetTradeAlertName} numberOfLines={1}>{sourceInfo.name}</Text>
+                <Text style={styles.sheetTradeAlertMeta} numberOfLines={1}>
+                  {[sourceInfo.race, sourceInfo.className, sourceInfo.level ? `Nível ${sourceInfo.level}` : ''].filter(Boolean).join(' • ')}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.sheetTradeDividerRow}>
+              <View style={styles.sheetTradeDividerLine} />
+              <Ionicons name="swap-horizontal-outline" size={15} color="#c48a44" />
+              <View style={styles.sheetTradeDividerLine} />
+            </View>
+
+            <Text style={styles.sheetTradeAlertNarrative}>
+              {isCounter ? `${sourceInfo.name} respondeu sua solicitação.` : `${sourceInfo.name} quer trocar com você.`}
+            </Text>
+
+            <Text style={styles.sheetTradeSideLabel}>VOCÊ RECEBERÁ</Text>
+            <View style={styles.sheetTradeAlertItemBox}>
+              <Text style={styles.sheetTradeAlertItemName}>{offeredItemName}</Text>
+              <Text style={styles.sheetTradeAlertItemQty}>x{offeredQty}</Text>
+            </View>
+
+            <View style={styles.sheetTradeAlertHint}>
+              <Ionicons name="information-circle-outline" size={18} color="#fff" />
+              <Text style={styles.sheetTradeAlertHintText}>Revise os itens e escolha como deseja responder.</Text>
+            </View>
+
+            <TouchableOpacity
+              style={styles.sheetTradePrimaryButton}
+              onPress={() => {
+                setTradeAlertEvent(null);
+                void openSheetTradeModal(tradeAlertEvent);
+              }}
+            >
+              <Text style={styles.sheetTradePrimaryText}>{isCounter ? 'REVISAR CONTRAPROPOSTA' : 'ACEITAR E RESPONDER'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.sheetTradeDangerButton}
+              onPress={() => {
+                const event = tradeAlertEvent;
+                setTradeAlertEvent(null);
+                void declineSheetTrade(event);
+              }}
+            >
+              <Text style={styles.sheetTradeDangerText}>RECUSAR</Text>
+            </TouchableOpacity>
+            <Text style={styles.sheetTradeFooterHint}>Toque fora do card para responder depois.</Text>
           </Pressable>
         </Pressable>
       </Modal>
@@ -2831,6 +2908,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       </Modal>
 
       {/* ================= MODAL DE ALERTAS CUSTOMIZADOS (AÇÕES) ================= */}
+      {renderTradeAlertModal()}
       {renderSheetTradeModal()}
 
       <Modal visible={customAlert.visible} transparent animationType="fade">
@@ -3114,6 +3192,19 @@ const styles = StyleSheet.create({
   sheetTradePrimaryText: { color: '#02112b', fontSize: 14, fontWeight: 'bold' },
   sheetTradeDangerButton: { minHeight: 46, alignItems: 'center', justifyContent: 'center', borderRadius: 12, backgroundColor: 'rgba(255,102,102,0.1)', borderWidth: 1, borderColor: 'rgba(255,102,102,0.35)', marginTop: 10 },
   sheetTradeDangerText: { color: '#ff6666', fontSize: 13, fontWeight: 'bold' },
+  sheetTradeFooterHint: { color: '#8bdcff', fontSize: 12, textAlign: 'center', marginTop: 14, fontWeight: 'bold', letterSpacing: 0.3 },
+  sheetTradeAlertBox: { backgroundColor: '#06182f', width: '90%', maxHeight: '86%', borderRadius: 20, padding: 16, borderWidth: 1, borderColor: 'rgba(196,138,68,0.58)', shadowColor: '#00d7ff', shadowOpacity: 0.22, shadowRadius: 18, elevation: 10 },
+  sheetTradeAlertSender: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 8 },
+  sheetTradeAlertAvatar: { width: 66, height: 66, borderRadius: 33, borderWidth: 1, borderColor: 'rgba(196,138,68,0.55)', backgroundColor: 'rgba(0,0,0,0.25)' },
+  sheetTradeAlertOverline: { color: '#c48a44', fontSize: 10, fontWeight: 'bold', letterSpacing: 0.9, marginBottom: 5 },
+  sheetTradeAlertName: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  sheetTradeAlertMeta: { color: 'rgba(255,255,255,0.66)', fontSize: 12, marginTop: 3 },
+  sheetTradeAlertNarrative: { color: 'rgba(255,255,255,0.84)', fontSize: 13, lineHeight: 19, textAlign: 'center', marginBottom: 12 },
+  sheetTradeAlertItemBox: { minHeight: 56, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, borderRadius: 10, paddingHorizontal: 14, backgroundColor: 'rgba(0,191,255,0.06)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.28)', marginTop: 8, marginBottom: 12 },
+  sheetTradeAlertItemName: { flex: 1, color: '#fff', fontSize: 15, fontWeight: 'bold' },
+  sheetTradeAlertItemQty: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
+  sheetTradeAlertHint: { flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 10, padding: 10, backgroundColor: 'rgba(255,255,255,0.04)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)', marginBottom: 12 },
+  sheetTradeAlertHintText: { flex: 1, color: 'rgba(255,255,255,0.72)', fontSize: 12, lineHeight: 17 },
 
   customAlertBox: { backgroundColor: '#102b56', width: '90%', maxHeight: '86%', borderRadius: 20, padding: 25, borderWidth: 1, borderColor: 'rgba(0,191,255,0.3)', alignItems: 'center' },
   customAlertTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },

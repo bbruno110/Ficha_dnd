@@ -340,6 +340,26 @@ export default function LanSessionScreen() {
   const playerAvatarSource = (snapshot: ReturnType<typeof playerSnapshot>, fallbackName: string) =>
     String(snapshot.data?.avatar_data_uri || snapshot.raw?.avatar_data_uri || '') || avatarSourceForName(fallbackName);
 
+  const tradeParticipantInfo = (event: LanOfficialEventMessage, side: 'source' | 'target' = 'source') => {
+    const payload = (event.payload || {}) as any;
+    const deviceId = String(side === 'source' ? payload.sourceDeviceId || event.actorDeviceId || '' : payload.targetDeviceId || event.targetDeviceId || '');
+    const characterId = Number(side === 'source' ? payload.sourceCharacterId || event.targetCharacterId || 0 : payload.targetCharacterId || event.targetCharacterId || 0);
+    const fallbackName = String(side === 'source' ? payload.sourceName || event.actorName || 'Personagem' : payload.targetName || event.targetName || 'Personagem');
+    const player = players.find(candidate => (
+      String(candidate.device_id || '') === deviceId &&
+      (!characterId || Number(candidate.character_id || 0) === characterId)
+    )) || players.find(candidate => String(candidate.device_id || '') === deviceId);
+    const snapshot = player ? playerSnapshot(player) : null;
+    const name = String(snapshot?.raw?.name || snapshot?.data?.name || player?.character_name || fallbackName);
+    return {
+      name,
+      race: String(snapshot?.race || ''),
+      className: String(snapshot?.className || ''),
+      level: Number(snapshot?.level || 0),
+      avatarUri: snapshot ? playerAvatarSource(snapshot, name) : avatarSourceForName(name),
+    };
+  };
+
   const playerActionKey = (player: typeof players[number]) => `${player.device_id}_${player.character_id || 'none'}`;
 
   const getCardAmount = (player: typeof players[number]) => cardAmounts[playerActionKey(player)] ?? '1';
@@ -2100,13 +2120,18 @@ export default function LanSessionScreen() {
               const payload = (event.payload || {}) as any;
               const itemName = payload.itemName || payload.item?.name || 'item';
               const qty = Math.max(1, numericValue(String(payload.quantity || 1), 1));
-              const sourceName = payload.sourceName || event.actorName || 'Personagem';
+              const source = tradeParticipantInfo(event, 'source');
               return (
                 <View key={event.commandId || event.eventId} style={styles.pendingRequestCard}>
+                  <Image source={{ uri: source.avatarUri }} style={styles.pendingTradeAvatar} />
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.pendingRequestTitle}>{sourceName}</Text>
+                    <Text style={styles.pendingRequestOverline}>PROPOSTA RECEBIDA DE</Text>
+                    <Text style={styles.pendingRequestTitle}>{source.name}</Text>
+                    <Text style={styles.pendingRequestMeta}>
+                      {[source.race, source.className, source.level ? `Nível ${source.level}` : ''].filter(Boolean).join(' • ')}
+                    </Text>
                     <Text style={styles.pendingRequestText}>
-                      Ofereceu {qty}x {itemName}. Responda com item, moedas ou nada.
+                      Quer trocar com você: {itemName} x{qty}.
                     </Text>
                   </View>
                   <View style={styles.pendingRequestActions}>
@@ -2131,14 +2156,19 @@ export default function LanSessionScreen() {
             </View>
             {pendingTradeCounters.map(event => {
               const payload = (event.payload || {}) as any;
-              const targetName = payload.targetName || event.actorName || 'Personagem';
+              const target = tradeParticipantInfo(event, 'target');
               const offeredName = payload.offeredItemName || payload.offeredItem?.name || 'item';
               const offeredQty = Math.max(1, numericValue(String(payload.offeredQuantity || 1), 1));
               const counterLabel = tradePartsLabel(payload.counterItem, Number(payload.counterQuantity || 0), payload.coins);
               return (
                 <View key={event.commandId || event.eventId} style={styles.pendingRequestCard}>
+                  <Image source={{ uri: target.avatarUri }} style={styles.pendingTradeAvatar} />
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.pendingRequestTitle}>{targetName}</Text>
+                    <Text style={styles.pendingRequestOverline}>CONTRAPROPOSTA DE</Text>
+                    <Text style={styles.pendingRequestTitle}>{target.name}</Text>
+                    <Text style={styles.pendingRequestMeta}>
+                      {[target.race, target.className, target.level ? `Nível ${target.level}` : ''].filter(Boolean).join(' • ')}
+                    </Text>
                     <Text style={styles.pendingRequestText}>
                       Aceitou receber {offeredQty}x {offeredName} e oferecer {counterLabel}. Confirme para executar.
                     </Text>
@@ -2213,6 +2243,7 @@ export default function LanSessionScreen() {
     const offeredQty = Math.max(1, numericValue(String(isConfirmingCounter ? payload.offeredQuantity || 1 : payload.quantity || 1), 1));
     const sourceName = payload.sourceName || tradeModal.actorName || 'Personagem';
     const counterName = payload.targetName || tradeModal.actorName || 'Personagem';
+    const sourceInfo = tradeParticipantInfo(tradeModal, isConfirmingCounter ? 'target' : 'source');
     const counterLabel = tradePartsLabel(payload.counterItem, Number(payload.counterQuantity || 0), payload.coins);
     const selectedItem = tradeCounterItemIndex !== null ? tradeCounterItems[tradeCounterItemIndex] : null;
     const selectedMaxQty = Math.max(1, Number(selectedItem?.qty || 1));
@@ -2242,11 +2273,26 @@ export default function LanSessionScreen() {
             </View>
 
             <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.tradeModalScrollContent}>
+              <View style={styles.tradeSenderCard}>
+                <Image source={{ uri: sourceInfo.avatarUri }} style={styles.tradeSenderAvatar} />
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={styles.tradeSenderOverline}>{isConfirmingCounter ? 'CONTRAPROPOSTA DE' : 'PROPOSTA RECEBIDA DE'}</Text>
+                  <Text style={styles.tradeSenderName} numberOfLines={1}>{sourceInfo.name}</Text>
+                  <Text style={styles.tradeSenderMeta} numberOfLines={1}>
+                    {[sourceInfo.race, sourceInfo.className, sourceInfo.level ? `Nível ${sourceInfo.level}` : ''].filter(Boolean).join(' • ')}
+                  </Text>
+                </View>
+              </View>
+
               <View style={styles.tradeDividerRow}>
                 <View style={styles.tradeDividerLine} />
                 <Ionicons name="swap-horizontal-outline" size={15} color="#c48a44" />
                 <View style={styles.tradeDividerLine} />
               </View>
+
+              <Text style={styles.tradeNarrativeText}>
+                {isConfirmingCounter ? `${sourceInfo.name} respondeu sua solicitação.` : `${sourceInfo.name} quer trocar com você.`}
+              </Text>
 
               <View style={styles.tradeBoard}>
                 <View style={styles.tradeSidePanel}>
@@ -2354,10 +2400,7 @@ export default function LanSessionScreen() {
                 <Ionicons name="close-circle-outline" size={18} color="#ff6666" />
                 <Text style={styles.dangerButtonText}>{isConfirmingCounter ? 'RECUSAR CONTRAPROPOSTA' : 'RECUSAR'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.secondaryWideButton} onPress={() => setTradeModal(null)}>
-                <Ionicons name="time-outline" size={18} color="#00bfff" />
-                <Text style={styles.secondaryButtonText}>FECHAR PARA DECIDIR DEPOIS</Text>
-              </TouchableOpacity>
+              <Text style={styles.tradeFooterHint}>Toque fora do card ou no X para responder depois.</Text>
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -3373,6 +3416,12 @@ const styles = StyleSheet.create({
   tradeModalSubtitle: { color: 'rgba(255,255,255,0.66)', fontSize: 12, lineHeight: 17, marginTop: 3 },
   tradeCloseButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
   tradeModalScrollContent: { paddingTop: 4, paddingBottom: 2 },
+  tradeSenderCard: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 8 },
+  tradeSenderAvatar: { width: 62, height: 62, borderRadius: 31, borderWidth: 1, borderColor: 'rgba(196,138,68,0.55)', backgroundColor: 'rgba(0,0,0,0.25)' },
+  tradeSenderOverline: { color: '#c48a44', fontSize: 10, fontWeight: 'bold', letterSpacing: 0.9, marginBottom: 5 },
+  tradeSenderName: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  tradeSenderMeta: { color: 'rgba(255,255,255,0.66)', fontSize: 12, marginTop: 3 },
+  tradeNarrativeText: { color: 'rgba(255,255,255,0.84)', fontSize: 13, lineHeight: 19, textAlign: 'center', marginBottom: 10 },
   tradeDividerRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginVertical: 10 },
   tradeDividerLine: { flex: 1, height: 1, backgroundColor: 'rgba(196,138,68,0.38)' },
   tradeDividerLabel: { color: '#c48a44', fontSize: 10, fontWeight: 'bold', letterSpacing: 0.8 },
@@ -3432,6 +3481,7 @@ const styles = StyleSheet.create({
   tradeChoiceBulletActive: { borderColor: '#66e8ff', backgroundColor: '#00bfff', shadowColor: '#00d7ff', shadowOpacity: 0.45, shadowRadius: 6 },
   tradeItemName: { flex: 1, color: '#fff', fontSize: 13, fontWeight: 'bold' },
   tradeItemQty: { color: 'rgba(255,255,255,0.55)', fontSize: 12, fontWeight: 'bold' },
+  tradeFooterHint: { color: '#8bdcff', fontSize: 12, textAlign: 'center', marginTop: 14, fontWeight: 'bold', letterSpacing: 0.3 },
   historyRow: {
     paddingVertical: 9,
     borderBottomWidth: 1,
@@ -3881,7 +3931,10 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   pendingRequestTitle: { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 3 },
+  pendingRequestOverline: { color: '#c48a44', fontSize: 9, fontWeight: 'bold', letterSpacing: 0.8, marginBottom: 2 },
+  pendingRequestMeta: { color: 'rgba(255,255,255,0.54)', fontSize: 11, marginBottom: 4 },
   pendingRequestText: { color: 'rgba(255,255,255,0.62)', fontSize: 12, lineHeight: 17 },
+  pendingTradeAvatar: { width: 44, height: 44, borderRadius: 22, borderWidth: 1, borderColor: 'rgba(196,138,68,0.45)', backgroundColor: 'rgba(0,0,0,0.24)' },
   pendingRequestActions: { flexDirection: 'row', gap: 8 },
   approveRequestButton: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: '#00fa9a' },
   denyRequestButton: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,100,100,0.1)', borderWidth: 1, borderColor: 'rgba(255,100,100,0.3)' },
