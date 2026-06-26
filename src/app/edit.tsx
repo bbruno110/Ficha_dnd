@@ -369,6 +369,9 @@ export default function EditCharacterScreen() {
   let passivesLvlCount = 0;
 
   let activeClassNames = classesData.filter(c => c.level > 0).map(c => c.name);
+  const activeSubclassNames = classesData
+    .filter(c => c.level > 0 && c.subclass)
+    .map(c => c.subclass as string);
   if (classesData.some(c => c.subclass === 'Cavaleiro Arcano' || c.subclass === 'Trapaceiro Arcano')) {
       if (!activeClassNames.includes('Mago')) activeClassNames.push('Mago');
   }
@@ -427,6 +430,11 @@ export default function EditCharacterScreen() {
     const sLvl = getSpellLevelNumber(s.level);
     const sCategory = getCategory(s);
     const spellClasses = String(s.classes || '');
+    const spellClassTokens = spellClasses.split(',').map(token => token.trim()).filter(Boolean);
+    const hasSelectedClass = activeClassNames.some(className => spellClassTokens.includes(className));
+    const hasSelectedSubclass = activeSubclassNames.some(subclassName => spellClassTokens.includes(subclassName));
+    const hasSubclassRestriction = dbSubclasses.some(subclass => spellClassTokens.includes(subclass.name));
+    const hasRaceRestriction = spellClassTokens.includes('Raça') || dbRaces.some(race => spellClassTokens.includes(race.name));
 
     let isAllowedByLevel = false;
     if (sCategory === 'Magia') {
@@ -435,7 +443,16 @@ export default function EditCharacterScreen() {
       isAllowedByLevel = true;
     }
 
-    const isCompatibleClass = lockedFeatures.includes(s.name) || activeClassNames.some(c => spellClasses.includes(c)) || spellClasses.includes('Raça');
+    let isCompatibleClass = lockedFeatures.includes(s.name);
+    if (!isCompatibleClass) {
+      if (hasRaceRestriction) {
+        isCompatibleClass = Boolean(character?.race && spellClassTokens.includes(character.race));
+      } else if (hasSubclassRestriction) {
+        isCompatibleClass = hasSelectedSubclass;
+      } else {
+        isCompatibleClass = hasSelectedClass;
+      }
+    }
 
     let reqPassed = true;
     if (s.class_level_required && !lockedFeatures.includes(s.name)) {

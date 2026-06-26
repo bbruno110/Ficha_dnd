@@ -382,6 +382,463 @@ type SpellcastingProgressionSeed = {
   slots: number[];
 };
 
+type FeatureRequirementSeed = string | { name: string; level?: number; spellLevel?: string };
+
+type BaseRaceFeatureRepair = {
+  name: string;
+  features: FeatureRequirementSeed[];
+};
+
+type BaseClassFeatureRepair = {
+  name: string;
+  features: FeatureRequirementSeed[];
+};
+
+type BaseSubclassFeatureRepair = {
+  name: string;
+  className: string;
+  levelRequired: number;
+  features: FeatureRequirementSeed[];
+};
+
+type BaseFeatureSpellRepair = {
+  name: string;
+  level: string;
+  category: 'Magia' | 'Habilidade' | 'Passiva';
+  classes: string;
+  castingTime?: string;
+  range?: string;
+  components?: string;
+  duration?: string;
+  damageDice?: string;
+  damageType?: string;
+  savingThrow?: string;
+  description: string;
+  classLevelRequired: number;
+};
+
+function normalizeFeatureRequirements(features: FeatureRequirementSeed[]) {
+  return JSON.stringify(features.map(feature => {
+    if (typeof feature === 'string') return { name: feature, level: 1 };
+    return { name: feature.name, level: feature.level || 1 };
+  }));
+}
+
+const BASE_RACE_FEATURE_REPAIRS: BaseRaceFeatureRepair[] = [
+  { name: 'Anão', features: ['Visão no Escuro', 'Resiliência Anã', 'Treinamento Anão em Combate', 'Proficiência com Ferramentas Anãs', 'Conhecimento de Pedras'] },
+  { name: 'Draconato', features: ['Ancestral Dracônico', 'Sopro Dracônico', 'Resistência Dracônica'] },
+  { name: 'Elfo', features: ['Visão no Escuro', 'Ancestral Feérico', 'Transe', 'Sentidos Aguçados'] },
+  { name: 'Gnomo', features: ['Visão no Escuro', 'Astúcia Gnômica'] },
+  { name: 'Halfling', features: ['Sortudo', 'Bravura', 'Agilidade Halfling'] },
+  { name: 'Humano', features: ['Idioma Extra'] },
+  { name: 'Meio-Elfo', features: ['Visão no Escuro', 'Ancestral Feérico', 'Versatilidade em Perícias'] },
+  { name: 'Meio-Orc', features: ['Visão no Escuro', 'Ameaçador', 'Resistência Implacável', 'Ataques Selvagens'] },
+  { name: 'Tiefling', features: ['Visão no Escuro', 'Resistência Infernal', 'Taumaturgia', { name: 'Legado Infernal: Repreensão Infernal', level: 3, spellLevel: 'Nível 1' }, { name: 'Legado Infernal: Escuridão', level: 5, spellLevel: 'Nível 2' }] },
+  { name: 'Githyanki', features: ['Conhecimento Astral', 'Mãos Mágicas (Githyanki)', { name: 'Legado Githyanki: Aprimorar Salto', level: 3, spellLevel: 'Nível 1' }, { name: 'Legado Githyanki: Passo Nebuloso', level: 5, spellLevel: 'Nível 2' }] },
+  { name: 'Alto Elfo', features: ['Visão no Escuro', 'Ancestral Feérico', 'Transe', 'Truque de Alto Elfo'] },
+  { name: 'Drow', features: ['Visão no Escuro Superior', 'Ancestral Feérico', 'Sensibilidade à Luz Solar', 'Treinamento com Armas Drow', 'Magia Drow: Globos de Luz', { name: 'Magia Drow: Fogo das Fadas', level: 3, spellLevel: 'Nível 1' }, { name: 'Magia Drow: Escuridão', level: 5, spellLevel: 'Nível 2' }] },
+  { name: 'Elfo da Floresta', features: ['Visão no Escuro', 'Ancestral Feérico', 'Pés Ligeiros', 'Máscara da Natureza'] },
+  { name: 'Aasimar', features: ['Visão no Escuro', 'Resistência Celestial', 'Mãos Curativas'] },
+  { name: 'Genasi do Fogo', features: ['Visão no Escuro', 'Resistência a Fogo', 'Chama Inata'] },
+  { name: 'Tabaxi', features: ['Agilidade Felina', 'Garras', 'Talento Felino'] },
+  { name: 'Firbolg', features: ['Magia Firbolg', 'Passo Oculto', 'Fala com Feras e Plantas'] },
+  { name: 'Kenku', features: ['Mimetismo', 'Treinamento Kenku', 'Memória de Perito'] },
+  { name: 'Kobold', features: ['Tática de Matilha', 'Grito Dracônico', 'Visão no Escuro'] },
+  { name: 'Tritão', features: ['Anfíbio', 'Controle do Ar e Água', 'Guardião das Profundezas'] },
+  { name: 'Shadar-kai', features: ['Resistência Necrótica', 'Benção da Rainha Corvo', 'Visão no Escuro'] },
+];
+
+const BASE_CLASS_FEATURE_REPAIRS: BaseClassFeatureRepair[] = [
+  {
+    name: 'Bárbaro',
+    features: ['Fúria', 'Defesa Sem Armadura', { name: 'Ataque Imprudente', level: 2 }, { name: 'Sentido de Perigo', level: 2 }, { name: 'Ataque Extra', level: 5 }, { name: 'Movimento Rápido', level: 5 }],
+  },
+  {
+    name: 'Bardo',
+    features: ['Inspiração Bárdica', 'Conjuração de Bardo', { name: 'Pau para Toda Obra', level: 2 }, { name: 'Canção de Descanso', level: 2 }, { name: 'Especialização', level: 3 }, { name: 'Fonte de Inspiração', level: 5 }],
+  },
+  {
+    name: 'Bruxo',
+    features: ['Patrono Sobrenatural', 'Magia de Pacto', { name: 'Invocações Místicas', level: 2 }, { name: 'Dádiva do Pacto', level: 3 }],
+  },
+  {
+    name: 'Clérigo',
+    features: ['Conjuração de Clérigo', 'Domínio Divino', { name: 'Canalizar Divindade', level: 2 }, { name: 'Destruir Mortos-Vivos', level: 5 }],
+  },
+  {
+    name: 'Druida',
+    features: ['Conjuração de Druida', 'Druídico', { name: 'Forma Selvagem', level: 2 }, { name: 'Círculo Druídico', level: 2 }, { name: 'Forma Selvagem Aprimorada', level: 4 }],
+  },
+  {
+    name: 'Feiticeiro',
+    features: ['Conjuração de Feiticeiro', 'Origem Feiticeira', { name: 'Fonte de Magia', level: 2 }, { name: 'Metamagia', level: 3 }],
+  },
+  {
+    name: 'Guerreiro',
+    features: ['Estilo de Luta', 'Segundo Fôlego', { name: 'Surto de Ação', level: 2 }, { name: 'Arquétipo Marcial', level: 3 }, { name: 'Ataque Extra', level: 5 }],
+  },
+  {
+    name: 'Ladino',
+    features: ['Especialização (Ladino)', 'Ataque Furtivo', 'Gíria de Ladrão', { name: 'Ação Ardilosa', level: 2 }, { name: 'Arquétipo Ladino', level: 3 }, { name: 'Esquiva Sobrenatural', level: 5 }],
+  },
+  {
+    name: 'Mago',
+    features: ['Conjuração de Mago', 'Recuperação Arcana', { name: 'Tradição Arcana', level: 2 }],
+  },
+  {
+    name: 'Monge',
+    features: ['Artes Marciais', 'Defesa Sem Armadura (Monge)', { name: 'Ki', level: 2 }, { name: 'Movimento Sem Armadura', level: 2 }, { name: 'Tradição Monástica', level: 3 }, { name: 'Queda Lenta', level: 4 }, { name: 'Ataque Extra', level: 5 }, { name: 'Ataque Atordoante', level: 5 }],
+  },
+  {
+    name: 'Paladino',
+    features: ['Sentido Divino', 'Imposição das Mãos', { name: 'Estilo de Luta', level: 2 }, { name: 'Conjuração de Paladino', level: 2 }, { name: 'Golpe Divino', level: 2 }, { name: 'Juramento Sagrado', level: 3 }, { name: 'Ataque Extra', level: 5 }],
+  },
+  {
+    name: 'Patrulheiro',
+    features: ['Inimigo Favorito', 'Explorador Nato', { name: 'Estilo de Luta', level: 2 }, { name: 'Conjuração de Patrulheiro', level: 2 }, { name: 'Arquétipo de Patrulheiro', level: 3 }, { name: 'Ataque Extra', level: 5 }],
+  },
+  {
+    name: 'Artifice',
+    features: ['Infusões Mágicas', 'Conjuração por Ferramentas', { name: 'Especialista em Ferramentas', level: 3 }, { name: 'Item Infundido Aprimorado', level: 5 }],
+  },
+  {
+    name: 'Mistico',
+    features: ['Talento Psiônico', 'Disciplina Mental', { name: 'Ordem Mística', level: 3 }, { name: 'Mente Fortificada', level: 5 }],
+  },
+];
+
+const BASE_SUBCLASS_FEATURE_REPAIRS: BaseSubclassFeatureRepair[] = [
+  { name: 'Caminho do Berserker', className: 'Bárbaro', levelRequired: 3, features: [{ name: 'Frenesi', level: 3 }, { name: 'Fúria sem Mente', level: 6 }] },
+  { name: 'Caminho do Totem Guerreiro', className: 'Bárbaro', levelRequired: 3, features: [{ name: 'Buscador Espiritual', level: 3 }, { name: 'Espírito Totêmico', level: 3 }, { name: 'Aspecto da Besta', level: 6 }] },
+  { name: 'Caminho do Guardião Ancestral', className: 'Bárbaro', levelRequired: 3, features: [{ name: 'Protetores Ancestrais', level: 3 }, { name: 'Escudo Espiritual', level: 6 }] },
+  { name: 'Colégio do Conhecimento', className: 'Bardo', levelRequired: 3, features: [{ name: 'Proficiência Bônus', level: 3 }, { name: 'Palavras Cortantes', level: 3 }, { name: 'Segredos Mágicos Adicionais', level: 6 }] },
+  { name: 'Colégio da Bravura', className: 'Bardo', levelRequired: 3, features: [{ name: 'Inspiração de Combate', level: 3 }, { name: 'Proficiências de Bravura', level: 3 }, { name: 'Ataque Extra', level: 6 }] },
+  { name: 'Colégio das Espadas', className: 'Bardo', levelRequired: 3, features: [{ name: 'Proficiências de Espadas', level: 3 }, { name: 'Estilo de Luta: Espadas', level: 3 }, { name: 'Floreio de Lâmina', level: 3 }, { name: 'Ataque Extra', level: 6 }] },
+  { name: 'O Corruptor', className: 'Bruxo', levelRequired: 1, features: ['Benção do Obscuro', { name: 'Sorte do Próprio Obscuro', level: 6 }] },
+  { name: 'O Arquifada', className: 'Bruxo', levelRequired: 1, features: ['Presença Feérica', { name: 'Fuga Enevoada', level: 6 }] },
+  { name: 'O Grande Antigo', className: 'Bruxo', levelRequired: 1, features: ['Mente Desperta', { name: 'Proteção Entrópica', level: 6 }] },
+  { name: 'Lâmina Maldita (Hexblade)', className: 'Bruxo', levelRequired: 1, features: ['Maldição da Lâmina Maldita', 'Guerreiro Maldito', { name: 'Espectro Amaldiçoado', level: 6 }] },
+  { name: 'Domínio da Vida', className: 'Clérigo', levelRequired: 1, features: ['Discípulo da Vida', 'Proficiência com Armadura Pesada', { name: 'Preservar Vida', level: 2 }] },
+  { name: 'Domínio da Luz', className: 'Clérigo', levelRequired: 1, features: ['Clarão Protetor', 'Truque de Luz', { name: 'Radiância do Amanhecer', level: 2 }] },
+  { name: 'Domínio da Guerra', className: 'Clérigo', levelRequired: 1, features: ['Sacerdote da Guerra', 'Proficiências de Guerra', { name: 'Ataque Guiado', level: 2 }] },
+  { name: 'Domínio da Tempestade', className: 'Clérigo', levelRequired: 1, features: ['Ira da Tempestade', 'Proficiências da Tempestade', { name: 'Ira Destrutiva', level: 2 }] },
+  { name: 'Domínio da Trapaça', className: 'Clérigo', levelRequired: 1, features: ['Benção do Trapaceiro', { name: 'Invocar Duplicidade', level: 2 }] },
+  { name: 'Círculo da Lua', className: 'Druida', levelRequired: 2, features: [{ name: 'Forma Selvagem de Combate', level: 2 }, { name: 'Formas do Círculo', level: 2 }, { name: 'Golpe Primal', level: 6 }] },
+  { name: 'Círculo da Terra', className: 'Druida', levelRequired: 2, features: [{ name: 'Truque Bônus', level: 2 }, { name: 'Recuperação Natural', level: 2 }, { name: 'Magias do Círculo', level: 3 }, { name: 'Passo da Terra', level: 6 }] },
+  { name: 'Círculo dos Esporos', className: 'Druida', levelRequired: 2, features: [{ name: 'Halo de Esporos', level: 2 }, { name: 'Entidade Simbiótica', level: 2 }, { name: 'Infestação Fúngica', level: 6 }] },
+  { name: 'Linhagem Dracônica', className: 'Feiticeiro', levelRequired: 1, features: ['Ancestral Dracônico', 'Resiliência Dracônica', { name: 'Afinidade Elemental', level: 6 }] },
+  { name: 'Magia Selvagem', className: 'Feiticeiro', levelRequired: 1, features: ['Surto de Magia Selvagem', 'Marés do Caos', { name: 'Dobrar Sorte', level: 6 }] },
+  { name: 'Alma Divina', className: 'Feiticeiro', levelRequired: 1, features: ['Magia Divina', 'Favorecido pelos Deuses', { name: 'Cura Potencializada', level: 6 }] },
+  { name: 'Mente Aberrante', className: 'Feiticeiro', levelRequired: 1, features: ['Magias Psiônicas', 'Discurso Telepático', { name: 'Defesas Psíquicas', level: 6 }] },
+  { name: 'Campeão', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Crítico Aprimorado', level: 3 }, { name: 'Atleta Notável', level: 7 }] },
+  { name: 'Mestre de Batalha', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Dados de Superioridade', level: 3 }, { name: 'Estudioso da Guerra', level: 3 }, { name: 'Ataque de Precisão', level: 3 }, { name: 'Ataque de Tropeço', level: 3 }, { name: 'Ataque Desarmante', level: 3 }, { name: 'Ataque Ameaçador', level: 3 }, { name: 'Ripostar', level: 3 }, { name: 'Ataque Empurrão', level: 3 }] },
+  { name: 'Cavaleiro Arcano', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Conjuração de Cavaleiro Arcano', level: 3 }, { name: 'Arma Vinculada', level: 3 }, { name: 'Magia de Guerra', level: 7 }] },
+  { name: 'Samurai', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Proficiência Bônus de Samurai', level: 3 }, { name: 'Espírito de Luta', level: 3 }, { name: 'Elegância Cortesã', level: 7 }] },
+  { name: 'Assassino', className: 'Ladino', levelRequired: 3, features: [{ name: 'Assassinar', level: 3 }, { name: 'Proficiência com Disfarce e Veneno', level: 3 }] },
+  { name: 'Ladrão', className: 'Ladino', levelRequired: 3, features: [{ name: 'Mãos Rápidas', level: 3 }, { name: 'Andarilho de Telhados', level: 3 }] },
+  { name: 'Trapaceiro Arcano', className: 'Ladino', levelRequired: 3, features: [{ name: 'Conjuração de Trapaceiro Arcano', level: 3 }, { name: 'Mãos Mágicas Ardilosas', level: 3 }, { name: 'Emboscada Mágica', level: 9 }] },
+  { name: 'Espadachim', className: 'Ladino', levelRequired: 3, features: [{ name: 'Jogo de Pés Elegante', level: 3 }, { name: 'Audácia Insolente', level: 3 }] },
+  { name: 'Abjuração', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Abjuração', level: 2 }, { name: 'Proteção Arcana', level: 2 }, { name: 'Proteção Projetada', level: 6 }] },
+  { name: 'Evocação', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Evocação', level: 2 }, { name: 'Esculpir Magias', level: 2 }, { name: 'Truque Potente', level: 6 }] },
+  { name: 'Necromancia', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Necromancia', level: 2 }, { name: 'Colheita Sombria', level: 2 }, { name: 'Servos Mortos-Vivos', level: 6 }] },
+  { name: 'Adivinhação', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Adivinhação', level: 2 }, { name: 'Presságio', level: 2 }, { name: 'Especialista em Adivinhação', level: 6 }] },
+  { name: 'Ilusão', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Ilusão', level: 2 }, { name: 'Ilusão Menor Aprimorada', level: 2 }, { name: 'Ilusões Maleáveis', level: 6 }] },
+  { name: 'Caminho da Mão Aberta', className: 'Monge', levelRequired: 3, features: [{ name: 'Técnica da Mão Aberta', level: 3 }, { name: 'Integridade Corporal', level: 6 }] },
+  { name: 'Caminho das Sombras', className: 'Monge', levelRequired: 3, features: [{ name: 'Artes das Sombras', level: 3 }, { name: 'Passo das Sombras', level: 6 }] },
+  { name: 'Caminho dos Quatro Elementos', className: 'Monge', levelRequired: 3, features: [{ name: 'Discípulo dos Elementos', level: 3 }, { name: 'Disciplinas Elementais', level: 3 }] },
+  { name: 'Devoção', className: 'Paladino', levelRequired: 3, features: [{ name: 'Arma Sagrada', level: 3 }, { name: 'Expulsar Profano', level: 3 }, { name: 'Aura de Devoção', level: 7 }] },
+  { name: 'Juramento dos Anciões', className: 'Paladino', levelRequired: 3, features: [{ name: 'Ira da Natureza', level: 3 }, { name: 'Expulsar Infiéis', level: 3 }, { name: 'Aura de Proteção Antiga', level: 7 }] },
+  { name: 'Juramento de Vingança', className: 'Paladino', levelRequired: 3, features: [{ name: 'Inimigo Abjurado', level: 3 }, { name: 'Voto de Inimizade', level: 3 }, { name: 'Vingador Implacável', level: 7 }] },
+  { name: 'Juramento de Conquista', className: 'Paladino', levelRequired: 3, features: [{ name: 'Presença Conquistadora', level: 3 }, { name: 'Golpe Guiado', level: 3 }, { name: 'Aura da Conquista', level: 7 }] },
+  { name: 'Caçador', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Presa do Caçador', level: 3 }, { name: 'Tática Defensiva', level: 7 }] },
+  { name: 'Mestre das Bestas', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Companheiro Animal', level: 3 }, { name: 'Treinamento Excepcional', level: 7 }] },
+  { name: 'Andarilho do Horizonte', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Detectar Portal', level: 3 }, { name: 'Guerreiro Planar', level: 3 }, { name: 'Passo Etéreo', level: 7 }] },
+  { name: 'Alquimista', className: 'Artifice', levelRequired: 3, features: [{ name: 'Elixir Experimental', level: 3 }, { name: 'Savant Alquímico', level: 5 }] },
+  { name: 'Armeiro', className: 'Artifice', levelRequired: 3, features: [{ name: 'Armadura Arcana (Armeiro)', level: 3 }, { name: 'Modelo Guardião', level: 3 }, { name: 'Ataque Extra', level: 5 }] },
+  { name: 'Artilheiro', className: 'Artifice', levelRequired: 3, features: [{ name: 'Canhão Eldritch', level: 3 }, { name: 'Arma de Fogo Arcana', level: 5 }] },
+  { name: 'Ferreiro de Batalha', className: 'Artifice', levelRequired: 3, features: [{ name: 'Pronto para Batalha', level: 3 }, { name: 'Defensor de Aço', level: 3 }, { name: 'Ataque Extra', level: 5 }] },
+  { name: 'Ordem do Despertar', className: 'Mistico', levelRequired: 3, features: [{ name: 'Olho Psíquico', level: 3 }, { name: 'Mente Expandida', level: 3 }] },
+  { name: 'Lamina Psiquica', className: 'Mistico', levelRequired: 3, features: [{ name: 'Lâmina Mental', level: 3 }, { name: 'Passo Imaterial', level: 3 }] },
+  { name: 'Nomade Astral', className: 'Mistico', levelRequired: 3, features: [{ name: 'Salto Nômade', level: 3 }, { name: 'Memória de Mil Caminhos', level: 3 }] },
+  { name: 'Cavaleiro Runico', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Runas de Gigante', level: 3 }, { name: 'Poder dos Gigantes', level: 3 }] },
+  { name: 'Colegio do Glamour', className: 'Bardo', levelRequired: 3, features: [{ name: 'Manto de Inspiração', level: 3 }, { name: 'Performance Encantadora', level: 3 }] },
+  { name: 'Batedor', className: 'Ladino', levelRequired: 3, features: [{ name: 'Escaramuça', level: 3 }, { name: 'Sobrevivente Nato', level: 3 }] },
+  { name: 'Alma Solar', className: 'Monge', levelRequired: 3, features: [{ name: 'Raio Solar Radiante', level: 3 }, { name: 'Arcos Solares', level: 6 }] },
+  { name: 'Perseguidor Sombrio', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Emboscador Sombrio', level: 3 }, { name: 'Visão Umbral', level: 3 }] },
+  { name: 'Juramento da Redencao', className: 'Paladino', levelRequired: 3, features: [{ name: 'Emissário da Paz', level: 3 }, { name: 'Repreender Violento', level: 3 }] },
+];
+
+const FEATURE_CATEGORY_OVERRIDES: Record<string, BaseFeatureSpellRepair['category']> = {
+  'Fúria': 'Habilidade',
+  'Sopro Dracônico': 'Habilidade',
+  'Mãos Curativas': 'Habilidade',
+  'Taumaturgia': 'Magia',
+  'Mãos Mágicas (Githyanki)': 'Magia',
+  'Truque de Alto Elfo': 'Magia',
+  'Magia Drow: Globos de Luz': 'Magia',
+  'Magia Drow: Fogo das Fadas': 'Magia',
+  'Magia Drow: Escuridão': 'Magia',
+  'Legado Infernal: Repreensão Infernal': 'Magia',
+  'Legado Infernal: Escuridão': 'Magia',
+  'Legado Githyanki: Aprimorar Salto': 'Magia',
+  'Legado Githyanki: Passo Nebuloso': 'Magia',
+  'Inspiração Bárdica': 'Habilidade',
+  'Forma Selvagem': 'Habilidade',
+  'Forma Selvagem Aprimorada': 'Habilidade',
+  'Segundo Fôlego': 'Habilidade',
+  'Surto de Ação': 'Habilidade',
+  'Imposição das Mãos': 'Habilidade',
+  'Sentido Divino': 'Habilidade',
+  'Golpe Divino': 'Habilidade',
+  'Canalizar Divindade': 'Habilidade',
+  'Ki': 'Habilidade',
+  'Ataque Atordoante': 'Habilidade',
+  'Frenesi': 'Habilidade',
+  'Palavras Cortantes': 'Habilidade',
+  'Presença Feérica': 'Habilidade',
+  'Clarão Protetor': 'Habilidade',
+  'Ira da Tempestade': 'Habilidade',
+  'Forma Selvagem de Combate': 'Habilidade',
+  'Surto de Magia Selvagem': 'Habilidade',
+  'Ataque de Precisão': 'Habilidade',
+  'Ataque de Tropeço': 'Habilidade',
+  'Ataque Desarmante': 'Habilidade',
+  'Ataque Ameaçador': 'Habilidade',
+  'Espírito de Luta': 'Habilidade',
+  'Assassinar': 'Habilidade',
+  'Mãos Rápidas': 'Habilidade',
+  'Presságio': 'Habilidade',
+  'Arma Sagrada': 'Habilidade',
+  'Inimigo Abjurado': 'Habilidade',
+  'Voto de Inimizade': 'Habilidade',
+  'Companheiro Animal': 'Habilidade',
+  'Guerreiro Planar': 'Habilidade',
+  'Elixir Experimental': 'Habilidade',
+  'Canhão Eldritch': 'Habilidade',
+  'Passo Imaterial': 'Habilidade',
+};
+
+const BASE_SPELL_NAME_REPAIRS = [
+  { from: 'Ataque Descuidado', to: 'Ataque Imprudente' },
+  { from: 'Ação Surto', to: 'Surto de Ação' },
+  { from: 'Ver o Futuro', to: 'Presságio' },
+  { from: 'Cavaleiro Arcano: Arma Vinculada', to: 'Arma Vinculada' },
+  { from: 'Juramento de Devoção: Arma Sagrada', to: 'Arma Sagrada' },
+  { from: 'Juramento de Vingança: Inimigo Abjurado', to: 'Inimigo Abjurado' },
+  { from: 'Mestre de Batalha: Ripostar', to: 'Ripostar' },
+  { from: 'Mestre de Batalha: Ataque Empurrão', to: 'Ataque Empurrão' },
+];
+
+function featureLevelToSpellLevel(level: number) {
+  if (level <= 0) return 'Passiva';
+  return level === 1 ? 'Nível 1' : `Nível ${level}`;
+}
+
+function featureSourceClasses(sourceType: 'race' | 'class' | 'subclass', sourceName: string, className?: string) {
+  if (sourceType === 'race') return `Raça,${sourceName}`;
+  if (sourceType === 'subclass') return [className, sourceName].filter(Boolean).join(',');
+  return sourceName;
+}
+
+function mergeCommaList(...values: (string | null | undefined)[]) {
+  const merged = new Set<string>();
+  values.forEach(value => {
+    String(value || '')
+      .split(',')
+      .map(item => item.trim())
+      .filter(Boolean)
+      .forEach(item => merged.add(item));
+  });
+  return Array.from(merged).join(',');
+}
+
+function parsePositiveLevel(value: unknown, fallback = 1) {
+  const parsed = parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function makeFeatureSpellRepair(
+  feature: FeatureRequirementSeed,
+  sourceType: 'race' | 'class' | 'subclass',
+  sourceName: string,
+  className?: string
+): BaseFeatureSpellRepair {
+  const normalizedFeature = typeof feature === 'string'
+    ? { name: feature, level: 1, spellLevel: undefined as string | undefined }
+    : { name: feature.name, level: feature.level || 1, spellLevel: feature.spellLevel };
+  const category = FEATURE_CATEGORY_OVERRIDES[normalizedFeature.name] || 'Passiva';
+  return {
+    name: normalizedFeature.name,
+    level: normalizedFeature.spellLevel || (category === 'Magia' && normalizedFeature.level === 1 ? 'Truque' : featureLevelToSpellLevel(normalizedFeature.level)),
+    category,
+    classes: featureSourceClasses(sourceType, sourceName, className),
+    castingTime: category === 'Passiva' ? 'Passiva' : 'Especial',
+    range: category === 'Passiva' ? 'Pessoal' : 'Variável',
+    components: category === 'Magia' ? 'V, S' : '-',
+    duration: category === 'Passiva' ? 'Permanente' : 'Variável',
+    damageDice: '-',
+    damageType: 'Outro',
+    savingThrow: 'Nenhum',
+    description: `${category} concedida por ${sourceName}.`,
+    classLevelRequired: normalizedFeature.level,
+  };
+}
+
+async function repairLegacyBaseSpellNames(db: SQLiteDatabase) {
+  for (const repair of BASE_SPELL_NAME_REPAIRS) {
+    const oldSpell = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM spells WHERE name = ? AND IFNULL(criador, 'base') = 'base' LIMIT 1`,
+      [repair.from]
+    );
+    if (!oldSpell?.id) continue;
+
+    const targetSpell = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM spells WHERE name = ? AND IFNULL(criador, 'base') = 'base' LIMIT 1`,
+      [repair.to]
+    );
+
+    if (targetSpell?.id) {
+      await db.runAsync(
+        `DELETE FROM spells WHERE name = ? AND IFNULL(criador, 'base') = 'base'`,
+        [repair.from]
+      );
+    } else {
+      await db.runAsync(
+        `UPDATE spells SET name = ? WHERE name = ? AND IFNULL(criador, 'base') = 'base'`,
+        [repair.to, repair.from]
+      );
+    }
+  }
+}
+
+async function upsertBaseFeatureSpell(db: SQLiteDatabase, spell: BaseFeatureSpellRepair) {
+  const existing = await db.getFirstAsync<{
+    id: number;
+    level?: string | null;
+    category?: string | null;
+    classes?: string | null;
+    casting_time?: string | null;
+    range?: string | null;
+    components?: string | null;
+    duration?: string | null;
+    damage_dice?: string | null;
+    damage_type?: string | null;
+    saving_throw?: string | null;
+    description?: string | null;
+    class_level_required?: string | number | null;
+  }>(
+    `SELECT id, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type,
+            saving_throw, description, class_level_required
+     FROM spells
+     WHERE name = ? AND IFNULL(criador, 'base') = 'base'
+     LIMIT 1`,
+    [spell.name]
+  );
+
+  if (existing?.id) {
+    const existingCategory = existing.category || spell.category;
+    const finalCategory = existingCategory === 'Magia' || spell.category === 'Magia' ? 'Magia' : existingCategory === 'Habilidade' || spell.category === 'Habilidade' ? 'Habilidade' : 'Passiva';
+    const finalRequiredLevel = Math.min(parsePositiveLevel(existing.class_level_required, spell.classLevelRequired), spell.classLevelRequired);
+
+    await db.runAsync(
+      `UPDATE spells
+       SET level = ?, category = ?, classes = ?, casting_time = ?, range = ?, components = ?, duration = ?,
+           damage_dice = ?, damage_type = ?, saving_throw = ?, description = ?, class_level_required = ?,
+           criador = 'base'
+       WHERE name = ? AND IFNULL(criador, 'base') = 'base'`,
+      [
+        existing.level || spell.level,
+        finalCategory,
+        mergeCommaList(existing.classes, spell.classes),
+        existing.casting_time || spell.castingTime || 'Especial',
+        existing.range || spell.range || 'Pessoal',
+        existing.components || spell.components || '-',
+        existing.duration || spell.duration || 'Variável',
+        existing.damage_dice || spell.damageDice || '-',
+        existing.damage_type || spell.damageType || 'Outro',
+        existing.saving_throw || spell.savingThrow || 'Nenhum',
+        existing.description || spell.description,
+        String(finalRequiredLevel),
+        spell.name,
+      ]
+    );
+    return;
+  }
+
+  await db.runAsync(
+    `INSERT INTO spells
+     (name, level, category, classes, casting_time, range, components, duration, damage_dice, damage_type, saving_throw, description, class_level_required, criador)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'base')`,
+    [
+      spell.name,
+      spell.level,
+      spell.category,
+      spell.classes,
+      spell.castingTime || 'Especial',
+      spell.range || 'Pessoal',
+      spell.components || '-',
+      spell.duration || 'Variável',
+      spell.damageDice || '-',
+      spell.damageType || 'Outro',
+      spell.savingThrow || 'Nenhum',
+      spell.description,
+      String(spell.classLevelRequired),
+    ]
+  );
+}
+
+async function repairBaseRulesCatalog(db: SQLiteDatabase) {
+  await repairLegacyBaseSpellNames(db);
+
+  for (const race of BASE_RACE_FEATURE_REPAIRS) {
+    await db.runAsync(
+      `UPDATE races SET features = ?, criador = 'base' WHERE name = ? AND IFNULL(criador, 'base') = 'base'`,
+      [normalizeFeatureRequirements(race.features), race.name]
+    );
+
+    for (const feature of race.features) {
+      await upsertBaseFeatureSpell(db, makeFeatureSpellRepair(feature, 'race', race.name));
+    }
+  }
+
+  for (const charClass of BASE_CLASS_FEATURE_REPAIRS) {
+    await db.runAsync(
+      `UPDATE classes SET features = ?, criador = 'base' WHERE name = ? AND IFNULL(criador, 'base') = 'base'`,
+      [normalizeFeatureRequirements(charClass.features), charClass.name]
+    );
+
+    for (const feature of charClass.features) {
+      await upsertBaseFeatureSpell(db, makeFeatureSpellRepair(feature, 'class', charClass.name));
+    }
+  }
+
+  for (const subclass of BASE_SUBCLASS_FEATURE_REPAIRS) {
+    const payload = normalizeFeatureRequirements(subclass.features);
+    const existing = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM subclasses WHERE name = ? AND class_name = ? AND IFNULL(criador, 'base') = 'base' LIMIT 1`,
+      [subclass.name, subclass.className]
+    );
+
+    if (existing?.id) {
+      await db.runAsync(
+        `UPDATE subclasses
+         SET level_required = ?, features = ?, criador = 'base'
+         WHERE name = ? AND class_name = ? AND IFNULL(criador, 'base') = 'base'`,
+        [subclass.levelRequired, payload, subclass.name, subclass.className]
+      );
+    } else {
+      await db.runAsync(
+        `INSERT INTO subclasses (name, class_name, level_required, features, criador) VALUES (?, ?, ?, ?, 'base')`,
+        [subclass.name, subclass.className, subclass.levelRequired, payload]
+      );
+    }
+
+    for (const feature of subclass.features) {
+      await upsertBaseFeatureSpell(db, makeFeatureSpellRepair(feature, 'subclass', subclass.name, subclass.className));
+    }
+  }
+}
+
 const EXPANDED_RACES = [
   { name: 'Aasimar', statBonuses: '{"CAR": 2, "SAB": 1}', speed: '9m', features: ['Visao no Escuro', 'Resistencia Celestial', 'Maos Curativas'] },
   { name: 'Genasi do Fogo', statBonuses: '{"CON": 2, "INT": 1}', speed: '9m', features: ['Visao no Escuro', 'Resistencia a Fogo', 'Chama Inata'] },
@@ -2325,6 +2782,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await seedExpandedBaseCatalog(db);
   await seedStructuredItemEffects(db);
   await seedFullSpellcastingProgression(db);
+  await repairBaseRulesCatalog(db);
   await repairStartingKitsAgainstCatalog(db);
   await organizeBaseCatalog(db);
   if (didResetTransientDebugState) {
