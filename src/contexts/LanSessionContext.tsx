@@ -80,6 +80,38 @@ import {
 
 const LanSessionContext = createContext<LanSessionContextValue | null>(null);
 
+function formatCoinsRequestFromPayload(payload: Record<string, any>) {
+  const gp = Math.max(0, Number(payload.gp || 0));
+  const sp = Math.max(0, Number(payload.sp || 0));
+  const cp = Math.max(0, Number(payload.cp || 0));
+  const fallbackAmount = Math.max(0, Number(payload.amount || 0));
+  const parts = [
+    gp > 0 ? `${gp} PO` : '',
+    sp > 0 ? `${sp} PP` : '',
+    cp > 0 ? `${cp} PC` : '',
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' + ') : fallbackAmount > 0 ? `${fallbackAmount} PO` : 'moedas';
+}
+
+function formatPlayerRequestDescription(actorName: string, command: LanCommandKind, payload: Record<string, any>) {
+  const amount = Math.max(0, Number(payload.amount || 0));
+  if (command === 'PLAYER_REQUEST_HP') {
+    const mode = String(payload.mode || 'heal');
+    return `${actorName} solicitou ${amount} PV${mode === 'damage' ? ' de dano' : ' de cura'}.`;
+  }
+  if (command === 'PLAYER_REQUEST_XP') {
+    return `${actorName} solicitou ${amount} XP.`;
+  }
+  if (command === 'PLAYER_REQUEST_COINS') {
+    return `${actorName} solicitou ${formatCoinsRequestFromPayload(payload)}.`;
+  }
+  if (command === 'PLAYER_REQUEST_ATTRIBUTE') {
+    const stat = String(payload.stat || 'atributo').toUpperCase();
+    return `${actorName} solicitou ${amount > 0 ? `+${amount} ` : ''}${stat}.`;
+  }
+  return `${actorName} enviou uma solicitação ao mestre.`;
+}
+
 export function LanSessionProvider({ children }: { children: React.ReactNode }) {
   const db = useSQLiteContext();
   const [activeSession, setActiveSession] = useState<LanSessionRecord | null>(null);
@@ -1312,18 +1344,53 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
 
       if (command.command.startsWith('PLAYER_REQUEST_')) {
+        const actorName = command.actorName || 'Jogador';
         await emitOfficialEvent({
           sessionId: session.id,
           eventType: 'PLAYER_REQUESTED',
           commandId: command.commandId,
           actorDeviceId: command.deviceId,
-          actorName: command.actorName || 'Jogador',
+          actorName,
           targetDeviceId: command.deviceId,
           targetCharacterId: command.characterId || null,
-          targetName: String(command.payload?.characterName || command.actorName || 'Personagem'),
-          description: `${command.actorName || 'Jogador'} solicitou ${command.command.replace('PLAYER_REQUEST_', '').toLowerCase()}.`,
+          targetName: String(command.payload?.characterName || actorName || 'Personagem'),
+          description: formatPlayerRequestDescription(actorName, command.command, command.payload || {}),
           payload: { command: command.command, ...command.payload },
         });
+        return;
+      }
+
+      if (command.command === 'PLAYER_LEAVE_SESSION') {
+        const leavingCharacterId = Number(command.characterId || command.payload?.characterId || 0) || null;
+        const leavingName = String(command.payload?.characterName || command.actorName || 'Jogador');
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'PLAYER_LEFT',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || leavingName,
+          targetDeviceId: command.deviceId,
+          targetCharacterId: leavingCharacterId,
+          targetName: leavingName,
+          description: `${leavingName} saiu da sessao e desvinculou a ficha.`,
+          payload: { command: command.command, ...command.payload },
+        });
+        await db.runAsync(
+          `UPDATE lan_session_players
+           SET connected = 0,
+               character_id = NULL,
+               character_name = NULL,
+               last_seen_at = CURRENT_TIMESTAMP
+           WHERE session_id = ? AND device_id = ?`,
+          [session.id, command.deviceId]
+        );
+        await db.runAsync(
+          `DELETE FROM lan_character_snapshots WHERE session_id = ? AND owner_device_id = ?`,
+          [session.id, command.deviceId]
+        );
+        await refreshPlayers();
+        setLanRevision(prev => prev + 1);
+        await pushTcpSyncRef.current?.(session, 'player-left');
         return;
       }
 
@@ -2037,7 +2104,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         });
       }
     },
-    [db, emitOfficialEvent, emitTradeExpiredEvent, finishClosedSessionHost, refreshSavedSessions, rejectCommand, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [db, emitOfficialEvent, emitTradeExpiredEvent, finishClosedSessionHost, refreshPlayers, refreshSavedSessions, rejectCommand, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   const runAuthoritativeCommandQueued = useCallback(

@@ -51,6 +51,8 @@ type ConditionEffectOption = {
 };
 
 const HISTORY_PAGE_SIZES = [10, 30, 50, 100];
+type CoinCode = 'gp' | 'sp' | 'cp';
+const COIN_LABELS: Record<CoinCode, string> = { gp: 'PO', sp: 'PP', cp: 'PC' };
 
 type MasterModalKind = 'attribute' | 'tempHp' | 'xp' | 'item' | 'sheet' | 'time' | 'effects' | 'applyEffect';
 type MasterModalState = {
@@ -99,6 +101,7 @@ export default function LanSessionScreen() {
   const [coinSp, setCoinSp] = useState('');
   const [coinCp, setCoinCp] = useState('');
   const [playerRequestAmount, setPlayerRequestAmount] = useState('');
+  const [playerRequestCoin, setPlayerRequestCoin] = useState<CoinCode>('gp');
   const [cardAmounts, setCardAmounts] = useState<Record<string, string>>({});
   const [cardCoins, setCardCoins] = useState<Record<string, { gp: string; sp: string; cp: string }>>({});
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
@@ -255,7 +258,11 @@ export default function LanSessionScreen() {
     Number(player.character_id) === selectedTargetCharacterId &&
     (!selectedTargetDeviceId || player.device_id === selectedTargetDeviceId)
   );
-  const visibleSavedSessions = savedSessions.filter(session => session.status !== 'closed');
+  const visibleSavedSessions = savedSessions.filter(session => {
+    if (session.status === 'closed') return false;
+    if (session.role === 'player' && !session.linked_character_id) return false;
+    return true;
+  });
 
   const safeJson = (value: unknown, fallback: any = null) => {
     if (value === null || value === undefined || value === '') return fallback;
@@ -915,9 +922,18 @@ export default function LanSessionScreen() {
   const handlePlayerRequest = async (command: 'PLAYER_REQUEST_HP' | 'PLAYER_REQUEST_XP' | 'PLAYER_REQUEST_COINS') => {
     const amount = Math.max(0, numericValue(playerRequestAmount, 0));
     if (amount <= 0) return;
+    const coinPayload = command === 'PLAYER_REQUEST_COINS'
+      ? {
+          gp: playerRequestCoin === 'gp' ? amount : 0,
+          sp: playerRequestCoin === 'sp' ? amount : 0,
+          cp: playerRequestCoin === 'cp' ? amount : 0,
+          coinType: playerRequestCoin,
+        }
+      : {};
     await sendLanCommand(command, {
       amount,
       characterName: selectedCharacter?.name || null,
+      ...coinPayload,
     });
     setPlayerRequestAmount('');
     await refreshSessionViews();
@@ -994,6 +1010,46 @@ export default function LanSessionScreen() {
       Number(coins?.cp || 0) > 0 ? `${Number(coins?.cp || 0)} PC` : '',
     ].filter(Boolean);
     return parts.length > 0 ? parts.join(' + ') : 'Nada';
+  };
+
+  const coinsRequestLabel = (payload: any) => {
+    const gp = Math.max(0, Number(payload.gp || 0));
+    const sp = Math.max(0, Number(payload.sp || 0));
+    const cp = Math.max(0, Number(payload.cp || 0));
+    const amount = Math.max(0, Number(payload.amount || 0));
+    const parts = [
+      gp > 0 ? `${gp} PO` : '',
+      sp > 0 ? `${sp} PP` : '',
+      cp > 0 ? `${cp} PC` : '',
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(' + ') : amount > 0 ? `${amount} PO` : 'moedas';
+  };
+
+  const pendingRequestDetail = (event: LanOfficialEventMessage) => {
+    const payload = (event.payload || {}) as any;
+    const requester = event.actorName || event.targetName || 'Jogador';
+    const requestCommand = String(payload.command || '');
+    const itemName = payload.itemName || payload.item?.name;
+    if (itemName) {
+      return `${requester} solicitou +${payload.quantity || payload.requestedDelta || 1}x ${itemName}.`;
+    }
+    if (requestCommand === 'PLAYER_REQUEST_HP') {
+      const amount = Math.max(0, Number(payload.amount || 0));
+      const mode = String(payload.mode || 'heal');
+      return `${requester} solicitou ${amount} PV${mode === 'damage' ? ' de dano' : ' de cura'}.`;
+    }
+    if (requestCommand === 'PLAYER_REQUEST_XP') {
+      return `${requester} solicitou ${Math.max(0, Number(payload.amount || 0))} XP.`;
+    }
+    if (requestCommand === 'PLAYER_REQUEST_COINS') {
+      return `${requester} solicitou ${coinsRequestLabel(payload)}.`;
+    }
+    if (requestCommand === 'PLAYER_REQUEST_ATTRIBUTE') {
+      const amount = Math.max(0, Number(payload.amount || 0));
+      const stat = String(payload.stat || 'atributo').toUpperCase();
+      return `${requester} solicitou ${amount > 0 ? `+${amount} ` : ''}${stat}.`;
+    }
+    return event.description || `${requester} enviou uma solicitação ao mestre.`;
   };
 
   const openTradeModal = async (event: LanOfficialEventMessage) => {
@@ -1113,11 +1169,13 @@ export default function LanSessionScreen() {
     }
 
     if (requestCommand === 'PLAYER_REQUEST_COINS') {
+      const fallbackAmount = Number(payload.amount || 0);
+      const hasExplicitCoins = Number(payload.gp || 0) > 0 || Number(payload.sp || 0) > 0 || Number(payload.cp || 0) > 0;
       await sendLanCommand('MASTER_APPLY_COINS', {
         targetCharacterId,
         targetDeviceId,
         targetName,
-        gp: Number(payload.gp || 0),
+        gp: hasExplicitCoins ? Number(payload.gp || 0) : fallbackAmount,
         sp: Number(payload.sp || 0),
         cp: Number(payload.cp || 0),
         requestCommandId,
@@ -1358,11 +1416,7 @@ export default function LanSessionScreen() {
           <Text style={styles.pendingCount}>{pendingMasterRequests.length}</Text>
         </View>
         {pendingMasterRequests.map(event => {
-          const payload = (event.payload || {}) as any;
-          const itemName = payload.itemName || payload.item?.name;
-          const detail = itemName
-            ? `${event.actorName || 'Jogador'} pediu +${payload.quantity || payload.requestedDelta || 1}x ${itemName}`
-            : event.description;
+          const detail = pendingRequestDetail(event);
           return (
             <View key={event.commandId || event.eventId} style={styles.pendingRequestCard}>
               <View style={{ flex: 1 }}>
@@ -2098,6 +2152,20 @@ export default function LanSessionScreen() {
               <Ionicons name="cash-outline" size={18} color="#00bfff" />
               <Text style={styles.secondaryButtonText}>Moedas</Text>
             </TouchableOpacity>
+          </View>
+          <View style={styles.requestCoinRow}>
+            <Text style={styles.requestCoinHint}>Moeda solicitada:</Text>
+            {(['gp', 'sp', 'cp'] as CoinCode[]).map(coin => (
+              <TouchableOpacity
+                key={coin}
+                style={[styles.requestCoinChip, playerRequestCoin === coin && styles.requestCoinChipActive]}
+                onPress={() => setPlayerRequestCoin(coin)}
+              >
+                <Text style={[styles.requestCoinChipText, playerRequestCoin === coin && styles.requestCoinChipTextActive]}>
+                  {COIN_LABELS[coin]}
+                </Text>
+              </TouchableOpacity>
+            ))}
           </View>
         </View>
       </>
@@ -3182,6 +3250,21 @@ const styles = StyleSheet.create({
   playerSub: { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2 },
   compactInputRow: { flexDirection: 'row', flexWrap: 'nowrap', alignItems: 'center', gap: 6, marginTop: 6 },
   compactInput: { width: 72, minHeight: 38, paddingVertical: 8, textAlign: 'center' },
+  requestCoinRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8, flexWrap: 'wrap' },
+  requestCoinHint: { color: 'rgba(255,255,255,0.48)', fontSize: 11, fontWeight: 'bold', letterSpacing: 0.4 },
+  requestCoinChip: {
+    minWidth: 42,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.25)',
+    backgroundColor: 'rgba(10,26,51,0.75)',
+    alignItems: 'center',
+  },
+  requestCoinChipActive: { borderColor: '#ffd166', backgroundColor: 'rgba(255,209,102,0.15)' },
+  requestCoinChipText: { color: '#8bdcff', fontSize: 11, fontWeight: 'bold' },
+  requestCoinChipTextActive: { color: '#ffd166' },
   coinInput: { width: '100%', minWidth: 0, minHeight: 44, paddingVertical: 10, textAlign: 'center' },
   secondaryWideButton: {
     flexDirection: 'row',

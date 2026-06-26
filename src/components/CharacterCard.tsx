@@ -19,10 +19,11 @@ type Props = {
   onPress: () => void;
   onDelete: (id: number) => void;
   onEdit: (id: number) => void;
+  onUnlinkFromSession?: (character: Character) => void;
   isLinkedToSession?: boolean;
 };
 
-export default function CharacterCard({ character, onPress, onDelete, onEdit, isLinkedToSession = false }: Props) {
+export default function CharacterCard({ character, onPress, onDelete, onEdit, onUnlinkFromSession, isLinkedToSession = false }: Props) {
   // Estados que controlam o nosso Menu Customizado
   const [modalVisible, setModalVisible] = useState(false);
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
@@ -54,6 +55,11 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, is
     onDelete(character.id);
   };
 
+  const handleUnlink = () => {
+    handleClose();
+    onUnlinkFromSession?.(character);
+  };
+
   return (
     <>
       {/* O CARD DO PERSONAGEM */}
@@ -72,9 +78,16 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, is
         <View style={styles.cardInfo}>
           <Text style={styles.characterName} numberOfLines={1}>{character.name}</Text>
           {character.linked_session_name && (
-            <Text style={styles.sessionDetails} numberOfLines={1}>
-              LAN: {character.linked_session_name} ({character.linked_session_role === 'master' ? 'Mestre' : 'Jogador'})
-            </Text>
+            <View style={styles.sessionRow}>
+              <Text style={styles.sessionDetails} numberOfLines={1}>
+                LAN: {character.linked_session_name} ({character.linked_session_role === 'master' ? 'Mestre' : 'Jogador'})
+              </Text>
+              {isLinkedToSession && onUnlinkFromSession && (
+                <TouchableOpacity style={styles.inlineUnlinkButton} onPress={handleUnlink} activeOpacity={0.8}>
+                  <Text style={styles.inlineUnlinkText}>Sair</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           )}
           <Text style={styles.characterDetails}>{character.race} • {character.class}</Text>
         </View>
@@ -102,9 +115,14 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, is
                 </TouchableOpacity>
                 
                 {isLinkedToSession && (
-                  <Text style={styles.linkedWarningText}>
-                    Esta ficha pertence a uma sessao LAN e sera liberada quando a sessao for encerrada.
-                  </Text>
+                  <>
+                    <Text style={styles.linkedWarningText}>
+                      Esta ficha está vinculada a uma mesa LAN. Ao sair, este aparelho perde o vínculo e precisará entrar novamente pelo código ou QR.
+                    </Text>
+                    <TouchableOpacity style={styles.unlinkButton} onPress={handleUnlink}>
+                      <Text style={styles.unlinkText}>Sair da mesa</Text>
+                    </TouchableOpacity>
+                  </>
                 )}
 
                 {!isLinkedToSession && (
@@ -174,12 +192,27 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: 'rgba(255, 255, 255, 0.6)',
   },
+  sessionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 3,
+  },
   sessionDetails: {
+    flex: 1,
     fontSize: 11,
     color: '#00fa9a',
     fontWeight: 'bold',
-    marginBottom: 3,
   },
+  inlineUnlinkButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 9,
+    backgroundColor: 'rgba(255, 209, 102, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 209, 102, 0.32)',
+  },
+  inlineUnlinkText: { color: '#ffd166', fontSize: 10, fontWeight: 'bold' },
   levelBadge: {
     backgroundColor: 'rgba(0, 191, 255, 0.15)',
     borderWidth: 1,
@@ -261,6 +294,20 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     textAlign: 'center',
     paddingVertical: 14,
+  },
+  unlinkButton: {
+    borderWidth: 1,
+    borderColor: 'rgba(255, 209, 102, 0.42)',
+    backgroundColor: 'rgba(255, 209, 102, 0.1)',
+    paddingVertical: 13,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  unlinkText: {
+    color: '#ffd166',
+    fontWeight: 'bold',
+    fontSize: 15,
   },
   confirmDeleteButton: {
     backgroundColor: 'rgba(255, 50, 50, 0.15)',

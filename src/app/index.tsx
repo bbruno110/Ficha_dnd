@@ -8,13 +8,19 @@ import { Alert, FlatList, StyleSheet, Text, TouchableOpacity, View } from 'react
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import CharacterCard, { Character } from '../components/CharacterCard';
 import { useLanSession } from '../contexts/LanSessionContext';
-import { getCharacterLinkedLanSession } from '../network/lanRepository';
+import { getCharacterLinkedLanSession, linkCharacterToSession, setLanSessionStatus } from '../network/lanRepository';
 
 export default function HomeScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const insets = useSafeAreaInsets();
-  const { activeSession } = useLanSession();
+  const {
+    activeSession,
+    closeActiveSession,
+    linkCharacterToActiveSession,
+    refreshSavedSessions,
+    sendLanCommand,
+  } = useLanSession();
   const [charactersList, setCharactersList] = useState<Character[]>([]);
   const lanNavigationLockRef = useRef(false);
   const sheetNavigationLockRef = useRef(false);
@@ -83,6 +89,74 @@ export default function HomeScreen() {
     }
   };
 
+  const unlinkCharacterFromSession = async (character: Character) => {
+    try {
+      const linkedSession = await getCharacterLinkedLanSession(db, character.id);
+      const session = linkedSession || (activeSession?.linked_character_id === character.id ? activeSession : null);
+      if (!session) {
+        await loadCharacters();
+        return;
+      }
+
+      const isActiveLinkedSession = activeSession?.id === session.id && activeSession.linked_character_id === character.id;
+      let commandSent = false;
+      if (isActiveLinkedSession && activeSession.role === 'player') {
+        try {
+          await sendLanCommand('PLAYER_LEAVE_SESSION', {
+            characterId: character.id,
+            characterName: character.name,
+          });
+          commandSent = true;
+        } catch (error) {
+          console.warn('Falha ao avisar mestre sobre saida da sessao:', error);
+        }
+      }
+
+      if (isActiveLinkedSession) {
+        await linkCharacterToActiveSession(null);
+        if (activeSession.role === 'player') {
+          await closeActiveSession();
+          await setLanSessionStatus(db, session.id, 'closed');
+          await refreshSavedSessions();
+        } else {
+          await refreshSavedSessions();
+        }
+      } else {
+        await linkCharacterToSession(db, session.id, null);
+        await refreshSavedSessions();
+      }
+
+      await loadCharacters();
+      Alert.alert(
+        'Você saiu da mesa',
+        commandSent
+          ? `${character.name} foi desvinculado de "${session.name}". O mestre foi avisado no histórico. Para voltar, entre novamente pelo código ou QR da mesa.`
+          : `${character.name} foi desvinculado de "${session.name}". Para voltar, entre novamente pelo código ou QR da mesa.`
+      );
+    } catch (error) {
+      console.error('Erro ao desvincular ficha da sessao:', error);
+      Alert.alert('Erro', 'Não foi possível desvincular esta ficha da sessão.');
+    }
+  };
+
+  const handleUnlinkCharacterFromSession = (character: Character) => {
+    const sessionName = character.linked_session_name || activeSession?.name || 'sessão LAN';
+    Alert.alert(
+      'Sair desta mesa?',
+      `A ficha "${character.name}" será desvinculada de "${sessionName}". A mesa do mestre continua aberta, mas este aparelho sai dela. Para voltar, entre novamente pelo código ou QR.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Sair da mesa',
+          style: 'destructive',
+          onPress: () => {
+            void unlinkCharacterFromSession(character);
+          },
+        },
+      ]
+    );
+  };
+
   const handleEditCharacter = (id: number) => {
     router.push({
       pathname: '/edit' as any,
@@ -129,6 +203,7 @@ export default function HomeScreen() {
             onPress={() => handleOpenSheet(item)}
             onDelete={handleDeleteCharacter}
             onEdit={handleEditCharacter}
+            onUnlinkFromSession={handleUnlinkCharacterFromSession}
             isLinkedToSession={Boolean(item.linked_session_name) || activeSession?.linked_character_id === item.id}
           />
         )}

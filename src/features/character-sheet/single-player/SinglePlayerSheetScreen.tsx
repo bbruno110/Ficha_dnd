@@ -2043,6 +2043,15 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
             {renderLanSessionPanel()}
 
             <View style={styles.headerBlock}>
+              <View style={styles.sheetHeroRow}>
+                <View style={styles.sheetAvatarFrame}>
+                  <Image
+                    source={{ uri: String(character.avatar_uri || '') || avatarSourceForName(character.name, 180) }}
+                    style={styles.sheetAvatar}
+                  />
+                </View>
+
+                <View style={styles.sheetHeroInfo}>
               <Text style={styles.charClassRace}>{character.race} • {character.class}</Text>
               
               <View style={styles.levelXpRow}>
@@ -2057,6 +2066,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                     <Ionicons name="arrow-up" size={24} color="#ffffff" />
                   </TouchableOpacity>
                 )}
+              </View>
+                </View>
               </View>
             </View>
 
@@ -2867,9 +2878,30 @@ const styles = StyleSheet.create({
   
   scrollContent: { padding: 20 },
   
-  headerBlock: { alignItems: 'center', marginBottom: 20 },
+  headerBlock: { marginBottom: 20 },
+  sheetHeroRow: { flexDirection: 'row', alignItems: 'center', gap: 13 },
+  sheetHeroInfo: { flex: 1, minWidth: 0 },
+  sheetAvatarFrame: {
+    width: 78,
+    height: 78,
+    borderRadius: 39,
+    padding: 3,
+    backgroundColor: 'rgba(0,191,255,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.45)',
+    shadowColor: '#00bfff',
+    shadowOpacity: 0.22,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  sheetAvatar: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 36,
+    backgroundColor: '#102b56',
+  },
   charClassRace: { fontSize: 14, color: '#00bfff' },
-  levelXpRow: { flexDirection: 'row', gap: 10, marginTop: 10, alignItems: 'center' },
+  levelXpRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 10, alignItems: 'center' },
   badge: { backgroundColor: 'rgba(0,191,255,0.1)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 },
   badgeText: { color: '#00bfff', fontSize: 11, fontWeight: 'bold' },
   
