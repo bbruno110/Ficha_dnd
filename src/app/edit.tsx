@@ -5,6 +5,7 @@ import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AvatarAdjustModal from '../components/AvatarAdjustModal';
 import { useLanSession } from '../contexts/LanSessionContext';
 import { AvatarAdjustment, AvatarDraft, deleteStoredCharacterAvatar, pickCharacterAvatarDraft, storeAdjustedCharacterAvatar } from '../utils/characterAvatar';
@@ -13,7 +14,7 @@ import { AvatarAdjustment, AvatarDraft, deleteStoredCharacterAvatar, pickCharact
 import SpellSelector from '../components/SpellSelector';
 
 // ADICIONADO O NOVO PASSO DE RESUMO FINAL
-const STEPS = ['Níveis & Vida', 'Atributos', 'Proficiências', 'Magias & Hab.', 'Resumo Final'];
+const STEPS = ['Atributos', 'Níveis & Vida', 'Proficiências', 'Magias & Hab.', 'Resumo Final'];
 
 type ClassEntry = { id: string; name: string; subclass: string; level: number };
 type SpellProgression = { cantrips_known: number, spells_known: number, slot_1: number, slot_2: number, slot_3: number, slot_4: number, slot_5: number, slot_6: number, slot_7: number, slot_8: number, slot_9: number };
@@ -46,6 +47,15 @@ const splitNameList = (value?: string | null) => String(value || '')
   .filter(Boolean);
 
 const listIncludesName = (value: string | null | undefined, name: string) => splitNameList(value).includes(name);
+
+const dedupeSpellsByName = <T extends { name?: string | null; id?: string | number | null }>(spells: T[]) => {
+  const seen = new Map<string, T>();
+  spells.forEach(spell => {
+    const key = String(spell.name || spell.id || '').trim().toLowerCase();
+    if (key && !seen.has(key)) seen.set(key, spell);
+  });
+  return Array.from(seen.values());
+};
 
 
 type FeatureRequirement = string | { name?: string; level?: string | number; level_required?: string | number; minLevel?: string | number };
@@ -88,6 +98,7 @@ export default function EditCharacterScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
   const { activeSession, broadcastCharacter } = useLanSession();
+  const insets = useSafeAreaInsets();
   const isLevelUpFlow = Boolean(levelUpTo);
 
   const [loading, setLoading] = useState(true);
@@ -219,7 +230,7 @@ export default function EditCharacterScreen() {
           setActiveSkills(parsedSkillsArray);
           setOriginalSkills(parsedSkillsArray);
           
-          setActiveSpells(parseArray((char as any).spells).map(String));
+          setActiveSpells(Array.from(new Set(parseArray((char as any).spells).map(String))));
         }
       } catch (e) { console.error(e); } finally { setLoading(false); }
     }
@@ -484,17 +495,26 @@ export default function EditCharacterScreen() {
     return isAllowedByLevel && isCompatibleClass && reqPassed;
   };
 
-  const availableClassCatalog = dbSpells.filter(isSpellAvailableForCurrentBuild);
+  const availableClassCatalog = dedupeSpellsByName(dbSpells.filter(isSpellAvailableForCurrentBuild));
   const availableClassCatalogKey = availableClassCatalog.map(s => String(s.id)).sort().join('|');
   const lockedFeaturesKey = lockedFeatures.slice().sort().join('|');
 
   const getValidActiveSpellIds = (spellIds: string[]) => {
     const availableIds = new Set(availableClassCatalog.map(s => String(s.id)));
+    const spellById = new Map(dbSpells.map(s => [String(s.id), s]));
+    const selectedByName = dedupeSpellsByName(
+      spellIds
+        .map(spellId => spellById.get(String(spellId)))
+        .filter(Boolean) as any[]
+    )
+      .map(spell => String(spell.id))
+      .filter(spellId => availableIds.has(spellId));
     const lockedIds = dbSpells
       .filter(s => lockedFeatures.includes(s.name) && availableIds.has(String(s.id)))
+      .filter((spell, index, list) => list.findIndex(candidate => String(candidate.name || '').toLowerCase() === String(spell.name || '').toLowerCase()) === index)
       .map(s => String(s.id));
     return Array.from(new Set([
-      ...spellIds.filter(spellId => availableIds.has(String(spellId))),
+      ...selectedByName,
       ...lockedIds,
     ]));
   };
@@ -629,7 +649,7 @@ export default function EditCharacterScreen() {
   };
 
   const goToNextStep = () => {
-    if (currentStep === 0 && currentLevelSum !== targetLevel) {
+    if (currentStep === 1 && currentLevelSum !== targetLevel) {
       Alert.alert("Atenção", `Por favor, distribua exatamente ${targetLevel} níveis entre suas classes. Faltam ${targetLevel - currentLevelSum}.`);
       return;
     }
@@ -1133,17 +1153,17 @@ export default function EditCharacterScreen() {
         ))}
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+      <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(insets.bottom + 120, 140) }]}>
         {renderAvatarPicker()}
-        {currentStep === 0 && renderStep0()}
-        {currentStep === 1 && renderStep1()}
+        {currentStep === 0 && renderStep1()}
+        {currentStep === 1 && renderStep0()}
         {currentStep === 2 && renderStep2()}
         {currentStep === 3 && renderStep3()}
         {currentStep === 4 && renderStep4()}
         <View style={{height: 100}} />
       </ScrollView>
 
-      <View style={styles.bottomNav}>
+      <View style={[styles.bottomNav, { paddingBottom: Math.max(insets.bottom + 12, 20) }]}>
         <TouchableOpacity style={styles.navBtn} disabled={currentStep === 0} onPress={() => setCurrentStep(prev => prev - 1)}><Text style={styles.navBtnText}>Voltar</Text></TouchableOpacity>
         {currentStep < 4 ? (
           <TouchableOpacity style={[styles.navBtn, styles.navBtnPrimary]} onPress={goToNextStep}><Text style={styles.navBtnPrimaryText}>Próximo</Text></TouchableOpacity>

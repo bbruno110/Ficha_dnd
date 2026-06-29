@@ -2655,22 +2655,27 @@ export default function LanSessionScreen() {
       <Modal visible transparent animationType="fade" onRequestClose={() => setTradeModal(null)}>
         <Pressable style={[styles.modalOverlay, { paddingTop: Math.max(insets.top + 18, 18), paddingBottom: Math.max(insets.bottom + 18, 18) }]} onPress={() => setTradeModal(null)}>
           <Pressable style={styles.tradeModalContent} onPress={event => event.stopPropagation()}>
-            <View style={styles.tradeModalHeader}>
-              <View style={styles.tradeTitleWrap}>
-                <Text style={styles.tradeStepNumber}>{isConfirmingCounter ? '04' : '02'}</Text>
-                <View style={styles.tradeTitleTextWrap}>
-                  <Text style={styles.tradeModalTitle}>{isConfirmingCounter ? 'Revisar contraproposta' : 'Proposta recebida'}</Text>
-                  <Text style={styles.tradeModalSubtitle}>
-                    {isConfirmingCounter ? `${counterName} respondeu sua solicitação.` : `${sourceName} quer trocar com você.`}
-                  </Text>
+            <ScrollView
+              style={styles.tradeModalScroll}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={styles.tradeModalScrollContent}
+            >
+              <View style={styles.tradeModalHeader}>
+                <View style={styles.tradeTitleWrap}>
+                  <Text style={styles.tradeStepNumber}>{isConfirmingCounter ? '04' : '02'}</Text>
+                  <View style={styles.tradeTitleTextWrap}>
+                    <Text style={styles.tradeModalTitle}>{isConfirmingCounter ? 'Revisar contraproposta' : 'Proposta recebida'}</Text>
+                    <Text style={styles.tradeModalSubtitle}>
+                      {isConfirmingCounter ? `${counterName} respondeu sua solicitação.` : `${sourceName} quer trocar com você.`}
+                    </Text>
+                  </View>
                 </View>
+                <TouchableOpacity style={styles.tradeCloseButton} onPress={() => setTradeModal(null)}>
+                  <Ionicons name="close" size={20} color="#fff" />
+                </TouchableOpacity>
               </View>
-              <TouchableOpacity style={styles.tradeCloseButton} onPress={() => setTradeModal(null)}>
-                <Ionicons name="close" size={20} color="#fff" />
-              </TouchableOpacity>
-            </View>
 
-            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.tradeModalScrollContent}>
               <View style={styles.tradeSenderCard}>
                 <Image source={{ uri: sourceInfo.avatarUri }} style={styles.tradeSenderAvatar} />
                 <View style={{ flex: 1, minWidth: 0 }}>
@@ -3114,77 +3119,86 @@ export default function LanSessionScreen() {
             )}
 
             {masterModal.kind === 'applyEffect' && (
-              <ScrollView showsVerticalScrollIndicator={false}>
-                <Text style={styles.modalHint}>
-                  {hasPlayer ? `Alvo: ${player.character_name || 'Personagem'}` : `Alvo: toda a party (${targetPlayers.length})`}
-                </Text>
-                <Text style={styles.modalFieldLabel}>Buscar efeito</Text>
-                <TextInput
-                  style={[styles.input, styles.fullInput]}
-                  value={effectSearch}
-                  onChangeText={setEffectSearch}
-                  placeholder="Buscar condicao, aura, veneno..."
-                  placeholderTextColor="rgba(255,255,255,0.35)"
-                />
-
-                {selectedEffectIds.length > 0 && (
-                  <View style={styles.selectedEffectsBox}>
-                    <Text style={styles.selectedEffectsTitle}>{selectedEffectIds.length} efeito(s) selecionado(s)</Text>
-                    <TouchableOpacity onPress={() => setSelectedEffectIds([])}>
-                      <Text style={styles.clearSelectionText}>Limpar</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-
-                <View style={styles.effectCatalogList}>
-                  {effectMatches.map(effect => {
-                    const selected = selectedEffectIds.includes(effect.id);
-                    return (
-                      <TouchableOpacity key={effect.id} style={[styles.effectCatalogRow, selected && styles.effectCatalogRowActive, { borderColor: selected ? effect.color : 'rgba(255,255,255,0.08)' }]} onPress={() => toggleSelectedEffect(effect.id)}>
-                        <View style={[styles.effectCatalogCheck, { backgroundColor: selected ? effect.color : 'rgba(255,255,255,0.08)' }]}>
-                          {selected ? <Ionicons name="checkmark" size={17} color="#02112b" /> : <View style={[styles.effectColorDot, { backgroundColor: effect.color }]} />}
-                        </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={[styles.effectCatalogKind, { color: effect.color }]}>CONDICAO</Text>
-                          <Text style={styles.effectCatalogName}>{effect.name}</Text>
-                          <Text style={styles.effectCatalogDescription} numberOfLines={3}>{effect.description || 'Sem descricao cadastrada.'}</Text>
-                        </View>
-                      </TouchableOpacity>
-                    );
-                  })}
-                  {effectMatches.length === 0 && <Text style={styles.modalHint}>Nenhum efeito encontrado no catalogo.</Text>}
-                </View>
-
-                <View style={styles.selectedEffectsBox}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.selectedEffectsTitle}>Aplicacao</Text>
-                    <Text style={styles.effectCatalogDescription}>Ajuste a duracao antes de aplicar.</Text>
-                  </View>
-                </View>
-
-                <View style={styles.modalInputGrid}>
-                  <View style={styles.modalInputBox}>
-                    <Text style={styles.modalFieldLabel}>Tempo</Text>
-                    <TextInput style={[styles.input, styles.modalNumberInput]} value={effectDurationValue} onChangeText={value => setEffectDurationValue(onlyNumberText(value))} keyboardType="numeric" placeholder="3" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus textAlign="center" />
-                  </View>
-                </View>
-                <View style={styles.durationChipWrap}>
-                  {(['turn', 'minute', 'hour', 'short_rest', 'long_rest'] as const).map(unit => (
-                    <TouchableOpacity key={unit} style={[styles.durationChip, effectDurationUnit === unit && styles.durationChipActive]} onPress={() => setEffectDurationUnit(unit)}>
-                      <Text style={[styles.durationChipText, effectDurationUnit === unit && styles.durationChipTextActive]}>{durationLabel(unit)}</Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-
-                <TouchableOpacity
-                  style={[styles.primaryWideButton, (selectedEffectIds.length === 0 || (!hasPlayer && targetPlayers.length === 0)) && styles.disabledButton]}
-                  disabled={selectedEffectIds.length === 0 || (!hasPlayer && targetPlayers.length === 0)}
-                  onPress={() => handleMasterApplySelectedEffects(hasPlayer ? player : undefined)}
+              <View style={styles.applyEffectModalBody}>
+                <ScrollView
+                  style={styles.masterModalScroll}
+                  showsVerticalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  contentContainerStyle={styles.applyEffectScrollContent}
                 >
-                  <Ionicons name="color-wand-outline" size={18} color="#02112b" />
-                  <Text style={styles.primaryWideButtonText}>APLICAR EFEITO</Text>
-                </TouchableOpacity>
-              </ScrollView>
+                  <Text style={styles.modalHint}>
+                    {hasPlayer ? `Alvo: ${player.character_name || 'Personagem'}` : `Alvo: toda a party (${targetPlayers.length})`}
+                  </Text>
+                  <Text style={styles.modalFieldLabel}>Buscar efeito</Text>
+                  <TextInput
+                    style={[styles.input, styles.fullInput]}
+                    value={effectSearch}
+                    onChangeText={setEffectSearch}
+                    placeholder="Buscar condicao, aura, veneno..."
+                    placeholderTextColor="rgba(255,255,255,0.35)"
+                  />
+
+                  {selectedEffectIds.length > 0 && (
+                    <View style={styles.selectedEffectsBox}>
+                      <Text style={styles.selectedEffectsTitle}>{selectedEffectIds.length} efeito(s) selecionado(s)</Text>
+                      <TouchableOpacity onPress={() => setSelectedEffectIds([])}>
+                        <Text style={styles.clearSelectionText}>Limpar</Text>
+                      </TouchableOpacity>
+                    </View>
+                  )}
+
+                  <View style={styles.effectCatalogList}>
+                    {effectMatches.map(effect => {
+                      const selected = selectedEffectIds.includes(effect.id);
+                      return (
+                        <TouchableOpacity key={effect.id} style={[styles.effectCatalogRow, selected && styles.effectCatalogRowActive, { borderColor: selected ? effect.color : 'rgba(255,255,255,0.08)' }]} onPress={() => toggleSelectedEffect(effect.id)}>
+                          <View style={[styles.effectCatalogCheck, { backgroundColor: selected ? effect.color : 'rgba(255,255,255,0.08)' }]}>
+                            {selected ? <Ionicons name="checkmark" size={17} color="#02112b" /> : <View style={[styles.effectColorDot, { backgroundColor: effect.color }]} />}
+                          </View>
+                          <View style={{ flex: 1 }}>
+                            <Text style={[styles.effectCatalogKind, { color: effect.color }]}>CONDICAO</Text>
+                            <Text style={styles.effectCatalogName}>{effect.name}</Text>
+                            <Text style={styles.effectCatalogDescription} numberOfLines={3}>{effect.description || 'Sem descricao cadastrada.'}</Text>
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+                    {effectMatches.length === 0 && <Text style={styles.modalHint}>Nenhum efeito encontrado no catalogo.</Text>}
+                  </View>
+                </ScrollView>
+
+                <View style={styles.applyEffectFooter}>
+                  <View style={styles.selectedEffectsBox}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.selectedEffectsTitle}>Aplicacao</Text>
+                      <Text style={styles.effectCatalogDescription}>Ajuste a duracao antes de aplicar.</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.modalInputGrid}>
+                    <View style={styles.modalInputBox}>
+                      <Text style={styles.modalFieldLabel}>Tempo</Text>
+                      <TextInput style={[styles.input, styles.modalNumberInput]} value={effectDurationValue} onChangeText={value => setEffectDurationValue(onlyNumberText(value))} keyboardType="numeric" placeholder="3" placeholderTextColor="rgba(255,255,255,0.35)" selectTextOnFocus textAlign="center" />
+                    </View>
+                  </View>
+                  <View style={styles.durationChipWrap}>
+                    {(['turn', 'minute', 'hour', 'short_rest', 'long_rest'] as const).map(unit => (
+                      <TouchableOpacity key={unit} style={[styles.durationChip, effectDurationUnit === unit && styles.durationChipActive]} onPress={() => setEffectDurationUnit(unit)}>
+                        <Text style={[styles.durationChipText, effectDurationUnit === unit && styles.durationChipTextActive]}>{durationLabel(unit)}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+
+                  <TouchableOpacity
+                    style={[styles.primaryWideButton, styles.applyEffectButton, (selectedEffectIds.length === 0 || (!hasPlayer && targetPlayers.length === 0)) && styles.disabledButton]}
+                    disabled={selectedEffectIds.length === 0 || (!hasPlayer && targetPlayers.length === 0)}
+                    onPress={() => handleMasterApplySelectedEffects(hasPlayer ? player : undefined)}
+                  >
+                    <Ionicons name="color-wand-outline" size={18} color="#02112b" />
+                    <Text style={styles.primaryWideButtonText}>APLICAR EFEITO</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
             )}
 
             {masterModal.kind === 'time' && (
@@ -3926,6 +3940,7 @@ const styles = StyleSheet.create({
   tradeModalTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', letterSpacing: 0.2 },
   tradeModalSubtitle: { color: 'rgba(255,255,255,0.66)', fontSize: 12, lineHeight: 17, marginTop: 3 },
   tradeCloseButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  tradeModalScroll: { width: '100%', maxHeight: '100%', flexShrink: 1 },
   tradeModalScrollContent: { paddingTop: 4, paddingBottom: 2 },
   tradeSenderCard: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 8 },
   tradeSenderAvatar: { width: 62, height: 62, borderRadius: 31, borderWidth: 1, borderColor: 'rgba(196,138,68,0.55)', backgroundColor: 'rgba(0,0,0,0.25)' },
@@ -4175,10 +4190,11 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(0,191,255,0.22)',
   },
   inlineResourceResetText: { color: '#8bdcff', fontSize: 10, fontWeight: 'bold' },
-  inlineSlotGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  inlineSlotGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7, alignItems: 'flex-start' },
   inlineSlotChip: {
-    minWidth: 74,
-    flexGrow: 1,
+    width: '31%',
+    minWidth: 72,
+    minHeight: 46,
     borderRadius: 10,
     padding: 8,
     backgroundColor: 'rgba(255,255,255,0.055)',
@@ -4337,6 +4353,15 @@ const styles = StyleSheet.create({
   selectedEffectsTitle: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
   clearSelectionText: { color: '#ff8a8a', fontSize: 12, fontWeight: 'bold' },
   effectCatalogList: { gap: 9, marginBottom: 12 },
+  applyEffectModalBody: { width: '100%', flexShrink: 1, minHeight: 0 },
+  applyEffectScrollContent: { paddingBottom: 12 },
+  applyEffectFooter: {
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: '#102b56',
+  },
+  applyEffectButton: { marginTop: 12 },
   effectCatalogRow: {
     minHeight: 92,
     flexDirection: 'row',
@@ -4383,21 +4408,22 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,100,100,0.28)',
   },
-  resourceManageGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  resourceManageGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, alignItems: 'flex-start' },
   resourceManageBox: {
-    flexGrow: 1,
-    minWidth: 118,
+    width: '31%',
+    minWidth: 96,
+    minHeight: 96,
     borderRadius: 12,
-    padding: 10,
+    padding: 9,
     backgroundColor: 'rgba(255,255,255,0.05)',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.1)',
   },
   resourceManageLabel: { color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: 'bold' },
-  resourceManageValue: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginTop: 4 },
-  resourceManageButtons: { flexDirection: 'row', gap: 6, marginTop: 10 },
-  resourceMiniButton: { flex: 1, alignItems: 'center', backgroundColor: '#00fa9a', borderRadius: 8, paddingVertical: 8 },
-  resourceMiniButtonAlt: { flex: 1, alignItems: 'center', backgroundColor: 'rgba(0,191,255,0.2)', borderRadius: 8, paddingVertical: 8, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)' },
+  resourceManageValue: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginTop: 3 },
+  resourceManageButtons: { flexDirection: 'row', gap: 5, marginTop: 8 },
+  resourceMiniButton: { minHeight: 30, flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#00fa9a', borderRadius: 8, paddingVertical: 6 },
+  resourceMiniButtonAlt: { minHeight: 30, flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,191,255,0.2)', borderRadius: 8, paddingVertical: 6, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)' },
   resourceMiniButtonText: { color: '#02112b', fontSize: 11, fontWeight: 'bold' },
   cardActionBlock: {
     marginTop: 7,
@@ -4508,6 +4534,7 @@ const styles = StyleSheet.create({
   initiativeActorFieldRow: { flexDirection: 'row', gap: 10, marginTop: 14, marginBottom: 18 },
   masterModalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 },
   masterModalTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', flex: 1 },
+  masterModalScroll: { width: '100%', maxHeight: '100%', flexShrink: 1 },
   modalIconButton: {
     width: 36,
     height: 36,

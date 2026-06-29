@@ -34,7 +34,15 @@ export function buildSessionShareCode(sessionId: string, hostIp: string, port = 
 export function formatManualSessionCode(rawCode: string) {
   const trimmed = rawCode.trim();
   if (!trimmed) return '';
-  if (trimmed.includes('|') || trimmed.startsWith('{')) return trimmed;
+  if (
+    trimmed.includes('|') ||
+    trimmed.startsWith('{') ||
+    /^https?:\/\//i.test(trimmed) ||
+    /^fichadnd:\/\//i.test(trimmed) ||
+    /\b\d{1,3}(?:\.\d{1,3}){3}\b/.test(trimmed)
+  ) {
+    return trimmed;
+  }
 
   const compact = trimmed
     .toUpperCase()
@@ -46,8 +54,21 @@ export function formatManualSessionCode(rawCode: string) {
 }
 
 export function parseSessionCode(rawCode: string): ParsedSessionCode | null {
-  const trimmed = rawCode.trim();
+  let trimmed = rawCode.trim();
   if (!trimmed) return null;
+
+  try {
+    const url = new URL(trimmed);
+    const codeParam = url.searchParams.get('code') || url.searchParams.get('session') || url.searchParams.get('sessionCode');
+    if (codeParam) {
+      const parsedFromParam = parseSessionCode(decodeURIComponent(codeParam));
+      if (parsedFromParam) return parsedFromParam;
+    }
+  } catch {}
+
+  if (/^DNDLAN:\/\//i.test(trimmed)) {
+    trimmed = trimmed.replace(/^DNDLAN:\/\//i, `${CODE_PREFIX}|`);
+  }
 
   const formattedShortCode = formatManualSessionCode(trimmed);
   if (/^[A-Z2-9]{4}-[A-Z2-9]{4}(-[A-Z2-9]{4})?$/.test(formattedShortCode)) {

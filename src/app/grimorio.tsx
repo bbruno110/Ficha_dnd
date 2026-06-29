@@ -1059,7 +1059,7 @@ export default function GrimoireScreen() {
         data={pageEntries}
         keyExtractor={item => item.id}
         renderItem={renderEntry}
-        contentContainerStyle={styles.listContent}
+        contentContainerStyle={[styles.listContent, { paddingBottom: Math.max(insets.bottom + 88, 104) }]}
         showsVerticalScrollIndicator={false}
         ListEmptyComponent={<Text style={styles.emptyText}>{loading ? 'Carregando grimório...' : 'Nenhum conteúdo encontrado com esses filtros.'}</Text>}
       />

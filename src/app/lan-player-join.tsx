@@ -16,12 +16,26 @@ import {
   View,
 } from 'react-native';
 import { useLanSession } from '../contexts/LanSessionContext';
-import { formatManualSessionCode } from '../network/lanProtocol';
+import { buildSessionShareCode, formatManualSessionCode, parseSessionCode } from '../network/lanProtocol';
+import { LAN_DEFAULT_PORT } from '../types/lan';
+
+function normalizeIpInput(value: string) {
+  return value.replace(/[^0-9.]/g, '').slice(0, 15);
+}
+
+function isValidIpv4(value: string) {
+  const parts = value.trim().split('.');
+  return parts.length === 4 && parts.every(part => {
+    const number = Number(part);
+    return Number.isInteger(number) && number >= 0 && number <= 255 && part === String(number);
+  });
+}
 
 export default function LanPlayerJoinScreen() {
   const router = useRouter();
   const { activeSession, joinPlayerSession } = useLanSession();
   const [joinCode, setJoinCode] = useState('');
+  const [hostIpOverride, setHostIpOverride] = useState('');
   const [playerName, setPlayerName] = useState('');
   const [scannerVisible, setScannerVisible] = useState(false);
   const [joining, setJoining] = useState(false);
@@ -55,8 +69,27 @@ export default function LanPlayerJoinScreen() {
 
     try {
       setJoining(true);
+      const rawCode = codeOverride || joinCode;
+      const ipOverride = hostIpOverride.trim();
+      let finalCode = rawCode;
+
+      if (!codeOverride && ipOverride) {
+        if (!isValidIpv4(ipOverride)) {
+          throw new Error('IP do mestre invalido. Use o formato que aparece na tela do mestre, por exemplo 192.168.1.34.');
+        }
+
+        const parsedCode = parseSessionCode(rawCode);
+        if (!parsedCode) {
+          throw new Error('Codigo de sessao invalido. Digite o codigo da mesa e, se quiser, o IP que aparece no aparelho do mestre.');
+        }
+
+        finalCode = parsedCode.hostIp
+          ? rawCode
+          : buildSessionShareCode(parsedCode.sessionId, ipOverride, parsedCode.port || LAN_DEFAULT_PORT, [ipOverride]);
+      }
+
       await joinPlayerSession({
-        code: codeOverride || joinCode,
+        code: finalCode,
         playerName,
         linkedCharacterId: null,
       });
@@ -126,6 +159,21 @@ export default function LanPlayerJoinScreen() {
                   <Ionicons name="qr-code-outline" size={24} color="#02112b" />
                 </TouchableOpacity>
               </View>
+            </View>
+
+            <View style={styles.formGroup}>
+              <Text style={styles.label}>IP DO MESTRE (OPCIONAL)</Text>
+              <TextInput
+                style={styles.input}
+                value={hostIpOverride}
+                onChangeText={text => setHostIpOverride(normalizeIpInput(text))}
+                keyboardType="decimal-pad"
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="Ex: 192.168.1.34"
+                placeholderTextColor="rgba(255,255,255,0.35)"
+              />
+              <Text style={styles.fieldHint}>Use se o QR/codigo curto nao encontrar a mesa. O IP aparece abaixo do QR no aparelho do mestre.</Text>
             </View>
 
             <TouchableOpacity style={[styles.primaryButton, joining && styles.disabledButton]} disabled={joining} onPress={() => handleJoin()}>
@@ -204,6 +252,7 @@ const styles = StyleSheet.create({
   formPanel: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 16, padding: 16 },
   formGroup: { marginBottom: 16 },
   label: { fontSize: 11, fontWeight: 'bold', color: '#00bfff', marginBottom: 8, letterSpacing: 1 },
+  fieldHint: { color: 'rgba(255,255,255,0.45)', fontSize: 11, lineHeight: 16, marginTop: 8 },
   input: {
     backgroundColor: 'rgba(0,0,0,0.28)',
     borderWidth: 1,

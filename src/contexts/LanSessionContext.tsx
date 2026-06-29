@@ -120,6 +120,17 @@ function estimateJsonBytes(value: unknown) {
   }
 }
 
+async function getRandomLanCampaignName(db: ReturnType<typeof useSQLiteContext>, fallback: string) {
+  try {
+    const row = await db.getFirstAsync<{ name?: string }>(
+      `SELECT name FROM random_lan_campaign_names ORDER BY RANDOM() LIMIT 1`
+    );
+    return String(row?.name || '').trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 const LAN_SYNC_DEFAULT_EVENT_LIMIT = 200;
 const LAN_SYNC_PUSH_EVENT_WINDOW = 24;
 const LAN_SYNC_PUSH_EVENT_LIMIT = 32;
@@ -1933,13 +1944,16 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
 
       const targetCharacterId = Number(command.payload?.targetCharacterId || command.characterId || 0);
-      const targetDeviceId = String(command.payload?.targetDeviceId || '');
+      const localDeviceId = deviceIdRef.current;
+      const explicitTargetDeviceId = String(command.payload?.targetDeviceId || '');
+      const targetDeviceId = explicitTargetDeviceId || (
+        command.command === 'MASTER_APPLY_RESOURCE' && command.deviceId !== localDeviceId ? command.deviceId : ''
+      );
       if (!targetCharacterId) {
         await rejectCommand(session.id, command, 'Comando sem personagem alvo.', peerId);
         return;
       }
 
-      const localDeviceId = deviceIdRef.current;
       const isLocalTarget = !targetDeviceId || targetDeviceId === localDeviceId;
       let target: any = null;
 
@@ -3477,6 +3491,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       await deactivateCurrentSessionLocally('start-master-session');
 
       const sessionId = makeShortSessionCode();
+      const sessionName = options.sessionName.trim() || await getRandomLanCampaignName(db, `Sessao ${sessionId}`);
       const hostCandidates = await getLanAddressCandidates();
       let hostIp = '0.0.0.0';
       try {
@@ -3488,7 +3503,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       const sessionCode = buildSessionShareCode(sessionId, hostIp, LAN_DEFAULT_PORT, hostCandidates);
       const session: LanSessionRecord = {
         id: sessionId,
-        name: options.sessionName.trim() || `Sessao ${sessionId}`,
+        name: sessionName,
         role: 'master',
         status: 'open',
         session_code: sessionCode,
@@ -3621,7 +3636,6 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         const deviceId = await getOrCreateDeviceId(db);
         deviceIdRef.current = deviceId;
         setLocalDeviceId(deviceId);
-        await deactivateCurrentSessionLocally('join-player-session');
 
         let characterName: string | null = null;
         let linkedSnapshot: Awaited<ReturnType<typeof getCharacterSnapshot>> = null;
@@ -3719,6 +3733,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           discovery = await discover('after-join-failed');
           joinResponse = await sendJoinWithRetry(discovery.host, discovery.port, 'rediscovered');
         }
+
+        await deactivateCurrentSessionLocally('join-player-session-confirmed');
 
         const config = (joinResponse.payload?.session as any)?.config || (joinResponse.payload as any)?.config || {};
         const session: LanSessionRecord = {

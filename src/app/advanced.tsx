@@ -8,6 +8,7 @@ import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useEffect, useState } from 'react';
 import { Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { EffectDraft, EffectDurationUnit, EffectKind, EffectValueMode, formatEffectSummary } from '../types/effects';
 
 // ================= TIPAGENS =================
@@ -147,6 +148,7 @@ const normalizeHexColorInput = (value: string) => {
 export default function AdvancedCreatorScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
+  const insets = useSafeAreaInsets();
   const [activeTab, setActiveTab] = useState('Item');
 
   // Estados Gerais
@@ -1872,7 +1874,7 @@ export default function AdvancedCreatorScreen() {
       </Modal>
 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ?'padding' : 'height'}>
-        <ScrollView contentContainerStyle={styles.scrollContent}>
+        <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(insets.bottom + 70, 90) }]}>
           {activeTab !== 'Acervo' ?(
             <>
               <View style={styles.cardBlock}>

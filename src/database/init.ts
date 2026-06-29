@@ -22,6 +22,7 @@ const TRACE_TABLES = [
   { table: 'random_lore_archetypes', idColumn: 'id' },
   { table: 'random_lore_entries', idColumn: 'id' },
   { table: 'random_name_parts', idColumn: 'id' },
+  { table: 'random_lan_campaign_names', idColumn: 'id' },
   { table: 'random_lore_connectors', idColumn: 'id' },
   { table: 'random_race_language_rules', idColumn: 'id' },
   { table: 'characters', idColumn: 'id' },
@@ -242,6 +243,8 @@ async function seedConditionEffectCatalog(db: SQLiteDatabase) {
 }
 
 async function organizeBaseCatalog(db: SQLiteDatabase) {
+  await dedupeBaseSpellCatalog(db);
+
   await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_items_catalog_name
       ON items (name COLLATE NOCASE);
@@ -472,7 +475,7 @@ const BASE_CLASS_FEATURE_REPAIRS: BaseClassFeatureRepair[] = [
   },
   {
     name: 'Feiticeiro',
-    features: ['Conjuração de Feiticeiro', 'Origem Feiticeira', { name: 'Fonte de Magia', level: 2 }, { name: 'Metamagia', level: 3 }],
+    features: ['Conjuração de Feiticeiro', 'Origem Feiticeira', { name: 'Fonte de Magia', level: 2 }, { name: 'Metamagia', level: 3 }, { name: 'Versatilidade Metamágica', level: 4 }, { name: 'Orientação Mágica', level: 5 }, { name: 'Restauração Feiticeira', level: 20 }],
   },
   {
     name: 'Guerreiro',
@@ -480,11 +483,11 @@ const BASE_CLASS_FEATURE_REPAIRS: BaseClassFeatureRepair[] = [
   },
   {
     name: 'Ladino',
-    features: ['Especialização (Ladino)', 'Ataque Furtivo', 'Gíria de Ladrão', { name: 'Ação Ardilosa', level: 2 }, { name: 'Arquétipo Ladino', level: 3 }, { name: 'Esquiva Sobrenatural', level: 5 }],
+    features: ['Especialização (Ladino)', 'Ataque Furtivo', 'Gíria de Ladrão', { name: 'Ação Ardilosa', level: 2 }, { name: 'Arquétipo Ladino', level: 3 }, { name: 'Esquiva Sobrenatural', level: 5 }, { name: 'Especialização Aprimorada', level: 6 }, { name: 'Evasão', level: 7 }, { name: 'Talento Confiável', level: 11 }, { name: 'Sentido Cego', level: 14 }, { name: 'Mente Escorregadia', level: 15 }, { name: 'Elusivo', level: 18 }, { name: 'Golpe de Sorte', level: 20 }],
   },
   {
     name: 'Mago',
-    features: ['Conjuração de Mago', 'Recuperação Arcana', { name: 'Tradição Arcana', level: 2 }],
+    features: ['Conjuração de Mago', 'Recuperação Arcana', 'Escriba de Grimório', 'Preparação Arcana', 'Magias Rituais de Mago', { name: 'Tradição Arcana', level: 2 }, { name: 'Maestria em Magias', level: 18 }, { name: 'Assinatura Arcana', level: 20 }],
   },
   {
     name: 'Monge',
@@ -492,7 +495,7 @@ const BASE_CLASS_FEATURE_REPAIRS: BaseClassFeatureRepair[] = [
   },
   {
     name: 'Paladino',
-    features: ['Sentido Divino', 'Imposição das Mãos', { name: 'Estilo de Luta', level: 2 }, { name: 'Conjuração de Paladino', level: 2 }, { name: 'Golpe Divino', level: 2 }, { name: 'Juramento Sagrado', level: 3 }, { name: 'Ataque Extra', level: 5 }, { name: 'Aura de Proteção', level: 6 }, { name: 'Aura de Coragem', level: 10 }, { name: 'Golpe Divino Aprimorado', level: 11 }, { name: 'Toque Purificador', level: 14 }],
+    features: ['Sentido Divino', 'Imposição das Mãos', { name: 'Estilo de Luta', level: 2 }, { name: 'Conjuração de Paladino', level: 2 }, { name: 'Golpe Divino', level: 2 }, { name: 'Juramento Sagrado', level: 3 }, { name: 'Saúde Divina', level: 3 }, { name: 'Ataque Extra', level: 5 }, { name: 'Aura de Proteção', level: 6 }, { name: 'Aura de Coragem', level: 10 }, { name: 'Golpe Divino Aprimorado', level: 11 }, { name: 'Toque Purificador', level: 14 }, { name: 'Aura Aprimorada', level: 18 }],
   },
   {
     name: 'Patrulheiro',
@@ -527,18 +530,20 @@ const BASE_SUBCLASS_FEATURE_REPAIRS: BaseSubclassFeatureRepair[] = [
   { name: 'Círculo da Lua', className: 'Druida', levelRequired: 2, features: [{ name: 'Forma Selvagem de Combate', level: 2 }, { name: 'Formas do Círculo', level: 2 }, { name: 'Golpe Primal', level: 6 }] },
   { name: 'Círculo da Terra', className: 'Druida', levelRequired: 2, features: [{ name: 'Truque Bônus', level: 2 }, { name: 'Recuperação Natural', level: 2 }, { name: 'Magias do Círculo', level: 3 }, { name: 'Passo da Terra', level: 6 }] },
   { name: 'Círculo dos Esporos', className: 'Druida', levelRequired: 2, features: [{ name: 'Halo de Esporos', level: 2 }, { name: 'Entidade Simbiótica', level: 2 }, { name: 'Infestação Fúngica', level: 6 }] },
-  { name: 'Linhagem Dracônica', className: 'Feiticeiro', levelRequired: 1, features: ['Ancestral Dracônico', 'Resiliência Dracônica', { name: 'Afinidade Elemental', level: 6 }] },
-  { name: 'Magia Selvagem', className: 'Feiticeiro', levelRequired: 1, features: ['Surto de Magia Selvagem', 'Marés do Caos', { name: 'Dobrar Sorte', level: 6 }] },
-  { name: 'Alma Divina', className: 'Feiticeiro', levelRequired: 1, features: ['Magia Divina', 'Favorecido pelos Deuses', { name: 'Cura Potencializada', level: 6 }] },
-  { name: 'Mente Aberrante', className: 'Feiticeiro', levelRequired: 1, features: ['Magias Psiônicas', 'Discurso Telepático', { name: 'Defesas Psíquicas', level: 6 }] },
+  { name: 'Linhagem Dracônica', className: 'Feiticeiro', levelRequired: 1, features: ['Ancestral Dracônico', 'Resiliência Dracônica', { name: 'Afinidade Elemental', level: 6 }, { name: 'Asas Dracônicas', level: 14 }, { name: 'Presença Dracônica', level: 18 }] },
+  { name: 'Magia Selvagem', className: 'Feiticeiro', levelRequired: 1, features: ['Surto de Magia Selvagem', 'Marés do Caos', { name: 'Dobrar Sorte', level: 6 }, { name: 'Caos Controlado', level: 14 }, { name: 'Bombardeio de Magia', level: 18 }] },
+  { name: 'Alma Divina', className: 'Feiticeiro', levelRequired: 1, features: ['Magia Divina', 'Favorecido pelos Deuses', { name: 'Cura Potencializada', level: 6 }, { name: 'Asas Sobrenaturais', level: 14 }, { name: 'Recuperação Sobrenatural', level: 18 }] },
+  { name: 'Mente Aberrante', className: 'Feiticeiro', levelRequired: 1, features: ['Magias Psiônicas', 'Discurso Telepático', { name: 'Feitiçaria Psíquica', level: 6 }, { name: 'Revelação em Carne', level: 14 }, { name: 'Implosão Distorcida', level: 18 }] },
+  { name: 'Magia Sombria', className: 'Feiticeiro', levelRequired: 1, features: ['Olhos da Escuridão', 'Força da Sepultura', { name: 'Cão do Mau Presságio', level: 6 }, { name: 'Caminhar nas Sombras', level: 14 }, { name: 'Forma Umbral', level: 18 }] },
+  { name: 'Feitiçaria da Tempestade', className: 'Feiticeiro', levelRequired: 1, features: ['Magia Tempestuosa', 'Alma da Tempestade', { name: 'Coração da Tempestade', level: 6 }, { name: 'Fúria da Tempestade', level: 14 }, { name: 'Alma do Vento', level: 18 }] },
   { name: 'Campeão', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Crítico Aprimorado', level: 3 }, { name: 'Atleta Notável', level: 7 }] },
   { name: 'Mestre de Batalha', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Dados de Superioridade', level: 3 }, { name: 'Estudioso da Guerra', level: 3 }, { name: 'Ataque de Precisão', level: 3 }, { name: 'Ataque de Tropeço', level: 3 }, { name: 'Ataque Desarmante', level: 3 }, { name: 'Ataque Ameaçador', level: 3 }, { name: 'Ripostar', level: 3 }, { name: 'Ataque Empurrão', level: 3 }] },
   { name: 'Cavaleiro Arcano', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Conjuração de Cavaleiro Arcano', level: 3 }, { name: 'Arma Vinculada', level: 3 }, { name: 'Magia de Guerra', level: 7 }] },
   { name: 'Samurai', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Proficiência Bônus de Samurai', level: 3 }, { name: 'Espírito de Luta', level: 3 }, { name: 'Elegância Cortesã', level: 7 }] },
-  { name: 'Assassino', className: 'Ladino', levelRequired: 3, features: [{ name: 'Assassinar', level: 3 }, { name: 'Proficiência com Disfarce e Veneno', level: 3 }] },
-  { name: 'Ladrão', className: 'Ladino', levelRequired: 3, features: [{ name: 'Mãos Rápidas', level: 3 }, { name: 'Andarilho de Telhados', level: 3 }] },
-  { name: 'Trapaceiro Arcano', className: 'Ladino', levelRequired: 3, features: [{ name: 'Conjuração de Trapaceiro Arcano', level: 3 }, { name: 'Mãos Mágicas Ardilosas', level: 3 }, { name: 'Emboscada Mágica', level: 9 }] },
-  { name: 'Espadachim', className: 'Ladino', levelRequired: 3, features: [{ name: 'Jogo de Pés Elegante', level: 3 }, { name: 'Audácia Insolente', level: 3 }] },
+  { name: 'Assassino', className: 'Ladino', levelRequired: 3, features: [{ name: 'Assassinar', level: 3 }, { name: 'Proficiência com Disfarce e Veneno', level: 3 }, { name: 'Infiltração Especializada', level: 9 }, { name: 'Impostor', level: 13 }, { name: 'Golpe Mortal', level: 17 }] },
+  { name: 'Ladrão', className: 'Ladino', levelRequired: 3, features: [{ name: 'Mãos Rápidas', level: 3 }, { name: 'Andarilho de Telhados', level: 3 }, { name: 'Furtividade Suprema', level: 9 }, { name: 'Uso de Dispositivo Mágico', level: 13 }, { name: 'Reflexos de Ladrão', level: 17 }] },
+  { name: 'Trapaceiro Arcano', className: 'Ladino', levelRequired: 3, features: [{ name: 'Conjuração de Trapaceiro Arcano', level: 3 }, { name: 'Mãos Mágicas Ardilosas', level: 3 }, { name: 'Emboscada Mágica', level: 9 }, { name: 'Trapaceiro Versátil', level: 13 }, { name: 'Ladrão de Magia', level: 17 }] },
+  { name: 'Espadachim', className: 'Ladino', levelRequired: 3, features: [{ name: 'Jogo de Pés Elegante', level: 3 }, { name: 'Audácia Insolente', level: 3 }, { name: 'Panache', level: 9 }, { name: 'Manobra Elegante', level: 13 }, { name: 'Mestre Duelista', level: 17 }] },
   { name: 'Abjuração', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Abjuração', level: 2 }, { name: 'Proteção Arcana', level: 2 }, { name: 'Proteção Projetada', level: 6 }] },
   { name: 'Evocação', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Evocação', level: 2 }, { name: 'Esculpir Magias', level: 2 }, { name: 'Truque Potente', level: 6 }] },
   { name: 'Necromancia', className: 'Mago', levelRequired: 2, features: [{ name: 'Sábio em Necromancia', level: 2 }, { name: 'Colheita Sombria', level: 2 }, { name: 'Servos Mortos-Vivos', level: 6 }] },
@@ -547,10 +552,10 @@ const BASE_SUBCLASS_FEATURE_REPAIRS: BaseSubclassFeatureRepair[] = [
   { name: 'Caminho da Mão Aberta', className: 'Monge', levelRequired: 3, features: [{ name: 'Técnica da Mão Aberta', level: 3 }, { name: 'Integridade Corporal', level: 6 }] },
   { name: 'Caminho das Sombras', className: 'Monge', levelRequired: 3, features: [{ name: 'Artes das Sombras', level: 3 }, { name: 'Passo das Sombras', level: 6 }] },
   { name: 'Caminho dos Quatro Elementos', className: 'Monge', levelRequired: 3, features: [{ name: 'Discípulo dos Elementos', level: 3 }, { name: 'Disciplinas Elementais', level: 3 }] },
-  { name: 'Devoção', className: 'Paladino', levelRequired: 3, features: [{ name: 'Arma Sagrada', level: 3 }, { name: 'Expulsar Profano', level: 3 }, { name: 'Aura de Devoção', level: 7 }] },
-  { name: 'Juramento dos Anciões', className: 'Paladino', levelRequired: 3, features: [{ name: 'Ira da Natureza', level: 3 }, { name: 'Expulsar Infiéis', level: 3 }, { name: 'Aura de Proteção Antiga', level: 7 }] },
-  { name: 'Juramento de Vingança', className: 'Paladino', levelRequired: 3, features: [{ name: 'Inimigo Abjurado', level: 3 }, { name: 'Voto de Inimizade', level: 3 }, { name: 'Vingador Implacável', level: 7 }] },
-  { name: 'Juramento de Conquista', className: 'Paladino', levelRequired: 3, features: [{ name: 'Presença Conquistadora', level: 3 }, { name: 'Golpe Guiado', level: 3 }, { name: 'Aura da Conquista', level: 7 }] },
+  { name: 'Devoção', className: 'Paladino', levelRequired: 3, features: [{ name: 'Arma Sagrada', level: 3 }, { name: 'Expulsar Profano', level: 3 }, { name: 'Aura de Devoção', level: 7 }, { name: 'Pureza de Espírito', level: 15 }, { name: 'Halo Sagrado', level: 20 }] },
+  { name: 'Juramento dos Anciões', className: 'Paladino', levelRequired: 3, features: [{ name: 'Ira da Natureza', level: 3 }, { name: 'Expulsar Infiéis', level: 3 }, { name: 'Aura de Proteção Antiga', level: 7 }, { name: 'Sentinela Imortal', level: 15 }, { name: 'Campeão Ancião', level: 20 }] },
+  { name: 'Juramento de Vingança', className: 'Paladino', levelRequired: 3, features: [{ name: 'Inimigo Abjurado', level: 3 }, { name: 'Voto de Inimizade', level: 3 }, { name: 'Vingador Implacável', level: 7 }, { name: 'Alma da Vingança', level: 15 }, { name: 'Anjo Vingador', level: 20 }] },
+  { name: 'Juramento de Conquista', className: 'Paladino', levelRequired: 3, features: [{ name: 'Presença Conquistadora', level: 3 }, { name: 'Golpe Guiado', level: 3 }, { name: 'Aura da Conquista', level: 7 }, { name: 'Repreensão Desdenhosa', level: 15 }, { name: 'Conquistador Invencível', level: 20 }] },
   { name: 'Caçador', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Presa do Caçador', level: 3 }, { name: 'Tática Defensiva', level: 7 }] },
   { name: 'Mestre das Bestas', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Companheiro Animal', level: 3 }, { name: 'Treinamento Excepcional', level: 7 }] },
   { name: 'Andarilho do Horizonte', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Detectar Portal', level: 3 }, { name: 'Guerreiro Planar', level: 3 }, { name: 'Passo Etéreo', level: 7 }] },
@@ -563,10 +568,10 @@ const BASE_SUBCLASS_FEATURE_REPAIRS: BaseSubclassFeatureRepair[] = [
   { name: 'Nomade Astral', className: 'Mistico', levelRequired: 3, features: [{ name: 'Salto Nômade', level: 3 }, { name: 'Memória de Mil Caminhos', level: 3 }] },
   { name: 'Cavaleiro Runico', className: 'Guerreiro', levelRequired: 3, features: [{ name: 'Runas de Gigante', level: 3 }, { name: 'Poder dos Gigantes', level: 3 }] },
   { name: 'Colegio do Glamour', className: 'Bardo', levelRequired: 3, features: [{ name: 'Manto de Inspiração', level: 3 }, { name: 'Performance Encantadora', level: 3 }] },
-  { name: 'Batedor', className: 'Ladino', levelRequired: 3, features: [{ name: 'Escaramuça', level: 3 }, { name: 'Sobrevivente Nato', level: 3 }] },
+  { name: 'Batedor', className: 'Ladino', levelRequired: 3, features: [{ name: 'Escaramuça', level: 3 }, { name: 'Sobrevivente Nato', level: 3 }, { name: 'Mobilidade Superior', level: 9 }, { name: 'Mestre de Emboscada', level: 13 }, { name: 'Golpe Repentino', level: 17 }] },
   { name: 'Alma Solar', className: 'Monge', levelRequired: 3, features: [{ name: 'Raio Solar Radiante', level: 3 }, { name: 'Arcos Solares', level: 6 }] },
   { name: 'Perseguidor Sombrio', className: 'Patrulheiro', levelRequired: 3, features: [{ name: 'Emboscador Sombrio', level: 3 }, { name: 'Visão Umbral', level: 3 }] },
-  { name: 'Juramento da Redencao', className: 'Paladino', levelRequired: 3, features: [{ name: 'Emissário da Paz', level: 3 }, { name: 'Repreender Violento', level: 3 }] },
+  { name: 'Juramento da Redencao', className: 'Paladino', levelRequired: 3, features: [{ name: 'Emissário da Paz', level: 3 }, { name: 'Repreender Violento', level: 3 }, { name: 'Aura do Guardião', level: 7 }, { name: 'Espírito Protetor', level: 15 }, { name: 'Emissário da Redenção', level: 20 }] },
 ];
 
 const FEATURE_CATEGORY_OVERRIDES: Record<string, BaseFeatureSpellRepair['category']> = {
@@ -629,9 +634,93 @@ const BASE_SPELL_NAME_REPAIRS = [
   { from: 'Mestre de Batalha: Ripostar', to: 'Ripostar' },
   { from: 'Mestre de Batalha: Ataque Empurrão', to: 'Ataque Empurrão' },
   { from: 'Aura de Protecao', to: 'Aura de Proteção' },
+  { from: 'Ação Astuta', to: 'Ação Ardilosa' },
+  { from: 'Evasao', to: 'Evasão' },
 ];
 
 const BASE_FEATURE_SPELL_DETAILS: Record<string, Partial<BaseFeatureSpellRepair>> = {
+  'Conjuração de Mago': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Espaços',
+    damageType: 'Magia',
+    description: 'Permite conjurar magias de Mago usando Inteligência, grimório, espaços de magia e preparação diária.',
+    forceUpdate: true,
+  },
+  'Recuperação Arcana': {
+    category: 'Habilidade',
+    castingTime: 'Descanso curto',
+    range: 'Pessoal',
+    duration: 'Instantânea',
+    damageDice: 'Espaços',
+    damageType: 'Recurso',
+    description: 'Uma vez por dia, ao terminar um descanso curto, recupera espaços de magia com soma de níveis limitada pelo nível de Mago.',
+    forceUpdate: true,
+  },
+  'Escriba de Grimório': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Grimório',
+    duration: 'Permanente',
+    damageDice: 'Cópia',
+    damageType: 'Magia',
+    description: 'Pode copiar magias de Mago encontradas para o grimório, pagando tempo e custo definidos pela mesa.',
+    forceUpdate: true,
+  },
+  'Preparação Arcana': {
+    category: 'Passiva',
+    castingTime: 'Após descanso longo',
+    range: 'Pessoal',
+    duration: 'Até próximo descanso longo',
+    damageDice: 'Nível + INT',
+    damageType: 'Magia',
+    description: 'Prepara diariamente uma quantidade de magias de Mago baseada no nível de Mago e modificador de Inteligência.',
+    forceUpdate: true,
+  },
+  'Magias Rituais de Mago': {
+    category: 'Passiva',
+    castingTime: 'Ritual',
+    range: 'Grimório',
+    duration: 'Variável',
+    damageDice: 'Ritual',
+    damageType: 'Magia',
+    description: 'Pode conjurar como ritual magias de Mago no grimório que tenham a marca ritual, mesmo sem prepará-las.',
+    forceUpdate: true,
+  },
+  'Tradição Arcana': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Subclasse',
+    damageType: 'Especialização',
+    description: 'Escolhe uma tradição arcana de Mago, desbloqueando recursos de subclasse a partir do 2º nível.',
+    forceUpdate: true,
+  },
+  'Maestria em Magias': {
+    level: 'Nível 18',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Magias fixas',
+    damageType: 'Magia',
+    description: 'Escolhe magias de baixo nível para conjurar com facilidade sem gastar espaços, conforme a regra da mesa.',
+    forceUpdate: true,
+  },
+  'Assinatura Arcana': {
+    level: 'Nível 20',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: '2 magias',
+    damageType: 'Magia',
+    description: 'Escolhe duas magias marcantes de Mago para manter sempre preparadas e conjurar com uso especial.',
+    forceUpdate: true,
+  },
   'Fúria': {
     category: 'Habilidade',
     castingTime: '1 Ação Bônus',
@@ -660,6 +749,213 @@ const BASE_FEATURE_SPELL_DETAILS: Record<string, Partial<BaseFeatureSpellRepair>
     damageDice: '1d6+',
     damageType: 'Extra',
     description: 'Uma vez por turno, causa dano extra se tiver vantagem ou aliado adjacente ao alvo.',
+    forceUpdate: true,
+  },
+  'Especialização (Ladino)': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: '2 perícias',
+    damageType: 'Perícia',
+    description: 'Escolhe duas proficiências para dobrar o bônus de proficiência nos testes correspondentes.',
+    forceUpdate: true,
+  },
+  'Gíria de Ladrão': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Social',
+    duration: 'Permanente',
+    damageDice: '-',
+    damageType: 'Interação',
+    description: 'Conhece códigos, sinais e expressões usados por criminosos e contatos do submundo.',
+    forceUpdate: true,
+  },
+  'Ação Ardilosa': {
+    level: 'Nível 2',
+    category: 'Habilidade',
+    castingTime: '1 Ação Bônus',
+    range: 'Pessoal',
+    duration: 'Turno atual',
+    damageDice: 'Ação bônus',
+    damageType: 'Movimento',
+    description: 'Pode Disparar, Desengajar ou Esconder-se como ação bônus.',
+    forceUpdate: true,
+  },
+  'Arquétipo Ladino': {
+    level: 'Nível 3',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Subclasse',
+    damageType: 'Especialização',
+    description: 'Escolhe um arquétipo de Ladino, liberando recursos de subclasse a partir do 3º nível.',
+    forceUpdate: true,
+  },
+  'Esquiva Sobrenatural': {
+    level: 'Nível 5',
+    category: 'Habilidade',
+    castingTime: 'Reação',
+    range: 'Pessoal',
+    duration: 'Instantânea',
+    damageDice: 'Metade',
+    damageType: 'Defesa',
+    description: 'Quando um atacante visível acerta você, usa reação para reduzir o dano pela metade.',
+    forceUpdate: true,
+  },
+  'Especialização Aprimorada': {
+    level: 'Nível 6',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: '+2 perícias',
+    damageType: 'Perícia',
+    description: 'Escolhe mais duas proficiências para receber Especialização.',
+    forceUpdate: true,
+  },
+  'Evasão': {
+    level: 'Nível 7',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Redução',
+    damageType: 'Defesa',
+    savingThrow: 'DES',
+    description: 'Em efeitos que exigem resistência de Destreza, sofre metade do dano em falha e nenhum dano em sucesso.',
+    forceUpdate: true,
+  },
+  'Talento Confiável': {
+    level: 'Nível 11',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Mín. 10',
+    damageType: 'Perícia',
+    description: 'Testes com proficiência tratam resultados baixos no d20 como 10, conforme regra da mesa.',
+    forceUpdate: true,
+  },
+  'Sentido Cego': {
+    level: 'Nível 14',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: '3m',
+    duration: 'Permanente',
+    damageDice: 'Percepção',
+    damageType: 'Detecção',
+    description: 'Percebe criaturas escondidas ou invisíveis próximas quando consegue ouvir.',
+    forceUpdate: true,
+  },
+  'Mente Escorregadia': {
+    level: 'Nível 15',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Proficiência',
+    damageType: 'Defesa',
+    savingThrow: 'SAB',
+    description: 'Ganha proficiência em testes de resistência de Sabedoria.',
+    forceUpdate: true,
+  },
+  'Elusivo': {
+    level: 'Nível 18',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Sem vantagem',
+    damageType: 'Defesa',
+    description: 'Enquanto não estiver incapacitado, ataques contra você não recebem vantagem.',
+    forceUpdate: true,
+  },
+  'Golpe de Sorte': {
+    level: 'Nível 20',
+    category: 'Habilidade',
+    castingTime: 'Ao falhar',
+    range: 'Pessoal',
+    duration: 'Instantânea',
+    damageDice: 'Acerto/20',
+    damageType: 'Recurso',
+    description: 'Transforma uma falha importante em acerto ou trata um teste como 20, uma vez por descanso.',
+    forceUpdate: true,
+  },
+  'Conjuração de Feiticeiro': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Espaços',
+    damageType: 'Magia',
+    description: 'Permite conjurar magias de Feiticeiro usando Carisma e uma lista de magias conhecidas.',
+    forceUpdate: true,
+  },
+  'Origem Feiticeira': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Subclasse',
+    damageType: 'Origem',
+    description: 'Define a fonte inata da magia do Feiticeiro e libera recursos de origem ao longo dos níveis.',
+    forceUpdate: true,
+  },
+  'Fonte de Magia': {
+    level: 'Nível 2',
+    category: 'Habilidade',
+    castingTime: 'Especial',
+    range: 'Pessoal',
+    duration: 'Variável',
+    damageDice: 'Pontos',
+    damageType: 'Recurso',
+    description: 'Recebe pontos de feitiçaria para converter em espaços de magia ou alimentar metamagias.',
+    forceUpdate: true,
+  },
+  'Metamagia': {
+    level: 'Nível 3',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Opções',
+    damageType: 'Magia',
+    description: 'Escolhe formas de alterar magias, como acelerar, ampliar, esconder componentes ou atingir alvos extras.',
+    forceUpdate: true,
+  },
+  'Versatilidade Metamágica': {
+    level: 'Nível 4',
+    category: 'Passiva',
+    castingTime: 'Ao evoluir',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Troca',
+    damageType: 'Magia',
+    description: 'Ao ganhar certos níveis, pode trocar uma opção de metamagia conhecida conforme regra da mesa.',
+    forceUpdate: true,
+  },
+  'Orientação Mágica': {
+    level: 'Nível 5',
+    category: 'Habilidade',
+    castingTime: 'Ao falhar',
+    range: 'Pessoal',
+    duration: 'Instantânea',
+    damageDice: '1 ponto',
+    damageType: 'Recurso',
+    description: 'Gasta ponto de feitiçaria para tentar melhorar um teste de atributo falho ligado à sua magia.',
+    forceUpdate: true,
+  },
+  'Restauração Feiticeira': {
+    level: 'Nível 20',
+    category: 'Passiva',
+    castingTime: 'Descanso curto',
+    range: 'Pessoal',
+    duration: 'Instantânea',
+    damageDice: '+4 pontos',
+    damageType: 'Recurso',
+    description: 'Recupera parte dos pontos de feitiçaria ao terminar um descanso curto.',
     forceUpdate: true,
   },
   'Forma Selvagem': {
@@ -764,6 +1060,17 @@ const BASE_FEATURE_SPELL_DETAILS: Record<string, Partial<BaseFeatureSpellRepair>
     description: 'Escolhe um juramento de Paladino e desbloqueia poderes de Canalizar Divindade e magias de juramento.',
     forceUpdate: true,
   },
+  'Saúde Divina': {
+    level: 'Nível 3',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Imunidade',
+    damageType: 'Defesa',
+    description: 'A energia divina torna o Paladino imune a doenças conforme regra da mesa.',
+    forceUpdate: true,
+  },
   'Aura de Proteção': {
     level: 'Nível 6',
     category: 'Passiva',
@@ -809,6 +1116,17 @@ const BASE_FEATURE_SPELL_DETAILS: Record<string, Partial<BaseFeatureSpellRepair>
     description: 'Encerra uma magia em você ou em uma criatura voluntária tocada.',
     forceUpdate: true,
   },
+  'Aura Aprimorada': {
+    level: 'Nível 18',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: '9m',
+    duration: 'Permanente',
+    damageDice: 'Aura 9m',
+    damageType: 'Suporte',
+    description: 'As auras principais do Paladino passam a alcançar uma área maior.',
+    forceUpdate: true,
+  },
 };
 
 function featureLevelToSpellLevel(level: number) {
@@ -832,6 +1150,71 @@ function mergeCommaList(...values: (string | null | undefined)[]) {
       .forEach(item => merged.add(item));
   });
   return Array.from(merged).join(',');
+}
+
+async function seedRandomLanCampaignNames(db: SQLiteDatabase) {
+  const names = [
+    'A Dungeon Sagrada',
+    'O Sepulcro das Brasas',
+    'A Cripta do Rei Sem Rosto',
+    'O Vale dos Juramentos Quebrados',
+    'A Torre sob a Lua Negra',
+    'As Minas do Coracao Antigo',
+    'O Santuario da Serpente Prateada',
+    'A Fortaleza dos Ecos',
+    'O Labirinto do Deus Adormecido',
+    'A Estrada para Noite Alta',
+    'O Cofre dos Sete Selos',
+    'A Ilha do Farol Morto',
+    'O Pacto de Pedra e Sangue',
+    'A Biblioteca Submersa',
+    'O Cerco de Cinzamar',
+    'A Coroa do Abismo',
+    'Os Portoes de Valdrakken',
+    'O Tumulo das Estrelas Frias',
+    'A Caverna do Ultimo Sino',
+    'O Festival dos Ossos Dourados',
+  ];
+
+  for (const name of names) {
+    await db.runAsync(
+      `INSERT OR IGNORE INTO random_lan_campaign_names (name, criador) VALUES (?, 'base')`,
+      [name]
+    );
+  }
+}
+
+async function dedupeBaseSpellCatalog(db: SQLiteDatabase) {
+  const duplicateNames = await db.getAllAsync<{ name: string }>(`
+    SELECT name
+    FROM spells
+    WHERE IFNULL(criador, 'base') = 'base'
+    GROUP BY name COLLATE NOCASE
+    HAVING COUNT(*) > 1
+  `);
+
+  for (const duplicate of duplicateNames) {
+    const rows = await db.getAllAsync<{ id: number; classes?: string | null }>(
+      `SELECT id, classes
+       FROM spells
+       WHERE name COLLATE NOCASE = ? AND IFNULL(criador, 'base') = 'base'
+       ORDER BY id ASC`,
+      [duplicate.name]
+    );
+    if (rows.length <= 1) continue;
+
+    const [keeper, ...duplicates] = rows;
+    await db.runAsync(
+      `UPDATE spells SET classes = ? WHERE id = ?`,
+      [mergeCommaList(...rows.map(row => row.classes)), keeper.id]
+    );
+
+    const duplicateIds = duplicates.map(row => row.id);
+    await db.runAsync(
+      `DELETE FROM spells WHERE id IN (${duplicateIds.map(() => '?').join(',')})`,
+      duplicateIds
+    );
+  }
 }
 
 function parsePositiveLevel(value: unknown, fallback = 1) {
@@ -1156,6 +1539,31 @@ const EXPANDED_SPELLS: ExpandedSpellSeed[] = [
   { name: 'Passo Trovejante', level: 'Nível 3', category: 'Magia', classes: 'Bruxo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: '27m', components: 'V', duration: 'Instantanea', damageDice: '3d10', damageType: 'Trovejante', savingThrow: 'CON', description: 'Teletransporta em um estouro que fere criaturas adjacentes.', classLevelRequired: 5 },
   { name: 'Servo Mecanico', level: 'Nível 2', category: 'Magia', classes: 'Artifice,Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: '1 Hora', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Anima um pequeno construto simples para tarefas basicas.', classLevelRequired: 3 },
   { name: 'Vortice Temporal', level: 'Nível 2', category: 'Magia', classes: 'Mago,Mistico', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Instantanea', damageDice: '2d8', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Desorienta o alvo com ecos de futuros possiveis.', classLevelRequired: 3 },
+  { name: 'Raio Arcano', level: 'Truque', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: 'Instantanea', damageDice: '1d10', damageType: 'Forca', savingThrow: 'Nenhum', description: 'Dispara um raio de energia arcana pura contra uma criatura ou objeto.', classLevelRequired: 1 },
+  { name: 'Lamina de Gelo', level: 'Truque', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: 'Arma', components: 'S, M', duration: '1 Rodada', damageDice: '1d6', damageType: 'Frio', savingThrow: 'Nenhum', description: 'Reveste uma arma ou foco com gelo cortante para um ataque rapido.', classLevelRequired: 1 },
+  { name: 'Selo Luminoso', level: 'Truque', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '9m', components: 'V, S', duration: '1 Minuto', damageDice: '-', damageType: 'Luz', savingThrow: 'Nenhum', description: 'Marca uma superficie com um simbolo luminoso pequeno e reconhecivel.', classLevelRequired: 1 },
+  { name: 'Identificar', level: 'Nível 1', category: 'Magia', classes: 'Mago', castingTime: '1 Minuto', range: 'Toque', components: 'V, S, M', duration: 'Instantanea', damageDice: '-', damageType: 'Deteccao', savingThrow: 'Nenhum', description: 'Revela propriedades magicas, vinculos e funcionamento basico de um objeto ou criatura tocada.', classLevelRequired: 1 },
+  { name: 'Orbe de Forca', level: 'Nível 1', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '27m', components: 'V, S', duration: 'Instantanea', damageDice: '3d8', damageType: 'Forca', savingThrow: 'Nenhum', description: 'Arremessa um orbe de energia concussiva contra um alvo visivel.', classLevelRequired: 1 },
+  { name: 'Barreira de Vidro', level: 'Nível 1', category: 'Magia', classes: 'Mago', castingTime: 'Reacao', range: 'Pessoal', components: 'V, S', duration: '1 Rodada', damageDice: '+3 CA', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Ergue uma pelicula arcana fragil que aumenta a CA contra o ataque recebido.', classLevelRequired: 1 },
+  { name: 'Seta Acida', level: 'Nível 1', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '27m', components: 'V, S, M', duration: 'Instantanea', damageDice: '2d4', damageType: 'Acido', savingThrow: 'Nenhum', description: 'Lanca uma seta corrosiva que causa dano imediato e pode continuar queimando.', classLevelRequired: 1 },
+  { name: 'Servo Invisivel', level: 'Nível 1', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '18m', components: 'V, S, M', duration: '1 Hora', damageDice: '-', damageType: 'Utilidade', savingThrow: 'Nenhum', description: 'Cria uma forca invisivel simples para executar tarefas domesticas ou manipular objetos leves.', classLevelRequired: 1 },
+  { name: 'Passo Sombrio', level: 'Nível 2', category: 'Magia', classes: 'Mago', castingTime: '1 Acao Bonus', range: '9m', components: 'V', duration: 'Instantanea', damageDice: 'Teleporte', damageType: 'Movimento', savingThrow: 'Nenhum', description: 'Teleporta para um ponto desocupado em penumbra ou escuridao que voce consiga ver.', classLevelRequired: 3 },
+  { name: 'Nublar', level: 'Nível 2', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: 'Desvantagem', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Seu corpo fica distorcido e ataques contra voce sofrem desvantagem enquanto durar.', classLevelRequired: 3 },
+  { name: 'Tranca Arcana', level: 'Nível 2', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Ate dissipar', damageDice: '-', damageType: 'Protecao', savingThrow: 'Nenhum', description: 'Fecha magicamente uma porta, bau ou portal, tornando-o muito mais dificil de abrir.', classLevelRequired: 3 },
+  { name: 'Detectar Pensamentos', level: 'Nível 2', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S, M', duration: 'Concentracao', damageDice: '-', damageType: 'Deteccao', savingThrow: 'SAB', description: 'Percebe pensamentos superficiais e pode sondar uma mente com risco de ser notado.', classLevelRequired: 3 },
+  { name: 'Levitacao', level: 'Nível 2', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '18m', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Movimento', damageType: 'Controle', savingThrow: 'CON', description: 'Faz uma criatura ou objeto subir verticalmente e permanecer suspenso.', classLevelRequired: 3 },
+  { name: 'Circulo de Protecao', level: 'Nível 3', category: 'Magia', classes: 'Mago', castingTime: '1 Minuto', range: '3m', components: 'V, S, M', duration: '1 Hora', damageDice: 'Barreira', damageType: 'Protecao', savingThrow: 'Nenhum', description: 'Cria uma zona protegida contra tipos sobrenaturais escolhidos pela mesa.', classLevelRequired: 5 },
+  { name: 'Clarao Hipnotico', level: 'Nível 3', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '36m', components: 'S, M', duration: 'Concentracao', damageDice: 'Incapacitado', damageType: 'Controle', savingThrow: 'SAB', description: 'Padrao luminoso fascina criaturas numa area, deixando-as incapacitadas em caso de falha.', classLevelRequired: 5 },
+  { name: 'Respirar na Agua', level: 'Nível 3', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: '24 Horas', damageDice: '-', damageType: 'Utilidade', savingThrow: 'Nenhum', description: 'Permite que varias criaturas respirem debaixo d agua ate a magia terminar.', classLevelRequired: 5 },
+  { name: 'Forma Gasosa', level: 'Nível 3', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Transformacao', damageType: 'Movimento', savingThrow: 'Nenhum', description: 'Transforma uma criatura voluntaria em nuvem gasosa capaz de atravessar frestas.', classLevelRequired: 5 },
+  { name: 'Olho Arcano', level: 'Nível 4', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Sensor', damageType: 'Deteccao', savingThrow: 'Nenhum', description: 'Cria um sensor magico invisivel que se move e transmite visao ao conjurador.', classLevelRequired: 7 },
+  { name: 'Moldar Pedra', level: 'Nível 4', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Instantanea', damageDice: '-', damageType: 'Transmutacao', savingThrow: 'Nenhum', description: 'Modela pedra tocada em uma forma simples, abrindo passagem ou criando objeto bruto.', classLevelRequired: 7 },
+  { name: 'Assassino Fantasmagorico', level: 'Nível 4', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: 'Concentracao', damageDice: '4d10', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Invoca o medo mais profundo do alvo, causando terror e dano psiquico recorrente.', classLevelRequired: 7 },
+  { name: 'Esfera Resiliente', level: 'Nível 4', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Barreira', damageType: 'Protecao', savingThrow: 'DES', description: 'Aprisiona uma criatura ou objeto em uma esfera de forca quase impenetravel.', classLevelRequired: 7 },
+  { name: 'Muralha de Forca', level: 'Nível 5', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '36m', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Barreira', damageType: 'Forca', savingThrow: 'Nenhum', description: 'Ergue uma parede invisivel de energia que bloqueia passagem e ataques fisicos.', classLevelRequired: 9 },
+  { name: 'Ligacao Telepatica', level: 'Nível 5', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: '1 Hora', damageDice: '-', damageType: 'Comunicacao', savingThrow: 'Nenhum', description: 'Conecta mentalmente criaturas voluntarias para comunicacao silenciosa a distancia.', classLevelRequired: 9 },
+  { name: 'Criar Passagem', level: 'Nível 5', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '9m', components: 'V, S, M', duration: '1 Hora', damageDice: '-', damageType: 'Transmutacao', savingThrow: 'Nenhum', description: 'Abre uma passagem temporaria em madeira, pedra ou gesso dentro do alcance.', classLevelRequired: 9 },
+  { name: 'Mao Arcana', level: 'Nível 5', category: 'Magia', classes: 'Mago', castingTime: '1 Acao', range: '36m', components: 'V, S, M', duration: 'Concentracao', damageDice: '4d8', damageType: 'Forca', savingThrow: 'Nenhum', description: 'Cria uma mao magica grande capaz de empurrar, agarrar, proteger ou atacar.', classLevelRequired: 9 },
   { name: 'Infusao: Arma Aprimorada', level: 'Nível 2', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Arma', components: '-', duration: 'Permanente', damageDice: '+1', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Arma infundida recebe bonus magico de ataque e dano.', classLevelRequired: 2 },
   { name: 'Infusao: Defesa Aprimorada', level: 'Nível 2', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Armadura', components: '-', duration: 'Permanente', damageDice: '+1 CA', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Armadura ou escudo infundido recebe bonus defensivo.', classLevelRequired: 2 },
   { name: 'Infusoes Magicas', level: 'Nível 1', category: 'Passiva', classes: 'Artifice', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Aprende a imbuir objetos comuns com propriedades arcanas temporarias.', classLevelRequired: 1 },
@@ -1172,6 +1580,25 @@ const EXPANDED_SPELLS: ExpandedSpellSeed[] = [
   { name: 'Lamina Mental', level: 'Nível 3', category: 'Habilidade', classes: 'Mistico', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '1d8', damageType: 'Psiquico', savingThrow: 'Nenhum', description: 'Forma uma lamina de energia mental para ataques rapidos.', classLevelRequired: 3 },
   { name: 'Poder dos Gigantes', level: 'Nível 3', category: 'Habilidade', classes: 'Guerreiro', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '+1d6', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Aumenta tamanho, forca e dano enquanto runas brilham.', classLevelRequired: 3 },
   { name: 'Manto de Inspiracao', level: 'Nível 3', category: 'Habilidade', classes: 'Bardo', castingTime: '1 Acao Bonus', range: '18m', components: '-', duration: 'Instantanea', damageDice: 'PV Temp', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Aliados recebem pontos temporarios e podem se mover sem provocar ataques.', classLevelRequired: 3 },
+  { name: 'Mira Certeira', level: 'Nível 1', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: 'Turno atual', damageDice: 'Vantagem', damageType: 'Precisao', savingThrow: 'Nenhum', description: 'Se nao se moveu no turno, concentra a mira para receber vantagem no proximo ataque.', classLevelRequired: 1 },
+  { name: 'Ataque pelas Sombras', level: 'Nível 1', category: 'Habilidade', classes: 'Ladino', castingTime: 'Ao atacar', range: 'Arma', components: '-', duration: 'Instantanea', damageDice: '+1d6', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Ataque feito de esconderijo ou penumbra causa dano extra narrativo conforme regra da mesa.', classLevelRequired: 1 },
+  { name: 'Truque da Gazua', level: 'Nível 1', category: 'Passiva', classes: 'Ladino', castingTime: 'Passiva', range: 'Ferramentas', components: '-', duration: 'Permanente', damageDice: '+Prof', damageType: 'Pericia', savingThrow: 'Nenhum', description: 'Treinamento refinado com ferramentas de ladrao para fechaduras, armadilhas e mecanismos.', classLevelRequired: 1 },
+  { name: 'Mao Leve', level: 'Nível 1', category: 'Passiva', classes: 'Ladino', castingTime: 'Passiva', range: 'Toque', components: '-', duration: 'Permanente', damageDice: '+DES', damageType: 'Pericia', savingThrow: 'Nenhum', description: 'Facilita truques de prestidigitacao, furto discreto e esconder pequenos objetos.', classLevelRequired: 1 },
+  { name: 'Passo Felino', level: 'Nível 2', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: 'Turno atual', damageDice: 'Movimento', damageType: 'Mobilidade', savingThrow: 'Nenhum', description: 'Move-se com cuidado para ignorar ruido leve e melhorar posicionamento furtivo.', classLevelRequired: 2 },
+  { name: 'Sumir nas Sombras', level: 'Nível 2', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: 'Ate revelar-se', damageDice: 'Furtividade', damageType: 'Ocultacao', savingThrow: 'Nenhum', description: 'Usa cobertura, penumbra ou distracao para tentar esconder-se rapidamente.', classLevelRequired: 2 },
+  { name: 'Finta Ardilosa', level: 'Nível 3', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: '1,5m', components: '-', duration: 'Turno atual', damageDice: 'Vantagem', damageType: 'Controle', savingThrow: 'SAB', description: 'Engana um alvo proximo para abrir brecha no proximo ataque contra ele.', classLevelRequired: 3 },
+  { name: 'Golpe Baixo', level: 'Nível 3', category: 'Habilidade', classes: 'Ladino', castingTime: 'Ao acertar', range: 'Arma', components: '-', duration: '1 Rodada', damageDice: '+1d4', damageType: 'Extra', savingThrow: 'CON', description: 'Ataque sujo mira ponto vulneravel e pode atrapalhar o deslocamento do alvo.', classLevelRequired: 3 },
+  { name: 'Veneno Rapido', level: 'Nível 3', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: 'Arma', components: 'Kit de Venenos', duration: '1 Minuto', damageDice: '+1d4', damageType: 'Veneno', savingThrow: 'CON', description: 'Aplica veneno em uma arma ou municao preparada sem gastar a acao principal.', classLevelRequired: 3 },
+  { name: 'Desarme Silencioso', level: 'Nível 3', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao', range: 'Toque', components: 'Ferramentas', duration: 'Instantanea', damageDice: '-', damageType: 'Utilidade', savingThrow: 'Nenhum', description: 'Tenta desativar armadilha ou mecanismo mantendo silencio e discricao.', classLevelRequired: 3 },
+  { name: 'Armadilha Improvisada', level: 'Nível 4', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Minuto', range: '1,5m', components: 'Ferramentas', duration: 'Ate disparar', damageDice: '1d6', damageType: 'Perfurante', savingThrow: 'DES', description: 'Monta uma armadilha simples com fios, laminas pequenas ou objetos do ambiente.', classLevelRequired: 4 },
+  { name: 'Corte no Tendao', level: 'Nível 5', category: 'Habilidade', classes: 'Ladino', castingTime: 'Ao acertar', range: 'Arma', components: '-', duration: '1 Rodada', damageDice: '+1d6', damageType: 'Cortante', savingThrow: 'CON', description: 'Golpe preciso reduz temporariamente o deslocamento do alvo.', classLevelRequired: 5 },
+  { name: 'Rolamento Evasivo', level: 'Nível 5', category: 'Habilidade', classes: 'Ladino', castingTime: 'Reacao', range: 'Pessoal', components: '-', duration: 'Instantanea', damageDice: '+2 CA', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Reage a perigo imediato com um rolamento que melhora a defesa contra um ataque ou efeito.', classLevelRequired: 5 },
+  { name: 'Poeira Cegante', level: 'Nível 6', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: '3m', components: 'Bolsa de po', duration: '1 Rodada', damageDice: 'Cego', damageType: 'Controle', savingThrow: 'CON', description: 'Arremessa po, areia ou cinzas para cegar brevemente uma criatura proxima.', classLevelRequired: 6 },
+  { name: 'Contra-Ataque Ardiloso', level: 'Nível 7', category: 'Habilidade', classes: 'Ladino', castingTime: 'Reacao', range: 'Arma', components: '-', duration: 'Instantanea', damageDice: 'Ataque', damageType: 'Reacao', savingThrow: 'Nenhum', description: 'Quando um inimigo erra um ataque corpo a corpo, usa a abertura para contra-atacar.', classLevelRequired: 7 },
+  { name: 'Rastro Falso', level: 'Nível 9', category: 'Habilidade', classes: 'Ladino', castingTime: '10 Minutos', range: 'Area', components: '-', duration: '8 Horas', damageDice: '-', damageType: 'Engano', savingThrow: 'Nenhum', description: 'Cria pistas falsas, pegadas alteradas ou evidencias plantadas para confundir perseguidores.', classLevelRequired: 9 },
+  { name: 'Leitura de Fraqueza', level: 'Nível 11', category: 'Passiva', classes: 'Ladino', castingTime: 'Passiva', range: 'Alvo observado', components: '-', duration: 'Permanente', damageDice: '+SAB/INT', damageType: 'Tatica', savingThrow: 'Nenhum', description: 'Observa postura, rotina e hesitacao para encontrar vantagens em testes sociais ou ataques planejados.', classLevelRequired: 11 },
+  { name: 'Sombra Impossivel', level: 'Nível 13', category: 'Habilidade', classes: 'Ladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: 'Furtividade', damageType: 'Ocultacao', savingThrow: 'Nenhum', description: 'Usa sombras, multidao ou terreno para manter ocultacao mesmo sob pressao.', classLevelRequired: 13 },
+  { name: 'Reflexo Letal', level: 'Nível 17', category: 'Habilidade', classes: 'Ladino', castingTime: 'Reacao', range: 'Arma', components: '-', duration: 'Instantanea', damageDice: '+2d6', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Explora uma abertura critica para causar dano extra quando um inimigo se expõe.', classLevelRequired: 17 },
   { name: 'Emboscador Sombrio', level: 'Nível 3', category: 'Passiva', classes: 'Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+1d8', damageType: 'Extra', savingThrow: 'Nenhum', description: 'No inicio do combate, move-se mais e causa dano extra.', classLevelRequired: 3 },
   { name: 'Palavra Radiante', level: 'Truque', category: 'Magia', classes: 'Clérigo', castingTime: '1 Acao', range: '1,5m', components: 'V, M', duration: 'Instantanea', damageDice: '1d6', damageType: 'Radiante', savingThrow: 'CON', description: 'Luz divina fere inimigos proximos que falham no teste.', classLevelRequired: 1 },
   { name: 'Lufada', level: 'Truque', category: 'Magia', classes: 'Druida,Feiticeiro,Mago', castingTime: '1 Acao', range: '9m', components: 'V, S', duration: 'Instantanea', damageDice: '-', damageType: 'Outro', savingThrow: 'FOR', description: 'Empurra uma criatura ou objeto leve com uma lufada de vento.', classLevelRequired: 1 },
@@ -1202,8 +1629,49 @@ const EXPANDED_SPELLS: ExpandedSpellSeed[] = [
   { name: 'Localizar Criatura', level: 'Nível 4', category: 'Magia', classes: 'Bardo,Clérigo,Druida,Mago,Paladino,Patrulheiro', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S, M', duration: 'Concentracao', damageDice: '-', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Sente a direcao de uma criatura conhecida dentro do alcance narrativo.', classLevelRequired: 7 },
   { name: 'Animar Objetos', level: 'Nível 5', category: 'Magia', classes: 'Bardo,Feiticeiro,Mago,Artifice', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: 'Concentracao', damageDice: 'Variavel', damageType: 'Concussao', savingThrow: 'Nenhum', description: 'Objetos proximos ganham vida e atacam sob comando.', classLevelRequired: 9 },
   { name: 'Telecinese', level: 'Nível 5', category: 'Magia', classes: 'Feiticeiro,Mago,Mistico', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Concentracao', damageDice: 'Controle', damageType: 'Outro', savingThrow: 'FOR', description: 'Move criaturas ou objetos com forca mental sustentada.', classLevelRequired: 9 },
+  { name: 'Converter Feitiçaria', level: 'Nível 2', category: 'Habilidade', classes: 'Feiticeiro', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: 'Instantanea', damageDice: 'Pontos/Espacos', damageType: 'Recurso', savingThrow: 'Nenhum', description: 'Converte pontos de feitiçaria em espacos de magia ou sacrifica espacos para recuperar pontos.', classLevelRequired: 2 },
+  { name: 'Metamagia: Magia Acelerada', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '2 pontos', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Conjura como acao bonus uma magia que normalmente usa uma acao.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Sutil', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '1 ponto', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Conjura sem componentes verbais ou somaticos, ideal para furtividade social ou prisao.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Distante', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '1 ponto', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Dobra o alcance de uma magia ou transforma alcance de toque em alcance curto.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Cuidadosa', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '1 ponto', damageType: 'Metamagia', savingThrow: 'Variavel', description: 'Protege aliados escolhidos contra o pior efeito de uma magia em area.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Geminada', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: 'Pontos variaveis', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Faz uma magia de alvo unico afetar uma segunda criatura valida.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Potencializada', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao causar dano', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '1 ponto', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Rerrola dados de dano de uma magia usando o poder bruto do sangue arcano.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Estendida', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Dobrada', damageDice: '1 ponto', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Dobra a duracao de uma magia dentro dos limites definidos pela mesa.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Transmutada', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '1 ponto', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Altera o tipo elemental de uma magia para adaptar dano e tema.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Elevada', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao conjurar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '3 pontos', damageType: 'Metamagia', savingThrow: 'Desvantagem', description: 'Impõe desvantagem no primeiro teste de resistencia de uma criatura contra sua magia.', classLevelRequired: 3 },
+  { name: 'Metamagia: Magia Buscadora', level: 'Nível 3', category: 'Habilidade', classes: 'Feiticeiro', castingTime: 'Ao errar', range: 'Magia', components: '-', duration: 'Instantanea', damageDice: '2 pontos', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Rerrola um ataque de magia perdido para tentar transformar falha em acerto.', classLevelRequired: 3 },
+  { name: 'Reserva Instavel', level: 'Nível 5', category: 'Habilidade', classes: 'Feiticeiro', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '+1 ponto', damageType: 'Recurso', savingThrow: 'Nenhum', description: 'Canaliza energia arriscada para ampliar uma magia futura, com possivel efeito colateral narrativo.', classLevelRequired: 5 },
+  { name: 'Pulso Caotico', level: 'Nível 1', category: 'Magia', classes: 'Feiticeiro', castingTime: '1 Acao', range: '36m', components: 'V, S', duration: 'Instantanea', damageDice: '2d8+1d6', damageType: 'Variavel', savingThrow: 'Nenhum', description: 'Dispara energia imprevisivel que assume um tipo de dano conforme o fluxo arcano.', classLevelRequired: 1 },
+  { name: 'Estilhaco Arcano', level: 'Truque', category: 'Magia', classes: 'Feiticeiro', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: 'Instantanea', damageDice: '1d6', damageType: 'Forca', savingThrow: 'DES', description: 'Fragmentos de energia inata atingem uma criatura e deixam rastro luminoso.', classLevelRequired: 1 },
+  { name: 'Sopro Elemental', level: 'Nível 1', category: 'Magia', classes: 'Feiticeiro', castingTime: '1 Acao', range: 'Cone', components: 'V, S', duration: 'Instantanea', damageDice: '3d6', damageType: 'Variavel', savingThrow: 'DES', description: 'Exala energia elemental ligada a sua origem ou escolhida no momento da conjuracao.', classLevelRequired: 1 },
+  { name: 'Manto de Mana', level: 'Nível 2', category: 'Magia', classes: 'Feiticeiro', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V, S', duration: 'Concentracao', damageDice: 'PV Temp', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Reveste o corpo com magia bruta, recebendo pontos temporarios e brilho arcano.', classLevelRequired: 3 },
+  { name: 'Eco de Feitiço', level: 'Nível 3', category: 'Magia', classes: 'Feiticeiro', castingTime: 'Reacao', range: 'Pessoal', components: 'V', duration: 'Instantanea', damageDice: 'Repetir', damageType: 'Metamagia', savingThrow: 'Nenhum', description: 'Tenta ecoar uma magia recem-conjurada com efeito reduzido ou custo narrativo.', classLevelRequired: 5 },
+  { name: 'Coroa de Chamas', level: 'Nível 4', category: 'Magia', classes: 'Feiticeiro', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S', duration: 'Concentracao', damageDice: '2d6', damageType: 'Fogo', savingThrow: 'DES', description: 'Uma coroa flamejante pune inimigos proximos e fortalece magias de fogo.', classLevelRequired: 7 },
+  { name: 'Forma de Mana', level: 'Nível 5', category: 'Magia', classes: 'Feiticeiro', castingTime: '1 Acao', range: 'Pessoal', components: 'V, S', duration: 'Concentracao', damageDice: 'Resistencia', damageType: 'Transformacao', savingThrow: 'Nenhum', description: 'Seu corpo vibra com magia pura, melhorando mobilidade e resistencia arcana.', classLevelRequired: 9 },
   { name: 'Restauracao Maior', level: 'Nível 5', category: 'Magia', classes: 'Bardo,Clérigo,Druida,Artifice', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Instantanea', damageDice: '-', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Remove efeitos severos como maldicao, reducao de atributo ou exaustao.', classLevelRequired: 9 },
   { name: 'Missao', level: 'Nível 5', category: 'Magia', classes: 'Bardo,Clérigo,Paladino', castingTime: '1 Minuto', range: '18m', components: 'V', duration: '30 Dias', damageDice: '5d10', damageType: 'Psiquico', savingThrow: 'SAB', description: 'Impõe uma ordem magica prolongada a uma criatura.', classLevelRequired: 9 },
+  { name: 'Favor Divino', level: 'Nível 1', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V, S', duration: 'Concentracao', damageDice: '+1d4', damageType: 'Radiante', savingThrow: 'Nenhum', description: 'Sua arma fica carregada com energia divina e causa dano radiante extra.', classLevelRequired: 2 },
+  { name: 'Duelo Compelido', level: 'Nível 1', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: '9m', components: 'V', duration: 'Concentracao', damageDice: 'Duelo', damageType: 'Controle', savingThrow: 'SAB', description: 'Desafia uma criatura a focar em voce e dificulta que ela se afaste.', classLevelRequired: 2 },
+  { name: 'Protecao contra o Mal e Bem', level: 'Nível 1', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: 'Toque', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Protecao', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Protege uma criatura contra entidades sobrenaturais escolhidas pela mesa.', classLevelRequired: 2 },
+  { name: 'Golpe Trovejante', level: 'Nível 1', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: '+2d6', damageType: 'Trovejante', savingThrow: 'FOR', description: 'O proximo acerto com arma explode em trovao e pode empurrar o alvo.', classLevelRequired: 2 },
+  { name: 'Golpe Colerico', level: 'Nível 1', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: '+1d6', damageType: 'Psiquico', savingThrow: 'SAB', description: 'O proximo acerto canaliza ira sagrada e pode amedrontar o alvo.', classLevelRequired: 2 },
+  { name: 'Postura do Protetor', level: 'Nível 2', category: 'Habilidade', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: '1 Minuto', damageDice: '+1 CA', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Assume uma guarda defensiva para proteger aliados e manter a linha de frente.', classLevelRequired: 2 },
+  { name: 'Arma Magica', level: 'Nível 2', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Toque', components: 'V, S', duration: 'Concentracao', damageDice: '+1', damageType: 'Magico', savingThrow: 'Nenhum', description: 'Torna uma arma tocada magica, melhorando ataque e dano conforme regra da mesa.', classLevelRequired: 5 },
+  { name: 'Localizar Montaria', level: 'Nível 2', category: 'Magia', classes: 'Paladino', castingTime: '10 Minutos', range: '9m', components: 'V, S', duration: 'Permanente', damageDice: 'Montaria', damageType: 'Invocacao', savingThrow: 'Nenhum', description: 'Invoca uma montaria espiritual fiel para viagem e combate.', classLevelRequired: 5 },
+  { name: 'Zona da Verdade', level: 'Nível 2', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: '18m', components: 'V, S', duration: '10 Minutos', damageDice: '-', damageType: 'Controle', savingThrow: 'CAR', description: 'Cria uma area onde criaturas tem dificuldade para mentir deliberadamente.', classLevelRequired: 5 },
+  { name: 'Golpe Marcante', level: 'Nível 2', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: '+2d6', damageType: 'Radiante', savingThrow: 'Nenhum', description: 'O proximo acerto marca o alvo com luz, dificultando que ele se esconda.', classLevelRequired: 5 },
+  { name: 'Juramento Renovado', level: 'Nível 3', category: 'Habilidade', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: '-', duration: 'Instantanea', damageDice: 'Recurso', damageType: 'Suporte', savingThrow: 'Nenhum', description: 'Reafirma o juramento em combate para recuperar foco e manter uma aura ativa pela cena.', classLevelRequired: 3 },
+  { name: 'Aura de Vitalidade', level: 'Nível 3', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: '2d6', damageType: 'Cura', savingThrow: 'Nenhum', description: 'Emana energia curativa e permite restaurar PV de aliados proximos durante a duracao.', classLevelRequired: 9 },
+  { name: 'Golpe Cegante', level: 'Nível 3', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: '+3d8', damageType: 'Radiante', savingThrow: 'CON', description: 'O proximo acerto explode em luz sagrada e pode cegar o alvo.', classLevelRequired: 9 },
+  { name: 'Remover Maldicao', level: 'Nível 3', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: 'Toque', components: 'V, S', duration: 'Instantanea', damageDice: '-', damageType: 'Purificacao', savingThrow: 'Nenhum', description: 'Encerra ou enfraquece uma maldicao em criatura, objeto ou area tocada.', classLevelRequired: 9 },
+  { name: 'Arma Elemental', level: 'Nível 3', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: 'Toque', components: 'V, S', duration: 'Concentracao', damageDice: '+1d4', damageType: 'Variavel', savingThrow: 'Nenhum', description: 'Imbui uma arma com energia elemental, melhorando ataques e dano.', classLevelRequired: 9 },
+  { name: 'Toque Restaurador', level: 'Nível 4', category: 'Habilidade', classes: 'Paladino', castingTime: '1 Acao', range: 'Toque', components: '-', duration: 'Instantanea', damageDice: 'Cura', damageType: 'Suporte', savingThrow: 'Nenhum', description: 'Converte energia de cura em purificacao para remover uma condicao debilitante.', classLevelRequired: 14 },
+  { name: 'Banimento Sagrado', level: 'Nível 4', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: '18m', components: 'V, S, M', duration: 'Concentracao', damageDice: 'Banimento', damageType: 'Controle', savingThrow: 'CAR', description: 'Tenta expulsar uma criatura extraplanar ou aprisionar um inimigo em energia sagrada.', classLevelRequired: 13 },
+  { name: 'Aura de Pureza', level: 'Nível 4', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: 'Resistencia', damageType: 'Defesa', savingThrow: 'Nenhum', description: 'Aliados proximos recebem protecao contra veneno, doenca e efeitos debilitantes.', classLevelRequired: 13 },
+  { name: 'Guardiao da Fe', level: 'Nível 4', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: '9m', components: 'V', duration: '8 Horas', damageDice: '20', damageType: 'Radiante', savingThrow: 'DES', description: 'Invoca um guardiao espiritual que pune inimigos que se aproximam.', classLevelRequired: 13 },
+  { name: 'Circulo de Poder', level: 'Nível 5', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: 'Vantagem', damageType: 'Defesa', savingThrow: 'Magias', description: 'Cria uma aura que fortalece resistencias contra magias e efeitos sobrenaturais.', classLevelRequired: 17 },
+  { name: 'Golpe Banidor', level: 'Nível 5', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao Bonus', range: 'Pessoal', components: 'V', duration: 'Concentracao', damageDice: '+5d10', damageType: 'Forca', savingThrow: 'CAR', description: 'O proximo acerto causa dano pesado e pode banir temporariamente o alvo.', classLevelRequired: 17 },
+  { name: 'Onda Destrutiva', level: 'Nível 5', category: 'Magia', classes: 'Paladino', castingTime: '1 Acao', range: '9m', components: 'V', duration: 'Instantanea', damageDice: '5d6+5d6', damageType: 'Trovejante/Radiante', savingThrow: 'CON', description: 'Libera uma onda de poder divino que derruba e fere inimigos ao redor.', classLevelRequired: 17 },
   { name: 'Estilo de Luta: Arquearia', level: 'Nível 1', category: 'Passiva', classes: 'Guerreiro,Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+2 Ataque', damageType: 'Outro', savingThrow: 'Nenhum', description: '+2 em jogadas de ataque com armas a distancia.', classLevelRequired: 1 },
   { name: 'Estilo de Luta: Duas Armas', level: 'Nível 1', category: 'Passiva', classes: 'Guerreiro,Patrulheiro', castingTime: 'Passiva', range: 'Pessoal', components: '-', duration: 'Permanente', damageDice: '+Mod Dano', damageType: 'Extra', savingThrow: 'Nenhum', description: 'Adiciona modificador de atributo ao dano da segunda arma.', classLevelRequired: 1 },
   { name: 'Estilo de Luta: Protecao', level: 'Nível 1', category: 'Habilidade', classes: 'Guerreiro,Paladino', castingTime: 'Reacao', range: '1,5m', components: '-', duration: 'Instantanea', damageDice: 'Desvantagem', damageType: 'Outro', savingThrow: 'Nenhum', description: 'Impõe desvantagem em ataque contra aliado proximo enquanto usa escudo.', classLevelRequired: 1 },
@@ -2185,6 +2653,12 @@ export async function initializeDatabase(db: SQLiteDatabase) {
       UNIQUE(gender, kind, class_name, value)
     );
 
+    CREATE TABLE IF NOT EXISTS random_lan_campaign_names (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      criador TEXT DEFAULT 'base',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
     CREATE TABLE IF NOT EXISTS random_lore_connectors (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2976,6 +3450,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
     console.log('Banco de dados já populado. Pulando inserção.');
   }
   await seedRandomCreatorContent(db);
+  await seedRandomLanCampaignNames(db);
   await seedConditionEffectCatalog(db);
   await seedStructuredBaseEffects(db);
   await seedExpandedBaseCatalog(db);

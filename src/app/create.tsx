@@ -10,6 +10,7 @@ import {
   ScrollView,
   StyleSheet, Text, TextInput, TouchableOpacity, View
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AvatarAdjustModal from '../components/AvatarAdjustModal';
 import { useLanSession } from '../contexts/LanSessionContext';
 import { AvatarAdjustment, AvatarDraft, deleteStoredCharacterAvatar, finalizeDraftCharacterAvatar, pickCharacterAvatarDraft, storeAdjustedCharacterAvatar } from '../utils/characterAvatar';
@@ -76,6 +77,7 @@ const BASE_CLASS_FEATURES = [
 export default function CreateCharacterScreen() {
   const router = useRouter();
   const db = useSQLiteContext();
+  const insets = useSafeAreaInsets();
   const { activeSession, linkCharacterToActiveSession, broadcastCharacter } = useLanSession();
   const isRandomizing = useRef(false);
   const saveLockRef = useRef(false);
@@ -1169,7 +1171,7 @@ export default function CreateCharacterScreen() {
       </Modal>
 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-        <ScrollView contentContainerStyle={styles.scrollContent}>
+        <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(insets.bottom + 120, 140) }]}>
           
           <View style={styles.header}>
             <View style={{flex: 1}}>
@@ -1190,7 +1192,7 @@ export default function CreateCharacterScreen() {
           {step === 7 && renderStepSummary()}
         </ScrollView>
 
-        <View style={styles.footer}>
+        <View style={[styles.footer, { bottom: Math.max(insets.bottom + 16, 30) }]}>
           {step > 1 && (
             <TouchableOpacity style={styles.backButton} onPress={() => setStep(step - 1)}>
               <Text style={styles.backButtonText}>VOLTAR</Text>

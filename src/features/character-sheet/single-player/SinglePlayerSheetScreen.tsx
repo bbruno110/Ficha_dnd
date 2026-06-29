@@ -11,6 +11,7 @@ import { isTradeEventExpired } from '@/contexts/lan/lanSessionHelpers';
 import { addTraceLog } from '@/network/traceRepository';
 import { EffectDraft, formatEffectSummary } from '@/types/effects';
 import { LanOfficialEventMessage } from '@/types/lan';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const XP_TABLE = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000, 85000, 100000, 120000, 140000, 165000, 195000, 225000, 265000, 305000, 355000];
 
@@ -154,6 +155,15 @@ const splitNameList = (value?: string | null) => String(value || '')
   .map(token => token.trim())
   .filter(Boolean);
 
+const dedupeSpellsByName = <T extends { name?: string | null; id?: string | number | null }>(spells: T[]) => {
+  const seen = new Map<string, T>();
+  spells.forEach(spell => {
+    const key = String(spell.name || spell.id || '').trim().toLowerCase();
+    if (key && !seen.has(key)) seen.set(key, spell);
+  });
+  return Array.from(seen.values());
+};
+
 const parseCharacterClassSummary = (classSummary: string, fallbackLevel = 1) => {
   const entries: { name: string; subclass: string; level: number }[] = [];
   const pattern = /([^/()]+?)(?:\s*\(([^)]*)\))?\s+(\d+)(?=\s*\/|$)/g;
@@ -251,6 +261,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const router = useRouter();
   const db = useSQLiteContext();
   const { activeSession, sendLanCommand, players, getHistoryPage, localDeviceId, connectionStatus, isTransportReady, forceRecoverLanSession } = useLanSession();
+  const insets = useSafeAreaInsets();
 
   const [activeTab, setActiveTab] = useState<'stats' | 'profs' | 'inv' | 'spells'>('stats');
   const [character, setCharacter] = useState<any>(null);
@@ -661,9 +672,9 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         }
         setSpellSlotMaxes(nextSlotMaxes);
 
-        const savedSpellIds = (Array.isArray(charData.spells) ? charData.spells : [])
+        const savedSpellIds = Array.from(new Set<number>((Array.isArray(charData.spells) ? charData.spells : [])
           .map((sp: string | number) => Number(sp))
-          .filter((spellId: number) => Number.isFinite(spellId));
+          .filter((spellId: number) => Number.isFinite(spellId))));
         const guaranteedFeatures = Array.from(guaranteedFeatureNames);
         const spellConditions: string[] = [];
         const spellParams: (string | number)[] = [];
@@ -679,7 +690,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
         if (spellConditions.length > 0) {
           const spellsFull = await db.getAllAsync(`SELECT * FROM spells WHERE ${spellConditions.join(' OR ')}`, spellParams);
-          setSpellDetails(spellsFull);
+          setSpellDetails(dedupeSpellsByName(spellsFull as any[]));
         } else {
           setSpellDetails([]);
         }
@@ -1025,12 +1036,30 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const saveMagicResources = async (nextState: MagicResourceState, reason = 'resource-update') => {
-    await updateDB({ spell_slots_used: normalizeMagicResourceState(nextState) });
+    const normalized = normalizeMagicResourceState(nextState);
+    if (isLanPlayerControlledSheet) {
+      try {
+        await sendLanCommand('MASTER_APPLY_RESOURCE', {
+          targetCharacterId: Number(character.id),
+          targetDeviceId: localDeviceId,
+          targetName: character.name || 'Personagem',
+          characterName: character.name || 'Personagem',
+          spellSlotsUsed: normalized,
+          description: `${character.name || 'Jogador'} atualizou recursos: ${reason}.`,
+        });
+        setCharacter((prev: any) => ({ ...prev, spell_slots_used: normalized }));
+      } catch (error) {
+        console.warn('Nao foi possivel sincronizar recurso LAN:', error);
+      }
+      return;
+    }
+
+    await updateDB({ spell_slots_used: normalized });
     console.log(`[MAGIC_RESOURCE] ${reason}`, nextState);
   };
 
   const handleRestoreSpellSlot = async (slotLevel: string, amount = 1) => {
-    if (isLanPlayerControlledSheet) {
+    if (false && isLanPlayerControlledSheet) {
       showCustomAlert('Controle do mestre', 'Na mesa LAN, os espaços e usos são ajustados pelo mestre.');
       return;
     }
@@ -1040,7 +1069,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const handleResetMagicResources = async (mode: 'all' | 'turn' | 'short_rest' | 'long_rest' = 'all') => {
-    if (isLanPlayerControlledSheet) {
+    if (false && isLanPlayerControlledSheet) {
       showCustomAlert('Controle do mestre', 'Na mesa LAN, descansos e recursos são controlados pelo mestre.');
       return;
     }
@@ -1048,7 +1077,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const handleUseSpellResource = async (spell: any, slotLevel?: number) => {
-    if (isLanPlayerControlledSheet) {
+    if (false && isLanPlayerControlledSheet) {
       showCustomAlert('Controle do mestre', 'Na mesa LAN, avise o mestre que você usou este recurso para ele registrar na mesa.');
       return;
     }
@@ -1092,7 +1121,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const handleRestoreAbilityUse = async (spell: any) => {
-    if (isLanPlayerControlledSheet) {
+    if (false && isLanPlayerControlledSheet) {
       showCustomAlert('Controle do mestre', 'Na mesa LAN, os usos de habilidade são ajustados pelo mestre.');
       return;
     }
@@ -2464,7 +2493,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         </ScrollView>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+      <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(insets.bottom + 44, 64) }]}>
         
         {/* ABA STATUS */}
         {activeTab === 'stats' && (
@@ -2917,7 +2946,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                                 <TouchableOpacity
                                   key={level}
                                   style={[styles.spellCastButton, remaining <= 0 && styles.spellCastButtonDisabled]}
-                                  disabled={remaining <= 0 && !isLanPlayerControlledSheet}
+                                  disabled={remaining <= 0}
                                   onPress={() => handleUseSpellResource(selectedSpell, Number(level))}
                                 >
                                   <Text style={styles.spellCastButtonText}>USAR NV {level}</Text>
@@ -2942,7 +2971,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                               <View style={styles.spellCastButtonGrid}>
                                 <TouchableOpacity
                                   style={[styles.spellCastButton, remaining <= 0 && styles.spellCastButtonDisabled]}
-                                  disabled={remaining <= 0 && !isLanPlayerControlledSheet}
+                                  disabled={remaining <= 0}
                                   onPress={() => handleUseSpellResource(selectedSpell)}
                                 >
                                   <Text style={styles.spellCastButtonText}>USAR</Text>

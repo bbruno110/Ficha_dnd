@@ -24,13 +24,28 @@ function uniqueAddresses(values: LanAddressInfo[]) {
   return result;
 }
 
+function addressPriority(info: LanAddressInfo) {
+  const iface = String(info.interfaceName || '').toLowerCase();
+  const address = String(info.address || '');
+  let score = 0;
+
+  if (iface.includes('wlan') || iface.includes('wifi')) score -= 80;
+  if (iface.includes('ap') || iface.includes('p2p')) score -= 40;
+  if (address.startsWith('192.168.') || address.startsWith('10.') || /^172\.(1[6-9]|2\d|3[0-1])\./.test(address)) score -= 20;
+  if (iface.includes('rmnet') || iface.includes('cell') || iface.includes('mobile')) score += 80;
+  if (iface.includes('tun') || iface.includes('vpn')) score += 100;
+
+  return score;
+}
+
 export async function getLanAddressInfos() {
   const nativeAddresses = await LanForegroundService.getLanAddresses().catch(() => []);
   const fallbackAddress = await Network.getIpAddressAsync()
     .then(address => [{ address, interfaceName: 'expo-network' }])
     .catch(() => []);
 
-  return uniqueAddresses([...nativeAddresses, ...fallbackAddress]);
+  return uniqueAddresses([...nativeAddresses, ...fallbackAddress])
+    .sort((a, b) => addressPriority(a) - addressPriority(b));
 }
 
 export async function getLanAddressCandidates() {

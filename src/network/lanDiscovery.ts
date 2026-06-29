@@ -51,10 +51,12 @@ function getPriorityCandidates(parsedCode: ParsedSessionCode) {
 
 function getLanHostCandidatesFromAddresses(parsedCode: ParsedSessionCode, localAddresses: LanAddressInfo[]) {
   const localIps = localAddresses.map(info => info.address);
+  const parsedIps = [parsedCode.hostIp, ...(parsedCode.hostCandidates || [])];
   return unique([
     parsedCode.hostIp,
     ...(parsedCode.hostCandidates || []),
     ...HOTSPOT_HOSTS,
+    ...parsedIps.flatMap(subnetCandidates),
     ...localIps.flatMap(subnetCandidates),
   ]);
 }
@@ -67,7 +69,7 @@ export async function discoverLanMaster(
   const priorityCandidates = getPriorityCandidates(parsedCode);
   const candidates = getLanHostCandidatesFromAddresses(parsedCode, localAddresses);
   const port = Number(parsedCode.port || LAN_DEFAULT_PORT);
-  const batchSize = 24;
+  const batchSize = 18;
   let lastError: string | null = null;
 
   await trace?.('start', {
@@ -91,7 +93,7 @@ export async function discoverLanMaster(
         sessionId: parsedCode.sessionId,
         payload: { code: parsedCode.sessionId },
         at: new Date().toISOString(),
-      }, 1100);
+      }, 1800);
 
       if (response.ok) {
         await trace?.('discovered', {
@@ -138,7 +140,7 @@ export async function discoverLanMaster(
             sessionId: parsedCode.sessionId,
             payload: { code: parsedCode.sessionId },
             at: new Date().toISOString(),
-          }, 520);
+          }, 850);
           return { host, response };
         } catch (error) {
           lastError = error instanceof Error ? error.message : String(error);

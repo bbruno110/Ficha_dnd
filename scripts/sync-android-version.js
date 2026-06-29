@@ -33,18 +33,25 @@ if (
   process.exit(0);
 }
 
+const versionCodePattern = /^(\s*)versionCode\s+\d+\s*$/m;
+const versionNamePattern = /^(\s*)versionName\s+["'][^"']*["']\s*$/m;
+
+if (!versionCodePattern.test(original) || !versionNamePattern.test(original)) {
+  throw new Error('Nao foi possivel localizar versionCode/versionName em android/app/build.gradle.');
+}
+
 let updated = original.replace(
-  /^(\s*)versionCode\s+\d+\s*$/m,
+  versionCodePattern,
   `$1versionCode ${versionCode}`
 );
 updated = updated.replace(
-  /^(\s*)versionName\s+["'][^"']*["']\s*$/m,
+  versionNamePattern,
   `$1versionName "${versionName}"`
 );
 
 if (updated === original) {
-  throw new Error('Nao foi possivel localizar versionCode/versionName em android/app/build.gradle.');
+  console.log(`Versao Android ja estava sincronizada: ${versionName} (${versionCode}).`);
+} else {
+  fs.writeFileSync(buildGradlePath, updated, 'utf8');
+  console.log(`Versao Android sincronizada: ${versionName} (${versionCode}).`);
 }
-
-fs.writeFileSync(buildGradlePath, updated, 'utf8');
-console.log(`Versao Android sincronizada: ${versionName} (${versionCode}).`);
