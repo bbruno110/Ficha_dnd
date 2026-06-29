@@ -1,6 +1,8 @@
 import { LanRpcRequest, LanRpcResponse, LanRpcServerCallbacks, makeRpcId } from './lanRpcTransport';
 import { dataToString, encodeFrame, getTcpSocketModule, readFrames } from './lanTcpFraming';
 
+const MISSED_PINGS_BEFORE_DISCONNECT = 8;
+
 export type LanTcpStreamMethod =
   | 'HELLO'
   | 'PONG'
@@ -263,7 +265,7 @@ export class LanTcpServer {
         if (now - client.lastPongAt > heartbeatMs * 2.5) {
           client.missedPings += 1;
         }
-        if (client.missedPings >= 2) {
+        if (client.missedPings >= MISSED_PINGS_BEFORE_DISCONNECT) {
           this.clients.delete(deviceId);
           try {
             client.socket.destroy?.();

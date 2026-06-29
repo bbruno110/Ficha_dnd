@@ -78,6 +78,8 @@ export default function CreateCharacterScreen() {
   const db = useSQLiteContext();
   const { activeSession, linkCharacterToActiveSession, broadcastCharacter } = useLanSession();
   const isRandomizing = useRef(false);
+  const saveLockRef = useRef(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   const hasConfirmedRandomize = useRef(false);
 
@@ -846,12 +848,18 @@ export default function CreateCharacterScreen() {
   };
 
   const handleSave = async () => {
+    if (saveLockRef.current) return;
+
     if (!name || race.includes('Selecione') || charClass.includes('Selecione')) {
       showCustomAlert("Atenção", "Preencha o Nome, Raça e Classe no Passo 1."); return;
     }
     const cleanInventory = inventory.filter(item => item.qty > 0);
     const activeSavesToSave = proficiencies.filter(p => p.startsWith('save_'));
     const activeSkillsToSave = proficiencies.filter(p => p.startsWith('skill_'));
+
+    saveLockRef.current = true;
+    setIsSaving(true);
+    let savedCharacterId = 0;
 
     try {
       const result = await db.runAsync(
@@ -870,6 +878,7 @@ export default function CreateCharacterScreen() {
         ]
       );
       const newCharacterId = Number((result as any).lastInsertRowId || 0);
+      savedCharacterId = newCharacterId;
       const finalAvatarUri = finalizeDraftCharacterAvatar(avatarUri, newCharacterId);
       if (newCharacterId > 0 && finalAvatarUri !== avatarUri) {
         await db.runAsync(`UPDATE characters SET avatar_uri = ? WHERE id = ?`, [finalAvatarUri, newCharacterId]);
@@ -886,6 +895,16 @@ export default function CreateCharacterScreen() {
       }
     } catch (error) {
       console.warn('Erro ao salvar ficha:', error);
+      if (savedCharacterId > 0) {
+        router.replace(`/sheet?id=${savedCharacterId}`);
+        return;
+      }
+      showCustomAlert("Erro", "Nao foi possivel salvar a ficha. Tente novamente.");
+    } finally {
+      if (savedCharacterId <= 0) {
+        saveLockRef.current = false;
+        setIsSaving(false);
+      }
     }
   };
 
@@ -1183,8 +1202,12 @@ export default function CreateCharacterScreen() {
               <Text style={styles.primaryButtonText}>PRÓXIMO PASSO</Text>
             </TouchableOpacity>
           ) : (
-            <TouchableOpacity style={[styles.primaryButton, {backgroundColor: '#00fa9a'}]} onPress={handleSave}>
-              <Text style={[styles.primaryButtonText, {color: '#02112b'}]}>CONFIRMAR E SALVAR</Text>
+            <TouchableOpacity
+              style={[styles.primaryButton, {backgroundColor: '#00fa9a'}, isSaving && styles.disabledButton]}
+              disabled={isSaving}
+              onPress={handleSave}
+            >
+              <Text style={[styles.primaryButtonText, {color: '#02112b'}]}>{isSaving ? 'SALVANDO...' : 'CONFIRMAR E SALVAR'}</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -1253,6 +1276,7 @@ const styles = StyleSheet.create({
   backButtonText: { fontSize: 14, fontWeight: 'bold', color: '#ffffff' },
   primaryButton: { flex: 2, backgroundColor: '#00bfff', borderRadius: 16, paddingVertical: 18, alignItems: 'center' },
   primaryButtonText: { fontSize: 14, fontWeight: 'bold', color: '#02112b' },
+  disabledButton: { opacity: 0.5 },
   infoBox: { backgroundColor: 'rgba(0, 191, 255, 0.1)', padding: 15, borderRadius: 12, borderColor: 'rgba(0, 191, 255, 0.3)', borderWidth: 1, marginBottom: 20 },
   hpHint: { color: 'rgba(255,255,255,0.5)', fontSize: 12, textAlign: 'center', marginTop: 5, marginBottom: 15, lineHeight: 18 },
   infoText: { color: '#ffffff', fontSize: 14, lineHeight: 20 },

@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -18,6 +18,7 @@ import {
   View,
 } from 'react-native';
 import QRCode from 'react-native-qrcode-svg';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useLanSession } from '../contexts/LanSessionContext';
 import { isTradeEventExpired } from '../contexts/lan/lanSessionHelpers';
 import { getLanSessionState } from '../network/lanRepository';
@@ -51,21 +52,157 @@ type ConditionEffectOption = {
   color: string;
 };
 
+type SpellcastingProgressionRow = {
+  source_type: string;
+  source_name: string;
+  level: number;
+  slot_1?: number;
+  slot_2?: number;
+  slot_3?: number;
+  slot_4?: number;
+  slot_5?: number;
+  slot_6?: number;
+  slot_7?: number;
+  slot_8?: number;
+  slot_9?: number;
+};
+
+type SpellResourceOption = {
+  id: number;
+  name: string;
+  level?: string | number | null;
+  category?: string | null;
+  casting_time?: string | null;
+  duration?: string | null;
+  description?: string | null;
+  damage_dice?: string | null;
+};
+
+type FeatureSourceRow = {
+  name: string;
+  class_name?: string | null;
+  features?: string | null;
+};
+
+type FeatureRequirement = string | { name?: string; level?: string | number; level_required?: string | number; minLevel?: string | number };
+
+type MagicResourceState = {
+  slots: Record<string, number>;
+  abilities: Record<string, { used: number; max: number; recharge: 'turn' | 'short_rest' | 'long_rest' }>;
+};
+
 const HISTORY_PAGE_SIZES = [10, 30, 50, 100];
 type CoinCode = 'gp' | 'sp' | 'cp';
 const COIN_LABELS: Record<CoinCode, string> = { gp: 'PO', sp: 'PP', cp: 'PC' };
 
-type MasterModalKind = 'attribute' | 'tempHp' | 'xp' | 'item' | 'sheet' | 'time' | 'effects' | 'applyEffect';
+type MasterModalKind = 'attribute' | 'tempHp' | 'xp' | 'item' | 'sheet' | 'time' | 'effects' | 'applyEffect' | 'resources';
 type MasterModalState = {
   kind: MasterModalKind;
   player?: any;
   stat?: string;
 };
 
+const emptyMagicResourceState = (): MagicResourceState => ({ slots: {}, abilities: {} });
+
+const normalizeMagicResourceState = (value: unknown): MagicResourceState => {
+  const parsed = typeof value === 'string'
+    ? (() => { try { return JSON.parse(value || '{}'); } catch { return {}; } })()
+    : value && typeof value === 'object'
+      ? value as any
+      : {};
+  const legacySlots = parsed?.slots || Object.fromEntries(
+    Object.entries(parsed || {}).filter(([key, val]) => /^\d+$/.test(key) && Number.isFinite(Number(val)))
+  );
+  const slots = Object.fromEntries(
+    Object.entries(legacySlots || {}).map(([level, used]) => [String(level), Math.max(0, Math.trunc(Number(used || 0)))])
+  );
+  const abilities = Object.fromEntries(
+    Object.entries(parsed?.abilities || {}).map(([id, entry]: [string, any]) => [String(id), {
+      used: Math.max(0, Math.trunc(Number(entry?.used || 0))),
+      max: Math.max(1, Math.trunc(Number(entry?.max || 1))),
+      recharge: ['turn', 'short_rest', 'long_rest'].includes(String(entry?.recharge)) ? String(entry.recharge) : 'long_rest',
+    }])
+  ) as MagicResourceState['abilities'];
+  return { slots, abilities };
+};
+
+const getFeatureRequirementLevel = (feature: FeatureRequirement) => {
+  if (typeof feature === 'string') return 1;
+  const rawLevel = feature.level_required ?? feature.level ?? feature.minLevel ?? 1;
+  const parsed = parseInt(String(rawLevel), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+};
+
+const parseFeatureNamesForLevel = (featuresJson?: string | null, characterLevel = 1) => {
+  try {
+    const parsed = JSON.parse(featuresJson || '[]') as FeatureRequirement[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(feature => getFeatureRequirementLevel(feature) <= characterLevel)
+      .map(feature => typeof feature === 'string' ? feature : feature.name)
+      .filter(Boolean) as string[];
+  } catch {
+    return [];
+  }
+};
+
+const splitNameList = (value?: string | null) => String(value || '')
+  .split(',')
+  .map(token => token.trim())
+  .filter(Boolean);
+
+const parseCharacterClassSummary = (classSummary: string, fallbackLevel = 1) => {
+  const entries: { name: string; subclass: string; level: number }[] = [];
+  const pattern = /([^/()]+?)(?:\s*\(([^)]*)\))?\s+(\d+)(?=\s*\/|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(classSummary))) {
+    entries.push({ name: match[1].trim(), subclass: (match[2] || '').trim(), level: Math.max(1, parseInt(match[3], 10) || 1) });
+  }
+  if (entries.length > 0) return entries;
+  const fallbackName = classSummary.replace(/\([^)]*\)/g, '').trim();
+  return fallbackName ? [{ name: fallbackName, subclass: '', level: Math.max(1, fallbackLevel) }] : [];
+};
+
+const getSpellLevelNumber = (levelValue?: string | number | null) => {
+  const text = String(levelValue || '');
+  if (text.toLowerCase() === 'truque') return 0;
+  const match = text.match(/\d+/);
+  return match ? parseInt(match[0], 10) : 0;
+};
+
+const getResourceCategory = (spell: SpellResourceOption) => {
+  if (spell.category && spell.category !== 'Desconhecido') return spell.category;
+  if (spell.level === 'Truque' || String(spell.level || '').includes('Nível')) return 'Magia';
+  if (spell.casting_time === 'Passiva' || spell.level === 'Passiva') return 'Passiva';
+  return 'Habilidade';
+};
+
+const spellUsesSlot = (spell: SpellResourceOption) => {
+  const category = getResourceCategory(spell);
+  const text = [spell.name, spell.description, spell.damage_dice, spell.duration].map(value => String(value || '').toLowerCase()).join(' ');
+  return (category === 'Magia' && getSpellLevelNumber(spell.level) > 0) || text.includes('espaço') || text.includes('espaco');
+};
+
+const getAbilityRecharge = (spell: SpellResourceOption): MagicResourceState['abilities'][string]['recharge'] => {
+  const text = [spell.name, spell.description, spell.duration, spell.casting_time].map(value => String(value || '').toLowerCase()).join(' ');
+  if (text.includes('turno') || text.includes('rodada')) return 'turn';
+  if (text.includes('descanso curto')) return 'short_rest';
+  return 'long_rest';
+};
+
+const getRechargeLabel = (recharge: MagicResourceState['abilities'][string]['recharge']) => {
+  if (recharge === 'turn') return 'turno';
+  if (recharge === 'short_rest') return 'descanso curto';
+  return 'descanso longo';
+};
+
 export default function LanSessionScreen() {
   const router = useRouter();
+  const params = useLocalSearchParams<{ lanAction?: string }>();
+  const insets = useSafeAreaInsets();
   const db = useSQLiteContext();
   const navigationLockRef = useRef(false);
+  const handledNotificationActionRef = useRef('');
   const {
     activeSession,
     savedSessions,
@@ -111,6 +248,10 @@ export default function LanSessionScreen() {
   const [cardItemSearch, setCardItemSearch] = useState<Record<string, string>>({});
   const [itemCatalog, setItemCatalog] = useState<ItemOption[]>([]);
   const [effectCatalog, setEffectCatalog] = useState<ConditionEffectOption[]>([]);
+  const [spellProgressions, setSpellProgressions] = useState<SpellcastingProgressionRow[]>([]);
+  const [spellCatalog, setSpellCatalog] = useState<SpellResourceOption[]>([]);
+  const [classFeatureCatalog, setClassFeatureCatalog] = useState<FeatureSourceRow[]>([]);
+  const [subclassFeatureCatalog, setSubclassFeatureCatalog] = useState<FeatureSourceRow[]>([]);
   const [effectSearch, setEffectSearch] = useState('');
   const [selectedEffectIds, setSelectedEffectIds] = useState<number[]>([]);
   const [effectDurationValue, setEffectDurationValue] = useState('3');
@@ -118,6 +259,39 @@ export default function LanSessionScreen() {
   const [globalXp, setGlobalXp] = useState('100');
   const [globalHp, setGlobalHp] = useState('1');
   const [globalCoins, setGlobalCoins] = useState({ gp: '', sp: '', cp: '' });
+
+  useEffect(() => {
+    const action = typeof params.lanAction === 'string' ? params.lanAction : '';
+    if (!action || handledNotificationActionRef.current === action) return;
+    if (activeSession?.role !== 'master' || activeSession.status === 'closed') return;
+
+    handledNotificationActionRef.current = action;
+    router.setParams({ lanAction: undefined as any });
+
+    if (action === 'pause' && activeSession.status !== 'paused') {
+      void pauseActiveSession().finally(() => { handledNotificationActionRef.current = ''; });
+      return;
+    }
+
+    if (action === 'end') {
+      Alert.alert(
+        'Encerrar mesa?',
+        'Isso encerra a sessao LAN e desconecta os jogadores. Para intervalo, use Pausar mesa.',
+        [
+          {
+            text: 'Cancelar',
+            style: 'cancel',
+            onPress: () => { handledNotificationActionRef.current = ''; },
+          },
+          {
+            text: 'Encerrar',
+            style: 'destructive',
+            onPress: () => { void endActiveSession().finally(() => { handledNotificationActionRef.current = ''; }); },
+          },
+        ]
+      );
+    }
+  }, [activeSession?.role, activeSession?.status, endActiveSession, params.lanAction, pauseActiveSession, router]);
   const [campaignTurn, setCampaignTurn] = useState(1);
   const [campaignMinutes, setCampaignMinutes] = useState(0);
   const [timeAmount, setTimeAmount] = useState('');
@@ -164,6 +338,24 @@ export default function LanSessionScreen() {
       `SELECT id, name, description, color FROM condition_effects ORDER BY name ASC`
     );
     setEffectCatalog(effects.map(effect => ({ ...effect, color: effect.color || '#F4A84D' })));
+    const progressions = await db.getAllAsync<SpellcastingProgressionRow>(
+      `SELECT source_type, source_name, level, slot_1, slot_2, slot_3, slot_4, slot_5, slot_6, slot_7, slot_8, slot_9
+       FROM spellcasting_progression`
+    );
+    setSpellProgressions(progressions);
+    const spells = await db.getAllAsync<SpellResourceOption>(
+      `SELECT id, name, level, category, casting_time, duration, description, damage_dice
+       FROM spells`
+    );
+    setSpellCatalog(spells);
+    const classFeatures = await db.getAllAsync<FeatureSourceRow>(
+      `SELECT name, features FROM classes`
+    );
+    setClassFeatureCatalog(classFeatures);
+    const subclassFeatures = await db.getAllAsync<FeatureSourceRow>(
+      `SELECT name, class_name, features FROM subclasses`
+    );
+    setSubclassFeatureCatalog(subclassFeatures);
   }, [activeSession?.id, db]);
 
   const loadHistory = useCallback(
@@ -331,7 +523,65 @@ export default function LanSessionScreen() {
       level: Number(data.level ?? parsed?.level ?? 1),
       race: String(data.race ?? parsed?.race ?? ''),
       className: String(data.class ?? parsed?.class ?? ''),
+      magicResources: normalizeMagicResourceState(data.spell_slots_used || '{}'),
     };
+  };
+
+  const spellSlotMaxesForSnapshot = (snapshot: ReturnType<typeof playerSnapshot>) => {
+    const maxes: Record<string, number> = {};
+    const entries = parseCharacterClassSummary(snapshot.className, snapshot.level);
+    entries.forEach(entry => {
+      const progression = spellProgressions.find(row => row.source_type === 'class' && row.source_name === entry.name && Number(row.level) === entry.level);
+      for (let level = 1; level <= 9; level++) {
+        const amount = Number(progression?.[`slot_${level}` as keyof SpellcastingProgressionRow] || 0);
+        if (amount > 0) maxes[String(level)] = Number(maxes[String(level)] || 0) + amount;
+      }
+      if (entry.subclass) {
+        const subclassProgression = spellProgressions.find(row => row.source_type === 'subclass' && row.source_name === entry.subclass && Number(row.level) === entry.level);
+        for (let level = 1; level <= 9; level++) {
+          const amount = Number(subclassProgression?.[`slot_${level}` as keyof SpellcastingProgressionRow] || 0);
+          if (amount > 0) maxes[String(level)] = Number(maxes[String(level)] || 0) + amount;
+        }
+      }
+    });
+    return maxes;
+  };
+
+  const resourceAbilitiesForSnapshot = (snapshot: ReturnType<typeof playerSnapshot>) => {
+    const savedSpellIds = (Array.isArray(safeJson(snapshot.data?.spells, snapshot.data?.spells || []))
+      ? safeJson(snapshot.data?.spells, [])
+      : []
+    )
+      .map((spellId: string | number) => Number(spellId))
+      .filter((spellId: number) => Number.isFinite(spellId));
+    const featureNames = new Set<string>();
+    const entries = parseCharacterClassSummary(snapshot.className, snapshot.level);
+
+    entries.forEach(entry => {
+      const classRow = classFeatureCatalog.find(row => row.name === entry.name);
+      parseFeatureNamesForLevel(classRow?.features, entry.level).forEach(feature => featureNames.add(feature));
+      if (entry.subclass) {
+        const subclassRow = subclassFeatureCatalog.find(row => row.name === entry.subclass && splitNameList(row.class_name).includes(entry.name));
+        parseFeatureNamesForLevel(subclassRow?.features, entry.level).forEach(feature => featureNames.add(feature));
+      }
+    });
+
+    const selected = spellCatalog.filter(spell =>
+      savedSpellIds.includes(Number(spell.id)) || featureNames.has(spell.name)
+    );
+    const unique = new Map<string, SpellResourceOption>();
+    selected.forEach(spell => {
+      const key = String(spell.id || spell.name);
+      if (getResourceCategory(spell) !== 'Passiva' && !spellUsesSlot(spell)) {
+        unique.set(key, spell);
+      }
+    });
+    Object.keys(normalizeMagicResourceState(snapshot.magicResources).abilities).forEach(key => {
+      if (!unique.has(key)) {
+        unique.set(key, { id: Number(key) || 0, name: `Habilidade #${key}` });
+      }
+    });
+    return Array.from(unique.values()).sort((a, b) => a.name.localeCompare(b.name));
   };
 
   const avatarSourceForName = (name: string, size = 120) =>
@@ -814,6 +1064,62 @@ export default function LanSessionScreen() {
     setCardBuffValue(player, { amount: '', durationValue: '1' });
     setMasterModal(null);
     await refreshSessionViews();
+  };
+
+  const handleMasterApplyResourceState = async (player: typeof players[number], nextResources: MagicResourceState, description: string) => {
+    if (!player.character_id) return;
+    await sendLanCommand('MASTER_APPLY_RESOURCE', {
+      targetCharacterId: Number(player.character_id),
+      targetDeviceId: player.device_id,
+      targetName: player.character_name || 'Personagem',
+      spellSlotsUsed: normalizeMagicResourceState(nextResources),
+      description,
+    });
+    await refreshSessionViews();
+  };
+
+  const handleMasterAdjustSlot = async (
+    player: typeof players[number],
+    snapshot: ReturnType<typeof playerSnapshot>,
+    slotLevel: string,
+    deltaUsed: number
+  ) => {
+    const maxes = spellSlotMaxesForSnapshot(snapshot);
+    const max = Number(maxes[slotLevel] || 0);
+    if (max <= 0) return;
+    const next = normalizeMagicResourceState(snapshot.magicResources);
+    const currentUsed = Number(next.slots[slotLevel] || 0);
+    next.slots[slotLevel] = Math.max(0, Math.min(max, currentUsed + deltaUsed));
+    await handleMasterApplyResourceState(
+      player,
+      next,
+      deltaUsed > 0
+        ? `Mestre consumiu um espaço de nível ${slotLevel}.`
+        : `Mestre restaurou +1 espaço de nível ${slotLevel}.`
+    );
+  };
+
+  const handleMasterAdjustAbility = async (
+    player: typeof players[number],
+    snapshot: ReturnType<typeof playerSnapshot>,
+    ability: SpellResourceOption,
+    deltaUsed: number
+  ) => {
+    const key = String(ability.id || ability.name);
+    const next = normalizeMagicResourceState(snapshot.magicResources);
+    const current = next.abilities[key] || { used: 0, max: 1, recharge: getAbilityRecharge(ability) };
+    const entry = { ...current, recharge: getAbilityRecharge(ability) };
+    next.abilities[key] = {
+      ...entry,
+      used: Math.max(0, Math.min(entry.max, entry.used + deltaUsed)),
+    };
+    await handleMasterApplyResourceState(
+      player,
+      next,
+      deltaUsed > 0
+        ? `Mestre consumiu uso de ${ability.name}.`
+        : `Mestre restaurou +1 uso de ${ability.name}.`
+    );
   };
 
   const handleMasterRemoveEffect = async (player: typeof players[number], effectId: string) => {
@@ -1887,6 +2193,10 @@ export default function LanSessionScreen() {
               const displayName = snapshot.raw?.name || snapshot.data?.name || player.character_name || (hasCharacter ? 'Personagem sem nome' : player.player_name || 'Jogador');
               const playerLabel = player.player_name && player.player_name !== displayName ? player.player_name : 'Jogador';
               const avatarUri = playerAvatarSource(snapshot, displayName);
+              const slotMaxes = spellSlotMaxesForSnapshot(snapshot);
+              const slotLevels = Object.keys(slotMaxes).filter(level => Number(slotMaxes[level] || 0) > 0).sort((a, b) => Number(a) - Number(b));
+              const resources = normalizeMagicResourceState(snapshot.magicResources);
+              const abilityOptions = resourceAbilitiesForSnapshot(snapshot);
 
               return (
                 <View key={playerActionKey(player)} style={[styles.playerSheetCard, !hasCharacter && styles.playerSheetCardDisabled]}>
@@ -1973,6 +2283,94 @@ export default function LanSessionScreen() {
                             {snapshot.activeEffects.map(effectLabel).join(' / ')}
                           </Text>
                         </TouchableOpacity>
+                      )}
+
+                      {(slotLevels.length > 0 || abilityOptions.length > 0) && (
+                        <View style={styles.inlineResourcePanel}>
+                          <View style={styles.inlineResourceHeader}>
+                            <View style={styles.inlineResourceTitleRow}>
+                              <Ionicons name="book-outline" size={14} color="#00fa9a" />
+                              <Text style={styles.inlineResourceTitle}>Recursos</Text>
+                            </View>
+                            {expanded && (
+                              <TouchableOpacity
+                                style={styles.inlineResourceReset}
+                                onPress={() => handleMasterApplyResourceState(player, emptyMagicResourceState(), 'Mestre resetou todos os espaços e recursos.')}
+                              >
+                                <Ionicons name="refresh-outline" size={13} color="#8bdcff" />
+                                <Text style={styles.inlineResourceResetText}>Resetar</Text>
+                              </TouchableOpacity>
+                            )}
+                          </View>
+
+                          {slotLevels.length > 0 && (
+                            <View style={styles.inlineSlotGrid}>
+                              {slotLevels.map(level => {
+                                const max = Number(slotMaxes[level] || 0);
+                                const used = Math.min(max, Number(resources.slots[level] || 0));
+                                const remaining = Math.max(0, max - used);
+                                return (
+                                  <View key={level} style={styles.inlineSlotChip}>
+                                    <View style={styles.inlineSlotTop}>
+                                      <Text style={styles.inlineSlotLabel}>N{level}</Text>
+                                      <Text style={styles.inlineSlotValue}>{remaining}/{max}</Text>
+                                    </View>
+                                    {expanded && (
+                                      <View style={styles.inlineResourceButtons}>
+                                        <TouchableOpacity
+                                          style={[styles.inlineMiniButton, remaining <= 0 && styles.disabledButton]}
+                                          disabled={remaining <= 0}
+                                          onPress={() => handleMasterAdjustSlot(player, snapshot, level, 1)}
+                                        >
+                                          <Text style={styles.inlineMiniButtonText}>Usar</Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                          style={styles.inlineMiniButtonAlt}
+                                          onPress={() => handleMasterAdjustSlot(player, snapshot, level, -1)}
+                                        >
+                                          <Text style={[styles.inlineMiniButtonText, styles.inlineMiniButtonAltText]}>+1</Text>
+                                        </TouchableOpacity>
+                                      </View>
+                                    )}
+                                  </View>
+                                );
+                              })}
+                            </View>
+                          )}
+
+                          {expanded && abilityOptions.length > 0 && (
+                            <View style={styles.inlineAbilityList}>
+                              {abilityOptions.slice(0, 6).map(ability => {
+                                const key = String(ability.id || ability.name);
+                                const current = resources.abilities[key] || { used: 0, max: 1, recharge: getAbilityRecharge(ability) };
+                                const remaining = Math.max(0, current.max - current.used);
+                                return (
+                                  <View key={key} style={styles.inlineAbilityRow}>
+                                    <View style={{ flex: 1, minWidth: 0 }}>
+                                      <Text style={styles.inlineAbilityName} numberOfLines={1}>{ability.name}</Text>
+                                      <Text style={styles.inlineAbilityMeta}>{remaining}/{current.max} / {getRechargeLabel(current.recharge)}</Text>
+                                    </View>
+                                    <View style={styles.inlineResourceButtons}>
+                                      <TouchableOpacity
+                                        style={[styles.inlineMiniButton, remaining <= 0 && styles.disabledButton]}
+                                        disabled={remaining <= 0}
+                                        onPress={() => handleMasterAdjustAbility(player, snapshot, ability, 1)}
+                                      >
+                                        <Text style={styles.inlineMiniButtonText}>Usar</Text>
+                                      </TouchableOpacity>
+                                      <TouchableOpacity
+                                        style={styles.inlineMiniButtonAlt}
+                                        onPress={() => handleMasterAdjustAbility(player, snapshot, ability, -1)}
+                                      >
+                                        <Text style={[styles.inlineMiniButtonText, styles.inlineMiniButtonAltText]}>+1</Text>
+                                      </TouchableOpacity>
+                                    </View>
+                                  </View>
+                                );
+                              })}
+                            </View>
+                          )}
+                        </View>
                       )}
 
                       {expanded && (
@@ -2255,7 +2653,7 @@ export default function LanSessionScreen() {
 
     return (
       <Modal visible transparent animationType="fade" onRequestClose={() => setTradeModal(null)}>
-        <Pressable style={styles.modalOverlay} onPress={() => setTradeModal(null)}>
+        <Pressable style={[styles.modalOverlay, { paddingTop: Math.max(insets.top + 18, 18), paddingBottom: Math.max(insets.bottom + 18, 18) }]} onPress={() => setTradeModal(null)}>
           <Pressable style={styles.tradeModalContent} onPress={event => event.stopPropagation()}>
             <View style={styles.tradeModalHeader}>
               <View style={styles.tradeTitleWrap}>
@@ -2432,11 +2830,12 @@ export default function LanSessionScreen() {
       time: 'Tempo da mesa',
       effects: 'Efeitos ativos',
       applyEffect: hasPlayer ? `Aplicar efeito em ${player.character_name || 'Personagem'}` : 'Aplicar efeito na party',
+      resources: hasPlayer ? `Recursos de ${player.character_name || 'Personagem'}` : 'Recursos',
     };
 
     return (
       <Modal visible transparent animationType="fade" onRequestClose={() => setMasterModal(null)}>
-        <Pressable style={styles.modalOverlay} onPress={() => setMasterModal(null)}>
+        <Pressable style={[styles.modalOverlay, { paddingTop: Math.max(insets.top + 18, 18), paddingBottom: Math.max(insets.bottom + 18, 18) }]} onPress={() => setMasterModal(null)}>
           <Pressable style={styles.masterModalContent} onPress={event => event.stopPropagation()}>
             <View style={styles.masterModalHeader}>
               <Text style={styles.masterModalTitle}>{titleByKind[masterModal.kind]}</Text>
@@ -2574,6 +2973,118 @@ export default function LanSessionScreen() {
                 <Text style={styles.sheetModalText}>{String(snapshot.data?.backstory || snapshot.data?.personalityTraits || 'Sem historia preenchida.')}</Text>
                 <Text style={styles.cardSectionLabel}>Pericias / idiomas</Text>
                 <Text style={styles.sheetModalText}>{String(snapshot.data?.languages || 'Sem idiomas registrados.')}</Text>
+              </ScrollView>
+            )}
+
+            {masterModal.kind === 'resources' && snapshot && hasPlayer && (
+              <ScrollView showsVerticalScrollIndicator={false}>
+                {(() => {
+                  const maxes = spellSlotMaxesForSnapshot(snapshot);
+                  const levels = Object.keys(maxes).filter(level => Number(maxes[level] || 0) > 0).sort((a, b) => Number(a) - Number(b));
+                  const resources = normalizeMagicResourceState(snapshot.magicResources);
+                  const abilityOptions = resourceAbilitiesForSnapshot(snapshot);
+
+                  if (levels.length === 0 && abilityOptions.length === 0 && Object.keys(resources.abilities).length === 0) {
+                    return <Text style={styles.modalHint}>Nenhum espaço ou recurso rastreável para esta ficha.</Text>;
+                  }
+
+                  return (
+                    <>
+                      {levels.length > 0 && (
+                        <>
+                          <Text style={styles.cardSectionLabel}>Espaços de magia</Text>
+                          <View style={styles.resourceManageGrid}>
+                            {levels.map(level => {
+                              const max = Number(maxes[level] || 0);
+                              const used = Math.min(max, Number(resources.slots[level] || 0));
+                              const remaining = max - used;
+                              return (
+                                <View key={level} style={styles.resourceManageBox}>
+                                  <Text style={styles.resourceManageLabel}>Nível {level}</Text>
+                                  <Text style={styles.resourceManageValue}>{remaining}/{max}</Text>
+                                  <View style={styles.resourceManageButtons}>
+                                    <TouchableOpacity
+                                      style={[styles.resourceMiniButton, remaining <= 0 && styles.disabledButton]}
+                                      disabled={remaining <= 0}
+                                      onPress={() => {
+                                        const next = normalizeMagicResourceState(resources);
+                                        next.slots[level] = Math.min(max, Number(next.slots[level] || 0) + 1);
+                                        handleMasterApplyResourceState(player, next, `Mestre consumiu um espaço de nível ${level}.`);
+                                      }}
+                                    >
+                                      <Text style={styles.resourceMiniButtonText}>Usar</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                      style={styles.resourceMiniButtonAlt}
+                                      onPress={() => {
+                                        const next = normalizeMagicResourceState(resources);
+                                        next.slots[level] = Math.max(0, Number(next.slots[level] || 0) - 1);
+                                        handleMasterApplyResourceState(player, next, `Mestre restaurou +1 espaço de nível ${level}.`);
+                                      }}
+                                    >
+                                      <Text style={styles.resourceMiniButtonText}>+1</Text>
+                                    </TouchableOpacity>
+                                  </View>
+                                </View>
+                              );
+                            })}
+                          </View>
+                        </>
+                      )}
+
+                      {abilityOptions.length > 0 && (
+                        <>
+                          <Text style={styles.cardSectionLabel}>Habilidades</Text>
+                          {abilityOptions.map(ability => {
+                            const key = String(ability.id || ability.name);
+                            const current = resources.abilities[key] || { used: 0, max: 1, recharge: getAbilityRecharge(ability) };
+                            const entry = { ...current, recharge: getAbilityRecharge(ability) };
+                            const remaining = Math.max(0, entry.max - entry.used);
+                            return (
+                              <View key={key} style={styles.effectManageRow}>
+                                <View style={{ flex: 1 }}>
+                                  <Text style={styles.effectManageTitle}>{ability.name}</Text>
+                                  <Text style={styles.effectManageSub}>{remaining}/{entry.max} / {getRechargeLabel(entry.recharge)}</Text>
+                                </View>
+                                <View style={styles.resourceManageButtons}>
+                                  <TouchableOpacity
+                                    style={[styles.resourceMiniButton, remaining <= 0 && styles.disabledButton]}
+                                    disabled={remaining <= 0}
+                                    onPress={() => {
+                                      const next = normalizeMagicResourceState(resources);
+                                      next.abilities[key] = { ...entry, used: Math.min(entry.max, entry.used + 1) };
+                                      handleMasterApplyResourceState(player, next, `Mestre consumiu uso de ${ability.name}.`);
+                                    }}
+                                  >
+                                    <Text style={styles.resourceMiniButtonText}>Usar</Text>
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    style={styles.resourceMiniButtonAlt}
+                                    onPress={() => {
+                                      const next = normalizeMagicResourceState(resources);
+                                      next.abilities[key] = { ...entry, used: Math.max(0, entry.used - 1) };
+                                      handleMasterApplyResourceState(player, next, `Mestre restaurou +1 uso de ${ability.name}.`);
+                                    }}
+                                  >
+                                    <Text style={styles.resourceMiniButtonText}>+1</Text>
+                                  </TouchableOpacity>
+                                </View>
+                              </View>
+                            );
+                          })}
+                        </>
+                      )}
+
+                      <TouchableOpacity
+                        style={[styles.secondaryWideButton, { marginTop: 12 }]}
+                        onPress={() => handleMasterApplyResourceState(player, emptyMagicResourceState(), 'Mestre resetou todos os espaços e recursos.')}
+                      >
+                        <Ionicons name="refresh-outline" size={18} color="#00bfff" />
+                        <Text style={styles.secondaryButtonText}>Resetar todos</Text>
+                      </TouchableOpacity>
+                    </>
+                  );
+                })()}
               </ScrollView>
             )}
 
@@ -2899,7 +3410,7 @@ export default function LanSessionScreen() {
       animationType="fade"
       onRequestClose={() => setInitiativeActorModalVisible(false)}
     >
-      <Pressable style={styles.modalOverlay} onPress={() => setInitiativeActorModalVisible(false)}>
+      <Pressable style={[styles.modalOverlay, { paddingTop: Math.max(insets.top + 18, 18), paddingBottom: Math.max(insets.bottom + 18, 18) }]} onPress={() => setInitiativeActorModalVisible(false)}>
         <Pressable style={styles.initiativeActorModal} onPress={event => event.stopPropagation()}>
           <View style={styles.initiativeActorModalHeader}>
             <View style={styles.virtualAvatarLarge}>
@@ -3051,7 +3562,7 @@ export default function LanSessionScreen() {
     <LinearGradient colors={['#102b56', '#02112b']} style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
 
-      <View style={styles.topBar}>
+      <View style={[styles.topBar, { paddingTop: Math.max(insets.top + 12, 50) }]}>
         <TouchableOpacity onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={28} color="#fff" />
         </TouchableOpacity>
@@ -3060,7 +3571,7 @@ export default function LanSessionScreen() {
       </View>
 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+        <ScrollView contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(insets.bottom + 72, 84) }]} showsVerticalScrollIndicator={false}>
           {renderActiveSession()}
           {renderAdminMenu()}
         </ScrollView>
@@ -3628,6 +4139,91 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,209,102,0.25)',
   },
   effectPreviewText: { color: '#ffd166', fontSize: 11, fontWeight: 'bold', flex: 1 },
+  resourcePreviewBox: {
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    marginBottom: 10,
+    backgroundColor: 'rgba(0,250,154,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,250,154,0.25)',
+  },
+  resourcePreviewText: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold', flex: 1 },
+  inlineResourcePanel: {
+    marginBottom: 10,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: 'rgba(0,250,154,0.055)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,250,154,0.18)',
+  },
+  inlineResourceHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 },
+  inlineResourceTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  inlineResourceTitle: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold', letterSpacing: 0.8, textTransform: 'uppercase' },
+  inlineResourceReset: {
+    minHeight: 26,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(0,191,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.22)',
+  },
+  inlineResourceResetText: { color: '#8bdcff', fontSize: 10, fontWeight: 'bold' },
+  inlineSlotGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  inlineSlotChip: {
+    minWidth: 74,
+    flexGrow: 1,
+    borderRadius: 10,
+    padding: 8,
+    backgroundColor: 'rgba(255,255,255,0.055)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  inlineSlotTop: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: 6 },
+  inlineSlotLabel: { color: 'rgba(255,255,255,0.52)', fontSize: 10, fontWeight: 'bold' },
+  inlineSlotValue: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
+  inlineResourceButtons: { flexDirection: 'row', gap: 5, marginTop: 7 },
+  inlineMiniButton: {
+    minHeight: 27,
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 8,
+    backgroundColor: '#64ee94',
+  },
+  inlineMiniButtonAlt: {
+    minHeight: 27,
+    minWidth: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,191,255,0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,255,0.32)',
+  },
+  inlineMiniButtonText: { color: '#02112b', fontSize: 10, fontWeight: 'bold' },
+  inlineMiniButtonAltText: { color: '#8bdcff' },
+  inlineAbilityList: { gap: 7, marginTop: 9 },
+  inlineAbilityRow: {
+    minHeight: 46,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderRadius: 10,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    backgroundColor: 'rgba(255,255,255,0.045)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.09)',
+  },
+  inlineAbilityName: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+  inlineAbilityMeta: { color: 'rgba(255,255,255,0.5)', fontSize: 10, marginTop: 2 },
   cardSectionLabel: { color: '#00bfff', fontSize: 10, fontWeight: 'bold', marginTop: 10, marginBottom: 7, letterSpacing: 1 },
   statsChipGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
   statChip: {
@@ -3787,6 +4383,22 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,100,100,0.28)',
   },
+  resourceManageGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  resourceManageBox: {
+    flexGrow: 1,
+    minWidth: 118,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  resourceManageLabel: { color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: 'bold' },
+  resourceManageValue: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginTop: 4 },
+  resourceManageButtons: { flexDirection: 'row', gap: 6, marginTop: 10 },
+  resourceMiniButton: { flex: 1, alignItems: 'center', backgroundColor: '#00fa9a', borderRadius: 8, paddingVertical: 8 },
+  resourceMiniButtonAlt: { flex: 1, alignItems: 'center', backgroundColor: 'rgba(0,191,255,0.2)', borderRadius: 8, paddingVertical: 8, borderWidth: 1, borderColor: 'rgba(0,191,255,0.35)' },
+  resourceMiniButtonText: { color: '#02112b', fontSize: 11, fontWeight: 'bold' },
   cardActionBlock: {
     marginTop: 7,
     borderTopWidth: 1,

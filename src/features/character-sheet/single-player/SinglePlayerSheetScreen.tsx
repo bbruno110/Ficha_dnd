@@ -31,6 +31,62 @@ const DEFAULT_SLOTS = {
   mainHand: null, offHand: null, ranged: null, lightSource: null 
 };
 
+type EquipmentSlotKey = keyof typeof DEFAULT_SLOTS;
+
+const normalizeItemText = (value: unknown) => String(value || '').toLowerCase();
+
+const itemRulesText = (item?: any) => [
+  item?.name,
+  item?.category,
+  item?.properties,
+  item?.descricao,
+].map(normalizeItemText).join(' ');
+
+const isShieldItem = (item?: any) => {
+  const category = normalizeItemText(item?.category);
+  const properties = normalizeItemText(item?.properties);
+  const name = normalizeItemText(item?.name);
+  return category === 'escudo' || /^escudo\b/.test(properties) || (name === 'escudo' && properties.includes('ca'));
+};
+
+const isArmorItem = (item?: any) => {
+  const category = normalizeItemText(item?.category);
+  const properties = String(item?.properties || '');
+  return !isShieldItem(item) && (category === 'armadura' || /^armadura\b/i.test(properties) || /ca\s*\d+/i.test(properties));
+};
+
+const isWeaponItem = (item?: any) => {
+  const category = normalizeItemText(item?.category);
+  if (category && category !== 'arma') return false;
+  if (category === 'arma') return true;
+
+  const damage = String(item?.damage || '').trim();
+  const text = itemRulesText(item);
+  return damage !== '' && damage !== '-' && /(arma|espada|machado|arco|besta|adaga|bordao|bordão|rapieira|maca|maça|dardo|cimitarra)/.test(text);
+};
+
+const acBonusFromItem = (item?: any) => {
+  const props = String(item?.properties || '');
+  const plusAfter = props.match(/\bCA\s*([+-]\d+)/i);
+  const plusBefore = props.match(/([+-]\d+)\s*CA\b/i);
+  return Number(plusAfter?.[1] || plusBefore?.[1] || 0) || 0;
+};
+
+const armorRuleFromItem = (item?: any) => {
+  const props = String(item?.properties || '');
+  const baseMatch = props.match(/\bCA\s*(\d+)/i);
+  if (!item || !baseMatch) return { base: 10, dexCap: null as number | null, addDex: true };
+
+  const base = Number(baseMatch[1]) || 10;
+  const addDex = /mod\s*des/i.test(props);
+  const capMatch = props.match(/m[aá]x\.?\s*(\d+)/i);
+  return {
+    base,
+    dexCap: capMatch ? Number(capMatch[1]) : null,
+    addDex,
+  };
+};
+
 const SPELL_LEVELS = ['Todos', 'Passiva', 'Habilidade', 'Truque', 'Nível 1', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6', 'Nível 7', 'Nível 8', 'Nível 9'];
 const SPELL_EFFECTS = ['Todos', 'Dano', 'Cura', 'Suporte/Defesa'];
 
@@ -64,6 +120,124 @@ type PendingRollEffect = {
   rolledValue: string;
 };
 
+type MagicResourceState = {
+  slots: Record<string, number>;
+  abilities: Record<string, { used: number; max: number; recharge: 'turn' | 'short_rest' | 'long_rest' }>;
+};
+
+type SpellSlotMaxes = Record<string, number>;
+
+type FeatureRequirement = string | { name?: string; level?: string | number; level_required?: string | number; minLevel?: string | number };
+
+const getFeatureRequirementLevel = (feature: FeatureRequirement) => {
+  if (typeof feature === 'string') return 1;
+  const rawLevel = feature.level_required ?? feature.level ?? feature.minLevel ?? 1;
+  const parsed = parseInt(String(rawLevel), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+};
+
+const parseFeatureNamesForLevel = (featuresJson?: string, characterLevel = 1) => {
+  try {
+    const parsed = JSON.parse(featuresJson || '[]') as FeatureRequirement[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(feature => getFeatureRequirementLevel(feature) <= characterLevel)
+      .map(feature => typeof feature === 'string' ? feature : feature.name)
+      .filter(Boolean) as string[];
+  } catch {
+    return [];
+  }
+};
+
+const splitNameList = (value?: string | null) => String(value || '')
+  .split(',')
+  .map(token => token.trim())
+  .filter(Boolean);
+
+const parseCharacterClassSummary = (classSummary: string, fallbackLevel = 1) => {
+  const entries: { name: string; subclass: string; level: number }[] = [];
+  const pattern = /([^/()]+?)(?:\s*\(([^)]*)\))?\s+(\d+)(?=\s*\/|$)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(classSummary))) {
+    entries.push({
+      name: match[1].trim(),
+      subclass: (match[2] || '').trim(),
+      level: Math.max(1, parseInt(match[3], 10) || 1),
+    });
+  }
+
+  if (entries.length > 0) return entries;
+
+  const fallbackMatch = classSummary.match(/^([^()]+?)(?:\s*\(([^)]*)\))?$/);
+  const fallbackName = (fallbackMatch?.[1] || classSummary).trim();
+  if (!fallbackName) return [];
+  return [{
+    name: fallbackName,
+    subclass: (fallbackMatch?.[2] || '').trim(),
+    level: Math.max(1, fallbackLevel),
+  }];
+};
+
+const emptyMagicResourceState = (): MagicResourceState => ({ slots: {}, abilities: {} });
+
+const normalizeMagicResourceState = (value: unknown): MagicResourceState => {
+  const parsed = typeof value === 'string'
+    ? (() => { try { return JSON.parse(value || '{}'); } catch { return {}; } })()
+    : value && typeof value === 'object'
+      ? value as any
+      : {};
+  const legacySlots = parsed?.slots || Object.fromEntries(
+    Object.entries(parsed || {}).filter(([key, val]) => /^\d+$/.test(key) && Number.isFinite(Number(val)))
+  );
+  const slots = Object.fromEntries(
+    Object.entries(legacySlots || {}).map(([level, used]) => [String(level), Math.max(0, Math.trunc(Number(used || 0)))])
+  );
+  const abilities = Object.fromEntries(
+    Object.entries(parsed?.abilities || {}).map(([id, entry]: [string, any]) => [String(id), {
+      used: Math.max(0, Math.trunc(Number(entry?.used || 0))),
+      max: Math.max(1, Math.trunc(Number(entry?.max || 1))),
+      recharge: ['turn', 'short_rest', 'long_rest'].includes(String(entry?.recharge)) ? String(entry.recharge) : 'long_rest',
+    }])
+  ) as MagicResourceState['abilities'];
+  return { slots, abilities };
+};
+
+const getSpellLevelNumber = (levelValue?: string | number | null) => {
+  const text = String(levelValue || '');
+  if (text.toLowerCase() === 'truque') return 0;
+  const match = text.match(/\d+/);
+  return match ? parseInt(match[0], 10) : 0;
+};
+
+const spellUsesSlot = (spell: any) => {
+  const category = getCategory(spell);
+  const text = [spell?.name, spell?.description, spell?.damage_dice, spell?.duration].map(value => String(value || '').toLowerCase()).join(' ');
+  return (category === 'Magia' && getSpellLevelNumber(spell?.level) > 0) || text.includes('espaço') || text.includes('espaco');
+};
+
+const getAbilityRecharge = (spell: any): MagicResourceState['abilities'][string]['recharge'] => {
+  const text = [spell?.name, spell?.description, spell?.duration, spell?.casting_time].map(value => String(value || '').toLowerCase()).join(' ');
+  if (text.includes('turno') || text.includes('rodada')) return 'turn';
+  if (text.includes('descanso curto')) return 'short_rest';
+  return 'long_rest';
+};
+
+const resetMagicResourceState = (state: MagicResourceState, mode: 'all' | 'turn' | 'short_rest' | 'long_rest') => {
+  const next = normalizeMagicResourceState(state);
+  if (mode === 'all' || mode === 'long_rest') {
+    return emptyMagicResourceState();
+  }
+  const abilities = Object.fromEntries(
+    Object.entries(next.abilities).filter(([, entry]) => {
+      if (mode === 'turn') return entry.recharge !== 'turn';
+      if (mode === 'short_rest') return entry.recharge === 'long_rest';
+      return true;
+    })
+  );
+  return { slots: next.slots, abilities };
+};
+
 // Força a categoria correta para o agrupamento
 const getCategory = (spell: any): string => {
   if (spell.category && spell.category !== 'Desconhecido') return spell.category;
@@ -82,6 +256,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const [character, setCharacter] = useState<any>(null);
   
   const [spellDetails, setSpellDetails] = useState<any[]>([]);
+  const [spellSlotMaxes, setSpellSlotMaxes] = useState<SpellSlotMaxes>({});
   const [dbItemsCatalog, setDbItemsCatalog] = useState<any[]>([]);
   const [dbSkills, setDbSkills] = useState<any[]>([]);
   const [dbSaves, setDbSaves] = useState<any[]>([]);
@@ -423,6 +598,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           skill_values: loadedSkills,
           equipment: parsedEquip,
           spells: JSON.parse((result as any).spells || '[]'),
+          spell_slots_used: normalizeMagicResourceState((result as any).spell_slots_used || '{}'),
         };
         setCharacter(charData);
 
@@ -435,16 +611,74 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
           setLevelUpModalVisible(true);
         }
 
-        const raceData = await db.getFirstAsync<{speed: string}>(`SELECT speed FROM races WHERE name = ?`, [charData.race]);
+        const raceData = await db.getFirstAsync<{speed: string; features?: string}>(`SELECT speed, features FROM races WHERE name = ?`, [charData.race]);
         if (raceData) setCharRaceSpeed(raceData.speed);
 
         const casterClasses = await db.getAllAsync<{name: string}>(`SELECT name FROM classes WHERE is_caster = 1`);
         const hasSpells = casterClasses.some(c => charData.class.includes(c.name));
         setCharHasSpells(true);
 
-        if (charData.spells.length > 0) {
-          const placeholders = charData.spells.map(() => '?').join(',');
-          const spellsFull = await db.getAllAsync(`SELECT * FROM spells WHERE id IN (${placeholders})`, charData.spells.map((sp: string) => Number(sp)));
+        const guaranteedFeatureNames = new Set<string>(parseFeatureNamesForLevel(raceData?.features, currentLevel));
+        const classEntries = parseCharacterClassSummary(String(charData.class || ''), currentLevel);
+        const nextSlotMaxes: SpellSlotMaxes = {};
+
+        for (const entry of classEntries) {
+          const classData = await db.getFirstAsync<{ features?: string }>(`SELECT features FROM classes WHERE name = ? LIMIT 1`, [entry.name]);
+          parseFeatureNamesForLevel(classData?.features, entry.level).forEach(feature => guaranteedFeatureNames.add(feature));
+
+          const progression = await db.getFirstAsync<any>(
+            `SELECT slot_1, slot_2, slot_3, slot_4, slot_5, slot_6, slot_7, slot_8, slot_9
+             FROM spellcasting_progression
+             WHERE source_type = 'class' AND source_name = ? AND level = ?
+             LIMIT 1`,
+            [entry.name, entry.level]
+          );
+          for (let slotLevel = 1; slotLevel <= 9; slotLevel++) {
+            const amount = Number(progression?.[`slot_${slotLevel}`] || 0);
+            if (amount > 0) nextSlotMaxes[String(slotLevel)] = Number(nextSlotMaxes[String(slotLevel)] || 0) + amount;
+          }
+
+          if (entry.subclass) {
+            const subclassRows = await db.getAllAsync<{ features?: string; class_name?: string }>(
+              `SELECT features, class_name FROM subclasses WHERE name = ?`,
+              [entry.subclass]
+            );
+            const subclassData = subclassRows.find(row => splitNameList(row.class_name).includes(entry.name));
+            parseFeatureNamesForLevel(subclassData?.features, entry.level).forEach(feature => guaranteedFeatureNames.add(feature));
+
+            const subclassProgression = await db.getFirstAsync<any>(
+              `SELECT slot_1, slot_2, slot_3, slot_4, slot_5, slot_6, slot_7, slot_8, slot_9
+               FROM spellcasting_progression
+               WHERE source_type = 'subclass' AND source_name = ? AND level = ?
+               LIMIT 1`,
+              [entry.subclass, entry.level]
+            );
+            for (let slotLevel = 1; slotLevel <= 9; slotLevel++) {
+              const amount = Number(subclassProgression?.[`slot_${slotLevel}`] || 0);
+              if (amount > 0) nextSlotMaxes[String(slotLevel)] = Number(nextSlotMaxes[String(slotLevel)] || 0) + amount;
+            }
+          }
+        }
+        setSpellSlotMaxes(nextSlotMaxes);
+
+        const savedSpellIds = (Array.isArray(charData.spells) ? charData.spells : [])
+          .map((sp: string | number) => Number(sp))
+          .filter((spellId: number) => Number.isFinite(spellId));
+        const guaranteedFeatures = Array.from(guaranteedFeatureNames);
+        const spellConditions: string[] = [];
+        const spellParams: (string | number)[] = [];
+
+        if (savedSpellIds.length > 0) {
+          spellConditions.push(`id IN (${savedSpellIds.map(() => '?').join(',')})`);
+          spellParams.push(...savedSpellIds);
+        }
+        if (guaranteedFeatures.length > 0) {
+          spellConditions.push(`name IN (${guaranteedFeatures.map(() => '?').join(',')})`);
+          spellParams.push(...guaranteedFeatures);
+        }
+
+        if (spellConditions.length > 0) {
+          const spellsFull = await db.getAllAsync(`SELECT * FROM spells WHERE ${spellConditions.join(' OR ')}`, spellParams);
           setSpellDetails(spellsFull);
         } else {
           setSpellDetails([]);
@@ -547,18 +781,22 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const totalWeight = bagWeight + slotsWeight + ((character.gp + character.sp + character.cp) * 0.01);
   const carryCap = (forBase + forTemp + forEquip) * 7.5;
 
-  let baseCa = 10;
-  let addDes = true;
-  if (character.equipment.slots.armor) {
-    const props = character.equipment.slots.armor.properties || '';
-    const match = props.match(/CA\s*(\d+)/i);
-    if (match) baseCa = parseInt(match[1]);
-    if (props.includes('CA 16') || props.includes('Armadura Completa') || props.includes('Pesada')) addDes = false; 
-  }
+  const hydrateEquippedItem = (item: any) => item ? { ...(dbItemsCatalog.find((cat: any) => cat.name === item.name) || {}), ...item } : item;
+  const equippedSlotsForRules = Object.fromEntries(
+    Object.entries(character.equipment.slots).map(([slot, item]) => [slot, hydrateEquippedItem(item)])
+  ) as Record<EquipmentSlotKey, any>;
+  const armorRule = armorRuleFromItem(equippedSlotsForRules.armor);
+  const dexBonusForArmor = armorRule.addDex
+    ? armorRule.dexCap === null ? desMod : Math.min(desMod, armorRule.dexCap)
+    : 0;
+  const equippedAcBonus = Object.values(equippedSlotsForRules).reduce(
+    (acc: number, item: any) => acc + acBonusFromItem(item),
+    0
+  );
   const caTemp = parseInt(character.stats.temp_mods?.CA) || 0;
   const caEquip = parseInt(character.stats.equip_mods?.CA) || 0;
-  const armorClassTotal = baseCa + (addDes ? desMod : 0) + caTemp + caEquip;
-  const caSumBuffs = caTemp + caEquip;
+  const armorClassTotal = armorRule.base + dexBonusForArmor + equippedAcBonus + caTemp + caEquip;
+  const caSumBuffs = equippedAcBonus + caTemp + caEquip;
   const caColor = caSumBuffs > 0 ? '#00fa9a' : (caSumBuffs < 0 ? '#ff6666' : '#fff');
 
   const expectedLevel = getExpectedLevelFromXp(Number(character.xp || 0));
@@ -569,6 +807,10 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   const isLanBadgeBusy = Boolean(syncAdapter?.enabled && (connectionStatus === 'syncing' || connectionStatus === 'reconnecting'));
   const isLanBadgeHealthy = Boolean(syncAdapter?.enabled && isTransportReady && connectionStatus === 'connected');
   const isLanBadgeWarning = Boolean(syncAdapter?.enabled && !isLanBadgeHealthy);
+  const magicResources = normalizeMagicResourceState(character.spell_slots_used);
+  const spellSlotLevels = Object.keys(spellSlotMaxes)
+    .filter(level => Number(spellSlotMaxes[level] || 0) > 0)
+    .sort((a, b) => Number(a) - Number(b));
 
   const handleTopLanBadgePress = async () => {
     if (isLanPausedReadOnly || !syncAdapter?.enabled) {
@@ -780,6 +1022,85 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
         });
       }
     } catch (e) { console.error(e); }
+  };
+
+  const saveMagicResources = async (nextState: MagicResourceState, reason = 'resource-update') => {
+    await updateDB({ spell_slots_used: normalizeMagicResourceState(nextState) });
+    console.log(`[MAGIC_RESOURCE] ${reason}`, nextState);
+  };
+
+  const handleRestoreSpellSlot = async (slotLevel: string, amount = 1) => {
+    if (isLanPlayerControlledSheet) {
+      showCustomAlert('Controle do mestre', 'Na mesa LAN, os espaços e usos são ajustados pelo mestre.');
+      return;
+    }
+    const next = normalizeMagicResourceState(magicResources);
+    next.slots[slotLevel] = Math.max(0, Number(next.slots[slotLevel] || 0) - amount);
+    await saveMagicResources(next, `Restaurou espaço de magia ${slotLevel}`);
+  };
+
+  const handleResetMagicResources = async (mode: 'all' | 'turn' | 'short_rest' | 'long_rest' = 'all') => {
+    if (isLanPlayerControlledSheet) {
+      showCustomAlert('Controle do mestre', 'Na mesa LAN, descansos e recursos são controlados pelo mestre.');
+      return;
+    }
+    await saveMagicResources(resetMagicResourceState(magicResources, mode), `Resetou recursos: ${mode}`);
+  };
+
+  const handleUseSpellResource = async (spell: any, slotLevel?: number) => {
+    if (isLanPlayerControlledSheet) {
+      showCustomAlert('Controle do mestre', 'Na mesa LAN, avise o mestre que você usou este recurso para ele registrar na mesa.');
+      return;
+    }
+
+    const next = normalizeMagicResourceState(magicResources);
+    const consumesSlot = spellUsesSlot(spell);
+    const minimumSlotLevel = Math.max(1, getSpellLevelNumber(spell?.level));
+
+    if (consumesSlot) {
+      const chosenSlot = String(slotLevel || minimumSlotLevel);
+      const maxSlots = Number(spellSlotMaxes[chosenSlot] || 0);
+      if (maxSlots <= 0) {
+        showCustomAlert('Sem espaço disponível', `Você não possui espaços de magia de nível ${chosenSlot}.`);
+        return;
+      }
+      const used = Number(next.slots[chosenSlot] || 0);
+      if (used >= maxSlots) {
+        showCustomAlert('Espaço esgotado', `Todos os espaços de nível ${chosenSlot} já foram usados.`);
+        return;
+      }
+      next.slots[chosenSlot] = used + 1;
+      await saveMagicResources(next, `Usou ${spell?.name || 'magia'} com espaço ${chosenSlot}`);
+      setSelectedSpell(null);
+      return;
+    }
+
+    if (getCategory(spell) === 'Passiva') {
+      showCustomAlert('Passiva', 'Esta habilidade é passiva e não consome recurso.');
+      return;
+    }
+
+    const abilityKey = String(spell?.id || spell?.name || 'habilidade');
+    const current = next.abilities[abilityKey] || { used: 0, max: 1, recharge: getAbilityRecharge(spell) };
+    if (current.used >= current.max) {
+      showCustomAlert('Uso esgotado', 'Esta habilidade já foi usada até a próxima recarga.');
+      return;
+    }
+    next.abilities[abilityKey] = { ...current, used: current.used + 1, recharge: getAbilityRecharge(spell) };
+    await saveMagicResources(next, `Usou habilidade ${spell?.name || abilityKey}`);
+    setSelectedSpell(null);
+  };
+
+  const handleRestoreAbilityUse = async (spell: any) => {
+    if (isLanPlayerControlledSheet) {
+      showCustomAlert('Controle do mestre', 'Na mesa LAN, os usos de habilidade são ajustados pelo mestre.');
+      return;
+    }
+    const abilityKey = String(spell?.id || spell?.name || 'habilidade');
+    const next = normalizeMagicResourceState(magicResources);
+    const current = next.abilities[abilityKey] || { used: 0, max: 1, recharge: getAbilityRecharge(spell) };
+    next.abilities[abilityKey] = { ...current, used: Math.max(0, current.used - 1) };
+    await saveMagicResources(next, `Restaurou habilidade ${spell?.name || abilityKey}`);
   };
 
   const handleXP = async (action: 'add' | 'remove') => {
@@ -1024,6 +1345,15 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
   };
 
   const getCatalogItem = (item: any) => dbItemsCatalog.find(cat => cat.name === item.name);
+  const hydrateItem = (item: any) => ({ ...(getCatalogItem(item) || {}), ...(item || {}) });
+  const isItemCompatibleWithSlot = (item: any, slot: EquipmentSlotKey | null) => {
+    if (!slot) return false;
+    const hydrated = hydrateItem(item);
+    if (slot === 'armor') return isArmorItem(hydrated);
+    if (slot === 'offHand') return isShieldItem(hydrated) || isWeaponItem(hydrated);
+    if (slot === 'mainHand' || slot === 'ranged') return isWeaponItem(hydrated);
+    return !isArmorItem(hydrated) && !isShieldItem(hydrated) && !isWeaponItem(hydrated);
+  };
 
   const toEffectNumber = (value: unknown, fallback = 0) => {
     const parsed = Number(value);
@@ -1477,6 +1807,11 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
 
   const handleEquipItem = async (itemToEquip: any) => {
     if (!activeSlot) return;
+    const itemToEquipFull = itemToEquip ? hydrateItem(itemToEquip) : null;
+    if (itemToEquipFull && !isItemCompatibleWithSlot(itemToEquipFull, activeSlot)) {
+      showCustomAlert("Espaço incompatível", "Este item não combina com o espaço escolhido. Armaduras devem ir em Armadura, escudos na mão secundária e armas nos espaços de ataque.");
+      return;
+    }
     let newBag = [...character.equipment.bag];
     let newSlots = { ...character.equipment.slots };
     let newStats = { ...character.stats };
@@ -1491,8 +1826,8 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       }
     }
 
-    if (itemToEquip) {
-      const props = itemToEquip.properties || '';
+    if (itemToEquipFull) {
+      const props = itemToEquipFull.properties || '';
       if (activeSlot === 'mainHand' && props.includes('Duas mãos')) {
         if (newSlots.offHand) {
           const offIdx = newBag.findIndex((i: any) => i.name === newSlots.offHand.name);
@@ -1524,15 +1859,15 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
       else newBag.push({ ...oldItem, qty: 1 });
     }
 
-    if (itemToEquip) {
-      const bagIdx = newBag.findIndex((i: any) => i.name === itemToEquip.name);
+    if (itemToEquipFull) {
+      const bagIdx = newBag.findIndex((i: any) => i.name === itemToEquipFull.name);
       if (bagIdx > -1) {
         newBag[bagIdx].qty -= 1;
         if (newBag[bagIdx].qty <= 0) newBag.splice(bagIdx, 1);
       }
-      newSlots[activeSlot] = { ...itemToEquip, qty: 1 };
+      newSlots[activeSlot] = { ...itemToEquipFull, qty: 1 };
 
-      const newBonuses = getEquipBonus(itemToEquip);
+      const newBonuses = getEquipBonus(itemToEquipFull);
       for (const [stat, val] of Object.entries(newBonuses)) {
         newStats.equip_mods[stat] = (newStats.equip_mods[stat] || 0) + (val as number);
       }
@@ -1543,12 +1878,12 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     updateDB({ equipment: { bag: newBag, slots: newSlots }, stats: newStats });
     setSlotModalVisible(false);
 
-    if (itemToEquip) {
-      await traceSheetProcess('ITEM_EQUIP', `Equipou ${itemToEquip.name}`, { item: itemToEquip.name, slot: activeSlot });
-      const effects = await getStructuredItemEffects(itemToEquip);
+    if (itemToEquipFull) {
+      await traceSheetProcess('ITEM_EQUIP', `Equipou ${itemToEquipFull.name}`, { item: itemToEquipFull.name, slot: activeSlot });
+      const effects = await getStructuredItemEffects(itemToEquipFull);
       const damageDiceEffects = effects.filter(effect => effect.effect_kind === 'damage' && effect.value_mode === 'dice');
       if (damageDiceEffects.length > 0) {
-        openRollValueModal(damageDiceEffects, itemToEquip, 1, undefined, false);
+        openRollValueModal(damageDiceEffects, itemToEquipFull, 1, undefined, false);
       }
     }
   };
@@ -1998,6 +2333,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
     if (!itemDamageType || itemDamageType === '-') itemDamageType = 'Concussão (Improvisada)';
 
     const props = item.properties || dbItem?.properties || '';
+    if (isShieldItem({ ...(dbItem || {}), ...item, properties: props })) return null;
     const isRanged = props.includes('Munição') || props.includes('Arremesso') || slotKey === 'ranged';
     const isFinesse = props.includes('Acuidade');
     
@@ -2416,6 +2752,47 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
               </ScrollView>
             </View>
 
+            {(spellSlotLevels.length > 0 || Object.keys(magicResources.abilities).length > 0) && (
+              <View style={styles.magicResourcePanel}>
+                <View style={styles.magicResourceHeader}>
+                  <Text style={styles.magicResourceTitle}>ESPAÇOS E RECURSOS</Text>
+                  <TouchableOpacity style={styles.magicResetButton} onPress={() => handleResetMagicResources('all')}>
+                    <Ionicons name="refresh-outline" size={14} color="#02112b" />
+                    <Text style={styles.magicResetButtonText}>Resetar</Text>
+                  </TouchableOpacity>
+                </View>
+                {spellSlotLevels.length > 0 && (
+                  <View style={styles.magicSlotWrap}>
+                    {spellSlotLevels.map(level => {
+                      const max = Number(spellSlotMaxes[level] || 0);
+                      const used = Math.min(max, Number(magicResources.slots[level] || 0));
+                      return (
+                        <View key={level} style={styles.magicSlotChip}>
+                          <Text style={styles.magicSlotLabel}>NV {level}</Text>
+                          <Text style={styles.magicSlotValue}>{max - used}/{max}</Text>
+                          <TouchableOpacity style={styles.magicSlotAddButton} onPress={() => handleRestoreSpellSlot(level)}>
+                            <Text style={styles.magicSlotAddText}>+1</Text>
+                          </TouchableOpacity>
+                        </View>
+                      );
+                    })}
+                  </View>
+                )}
+                {Object.entries(magicResources.abilities).length > 0 && (
+                  <View style={styles.abilityUseSummary}>
+                    {Object.entries(magicResources.abilities).map(([id, entry]) => {
+                      const spell = spellDetails.find(candidate => String(candidate.id) === id);
+                      return (
+                        <Text key={id} style={styles.abilityUseSummaryText} numberOfLines={1}>
+                          {spell?.name || 'Habilidade'}: {Math.max(0, entry.max - entry.used)}/{entry.max}
+                        </Text>
+                      );
+                    })}
+                  </View>
+                )}
+              </View>
+            )}
+
             <View style={{marginTop: 10}}>
               {getGroupedSpells().length > 0 ? getGroupedSpells().map(([groupName, spells]) => (
                 <View key={groupName} style={{marginBottom: 20}}>
@@ -2515,6 +2892,70 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                         {selectedSpell.damage_dice || selectedSpell.damage} {selectedSpell.damage_type && selectedSpell.damage_type !== 'Nenhum' ? `(${selectedSpell.damage_type})` : ''}
                         {selectedSpell.saving_throw && selectedSpell.saving_throw !== 'Nenhum' ? ` • CD ${selectedSpell.saving_throw}` : ''}
                       </Text>
+                    </View>
+                  )}
+
+                  {getCategory(selectedSpell) !== 'Passiva' && (
+                    <View style={styles.spellUsePanel}>
+                      <View style={styles.magicResourceHeader}>
+                        <Text style={styles.magicResourceTitle}>USO DO RECURSO</Text>
+                        <TouchableOpacity style={styles.magicResetButton} onPress={() => handleResetMagicResources('all')}>
+                          <Ionicons name="refresh-outline" size={14} color="#02112b" />
+                          <Text style={styles.magicResetButtonText}>Resetar</Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      {spellUsesSlot(selectedSpell) ? (
+                        <View style={styles.spellCastButtonGrid}>
+                          {spellSlotLevels
+                            .filter(level => Number(level) >= Math.max(1, getSpellLevelNumber(selectedSpell.level)))
+                            .map(level => {
+                              const max = Number(spellSlotMaxes[level] || 0);
+                              const used = Math.min(max, Number(magicResources.slots[level] || 0));
+                              const remaining = max - used;
+                              return (
+                                <TouchableOpacity
+                                  key={level}
+                                  style={[styles.spellCastButton, remaining <= 0 && styles.spellCastButtonDisabled]}
+                                  disabled={remaining <= 0 && !isLanPlayerControlledSheet}
+                                  onPress={() => handleUseSpellResource(selectedSpell, Number(level))}
+                                >
+                                  <Text style={styles.spellCastButtonText}>USAR NV {level}</Text>
+                                  <Text style={styles.spellCastButtonSub}>{remaining}/{max}</Text>
+                                </TouchableOpacity>
+                              );
+                            })}
+                          {spellSlotLevels.filter(level => Number(level) >= Math.max(1, getSpellLevelNumber(selectedSpell.level))).length === 0 && (
+                            <Text style={styles.emptyText}>Nenhum espaço compatível disponível.</Text>
+                          )}
+                        </View>
+                      ) : (
+                        (() => {
+                          const abilityKey = String(selectedSpell?.id || selectedSpell?.name || 'habilidade');
+                          const entry = magicResources.abilities[abilityKey] || { used: 0, max: 1, recharge: getAbilityRecharge(selectedSpell) };
+                          const remaining = Math.max(0, entry.max - entry.used);
+                          return (
+                            <View>
+                              <Text style={styles.spellResourceHint}>
+                                Usos: {remaining}/{entry.max} / recarga: {entry.recharge === 'turn' ? 'turno' : entry.recharge === 'short_rest' ? 'descanso curto' : 'descanso longo'}
+                              </Text>
+                              <View style={styles.spellCastButtonGrid}>
+                                <TouchableOpacity
+                                  style={[styles.spellCastButton, remaining <= 0 && styles.spellCastButtonDisabled]}
+                                  disabled={remaining <= 0 && !isLanPlayerControlledSheet}
+                                  onPress={() => handleUseSpellResource(selectedSpell)}
+                                >
+                                  <Text style={styles.spellCastButtonText}>USAR</Text>
+                                  <Text style={styles.spellCastButtonSub}>{remaining}/{entry.max}</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity style={styles.spellCastButtonSecondary} onPress={() => handleRestoreAbilityUse(selectedSpell)}>
+                                  <Text style={styles.spellCastButtonText}>+1 USO</Text>
+                                </TouchableOpacity>
+                              </View>
+                            </View>
+                          );
+                        })()
+                      )}
                     </View>
                   )}
 
@@ -2819,15 +3260,15 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                 <Text style={styles.modalTitle}>O que deseja equipar?</Text>
                 <TouchableOpacity style={styles.unequipBtn} onPress={() => handleEquipItem(null)}><Text style={styles.unequipBtnText}>[ Limpar Espaço ]</Text></TouchableOpacity>
                 <FlatList
-                    data={character?.equipment?.bag || []}
+                    data={(character?.equipment?.bag || []).filter((item: any) => isItemCompatibleWithSlot(item, activeSlot))}
                     keyExtractor={(i, idx) => idx.toString()}
                     renderItem={({item}) => {
-                      const dbItem = dbItemsCatalog.find(cat => cat.name === item.name);
-                      const itemDamage = item.damage || dbItem?.damage;
-                      const itemDamageType = item.damage_type || dbItem?.damage_type;
-                      const itemProps = item.properties || dbItem?.properties;
+                      const hydratedItem = hydrateItem(item);
+                      const itemDamage = hydratedItem.damage;
+                      const itemDamageType = hydratedItem.damage_type;
+                      const itemProps = hydratedItem.properties;
                       
-                      let subText = `Peso: ${item.weight}kg`;
+                      let subText = `Peso: ${hydratedItem.weight || item.weight}kg`;
                       if (itemDamage && itemDamage !== '-') subText = `⚔️ ${itemDamage} ${itemDamageType && itemDamageType !== '-' ? itemDamageType : ''} • ${subText}`;
                       else if (itemProps && itemProps !== '-') subText = `✨ ${itemProps.split(',')[0]} • ${subText}`;
 
@@ -2838,7 +3279,7 @@ export default function SinglePlayerSheetScreen({ characterId, syncAdapter, onOp
                         </TouchableOpacity>
                       )
                     }}
-                    ListEmptyComponent={<Text style={styles.emptyText}>Mochila vazia.</Text>}
+                    ListEmptyComponent={<Text style={styles.emptyText}>Nenhum item compatível na mochila.</Text>}
                 />
             </View>
         </Pressable>
@@ -3107,6 +3548,27 @@ const styles = StyleSheet.create({
   spellDetailInfoLabel: { color: 'rgba(255,255,255,0.4)', fontSize: 9, fontWeight: 'bold', letterSpacing: 1, marginBottom: 4 },
   spellDetailInfoValue: { color: '#fff', fontSize: 13, fontWeight: 'bold', textAlign: 'center' },
   spellDetailDescription: { color: 'rgba(255,255,255,0.8)', fontSize: 14, lineHeight: 22 },
+  magicResourcePanel: { backgroundColor: 'rgba(0,191,255,0.08)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.25)', borderRadius: 14, padding: 12, marginTop: 10, marginBottom: 8 },
+  magicResourceHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 10 },
+  magicResourceTitle: { color: '#00bfff', fontSize: 11, fontWeight: 'bold', letterSpacing: 1 },
+  magicResetButton: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#00bfff', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7 },
+  magicResetButtonText: { color: '#02112b', fontSize: 11, fontWeight: 'bold' },
+  magicSlotWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  magicSlotChip: { minWidth: 74, backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: 10, padding: 8, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+  magicSlotLabel: { color: 'rgba(255,255,255,0.55)', fontSize: 10, fontWeight: 'bold' },
+  magicSlotValue: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginTop: 2 },
+  magicSlotAddButton: { marginTop: 6, alignItems: 'center', backgroundColor: 'rgba(0,250,154,0.16)', borderRadius: 7, paddingVertical: 4 },
+  magicSlotAddText: { color: '#00fa9a', fontSize: 11, fontWeight: 'bold' },
+  abilityUseSummary: { marginTop: 10, gap: 4 },
+  abilityUseSummaryText: { color: 'rgba(255,255,255,0.72)', fontSize: 12 },
+  spellUsePanel: { backgroundColor: 'rgba(0,191,255,0.08)', borderWidth: 1, borderColor: 'rgba(0,191,255,0.22)', borderRadius: 12, padding: 12, marginBottom: 15 },
+  spellCastButtonGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  spellCastButton: { flexGrow: 1, minWidth: 92, alignItems: 'center', backgroundColor: '#00fa9a', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12 },
+  spellCastButtonSecondary: { flexGrow: 1, minWidth: 92, alignItems: 'center', backgroundColor: 'rgba(0,191,255,0.2)', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12, borderWidth: 1, borderColor: 'rgba(0,191,255,0.4)' },
+  spellCastButtonDisabled: { opacity: 0.45 },
+  spellCastButtonText: { color: '#02112b', fontSize: 12, fontWeight: 'bold' },
+  spellCastButtonSub: { color: 'rgba(2,17,43,0.7)', fontSize: 11, marginTop: 2, fontWeight: 'bold' },
+  spellResourceHint: { color: 'rgba(255,255,255,0.72)', fontSize: 12, marginBottom: 10 },
 
   // NOVOS ESTILOS PARA CÂMBIO DE MOEDAS
   exchangeBox: { flexDirection: 'row', backgroundColor: 'rgba(0,0,0,0.3)', padding: 15, borderRadius: 16, alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' },

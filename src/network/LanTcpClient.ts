@@ -24,6 +24,7 @@ export class LanTcpClient {
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private lastServerMessageAt = 0;
   private connected = false;
+  private reconnectAttempts = 0;
 
   constructor(options: LanTcpClientOptions) {
     this.options = options;
@@ -36,6 +37,7 @@ export class LanTcpClient {
 
   close() {
     this.closedByUser = true;
+    this.reconnectAttempts = 0;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -58,6 +60,7 @@ export class LanTcpClient {
 
     const socket = TcpSocket.createConnection({ host: this.options.host, port: this.options.port }, () => {
       this.connected = true;
+      this.reconnectAttempts = 0;
       this.lastServerMessageAt = Date.now();
       this.options.onStatus?.('connected');
       try {
@@ -125,10 +128,13 @@ export class LanTcpClient {
     this.destroySocket();
     if (this.reconnectTimer) return;
     this.options.onStatus?.('reconnecting');
+    this.reconnectAttempts += 1;
+    const baseDelayMs = this.options.reconnectMs || 3000;
+    const delayMs = Math.min(30000, baseDelayMs * Math.max(1, this.reconnectAttempts));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
-    }, this.options.reconnectMs || 3000);
+    }, delayMs);
   }
 
   private destroySocket() {

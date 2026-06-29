@@ -415,6 +415,7 @@ type BaseFeatureSpellRepair = {
   savingThrow?: string;
   description: string;
   classLevelRequired: number;
+  forceUpdate?: boolean;
 };
 
 function normalizeFeatureRequirements(features: FeatureRequirementSeed[]) {
@@ -491,7 +492,7 @@ const BASE_CLASS_FEATURE_REPAIRS: BaseClassFeatureRepair[] = [
   },
   {
     name: 'Paladino',
-    features: ['Sentido Divino', 'Imposição das Mãos', { name: 'Estilo de Luta', level: 2 }, { name: 'Conjuração de Paladino', level: 2 }, { name: 'Golpe Divino', level: 2 }, { name: 'Juramento Sagrado', level: 3 }, { name: 'Ataque Extra', level: 5 }],
+    features: ['Sentido Divino', 'Imposição das Mãos', { name: 'Estilo de Luta', level: 2 }, { name: 'Conjuração de Paladino', level: 2 }, { name: 'Golpe Divino', level: 2 }, { name: 'Juramento Sagrado', level: 3 }, { name: 'Ataque Extra', level: 5 }, { name: 'Aura de Proteção', level: 6 }, { name: 'Aura de Coragem', level: 10 }, { name: 'Golpe Divino Aprimorado', level: 11 }, { name: 'Toque Purificador', level: 14 }],
   },
   {
     name: 'Patrulheiro',
@@ -627,7 +628,188 @@ const BASE_SPELL_NAME_REPAIRS = [
   { from: 'Juramento de Vingança: Inimigo Abjurado', to: 'Inimigo Abjurado' },
   { from: 'Mestre de Batalha: Ripostar', to: 'Ripostar' },
   { from: 'Mestre de Batalha: Ataque Empurrão', to: 'Ataque Empurrão' },
+  { from: 'Aura de Protecao', to: 'Aura de Proteção' },
 ];
+
+const BASE_FEATURE_SPELL_DETAILS: Record<string, Partial<BaseFeatureSpellRepair>> = {
+  'Fúria': {
+    category: 'Habilidade',
+    castingTime: '1 Ação Bônus',
+    range: 'Pessoal',
+    duration: '1 Minuto',
+    damageDice: '+2 Dano',
+    damageType: 'Extra',
+    description: 'Entra em fúria, ganhando bônus de dano corpo a corpo com Força e resistência a dano físico comum.',
+    forceUpdate: true,
+  },
+  'Inspiração Bárdica': {
+    category: 'Habilidade',
+    castingTime: '1 Ação Bônus',
+    range: '18m',
+    duration: '10 Minutos',
+    damageDice: '1d6',
+    damageType: 'Suporte',
+    description: 'Concede um dado de inspiração para aliado somar a teste, ataque ou resistência.',
+    forceUpdate: true,
+  },
+  'Ataque Furtivo': {
+    category: 'Habilidade',
+    castingTime: 'Ao acertar',
+    range: 'Arma',
+    duration: 'Instantânea',
+    damageDice: '1d6+',
+    damageType: 'Extra',
+    description: 'Uma vez por turno, causa dano extra se tiver vantagem ou aliado adjacente ao alvo.',
+    forceUpdate: true,
+  },
+  'Forma Selvagem': {
+    category: 'Habilidade',
+    castingTime: '1 Ação',
+    range: 'Pessoal',
+    duration: 'Horas',
+    damageDice: '-',
+    damageType: 'Transformação',
+    description: 'Assume a forma de uma fera conhecida, usando usos da Forma Selvagem.',
+    forceUpdate: true,
+  },
+  'Segundo Fôlego': {
+    category: 'Habilidade',
+    castingTime: '1 Ação Bônus',
+    range: 'Pessoal',
+    duration: 'Instantânea',
+    damageDice: '1d10 + nível',
+    damageType: 'Cura',
+    description: 'Recupera pontos de vida uma vez por descanso curto ou longo.',
+    forceUpdate: true,
+  },
+  'Surto de Ação': {
+    category: 'Habilidade',
+    castingTime: 'Livre',
+    range: 'Pessoal',
+    duration: 'Turno atual',
+    damageDice: '+1 Ação',
+    damageType: 'Ação',
+    description: 'Ganha uma ação adicional no turno uma vez por descanso curto ou longo.',
+    forceUpdate: true,
+  },
+  'Ki': {
+    category: 'Habilidade',
+    castingTime: 'Especial',
+    range: 'Pessoal',
+    duration: 'Variável',
+    damageDice: 'Pontos de Ki',
+    damageType: 'Recurso',
+    description: 'Usa pontos de Ki para técnicas como Rajada de Golpes, Defesa Paciente e Passo do Vento.',
+    forceUpdate: true,
+  },
+  'Ataque Atordoante': {
+    category: 'Habilidade',
+    castingTime: 'Ao acertar',
+    range: 'Corpo a corpo',
+    duration: '1 Rodada',
+    damageDice: '1 Ki',
+    damageType: 'Controle',
+    savingThrow: 'CON',
+    description: 'Ao acertar ataque corpo a corpo com arma, gasta Ki para tentar atordoar o alvo.',
+    forceUpdate: true,
+  },
+  'Sentido Divino': {
+    category: 'Habilidade',
+    castingTime: '1 Ação',
+    range: '18m',
+    duration: 'Até fim do próximo turno',
+    damageDice: '-',
+    damageType: 'Detecção',
+    description: 'Detecta celestiais, corruptores, mortos-vivos e locais/objetos consagrados ou profanados próximos.',
+    forceUpdate: true,
+  },
+  'Imposição das Mãos': {
+    category: 'Habilidade',
+    castingTime: '1 Ação',
+    range: 'Toque',
+    duration: 'Instantânea',
+    damageDice: '5 x nível',
+    damageType: 'Cura',
+    description: 'Reserva de cura igual a 5 vezes o nível de Paladino; também pode remover doença ou veneno.',
+    forceUpdate: true,
+  },
+  'Conjuração de Paladino': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Espaços',
+    damageType: 'Magia',
+    description: 'Permite preparar e conjurar magias de Paladino usando Carisma.',
+    forceUpdate: true,
+  },
+  'Golpe Divino': {
+    level: 'Nível 2',
+    category: 'Habilidade',
+    castingTime: 'Após acertar',
+    range: 'Arma',
+    duration: 'Instantânea',
+    damageDice: '2d8 + 1d8/nível',
+    damageType: 'Radiante',
+    description: 'Ao acertar com arma corpo a corpo, gasta um espaço de magia para causar dano radiante extra. +1d8 por nível do espaço acima do 1º.',
+    forceUpdate: true,
+  },
+  'Juramento Sagrado': {
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Pessoal',
+    duration: 'Permanente',
+    damageDice: 'Subclasse',
+    damageType: 'Juramento',
+    description: 'Escolhe um juramento de Paladino e desbloqueia poderes de Canalizar Divindade e magias de juramento.',
+    forceUpdate: true,
+  },
+  'Aura de Proteção': {
+    level: 'Nível 6',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: '3m',
+    duration: 'Permanente',
+    damageDice: '+CAR',
+    damageType: 'Defesa',
+    savingThrow: 'Todos',
+    description: 'Você e aliados próximos somam seu modificador de Carisma aos testes de resistência.',
+    forceUpdate: true,
+  },
+  'Aura de Coragem': {
+    level: 'Nível 10',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: '3m',
+    duration: 'Permanente',
+    damageDice: '-',
+    damageType: 'Defesa',
+    description: 'Você e aliados próximos não podem ficar amedrontados enquanto você estiver consciente.',
+    forceUpdate: true,
+  },
+  'Golpe Divino Aprimorado': {
+    level: 'Nível 11',
+    category: 'Passiva',
+    castingTime: 'Passiva',
+    range: 'Arma',
+    duration: 'Permanente',
+    damageDice: '+1d8',
+    damageType: 'Radiante',
+    description: 'Seus ataques corpo a corpo com arma causam 1d8 de dano radiante extra.',
+    forceUpdate: true,
+  },
+  'Toque Purificador': {
+    level: 'Nível 14',
+    category: 'Habilidade',
+    castingTime: '1 Ação',
+    range: 'Toque',
+    duration: 'Instantânea',
+    damageDice: 'Encerrar magia',
+    damageType: 'Suporte',
+    description: 'Encerra uma magia em você ou em uma criatura voluntária tocada.',
+    forceUpdate: true,
+  },
+};
 
 function featureLevelToSpellLevel(level: number) {
   if (level <= 0) return 'Passiva';
@@ -657,6 +839,19 @@ function parsePositiveLevel(value: unknown, fallback = 1) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function shouldUseBaseFeatureDetail(existing: unknown, replacement: unknown, genericValues: string[] = []) {
+  const existingText = String(existing ?? '').trim();
+  const replacementText = String(replacement ?? '').trim();
+  if (!replacementText) return existingText;
+  if (!existingText || genericValues.includes(existingText)) return replacementText;
+  return existingText;
+}
+
+function isGenericFeatureDescription(value: unknown) {
+  const text = String(value ?? '').trim().toLowerCase();
+  return !text || text.includes('concedida por');
+}
+
 function makeFeatureSpellRepair(
   feature: FeatureRequirementSeed,
   sourceType: 'race' | 'class' | 'subclass',
@@ -666,21 +861,23 @@ function makeFeatureSpellRepair(
   const normalizedFeature = typeof feature === 'string'
     ? { name: feature, level: 1, spellLevel: undefined as string | undefined }
     : { name: feature.name, level: feature.level || 1, spellLevel: feature.spellLevel };
-  const category = FEATURE_CATEGORY_OVERRIDES[normalizedFeature.name] || 'Passiva';
+  const details = BASE_FEATURE_SPELL_DETAILS[normalizedFeature.name] || {};
+  const category = details.category || FEATURE_CATEGORY_OVERRIDES[normalizedFeature.name] || 'Passiva';
   return {
     name: normalizedFeature.name,
-    level: normalizedFeature.spellLevel || (category === 'Magia' && normalizedFeature.level === 1 ? 'Truque' : featureLevelToSpellLevel(normalizedFeature.level)),
+    level: details.level || normalizedFeature.spellLevel || (category === 'Magia' && normalizedFeature.level === 1 ? 'Truque' : featureLevelToSpellLevel(normalizedFeature.level)),
     category,
     classes: featureSourceClasses(sourceType, sourceName, className),
-    castingTime: category === 'Passiva' ? 'Passiva' : 'Especial',
-    range: category === 'Passiva' ? 'Pessoal' : 'Variável',
-    components: category === 'Magia' ? 'V, S' : '-',
-    duration: category === 'Passiva' ? 'Permanente' : 'Variável',
-    damageDice: '-',
-    damageType: 'Outro',
-    savingThrow: 'Nenhum',
-    description: `${category} concedida por ${sourceName}.`,
+    castingTime: details.castingTime || (category === 'Passiva' ? 'Passiva' : 'Especial'),
+    range: details.range || (category === 'Passiva' ? 'Pessoal' : 'Variável'),
+    components: details.components || (category === 'Magia' ? 'V, S' : '-'),
+    duration: details.duration || (category === 'Passiva' ? 'Permanente' : 'Variável'),
+    damageDice: details.damageDice || '-',
+    damageType: details.damageType || 'Outro',
+    savingThrow: details.savingThrow || 'Nenhum',
+    description: details.description || `${category} concedida por ${sourceName}.`,
     classLevelRequired: normalizedFeature.level,
+    forceUpdate: details.forceUpdate,
   };
 }
 
@@ -739,6 +936,7 @@ async function upsertBaseFeatureSpell(db: SQLiteDatabase, spell: BaseFeatureSpel
     const existingCategory = existing.category || spell.category;
     const finalCategory = existingCategory === 'Magia' || spell.category === 'Magia' ? 'Magia' : existingCategory === 'Habilidade' || spell.category === 'Habilidade' ? 'Habilidade' : 'Passiva';
     const finalRequiredLevel = Math.min(parsePositiveLevel(existing.class_level_required, spell.classLevelRequired), spell.classLevelRequired);
+    const useDetail = Boolean(spell.forceUpdate);
 
     await db.runAsync(
       `UPDATE spells
@@ -747,17 +945,17 @@ async function upsertBaseFeatureSpell(db: SQLiteDatabase, spell: BaseFeatureSpel
            criador = 'base'
        WHERE name = ? AND IFNULL(criador, 'base') = 'base'`,
       [
-        existing.level || spell.level,
+        useDetail ? spell.level : shouldUseBaseFeatureDetail(existing.level, spell.level),
         finalCategory,
         mergeCommaList(existing.classes, spell.classes),
-        existing.casting_time || spell.castingTime || 'Especial',
-        existing.range || spell.range || 'Pessoal',
-        existing.components || spell.components || '-',
-        existing.duration || spell.duration || 'Variável',
-        existing.damage_dice || spell.damageDice || '-',
-        existing.damage_type || spell.damageType || 'Outro',
-        existing.saving_throw || spell.savingThrow || 'Nenhum',
-        existing.description || spell.description,
+        useDetail ? (spell.castingTime || 'Especial') : shouldUseBaseFeatureDetail(existing.casting_time, spell.castingTime || 'Especial', ['Especial']),
+        useDetail ? (spell.range || 'Pessoal') : shouldUseBaseFeatureDetail(existing.range, spell.range || 'Pessoal', ['Variável']),
+        useDetail ? (spell.components || '-') : shouldUseBaseFeatureDetail(existing.components, spell.components || '-'),
+        useDetail ? (spell.duration || 'Variável') : shouldUseBaseFeatureDetail(existing.duration, spell.duration || 'Variável', ['Variável']),
+        useDetail ? (spell.damageDice || '-') : shouldUseBaseFeatureDetail(existing.damage_dice, spell.damageDice || '-', ['-', '2d8+']),
+        useDetail ? (spell.damageType || 'Outro') : shouldUseBaseFeatureDetail(existing.damage_type, spell.damageType || 'Outro', ['Outro']),
+        useDetail ? (spell.savingThrow || 'Nenhum') : shouldUseBaseFeatureDetail(existing.saving_throw, spell.savingThrow || 'Nenhum', ['Nenhum']),
+        useDetail || isGenericFeatureDescription(existing.description) ? spell.description : (existing.description || spell.description),
         String(finalRequiredLevel),
         spell.name,
       ]
@@ -2172,6 +2370,7 @@ export async function initializeDatabase(db: SQLiteDatabase) {
   await ensureColumn(db, 'bg3_companions', 'origin_traits', 'TEXT');
   await ensureColumn(db, 'characters', 'hp_temp', 'INTEGER DEFAULT 0');
   await ensureColumn(db, 'characters', 'avatar_uri', 'TEXT');
+  await ensureColumn(db, 'characters', 'spell_slots_used', `TEXT DEFAULT '{}'`);
   await ensureColumn(db, 'items', 'category', 'TEXT');
   await ensureColumn(db, 'items', 'is_consumable', 'INTEGER DEFAULT 0');
   await ensureColumn(db, 'effects', 'source_name', 'TEXT');

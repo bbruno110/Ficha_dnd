@@ -125,6 +125,16 @@ const LAN_SYNC_PUSH_EVENT_WINDOW = 24;
 const LAN_SYNC_PUSH_EVENT_LIMIT = 32;
 const LAN_SYNC_PUSH_RECENT_LIMIT = 6;
 const LAN_HP_BATCH_WINDOW_MS = 90;
+const LAN_PLAYER_POLL_CONNECTED_INTERVAL_MS = 3200;
+const LAN_PLAYER_POLL_RECONNECTING_INTERVAL_MS = 6500;
+const LAN_PLAYER_POLL_PAUSED_INTERVAL_MS = 9000;
+const LAN_PLAYER_POLL_TIMEOUT_MS = 2400;
+const LAN_PLAYER_POLL_PAUSED_TIMEOUT_MS = 1600;
+const LAN_PLAYER_POLL_FAILURES_BEFORE_RECOVERY = 3;
+const LAN_DISCOVERY_RETRY_COOLDOWN_MS = 22000;
+const LAN_RECOVERY_RETRY_BASE_MS = 8000;
+const LAN_RECOVERY_RETRY_MAX_MS = 45000;
+const LAN_MASTER_OFFLINE_GRACE_MS = 120000;
 
 type BuildRpcSyncPayloadOptions = {
   sinceSeq?: number;
@@ -199,8 +209,6 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const [lanRevision, setLanRevision] = useState(0);
   const [localDeviceId, setLocalDeviceId] = useState('');
   const [players, setPlayers] = useState<LanPlayerSummary[]>([]);
-  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
-
   const rpcServerRef = useRef<LanTcpServer | null>(null);
   const tcpClientRef = useRef<LanTcpClient | null>(null);
   const tcpClientKeyRef = useRef('');
@@ -224,6 +232,9 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
   const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
   const hpCommandBatchRef = useRef<Record<string, PendingHpBatch>>({});
   const playerPollInFlightRef = useRef(false);
+  const playerPollFailureCountRef = useRef<Record<string, number>>({});
+  const lastDiscoveryAttemptAtRef = useRef<Record<string, number>>({});
+  const delayedOfflineTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const pushTcpSyncRef = useRef<((session: LanSessionRecord, reason?: string) => Promise<void>) | null>(null);
   const scheduledPushSyncRef = useRef<{
     timer: ReturnType<typeof setTimeout>;
@@ -244,7 +255,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       const session = activeSessionRef.current;
       if (!session || session.status === 'closed' || session.role !== 'player') return;
       if (suppressReconnectRef.current) return;
-      if (reconnectingRef.current || reconnectTimerRef.current) return;
+      if (reconnectTimerRef.current) return;
+      if (reconnectingRef.current && !reason.startsWith('recover-retry')) return;
 
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null;
@@ -347,6 +359,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    reconnectingRef.current = false;
+    playerPollInFlightRef.current = false;
     if (closingSessionTimerRef.current) {
       clearTimeout(closingSessionTimerRef.current);
       closingSessionTimerRef.current = null;
@@ -354,6 +368,10 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     closingSessionPendingDevicesRef.current = {};
     closingSessionRef.current = null;
     reconnectFailureCountRef.current = {};
+    playerPollFailureCountRef.current = {};
+    lastDiscoveryAttemptAtRef.current = {};
+    Object.values(delayedOfflineTimersRef.current).forEach(timer => clearTimeout(timer));
+    delayedOfflineTimersRef.current = {};
     joinedCharacterEventsRef.current = {};
     closedAckSentRef.current = {};
     await LanForegroundService.stop().catch(() => undefined);
@@ -391,6 +409,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       closingSessionPendingDevicesRef.current[sessionId]?.clear();
       delete closingSessionPendingDevicesRef.current[sessionId];
       joinedCharacterEventsRef.current = {};
+      Object.values(delayedOfflineTimersRef.current).forEach(timer => clearTimeout(timer));
+      delayedOfflineTimersRef.current = {};
       await rpcServerRef.current?.close();
       rpcServerRef.current = null;
       closingSessionRef.current = null;
@@ -462,6 +482,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
       reconnectingRef.current = false;
       delete reconnectFailureCountRef.current[session.id];
+      delete playerPollFailureCountRef.current[session.id];
+      delete lastDiscoveryAttemptAtRef.current[session.id];
 
       await setLanSessionStatus(db, session.id, 'closed');
       await linkCharacterToSession(db, session.id, null);
@@ -609,7 +631,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
 
         if (!deviceId || deviceId === deviceIdRef.current) {
-          const allowedColumns = ['equipment', 'gp', 'sp', 'cp', 'hp_current', 'hp_temp', 'xp', 'stats'];
+          const allowedColumns = ['equipment', 'gp', 'sp', 'cp', 'hp_current', 'hp_temp', 'xp', 'stats', 'spell_slots_used'];
           const entries = Object.entries(normalizedPatch).filter(([key]) => allowedColumns.includes(key));
           if (entries.length > 0) {
             const values = entries.map(([, value]) => (
@@ -734,6 +756,20 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             await db.runAsync(`UPDATE characters SET stats = ? WHERE id = ?`, [statsText, event.targetCharacterId]);
           }
           await patchRemoteSnapshot({ stats: statsText });
+          didMutateCharacter = true;
+        }
+      }
+
+      if (event.eventType === 'RESOURCE_CHANGED') {
+        const currentValue = event.currentValue as { spell_slots_used?: unknown } | undefined;
+        if (currentValue && currentValue.spell_slots_used !== undefined) {
+          const resourceText = typeof currentValue.spell_slots_used === 'string'
+            ? currentValue.spell_slots_used
+            : JSON.stringify(currentValue.spell_slots_used || {});
+          if (shouldUpdateLocalCharacter) {
+            await db.runAsync(`UPDATE characters SET spell_slots_used = ? WHERE id = ?`, [resourceText, event.targetCharacterId]);
+          }
+          await patchRemoteSnapshot({ spell_slots_used: resourceText });
           didMutateCharacter = true;
         }
       }
@@ -1536,6 +1572,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           hostIp: resumedSession.host_ip || null,
           port,
           playerCount: players.length,
+          role: resumedSession.role,
+          status: resumedSession.status,
         }).catch(error => {
           void traceLan('FUNCTION', 'LanForegroundService.start', 'native_unavailable', 'Foreground Service nativo indisponivel ou falhou.', {
             error: error instanceof Error ? error.message : String(error),
@@ -1617,6 +1655,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           hostIp: closedSession.host_ip || null,
           port,
           playerCount: pendingDevices.size,
+          role: closedSession.role,
+          status: closedSession.status,
         }).catch(error => {
           void traceLan('FUNCTION', 'LanForegroundService.start', 'native_unavailable', 'Foreground Service nativo indisponivel ou falhou ao anunciar encerramento.', {
             error: error instanceof Error ? error.message : String(error),
@@ -1667,6 +1707,32 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       }
 
       const progressSessionEffects = async (progress: { turns?: number; minutes?: number; restType?: 'short_rest' | 'long_rest' }) => {
+        const normalizeResources = (value: unknown) => {
+          const parsed = typeof value === 'string'
+            ? (() => { try { return JSON.parse(value || '{}'); } catch { return {}; } })()
+            : value && typeof value === 'object'
+              ? value as any
+              : {};
+          const slots = Object.fromEntries(Object.entries(parsed?.slots || {}).map(([level, used]) => [String(level), Math.max(0, Math.trunc(Number(used || 0)))]));
+          const abilities = Object.fromEntries(Object.entries(parsed?.abilities || {}).map(([id, entry]: [string, any]) => [String(id), {
+            used: Math.max(0, Math.trunc(Number(entry?.used || 0))),
+            max: Math.max(1, Math.trunc(Number(entry?.max || 1))),
+            recharge: ['turn', 'short_rest', 'long_rest'].includes(String(entry?.recharge)) ? String(entry.recharge) : 'long_rest',
+          }]));
+          return { slots, abilities };
+        };
+        const resetResources = (value: unknown) => {
+          const resources = normalizeResources(value);
+          if (progress.restType === 'long_rest') return { slots: {}, abilities: {} };
+          if (progress.restType === 'short_rest') {
+            return { slots: resources.slots, abilities: Object.fromEntries(Object.entries(resources.abilities).filter(([, entry]: [string, any]) => entry.recharge === 'long_rest')) };
+          }
+          if (Number(progress.turns || 0) > 0) {
+            return { slots: resources.slots, abilities: Object.fromEntries(Object.entries(resources.abilities).filter(([, entry]: [string, any]) => entry.recharge !== 'turn')) };
+          }
+          return resources;
+        };
+
         const linkedPlayers = await db.getAllAsync<any>(
           `SELECT device_id, character_id, character_name FROM lan_session_players WHERE session_id = ? AND character_id IS NOT NULL`,
           [session.id]
@@ -1676,7 +1742,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           const characterId = Number(player.character_id || 0);
           if (!characterId) continue;
 
-          let character = await db.getFirstAsync<any>(`SELECT id, name, stats, hp_temp FROM characters WHERE id = ?`, [characterId]);
+          let character = await db.getFirstAsync<any>(`SELECT id, name, stats, hp_temp, spell_slots_used FROM characters WHERE id = ?`, [characterId]);
           if (!character) {
             const snapshotRow = await db.getFirstAsync<{ payload: string }>(
               `SELECT payload FROM lan_character_snapshots
@@ -1695,6 +1761,29 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           }
 
           if (!character) continue;
+          const previousResources = normalizeResources(character.spell_slots_used || '{}');
+          const nextResources = resetResources(previousResources);
+          if (JSON.stringify(previousResources) !== JSON.stringify(nextResources)) {
+            await emitOfficialEvent({
+              sessionId: session.id,
+              eventType: 'RESOURCE_CHANGED',
+              commandId: command.commandId,
+              actorDeviceId: command.deviceId,
+              actorName: command.actorName || 'Mestre',
+              targetDeviceId: player.device_id || null,
+              targetCharacterId: characterId,
+              targetName: character.name || player.character_name || 'Personagem',
+              previousValue: { spell_slots_used: JSON.stringify(previousResources) },
+              currentValue: { spell_slots_used: JSON.stringify(nextResources) },
+              description: progress.restType === 'long_rest'
+                ? `Recursos de ${character.name || player.character_name || 'Personagem'} foram resetados por descanso longo.`
+                : progress.restType === 'short_rest'
+                  ? `Recursos de descanso curto foram resetados em ${character.name || player.character_name || 'Personagem'}.`
+                  : `Recursos de turno foram atualizados em ${character.name || player.character_name || 'Personagem'}.`,
+              payload: { progress },
+            });
+          }
+
           const previousStats = normalizeStats(character.stats);
           if (previousStats.timed_effects.length === 0) continue;
 
@@ -1855,7 +1944,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       let target: any = null;
 
       if (isLocalTarget) {
-        target = await db.getFirstAsync<any>(`SELECT id, name, stats, equipment, hp_current, hp_max, hp_temp, xp, gp, sp, cp FROM characters WHERE id = ?`, [
+        target = await db.getFirstAsync<any>(`SELECT id, name, stats, equipment, hp_current, hp_max, hp_temp, xp, gp, sp, cp, spell_slots_used FROM characters WHERE id = ?`, [
           targetCharacterId,
         ]);
       } else {
@@ -2057,6 +2146,32 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             durationMode,
             durationUnit,
             durationValue,
+            requestCommandId: command.payload?.requestCommandId || null,
+          },
+        });
+        return;
+      }
+
+      if (command.command === 'MASTER_APPLY_RESOURCE') {
+        const previousText = typeof target?.spell_slots_used === 'string'
+          ? target.spell_slots_used
+          : JSON.stringify(target?.spell_slots_used || {});
+        const nextPayload = command.payload?.spellSlotsUsed ?? command.payload?.spell_slots_used ?? {};
+        const nextText = typeof nextPayload === 'string' ? nextPayload : JSON.stringify(nextPayload || {});
+
+        await emitOfficialEvent({
+          sessionId: session.id,
+          eventType: 'RESOURCE_CHANGED',
+          commandId: command.commandId,
+          actorDeviceId: command.deviceId,
+          actorName: command.actorName || 'Mestre',
+          targetDeviceId: targetDeviceId || null,
+          targetCharacterId,
+          targetName,
+          previousValue: { spell_slots_used: previousText },
+          currentValue: { spell_slots_used: nextText },
+          description: String(command.payload?.description || `Mestre ajustou recursos de ${targetName}.`),
+          payload: {
             requestCommandId: command.payload?.requestCommandId || null,
           },
         });
@@ -2745,6 +2860,11 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           const payload = request.payload || {};
           const deviceId = String(request.deviceId || payload.deviceId || '');
           if (!deviceId) return makeRpcResponse(request, false, undefined, 'Jogador sem deviceId.');
+          const offlineTimerKey = `${session.id}:${deviceId}`;
+          if (delayedOfflineTimersRef.current[offlineTimerKey]) {
+            clearTimeout(delayedOfflineTimersRef.current[offlineTimerKey]);
+            delete delayedOfflineTimersRef.current[offlineTimerKey];
+          }
 
           const playerName = String(payload.playerName || 'Jogador');
           const characterId = payload.characterId ? Number(payload.characterId) : null;
@@ -2809,6 +2929,11 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           const payload = request.payload || {};
           const deviceId = String(request.deviceId || payload.deviceId || '');
           if (deviceId) {
+            const offlineTimerKey = `${session.id}:${deviceId}`;
+            if (delayedOfflineTimersRef.current[offlineTimerKey]) {
+              clearTimeout(delayedOfflineTimersRef.current[offlineTimerKey]);
+              delete delayedOfflineTimersRef.current[offlineTimerKey];
+            }
             const playerName = String(payload.playerName || 'Jogador');
             await upsertLanPlayer(db, session.id, deviceId, playerName, payload.characterId ? Number(payload.characterId) : null, payload.characterName ? String(payload.characterName) : null, true);
           }
@@ -2878,7 +3003,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
   const makeLanTcpServer = useCallback(
     (sessionId: string, errorMetadata: Record<string, unknown> = {}) => new LanTcpServer(handleRpcRequest, {
-      heartbeatMs: 10000,
+      heartbeatMs: 15000,
       onStatus: status => setLastNotice(status),
       onError: message => {
         setLastError(message);
@@ -2897,6 +3022,12 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         if (!response.ok) {
           return { error: response.error || 'Falha ao entrar na sessao LAN.' };
         }
+        const deviceId = String(message.deviceId || message.payload?.deviceId || '');
+        const offlineTimerKey = `${sessionId}:${deviceId}`;
+        if (delayedOfflineTimersRef.current[offlineTimerKey]) {
+          clearTimeout(delayedOfflineTimersRef.current[offlineTimerKey]);
+          delete delayedOfflineTimersRef.current[offlineTimerKey];
+        }
         setPeerCount(rpcServerRef.current?.connectedDeviceIds().length || 0);
         return response.payload;
       },
@@ -2908,16 +3039,34 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         }
       },
       onClientDisconnected: async (deviceId, disconnectedSessionId) => {
-        await db.runAsync(
-          `UPDATE lan_session_players SET connected = 0, last_seen_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ?`,
-          [disconnectedSessionId, deviceId]
-        );
+        const offlineTimerKey = `${disconnectedSessionId}:${deviceId}`;
+        if (delayedOfflineTimersRef.current[offlineTimerKey]) {
+          clearTimeout(delayedOfflineTimersRef.current[offlineTimerKey]);
+        }
         setPeerCount(rpcServerRef.current?.connectedDeviceIds().length || 0);
-        await refreshPlayers();
-        await traceLan('LAN_TCP', 'LanTcpServer', 'client_disconnected', 'Jogador desconectado do socket persistente.', {
+        await traceLan('LAN_TCP', 'LanTcpServer', 'client_disconnect_pending', 'Socket do jogador caiu; aguardando reconexao antes de marcar offline.', {
           sessionId: disconnectedSessionId,
           deviceId,
+          graceMs: LAN_MASTER_OFFLINE_GRACE_MS,
         }, 'warn');
+        delayedOfflineTimersRef.current[offlineTimerKey] = setTimeout(() => {
+          delete delayedOfflineTimersRef.current[offlineTimerKey];
+          const stillDisconnected = !rpcServerRef.current?.connectedDeviceIds().includes(deviceId);
+          if (!stillDisconnected) return;
+          void (async () => {
+            await db.runAsync(
+              `UPDATE lan_session_players SET connected = 0, last_seen_at = CURRENT_TIMESTAMP WHERE session_id = ? AND device_id = ?`,
+              [disconnectedSessionId, deviceId]
+            );
+            setPeerCount(rpcServerRef.current?.connectedDeviceIds().length || 0);
+            await refreshPlayers();
+            await traceLan('LAN_TCP', 'LanTcpServer', 'client_disconnected', 'Jogador marcado offline apos janela de reconexao.', {
+              sessionId: disconnectedSessionId,
+              deviceId,
+              graceMs: LAN_MASTER_OFFLINE_GRACE_MS,
+            }, 'warn');
+          })().catch(() => undefined);
+        }, LAN_MASTER_OFFLINE_GRACE_MS);
       },
     }),
     [acknowledgeClosedSessionDelivery, db, handleRpcRequest, refreshPlayers, traceLan]
@@ -2956,8 +3105,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         sessionId: session.id,
         deviceId,
         payload,
-        reconnectMs: 3000,
-        serverSilenceMs: 26000,
+        reconnectMs: 4000,
+        serverSilenceMs: 50000,
         onStatus: status => {
           tcpClientConnectedRef.current = status === 'connected';
           setTransportReadyState(status === 'connected');
@@ -3077,6 +3226,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
             hostIp: session.host_ip || null,
             port: Number(session.port || LAN_DEFAULT_PORT),
             playerCount: players.length,
+            role: session.role,
+            status: session.status,
           }).catch(error => {
             void traceLan('FUNCTION', 'LanForegroundService.start', 'native_unavailable', 'Foreground Service nativo indisponivel ou falhou.', {
               error: error instanceof Error ? error.message : String(error),
@@ -3130,6 +3281,14 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           } catch (error) {
             const parsedCode = parseSessionCode(nextSession.session_code || nextSession.id);
             if (!parsedCode) throw error;
+            const now = Date.now();
+            const lastDiscoveryAttemptAt = lastDiscoveryAttemptAtRef.current[nextSession.id] || 0;
+            const canRediscoverNow = reason.startsWith('manual-') || now - lastDiscoveryAttemptAt >= LAN_DISCOVERY_RETRY_COOLDOWN_MS;
+            if (!canRediscoverNow) {
+              const retryInMs = Math.max(1000, LAN_DISCOVERY_RETRY_COOLDOWN_MS - (now - lastDiscoveryAttemptAt));
+              throw new Error(`Mestre LAN temporariamente sem resposta. Nova redescoberta em ${Math.ceil(retryInMs / 1000)}s.`);
+            }
+            lastDiscoveryAttemptAtRef.current[nextSession.id] = now;
             await traceLan('LAN_DISCOVERY', 'recoverLanSession', 'rediscover_after_poll_failed', 'Polling falhou; redescobrindo mestre LAN.', {
               sessionId: nextSession.id,
               previousHostIp: nextSession.host_ip || null,
@@ -3169,6 +3328,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
         setLanRevision(prev => prev + 1);
         delete reconnectFailureCountRef.current[(session as LanSessionRecord).id];
+        delete playerPollFailureCountRef.current[(session as LanSessionRecord).id];
         await traceLan('FUNCTION', 'recoverLanSession', 'success', 'Retomada LAN concluida.', {
           sessionId: (session as LanSessionRecord).id,
           role: (session as LanSessionRecord).role,
@@ -3177,29 +3337,41 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const currentSession = activeSessionRef.current;
-        const masterClosedExplicitly = /encerrada|encerrado|closed/i.test(message);
+        const masterClosedExplicitly = /(mesa|sessao|sessão).*(encerrada|encerrado|closed)|session[_ -]?closed/i.test(message);
         const masterNotFound = /nao encontrada|não encontrada|not found/i.test(message);
-        const shouldCloseAfterMissingMaster =
-          currentSession?.role === 'player' &&
-          currentSession.status !== 'paused' &&
-          masterNotFound &&
-          ((reconnectFailureCountRef.current[currentSession.id] || 0) + 1 >= 2);
         if (currentSession?.role === 'player' && masterNotFound) {
           reconnectFailureCountRef.current[currentSession.id] = (reconnectFailureCountRef.current[currentSession.id] || 0) + 1;
         }
-        if (currentSession?.role === 'player' && (masterClosedExplicitly || shouldCloseAfterMissingMaster)) {
+        if (currentSession?.role === 'player' && masterClosedExplicitly) {
           await finalizeClosedPlayerSession(
             currentSession,
-            masterClosedExplicitly ? 'master-closed-error' : 'master-missing',
-            masterClosedExplicitly
+            'master-closed-error',
+            true
           );
-          await traceLan('FUNCTION', 'recoverLanSession', masterClosedExplicitly ? 'closed_after_master_closed' : 'closed_after_master_missing', 'Sessao local do jogador foi finalizada e ficha desvinculada.', {
+          await traceLan('FUNCTION', 'recoverLanSession', 'closed_after_master_closed', 'Sessao local do jogador foi finalizada por encerramento explicito do mestre.', {
             sessionId: currentSession.id,
             error: message,
             reason,
             masterClosedExplicitly,
             masterNotFound,
           }, 'info');
+          return;
+        }
+        if (currentSession?.role === 'player') {
+          const failureCount = reconnectFailureCountRef.current[currentSession.id] || 1;
+          const retryDelayMs = Math.min(LAN_RECOVERY_RETRY_MAX_MS, LAN_RECOVERY_RETRY_BASE_MS * failureCount);
+          setTransportReadyState(false);
+          setLanConnectionStatus('reconnecting');
+          setLastError(`Conexao LAN instavel. Tentando reconectar sem liberar sua ficha. (${message})`);
+          scheduleLanReconnect('recover-retry-preserved-session', retryDelayMs);
+          await traceLan('FUNCTION', 'recoverLanSession', masterNotFound ? 'missing_master_preserved' : 'transient_error_preserved', 'Falha ao retomar LAN preservou sessao/ficha para nova tentativa.', {
+            sessionId: currentSession.id,
+            error: message,
+            reason,
+            masterNotFound,
+            failureCount,
+            retryDelayMs,
+          }, masterNotFound ? 'warn' : 'error');
           return;
         }
         setTransportReadyState(false);
@@ -3213,7 +3385,7 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         reconnectingRef.current = false;
       }
     },
-    [applyRpcSyncPayload, db, ensureTcpClient, finalizeClosedPlayerSession, getLocalLastEventSeq, handleRpcRequest, makeLanTcpServer, players.length, refreshPlayers, refreshSavedSessions, setLanConnectionStatus, setTransportReadyState, traceLan]
+    [applyRpcSyncPayload, db, ensureTcpClient, finalizeClosedPlayerSession, getLocalLastEventSeq, handleRpcRequest, makeLanTcpServer, players.length, refreshPlayers, refreshSavedSessions, scheduleLanReconnect, setLanConnectionStatus, setTransportReadyState, traceLan]
   );
 
   useEffect(() => {
@@ -3295,7 +3467,6 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         },
       }, 'info');
       setLastError(null);
-      sessionGenerationRef.current += 1;
       const deviceId = await getOrCreateDeviceId(db);
       deviceIdRef.current = deviceId;
       setLocalDeviceId(deviceId);
@@ -3392,6 +3563,8 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
         hostIp,
         port: LAN_DEFAULT_PORT,
         playerCount: 0,
+        role: session.role,
+        status: session.status,
       }).catch(error => {
         void traceLan('FUNCTION', 'LanForegroundService.start', 'native_unavailable', 'Foreground Service nativo indisponivel ou falhou.', {
           error: error instanceof Error ? error.message : String(error),
@@ -3439,7 +3612,6 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       if (!parsedCode) {
         throw new Error('Codigo de sessao invalido.');
       }
-      sessionGenerationRef.current += 1;
 
       let discovery: Awaited<ReturnType<typeof discoverLanMaster>> | null = null;
 
@@ -3634,9 +3806,17 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
 
     if (session) {
       await deactivateCurrentSessionLocally('close-active-session');
+      if (session.role === 'player') {
+        await linkCharacterToSession(db, session.id, null);
+        await refreshSavedSessions();
+      }
     }
-    setLastNotice('Sessao LAN ficou inativa. Voce pode retomar pela lista de mesas.');
-  }, [db, deactivateCurrentSessionLocally, traceLan]);
+    setLastNotice(
+      session?.role === 'player'
+        ? 'Voce saiu da mesa. A ficha foi liberada para entrar em outra sessao.'
+        : 'Sessao LAN ficou inativa. Voce pode retomar pela lista de mesas.'
+    );
+  }, [db, deactivateCurrentSessionLocally, refreshSavedSessions, traceLan]);
 
   const linkCharacterToActiveSession = useCallback(
     async (characterId: number | null) => {
@@ -4030,7 +4210,6 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     const subscription = AppState.addEventListener('change', nextState => {
       const previousState = appStateRef.current;
       appStateRef.current = nextState;
-      setAppState(nextState);
 
       if ((previousState === 'background' || previousState === 'inactive') && nextState === 'active') {
         void recoverLanSession('app-returned-active');
@@ -4048,36 +4227,26 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
       tcpClientConnectedRef.current = false;
       return undefined;
     }
-    if (appState !== 'active' || !activeSession.host_ip || !activeSession.port) return undefined;
+    if (!activeSession.host_ip || !activeSession.port) return undefined;
 
     void ensureTcpClient(activeSession, 'active-session-effect');
     return undefined;
-  }, [
-    activeSession?.id,
-    activeSession?.role,
-    activeSession?.status,
-    activeSession?.host_ip,
-    activeSession?.port,
-    activeSession?.linked_character_id,
-    appState,
-    ensureTcpClient,
-  ]);
+  }, [activeSession, ensureTcpClient]);
 
   useEffect(() => {
     if (!activeSession || activeSession.status === 'closed' || activeSession.status === 'inactive' || activeSession.role !== 'player') return undefined;
-    if (appState !== 'active') return undefined;
 
     const pollIntervalMs = activeSession.status === 'paused'
-      ? 7000
+      ? LAN_PLAYER_POLL_PAUSED_INTERVAL_MS
       : connectionStatus === 'reconnecting'
-        ? 3200
-        : 1800;
-    const pollTimeoutMs = activeSession.status === 'paused' ? 1100 : 1400;
+        ? LAN_PLAYER_POLL_RECONNECTING_INTERVAL_MS
+        : LAN_PLAYER_POLL_CONNECTED_INTERVAL_MS;
+    const pollTimeoutMs = activeSession.status === 'paused' ? LAN_PLAYER_POLL_PAUSED_TIMEOUT_MS : LAN_PLAYER_POLL_TIMEOUT_MS;
 
     const interval = setInterval(() => {
       const session = activeSessionRef.current;
       if (!session || session.role !== 'player' || session.status === 'closed' || session.status === 'inactive' || !session.host_ip || !session.port) return;
-      if (appStateRef.current !== 'active' || playerPollInFlightRef.current || tcpClientConnectedRef.current) return;
+      if (playerPollInFlightRef.current || tcpClientConnectedRef.current) return;
       playerPollInFlightRef.current = true;
 
       void (async () => {
@@ -4101,17 +4270,27 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
           await applyRpcSyncPayload(response.payload);
           setTransportReadyState(true);
           setLanConnectionStatus('connected');
+          playerPollFailureCountRef.current[session.id] = 0;
         } catch (error) {
+          const failureCount = (playerPollFailureCountRef.current[session.id] || 0) + 1;
+          playerPollFailureCountRef.current[session.id] = failureCount;
           setTransportReadyState(false);
           setLanConnectionStatus('reconnecting');
-          scheduleLanReconnect(
-            session.status === 'paused' ? 'paused-player-poll-failed' : 'player-poll-failed',
-            session.status === 'paused' ? 7000 : 900
-          );
+          if (failureCount >= LAN_PLAYER_POLL_FAILURES_BEFORE_RECOVERY) {
+            const recoverDelayMs = session.status === 'paused'
+              ? LAN_PLAYER_POLL_PAUSED_INTERVAL_MS
+              : Math.min(LAN_RECOVERY_RETRY_MAX_MS, LAN_RECOVERY_RETRY_BASE_MS + (failureCount - LAN_PLAYER_POLL_FAILURES_BEFORE_RECOVERY) * 4000);
+            scheduleLanReconnect(
+              session.status === 'paused' ? 'paused-player-poll-failed' : 'player-poll-failed',
+              recoverDelayMs
+            );
+          }
           await traceLan('LAN_RPC', 'playerPoll', 'failed', 'Polling LAN do jogador falhou.', {
             sessionId: session.id,
             hostIp: session.host_ip,
             sessionStatus: session.status,
+            failureCount,
+            recoveryAfterFailures: LAN_PLAYER_POLL_FAILURES_BEFORE_RECOVERY,
             error: error instanceof Error ? error.message : String(error),
           }, 'warn');
         } finally {
@@ -4121,18 +4300,26 @@ export function LanSessionProvider({ children }: { children: React.ReactNode }) 
     }, pollIntervalMs);
 
     return () => clearInterval(interval);
-  }, [activeSession?.id, activeSession?.role, activeSession?.status, appState, applyRpcSyncPayload, connectionStatus, db, getLocalLastEventSeq, scheduleLanReconnect, setLanConnectionStatus, setTransportReadyState, traceLan]);
+  }, [activeSession, applyRpcSyncPayload, connectionStatus, db, getLocalLastEventSeq, scheduleLanReconnect, setLanConnectionStatus, setTransportReadyState, traceLan]);
 
   useEffect(() => {
-    if (activeSession?.role !== 'master') return;
-    void LanForegroundService.update({
+    if (!activeSession) return;
+    if (activeSession.status === 'closed') return;
+    if (activeSession.status === 'paused' || activeSession.status === 'inactive') {
+      void LanForegroundService.stop().catch(() => undefined);
+      return;
+    }
+
+    void LanForegroundService.start({
       sessionId: activeSession.id,
       sessionName: activeSession.name,
       hostIp: activeSession.host_ip || null,
       port: Number(activeSession.port || LAN_DEFAULT_PORT),
-      playerCount: players.length,
+      playerCount: activeSession.role === 'master' ? players.length : 1,
+      role: activeSession.role,
+      status: activeSession.status,
     }).catch(() => undefined);
-  }, [activeSession?.id, activeSession?.name, activeSession?.role, activeSession?.host_ip, activeSession?.port, players.length]);
+  }, [activeSession, players.length]);
 
   const value = useMemo<LanSessionContextValue>(
     () => ({

@@ -23,7 +23,7 @@ export function makeShortSessionCode() {
     }
     return result;
   };
-  return `${nextPart(4)}-${nextPart(4)}`;
+  return `${nextPart(4)}-${nextPart(4)}-${nextPart(4)}`;
 }
 
 export function buildSessionShareCode(sessionId: string, hostIp: string, port = LAN_DEFAULT_PORT, hostCandidates: string[] = []) {
@@ -31,13 +31,28 @@ export function buildSessionShareCode(sessionId: string, hostIp: string, port = 
   return `${CODE_PREFIX}|${sessionId}|${hostIp}|${port}|${candidates.join(',')}`;
 }
 
+export function formatManualSessionCode(rawCode: string) {
+  const trimmed = rawCode.trim();
+  if (!trimmed) return '';
+  if (trimmed.includes('|') || trimmed.startsWith('{')) return trimmed;
+
+  const compact = trimmed
+    .toUpperCase()
+    .replace(/[^A-Z2-9]/g, '')
+    .slice(0, 12);
+
+  const groups = compact.match(/.{1,4}/g) || [];
+  return groups.join('-');
+}
+
 export function parseSessionCode(rawCode: string): ParsedSessionCode | null {
-  const trimmed = rawCode.trim().toUpperCase();
+  const trimmed = rawCode.trim();
   if (!trimmed) return null;
 
-  if (/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(trimmed)) {
+  const formattedShortCode = formatManualSessionCode(trimmed);
+  if (/^[A-Z2-9]{4}-[A-Z2-9]{4}(-[A-Z2-9]{4})?$/.test(formattedShortCode)) {
     return {
-      sessionId: trimmed,
+      sessionId: formattedShortCode,
       hostIp: '',
       hostCandidates: [],
       port: LAN_DEFAULT_PORT,
@@ -61,7 +76,7 @@ export function parseSessionCode(rawCode: string): ParsedSessionCode | null {
 
   if (trimmed.includes('|')) {
     const [prefix, sessionId, hostIp, port, candidates] = trimmed.split('|');
-    if (prefix === CODE_PREFIX && sessionId && hostIp) {
+    if (prefix.toUpperCase() === CODE_PREFIX && sessionId && hostIp) {
       const hostCandidates = uniqueIps([hostIp, ...(candidates ? candidates.split(',') : [])]);
       return {
         sessionId: sessionId.toUpperCase(),

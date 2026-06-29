@@ -40,6 +40,13 @@ const getCategory = (spell: any): string => {
   return 'Habilidade';
 };
 
+const splitNameList = (value?: string | null) => String(value || '')
+  .split(',')
+  .map(token => token.trim())
+  .filter(Boolean);
+
+const listIncludesName = (value: string | null | undefined, name: string) => splitNameList(value).includes(name);
+
 
 type FeatureRequirement = string | { name?: string; level?: string | number; level_required?: string | number; minLevel?: string | number };
 
@@ -126,6 +133,7 @@ export default function EditCharacterScreen() {
   const [maxCantrips, setMaxCantrips] = useState(0);
   const [maxSpellsAllowed, setMaxSpellsAllowed] = useState(0);
   const [maxSpellLevelAllowed, setMaxSpellLevelAllowed] = useState(0);
+  const [magicLimitsReady, setMagicLimitsReady] = useState(false);
   
   const [totalCasterLevel, setTotalCasterLevel] = useState(0);
 
@@ -233,7 +241,7 @@ export default function EditCharacterScreen() {
         try { if (currentClass && currentClass.features) cFeats.push(...parseFeatureNamesForLevel(currentClass.features, cls.level)); } catch(e){}
         
         if (cls.subclass) {
-          const currentSub = dbSubclasses.find(s => s.name === cls.subclass && s.class_name === cls.name);
+          const currentSub = dbSubclasses.find(s => s.name === cls.subclass && listIncludesName(s.class_name, cls.name));
           try { if (currentSub && currentSub.features) cFeats.push(...parseFeatureNamesForLevel(currentSub.features, cls.level)); } catch(e){}
         }
       }
@@ -247,6 +255,7 @@ export default function EditCharacterScreen() {
   useEffect(() => {
     async function updateMagicLimits() {
       if (!character || classesData.length === 0) return;
+      setMagicLimitsReady(false);
 
       let calcCantrips = 0;
       let highestSlot = 0;
@@ -316,6 +325,7 @@ export default function EditCharacterScreen() {
       setMaxCantrips(calcCantrips);
       setMaxSpellLevelAllowed(highestSlot);
       setMaxSpellsAllowed(calcSpellsKnown);
+      setMagicLimitsReady(true);
     }
     updateMagicLimits();
   }, [classesData, character, stats, targetLevel, dbClasses]);
@@ -426,15 +436,14 @@ export default function EditCharacterScreen() {
            BG3_ORIGIN_FEATURES.includes(s.name);
   };
 
-  const availableClassCatalog = dbSpells.filter(s => {
+  const isSpellAvailableForCurrentBuild = (s: any) => {
     const sLvl = getSpellLevelNumber(s.level);
     const sCategory = getCategory(s);
-    const spellClasses = String(s.classes || '');
-    const spellClassTokens = spellClasses.split(',').map(token => token.trim()).filter(Boolean);
+    const spellClassTokens = splitNameList(s.classes);
     const hasSelectedClass = activeClassNames.some(className => spellClassTokens.includes(className));
     const hasSelectedSubclass = activeSubclassNames.some(subclassName => spellClassTokens.includes(subclassName));
     const hasSubclassRestriction = dbSubclasses.some(subclass => spellClassTokens.includes(subclass.name));
-    const hasRaceRestriction = spellClassTokens.includes('Raça') || dbRaces.some(race => spellClassTokens.includes(race.name));
+    const hasRaceRestriction = spellClassTokens.includes('Raça') || spellClassTokens.includes('Raca') || dbRaces.some(race => spellClassTokens.includes(race.name));
 
     let isAllowedByLevel = false;
     if (sCategory === 'Magia') {
@@ -462,7 +471,7 @@ export default function EditCharacterScreen() {
           const [cName, cLevel] = req.split(':');
           if (cName && cLevel) {
             const playerClassData = classesData.find(cd => cd.name === cName);
-            if (playerClassData && playerClassData.level < parseInt(cLevel, 10)) {
+            if (!playerClassData || playerClassData.level < parseInt(cLevel, 10)) {
               reqPassed = false;
             }
           }
@@ -473,7 +482,32 @@ export default function EditCharacterScreen() {
     }
 
     return isAllowedByLevel && isCompatibleClass && reqPassed;
-  });
+  };
+
+  const availableClassCatalog = dbSpells.filter(isSpellAvailableForCurrentBuild);
+  const availableClassCatalogKey = availableClassCatalog.map(s => String(s.id)).sort().join('|');
+  const lockedFeaturesKey = lockedFeatures.slice().sort().join('|');
+
+  const getValidActiveSpellIds = (spellIds: string[]) => {
+    const availableIds = new Set(availableClassCatalog.map(s => String(s.id)));
+    const lockedIds = dbSpells
+      .filter(s => lockedFeatures.includes(s.name) && availableIds.has(String(s.id)))
+      .map(s => String(s.id));
+    return Array.from(new Set([
+      ...spellIds.filter(spellId => availableIds.has(String(spellId))),
+      ...lockedIds,
+    ]));
+  };
+
+  useEffect(() => {
+    if (loading || !character || !magicLimitsReady || dbSpells.length === 0 || classesData.length === 0) return;
+    setActiveSpells(prev => {
+      const next = getValidActiveSpellIds(prev);
+      if (next.length === prev.length && next.every((spellId, index) => spellId === prev[index])) return prev;
+      return next;
+    });
+    // getValidActiveSpellIds is intentionally keyed by the catalog/lock signatures above.
+  }, [availableClassCatalogKey, lockedFeaturesKey, loading, character?.id, magicLimitsReady, dbSpells.length, classesData.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!isLevelUpFlow || loading || currentStep !== 3 || openedLevelUpCatalogRef.current) return;
@@ -488,7 +522,9 @@ export default function EditCharacterScreen() {
         const newLevel = c.level + delta;
         if (newLevel < 0) return c;
         if (currentLevelSum + delta > targetLevel) return c; 
-        return { ...c, level: newLevel };
+        const dbClassObj = dbClasses.find(dbClass => dbClass.name === c.name);
+        const subclassLevel = Number(dbClassObj?.subclass_level || 3);
+        return { ...c, level: newLevel, subclass: newLevel >= subclassLevel ? c.subclass : '' };
       }
       return c;
     }));
@@ -651,11 +687,12 @@ export default function EditCharacterScreen() {
 
     const addedHp = parseInt(hpIncrease) || 0;
     const statsToSave = { ...stats, temp_mods: tempMods, extra_points: extraPoints };
+    const spellsToSave = magicLimitsReady ? getValidActiveSpellIds(activeSpells) : activeSpells;
 
     try {
       await db.runAsync(
         `UPDATE characters SET level=?, class=?, hp_max=?, hp_current=?, stats=?, save_values=?, skill_values=?, spells=?, avatar_uri=? WHERE id=?`,
-        [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(activeSpells), avatarUri, character.id]
+        [targetLevel, finalClassStr, character.hp_max + addedHp, character.hp_current + addedHp, JSON.stringify(statsToSave), JSON.stringify(activeSaves), JSON.stringify(activeSkills), JSON.stringify(spellsToSave), avatarUri, character.id]
       );
       if (originalAvatarUri && originalAvatarUri !== avatarUri) deleteStoredCharacterAvatar(originalAvatarUri);
       

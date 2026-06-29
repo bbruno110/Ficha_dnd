@@ -16,6 +16,7 @@ import {
   View,
 } from 'react-native';
 import { useLanSession } from '../contexts/LanSessionContext';
+import { formatManualSessionCode } from '../network/lanProtocol';
 
 export default function LanPlayerJoinScreen() {
   const router = useRouter();
@@ -115,9 +116,10 @@ export default function LanPlayerJoinScreen() {
                 <TextInput
                   style={[styles.input, { flex: 1 }]}
                   value={joinCode}
-                  onChangeText={setJoinCode}
+                  onChangeText={text => setJoinCode(formatManualSessionCode(text))}
                   autoCapitalize="characters"
-                  placeholder="DNDLAN-..."
+                  autoCorrect={false}
+                  placeholder="XXXX-XXXX-XXXX"
                   placeholderTextColor="rgba(255,255,255,0.35)"
                 />
                 <TouchableOpacity style={styles.scanButton} onPress={openScanner}>

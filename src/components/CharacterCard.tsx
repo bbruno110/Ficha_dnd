@@ -19,11 +19,22 @@ type Props = {
   onPress: () => void;
   onDelete: (id: number) => void;
   onEdit: (id: number) => void;
+  onExport?: (character: Character) => void;
+  onDuplicate?: (character: Character) => void;
   onUnlinkFromSession?: (character: Character) => void;
   isLinkedToSession?: boolean;
 };
 
-export default function CharacterCard({ character, onPress, onDelete, onEdit, onUnlinkFromSession, isLinkedToSession = false }: Props) {
+export default function CharacterCard({
+  character,
+  onPress,
+  onDelete,
+  onEdit,
+  onExport,
+  onDuplicate,
+  onUnlinkFromSession,
+  isLinkedToSession = false,
+}: Props) {
   // Estados que controlam o nosso Menu Customizado
   const [modalVisible, setModalVisible] = useState(false);
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
@@ -48,6 +59,16 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, on
 
   const handleDeleteClick = () => {
     setIsConfirmingDelete(true); // Muda o conteúdo do modal para a pergunta de confirmação
+  };
+
+  const handleExport = () => {
+    handleClose();
+    onExport?.(character);
+  };
+
+  const handleDuplicate = () => {
+    handleClose();
+    onDuplicate?.(character);
   };
 
   const handleConfirmDelete = () => {
@@ -114,6 +135,18 @@ export default function CharacterCard({ character, onPress, onDelete, onEdit, on
                   <Text style={styles.optionText}>✏️ Editar Ficha</Text>
                 </TouchableOpacity>
                 
+                {onExport && (
+                  <TouchableOpacity style={styles.optionButton} onPress={handleExport}>
+                    <Text style={styles.optionText}>Exportar ficha</Text>
+                  </TouchableOpacity>
+                )}
+
+                {onDuplicate && (
+                  <TouchableOpacity style={styles.optionButton} onPress={handleDuplicate}>
+                    <Text style={styles.optionText}>Duplicar ficha</Text>
+                  </TouchableOpacity>
+                )}
+
                 {isLinkedToSession && (
                   <>
                     <Text style={styles.linkedWarningText}>

@@ -6,6 +6,8 @@ export type LanForegroundServiceOptions = {
   port: number;
   hostIp?: string | null;
   playerCount?: number;
+  role?: 'master' | 'player';
+  status?: string;
 };
 
 export type LanAddressInfo = {
